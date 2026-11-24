@@ -4,6 +4,7 @@
 //! refused as `environment-missing`; each refusal carries its message and a `hint`.
 
 use std::io;
+use std::os::unix::ffi::OsStringExt as _;
 
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi::{Env, JsError};
@@ -306,6 +307,14 @@ pub struct DescriptorNames {
     pub unread: Option<String>,
 }
 
+fn unread_reason(why: procinfo::Unread) -> String {
+    match why {
+        procinfo::Unread::Gone => "gone",
+        procinfo::Unread::Withheld => "withheld",
+    }
+    .to_owned()
+}
+
 /// The names of the open descriptors of the process `pid`. `devices` asks for pipes and sockets
 /// (named by address on Darwin), `inodes` for everything named by an inode.
 #[napi(js_name = "descriptorNames")]
@@ -331,13 +340,67 @@ pub fn descriptor_names(
         },
         Err(why) => DescriptorNames {
             descriptors: Vec::new(),
-            unread: Some(
-                match why {
-                    procinfo::Unread::Gone => "gone",
-                    procinfo::Unread::Withheld => "withheld",
-                }
-                .to_owned(),
-            ),
+            unread: Some(unread_reason(why)),
+        },
+    })
+}
+
+/// The current working directory of the process `pid`, byte for byte, or `null` once no process
+/// holds the pid.
+#[napi(js_name = "processCwd")]
+pub fn process_cwd(env: Env, pid: i32) -> napi::Result<Option<Buffer>> {
+    let pid = process_id(env, pid, "process id")?;
+    procinfo::directories(pid)
+        .map(|dirs| {
+            dirs.and_then(|dirs| dirs.cwd)
+                .map(|path| Buffer::from(path.into_os_string().into_vec()))
+        })
+        .map_err(|error| {
+            unread(
+                env,
+                format!("the working directory of process {pid}"),
+                &error,
+            )
+        })
+}
+
+/// One open descriptor of a process that names a file-system path.
+#[napi(object)]
+pub struct OpenPath {
+    pub fd: i32,
+    pub path: Buffer,
+    pub event_only: bool,
+}
+
+/// Another process's open file-system paths, or why they were not read: `unread` is `gone` (the
+/// process exited, or none has the pid) or `withheld` (the kernel withholds them from this user).
+#[napi(object)]
+pub struct OpenPaths {
+    pub paths: Vec<OpenPath>,
+    pub unread: Option<String>,
+}
+
+/// The open descriptors of the process `pid` that name a file-system path, in descriptor order.
+#[napi(js_name = "openPaths")]
+pub fn open_paths(env: Env, pid: i32) -> napi::Result<OpenPaths> {
+    let pid = process_id(env, pid, "process id")?;
+    let read = procinfo::open_paths(pid)
+        .map_err(|error| unread(env, format!("the open paths of process {pid}"), &error))?;
+    Ok(match read {
+        Ok(paths) => OpenPaths {
+            paths: paths
+                .into_iter()
+                .map(|entry| OpenPath {
+                    fd: entry.fd,
+                    path: Buffer::from(entry.path.into_os_string().into_vec()),
+                    event_only: entry.event_only,
+                })
+                .collect(),
+            unread: None,
+        },
+        Err(why) => OpenPaths {
+            paths: Vec::new(),
+            unread: Some(unread_reason(why)),
         },
     })
 }

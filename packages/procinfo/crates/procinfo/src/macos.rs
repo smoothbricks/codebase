@@ -6,12 +6,13 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    DescriptorName, GroupMember, HeldLock, LockHolders, NameKinds, ProcessArguments,
-    ProcessLineage, RunState, Unread,
+    DescriptorName, Directories, GroupMember, HeldLock, LockHolders, NameKinds, OpenPath,
+    ProcessArguments, ProcessLineage, RunState, Unread,
 };
 
 /// How long reading a file's locks may take: opening its path waits on the file system, which a
@@ -820,7 +821,7 @@ const TSI_S_LISTEN: libc::c_int = 1;
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ProcFileInfo {
-    _fi_openflags: u32,
+    fi_openflags: u32,
     _fi_status: u32,
     _fi_offset: libc::off_t,
     _fi_type: i32,
@@ -1178,6 +1179,131 @@ const _: () = {
     assert!(size_of::<VnodeFdInfo>() == 176);
     assert!(offset_of!(VnodeFdInfo, pvi) == 24);
 };
+
+/// `PROC_PIDFDVNODEPATHINFO` (`<sys/proc_info.h>`), which the `libc` crate does not declare.
+const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+/// `fcntl.h`'s `O_EVTONLY` as `proc_fileinfo.fi_openflags` carries it: an open for event
+/// notification only, which holds no data and never blocks an unmount.
+const O_EVTONLY: u32 = 0x0000_8000;
+
+/// `struct vnode_fdinfowithpath`: what `PROC_PIDFDVNODEPATHINFO` writes.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    pfi: ProcFileInfo,
+    pvip: libc::vnode_info_path,
+}
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<VnodeFdInfoWithPath>() == 1200);
+    assert!(offset_of!(VnodeFdInfoWithPath, pfi.fi_openflags) == 0);
+    assert!(offset_of!(VnodeFdInfoWithPath, pvip) == 24);
+};
+
+/// The path a NUL-terminated `c_char` buffer holds, or `None` if it holds none. `c_char` is
+/// signed on x86-64 Apple and unsigned on arm64 Apple; `to_ne_bytes` reads either as the same
+/// byte.
+fn c_path(bytes: &[libc::c_char]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let path: Vec<u8> = bytes
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| u8::from_ne_bytes(byte.to_ne_bytes()))
+        .collect();
+    (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(path)))
+}
+
+/// [`Directories`] of process `pid` (`proc_pidinfo(PROC_PIDVNODEPATHINFO)`), or `None` when no
+/// process holds it. Another user's process that the kernel withholds is an error (`EPERM`), as
+/// [`resident_bytes`] and [`cpu_time`] answer it. No file-system path is probed.
+pub fn directories(pid: libc::pid_t) -> io::Result<Option<Directories>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>())
+        .map_err(io::Error::other)?;
+    // SAFETY: errno is thread-local; `info` is writable storage of exactly `size` bytes.
+    let written = unsafe {
+        *libc::__error() = 0;
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written == size {
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        let info = unsafe { info.assume_init() };
+        return Ok(Some(Directories {
+            cwd: c_path(info.pvi_cdir.vip_path.as_flattened()),
+            root: c_path(info.pvi_rdir.vip_path.as_flattened()),
+        }));
+    }
+    if written > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "proc_pidinfo returned {written} bytes of process {pid}'s directories, \
+                 expected {size}"
+            ),
+        ));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(None),
+        _ => Err(io::Error::new(
+            error.kind(),
+            format!("the directories of process {pid} cannot be read: {error}"),
+        )),
+    }
+}
+
+/// Every open vnode descriptor of process `pid` that names a file-system path, in descriptor
+/// order, or why none were read. Reuses [`listing`] and [`descriptor_info`] with
+/// `PROC_PIDFDVNODEPATHINFO`; a descriptor closed since its listing (`EBADF`) or a revoked vnode
+/// (`ENOENT`) is left out. No file-system path is probed.
+pub fn open_paths(pid: libc::pid_t) -> io::Result<Result<Vec<OpenPath>, Unread>> {
+    let listed = match listing(pid)? {
+        Ok(listed) => listed,
+        Err(unread) => return Ok(Err(unread)),
+    };
+    let mut paths = Vec::new();
+    for listed in listed {
+        if libc::c_int::try_from(listed.proc_fdtype) != Ok(libc::PROX_FDTYPE_VNODE) {
+            continue;
+        }
+        match descriptor_info::<VnodeFdInfoWithPath>(pid, listed.proc_fd, PROC_PIDFDVNODEPATHINFO)?
+        {
+            Ok(info) => {
+                if let Some(path) = c_path(info.pvip.vip_path.as_flattened()) {
+                    paths.push(OpenPath {
+                        fd: listed.proc_fd,
+                        path,
+                        event_only: info.pfi.fi_openflags & O_EVTONLY != 0,
+                    });
+                }
+            }
+            // Closed since its listing, or a revoked vnode (lsof's `(revoked)` with no node).
+            Err(libc::EBADF | libc::ENOENT) => {}
+            Err(libc::ESRCH) => return Ok(Err(Unread::Gone)),
+            Err(libc::EPERM) => return Ok(Err(Unread::Withheld)),
+            Err(errno) => {
+                let error = io::Error::from_raw_os_error(errno);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "descriptor {} of process {pid} cannot be read: {error}",
+                        listed.proc_fd
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(Ok(paths))
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,16 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { type ChildProcess, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { closeSync, fstatSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,8 +24,10 @@ import {
   hostLoad,
   listeningPorts,
   lockHolders,
+  openPaths,
   ownDescriptorName,
   processArguments,
+  processCwd,
   processGroups,
   processLineages,
   processRunState,
@@ -248,6 +259,87 @@ describe('descriptor names', () => {
     const { child, pid } = await started('echo up; exec sleep 600');
     await stop(child);
     expect(descriptorNames(pid, { devices: true, inodes: true })).toEqual({ unread: 'gone' });
+  });
+});
+
+describe('processCwd', () => {
+  it('equals process.cwd(), changes after process.chdir, and answers null for a reaped pid', async () => {
+    const text = new TextDecoder();
+    const original = process.cwd();
+    const initial = processCwd(process.pid);
+    expect(initial).not.toBeNull();
+    expect(text.decode(initial ?? new Uint8Array())).toBe(realpathSync(original));
+
+    const other = mkdtempSync(join(tmpdir(), `procinfo-cwd-${process.pid}-`));
+    try {
+      process.chdir(other);
+      const changed = processCwd(process.pid);
+      expect(changed).not.toBeNull();
+      expect(text.decode(changed ?? new Uint8Array())).toBe(realpathSync(other));
+    } finally {
+      process.chdir(original);
+      rmSync(other, { recursive: true, force: true });
+    }
+
+    const { child, pid } = await started('echo up; exec sleep 600');
+    await stop(child);
+    expect(processCwd(pid)).toBeNull();
+  });
+
+  it('refuses invalid ids and an uninspectable process', () => {
+    expect(() => processCwd(0)).toThrow(expect.objectContaining({ code: 'usage', hint: expect.any(String) }));
+    expect(() => processCwd(1.5)).toThrow(RangeError);
+    if (process.geteuid?.() !== 0) {
+      expect(() => processCwd(1)).toThrow(
+        expect.objectContaining({ code: 'environment-missing', hint: expect.any(String) }),
+      );
+    }
+  });
+});
+
+describe('openPaths', () => {
+  it("lists this process's and a child's open files in descriptor order, and marks gone and withheld", async () => {
+    const text = new TextDecoder();
+    const file = join(tmpdir(), `procinfo-open-${process.pid}`);
+    writeFileSync(file, 'x');
+    const canonical = realpathSync(file);
+    const fd = openSync(file, 'r');
+    try {
+      const own = openPaths(process.pid);
+      expect('paths' in own).toBe(true);
+      if (!('paths' in own)) throw new Error('own openPaths was unread');
+      for (let index = 1; index < own.paths.length; index += 1) {
+        const previous = own.paths[index - 1];
+        const current = own.paths[index];
+        if (previous !== undefined && current !== undefined) expect(previous.fd).toBeLessThan(current.fd);
+      }
+      expect(
+        own.paths.some((entry) => entry.fd === fd && text.decode(entry.path) === canonical && !entry.eventOnly),
+      ).toBe(true);
+
+      const { child, pid } = await started('exec 3<"$0"; echo up; read _', { args: [file] });
+      const childOpen = openPaths(pid);
+      expect('paths' in childOpen).toBe(true);
+      if (!('paths' in childOpen)) throw new Error('child openPaths was unread');
+      expect(
+        childOpen.paths.some((entry) => entry.fd === 3 && text.decode(entry.path) === canonical && !entry.eventOnly),
+      ).toBe(true);
+
+      await stop(child);
+      expect(openPaths(pid)).toEqual({ unread: 'gone' });
+    } finally {
+      closeSync(fd);
+      rmSync(file, { force: true });
+    }
+
+    if (process.geteuid?.() !== 0) {
+      expect(openPaths(1)).toEqual({ unread: 'withheld' });
+    }
+  });
+
+  it('refuses invalid ids', () => {
+    expect(() => openPaths(0)).toThrow(expect.objectContaining({ code: 'usage', hint: expect.any(String) }));
+    expect(() => openPaths(1.5)).toThrow(RangeError);
   });
 });
 

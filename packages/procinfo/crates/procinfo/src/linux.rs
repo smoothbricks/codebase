@@ -5,12 +5,13 @@
 
 use std::collections::BTreeSet;
 use std::io;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    DescriptorName, GroupMember, HeldLock, LockHolders, NameKinds, ProcessArguments,
-    ProcessLineage, RunState, Unread,
+    DescriptorName, Directories, GroupMember, HeldLock, LockHolders, NameKinds, OpenPath,
+    ProcessArguments, ProcessLineage, RunState, Unread,
 };
 /// [`running`] from procfs: a pid without a stat has been reaped, and state `Z` (zombie) or `X`
 /// (dead) has exited.
@@ -587,34 +588,59 @@ pub fn descriptor_name(descriptor: std::os::fd::RawFd) -> io::Result<DescriptorN
     Ok(inode(descriptor)?.map_or(DescriptorName::Closed, DescriptorName::Inode))
 }
 
-/// [`descriptor_names`] on Linux, from procfs: each `/proc/<pid>/fd` entry followed to its file,
-/// whose inode is the one `fstat(2)` in that process reports.
-pub fn descriptor_names(
-    pid: libc::pid_t,
-    kinds: NameKinds,
-) -> io::Result<Result<Vec<(std::os::fd::RawFd, DescriptorName)>, Unread>> {
-    use std::os::unix::fs::MetadataExt as _;
+/// [`directories`] from procfs: `readlink` of `/proc/<pid>/cwd` and `/proc/<pid>/root`, with no
+/// `stat` of either target. `None` when no process holds `pid` (or an exited process has no
+/// filesystem links left); another user's process is a `PermissionDenied` error.
+pub fn directories(pid: libc::pid_t) -> io::Result<Option<Directories>> {
+    let read = |link: &str| {
+        let path = format!("/proc/{pid}/{link}");
+        match std::fs::read_link(&path) {
+            Ok(target) => Ok(Some(target)),
+            Err(error) if gone(&error) => Ok(None),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("the directories of process {pid} cannot be read: {error}"),
+            )),
+        }
+    };
+    let Some(cwd) = read("cwd")? else {
+        return Ok(None);
+    };
+    let Some(root) = read("root")? else {
+        return Ok(None);
+    };
+    Ok(Some(Directories {
+        cwd: Some(cwd),
+        root: Some(root),
+    }))
+}
 
-    let unread = |error: io::Error| match error.kind() {
-        io::ErrorKind::NotFound => Ok(Err(Unread::Gone)),
-        io::ErrorKind::PermissionDenied => Ok(Err(Unread::Withheld)),
-        _ => Err(io::Error::new(
+/// Map an error from reading `/proc/<pid>/fd` into [`Unread`] or a fatal `io::Error`.
+fn fd_unread<T>(pid: libc::pid_t, error: io::Error) -> io::Result<Result<T, Unread>> {
+    if gone(&error) {
+        Ok(Err(Unread::Gone))
+    } else if error.kind() == io::ErrorKind::PermissionDenied {
+        Ok(Err(Unread::Withheld))
+    } else {
+        Err(io::Error::new(
             error.kind(),
             format!("the descriptors of process {pid} cannot be read: {error}"),
-        )),
-    };
-    if !kinds.inodes {
-        return Ok(Ok(Vec::new()));
+        ))
     }
+}
+
+/// Every entry of `/proc/<pid>/fd` as `(fd, path)`, in ascending descriptor order, or why none
+/// were read.
+fn fd_entries(pid: libc::pid_t) -> io::Result<Result<Vec<(std::os::fd::RawFd, PathBuf)>, Unread>> {
     let entries = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
         Ok(entries) => entries,
-        Err(error) => return unread(error),
+        Err(error) => return fd_unread(pid, error),
     };
-    let mut named = Vec::new();
+    let mut listed = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error) => return unread(error),
+            Err(error) => return fd_unread(pid, error),
         };
         let number = entry.file_name();
         let descriptor = number
@@ -626,15 +652,67 @@ pub fn descriptor_names(
                     format!("/proc/{pid}/fd lists {number:?}, which is no descriptor number"),
                 )
             })?;
-        match std::fs::metadata(entry.path()) {
+        listed.push((descriptor, entry.path()));
+    }
+    listed.sort_unstable_by_key(|(descriptor, _)| *descriptor);
+    Ok(Ok(listed))
+}
+
+/// [`descriptor_names`] on Linux, from procfs: each `/proc/<pid>/fd` entry followed to its file,
+/// whose inode is the one `fstat(2)` in that process reports.
+pub fn descriptor_names(
+    pid: libc::pid_t,
+    kinds: NameKinds,
+) -> io::Result<Result<Vec<(std::os::fd::RawFd, DescriptorName)>, Unread>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !kinds.inodes {
+        return Ok(Ok(Vec::new()));
+    }
+    let entries = match fd_entries(pid)? {
+        Ok(entries) => entries,
+        Err(unread) => return Ok(Err(unread)),
+    };
+    let mut named = Vec::new();
+    for (descriptor, path) in entries {
+        match std::fs::metadata(&path) {
             Ok(file) => named.push((descriptor, DescriptorName::Inode(file.ino()))),
             // Closed since the directory was read: it names nothing now.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return unread(error),
+            Err(error) if gone(&error) => {}
+            Err(error) => return fd_unread(pid, error),
         }
     }
-    named.sort_unstable_by_key(|(descriptor, _)| *descriptor);
     Ok(Ok(named))
+}
+
+/// [`open_paths`] on Linux, from procfs: `readlink` of each `/proc/<pid>/fd/<n>`, keeping only
+/// absolute file-system paths (excluding `socket:[…]`, `pipe:[…]`, `anon_inode:…`). No target
+/// path is stat'd; Linux has no event-only open, so `event_only` is always `false`.
+pub fn open_paths(pid: libc::pid_t) -> io::Result<Result<Vec<OpenPath>, Unread>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let entries = match fd_entries(pid)? {
+        Ok(entries) => entries,
+        Err(unread) => return Ok(Err(unread)),
+    };
+    let mut paths = Vec::new();
+    for (fd, link) in entries {
+        match std::fs::read_link(&link) {
+            Ok(target) => {
+                if target.as_os_str().as_bytes().starts_with(b"/") {
+                    paths.push(OpenPath {
+                        fd,
+                        path: target,
+                        event_only: false,
+                    });
+                }
+            }
+            // Closed since the directory was read: it names nothing now.
+            Err(error) if gone(&error) => {}
+            Err(error) => return fd_unread(pid, error),
+        }
+    }
+    Ok(Ok(paths))
 }
 
 /// The inode `fstat(2)` reports for `descriptor`; `None` when it is not open.

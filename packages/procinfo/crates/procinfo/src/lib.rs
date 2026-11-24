@@ -26,8 +26,9 @@ use macos as platform;
 
 // Each fact is read from its platform's own kernel, selected here and nowhere else.
 pub use platform::{
-    child_pids, cpu_time, descriptor_name, descriptor_names, lineage, listening_ports,
-    lock_holders, process_arguments, resident_bytes, run_state, running, sandboxed, started,
+    child_pids, cpu_time, descriptor_name, descriptor_names, directories, lineage, listening_ports,
+    lock_holders, open_paths, process_arguments, resident_bytes, run_state, running, sandboxed,
+    started,
 };
 // A process group's members, where the kernel lists them (`proc_listpgrppids`). Linux lists a
 // group only to a census of `/proc`, so procinfo offers no group facts there: cowshed's Linux job
@@ -173,7 +174,26 @@ pub enum DescriptorName {
     Unnamed { fd_type: u32 },
 }
 
-/// Why another process's descriptors were not read ([`descriptor_names`]).
+/// A process's current working directory and root directory, as the kernel records them
+/// ([`directories`]). Either is `None` where the kernel names none (on Darwin, `pvi_rdir` is empty
+/// unless the process is chrooted, so `root` is `None` for an ordinary process).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Directories {
+    pub cwd: Option<std::path::PathBuf>,
+    pub root: Option<std::path::PathBuf>,
+}
+
+/// One open descriptor of a process that names a file-system path ([`open_paths`]).
+/// `event_only` marks a Darwin `O_EVTONLY` open (for event notification only, which holds no data
+/// and never blocks an unmount); Linux has no event-only open, so it is always `false` there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenPath {
+    pub fd: std::os::fd::RawFd,
+    pub path: std::path::PathBuf,
+    pub event_only: bool,
+}
+
+/// Why another process's descriptors were not read ([`descriptor_names`], [`open_paths`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unread {
     /// The process exited, or no process has the pid, before they were read.
@@ -357,6 +377,188 @@ mod tests {
         // SAFETY: geteuid has no failure and touches no memory.
         let root = unsafe { libc::geteuid() } == 0;
         let init = descriptor_names(1, all).expect("read");
+        assert_eq!(init.is_ok(), root, "{init:?}");
+        assert!(root || init == Err(Unread::Withheld), "{init:?}");
+    }
+
+    /// A process's directories follow `chdir`, hold its root directory, vanish once a child is
+    /// reaped, and refuse another user's process with an error unless this process is root.
+    #[test]
+    fn a_process_s_directories_follow_chdir_and_vanish_when_reaped() {
+        struct RestoreDir(std::path::PathBuf);
+        impl Drop for RestoreDir {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let me = libc::pid_t::try_from(std::process::id()).expect("a pid");
+        let original = std::env::current_dir().expect("current dir");
+        let _restore = RestoreDir(original.clone());
+        let expected_original = std::fs::canonicalize(&original).expect("canonical original");
+        let initial = directories(me)
+            .expect("read own directories")
+            .expect("this process runs");
+        assert_eq!(initial.cwd.as_deref(), Some(expected_original.as_path()));
+        if cfg!(target_os = "linux") {
+            assert_eq!(initial.root.as_deref(), Some(std::path::Path::new("/")));
+        } else {
+            assert!(
+                initial.root.is_none()
+                    || initial.root.as_deref() == Some(std::path::Path::new("/")),
+                "{initial:?}"
+            );
+        }
+
+        let temp = std::env::temp_dir().join(format!("procinfo-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let expected_temp = std::fs::canonicalize(&temp).expect("canonical temp");
+        std::env::set_current_dir(&temp).expect("chdir to temp");
+        let after_chdir = directories(me);
+        std::env::set_current_dir(&original).expect("restore original dir");
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "echo ready; read _"])
+            .current_dir(&temp)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_reaped()
+            .expect("spawn child");
+        let child_pid = libc::pid_t::try_from(child.id()).expect("a pid");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().expect("piped stdout")),
+            &mut ready,
+        )
+        .expect("read child readiness");
+        let child_dirs = directories(child_pid);
+        drop(child.stdin.take());
+        child.wait().expect("reap child");
+        let reaped = directories(child_pid);
+        std::fs::remove_dir_all(&temp).expect("remove temp dir");
+
+        assert_eq!(ready, "ready\n");
+        let after_chdir = after_chdir
+            .expect("read own directories after chdir")
+            .expect("this process runs");
+        assert_eq!(after_chdir.cwd.as_deref(), Some(expected_temp.as_path()));
+        let child_dirs = child_dirs
+            .expect("read child directories")
+            .expect("child runs");
+        assert_eq!(child_dirs.cwd.as_deref(), Some(expected_temp.as_path()));
+        if cfg!(target_os = "linux") {
+            assert_eq!(child_dirs.root.as_deref(), Some(std::path::Path::new("/")));
+        } else {
+            assert!(
+                child_dirs.root.is_none()
+                    || child_dirs.root.as_deref() == Some(std::path::Path::new("/")),
+                "{child_dirs:?}"
+            );
+        }
+        assert_eq!(reaped.expect("read reaped directories"), None);
+
+        // SAFETY: geteuid has no failure and touches no memory.
+        let root = unsafe { libc::geteuid() } == 0;
+        let init = directories(1);
+        assert_eq!(init.is_ok(), root, "{init:?}");
+    }
+
+    /// Open file-system paths appear in descriptor order for this process and its child (with
+    /// `event_only` marking Darwin `O_EVTONLY` opens), pipes do not, a reaped child is gone, and
+    /// pid 1 is withheld unless this process is root.
+    #[test]
+    fn open_paths_lists_open_files_in_descriptor_order_and_marks_gone_and_withheld() {
+        use std::os::fd::AsRawFd as _;
+
+        let me = libc::pid_t::try_from(std::process::id()).expect("a pid");
+        let path = std::env::temp_dir().join(format!("procinfo-open-{}", std::process::id()));
+        std::fs::write(&path, b"x").expect("create temp file");
+        let canonical = std::fs::canonicalize(&path).expect("canonical temp file");
+        let file = std::fs::File::open(&path).expect("open temp file");
+        let (pipe_read, pipe_write) = std::io::pipe().expect("pipe");
+        #[cfg(target_os = "macos")]
+        let evtonly = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0x0000_8000)
+                .open(&path)
+                .expect("open O_EVTONLY")
+        };
+
+        let own = open_paths(me)
+            .expect("read own open paths")
+            .expect("own descriptors are readable");
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec 3<\"$0\"; echo ready; read _"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_reaped()
+            .expect("spawn child");
+        let child_pid = libc::pid_t::try_from(child.id()).expect("a pid");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().expect("piped stdout")),
+            &mut ready,
+        )
+        .expect("read child readiness");
+        let child_open = open_paths(child_pid);
+        drop(child.stdin.take());
+        child.wait().expect("reap child");
+        let reaped = open_paths(child_pid);
+
+        assert!(
+            own.windows(2).all(|pair| pair[0].fd < pair[1].fd),
+            "descriptors are strictly ascending: {own:?}"
+        );
+        assert!(
+            own.contains(&OpenPath {
+                fd: file.as_raw_fd(),
+                path: canonical.clone(),
+                event_only: false,
+            }),
+            "{own:?}"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                own.contains(&OpenPath {
+                    fd: evtonly.as_raw_fd(),
+                    path: canonical.clone(),
+                    event_only: true,
+                }),
+                "{own:?}"
+            );
+            drop(evtonly);
+        }
+        assert!(
+            !own.iter().any(
+                |entry| entry.fd == pipe_read.as_raw_fd() || entry.fd == pipe_write.as_raw_fd()
+            ),
+            "pipes name no file-system path: {own:?}"
+        );
+        drop((file, pipe_read, pipe_write));
+        std::fs::remove_file(&path).expect("remove temp file");
+
+        assert_eq!(ready, "ready\n");
+        let child_open = child_open
+            .expect("read child open paths")
+            .expect("child descriptors are readable");
+        assert!(
+            child_open.contains(&OpenPath {
+                fd: 3,
+                path: canonical,
+                event_only: false,
+            }),
+            "{child_open:?}"
+        );
+        assert_eq!(reaped.expect("read reaped open paths"), Err(Unread::Gone));
+
+        // SAFETY: geteuid has no failure and touches no memory.
+        let root = unsafe { libc::geteuid() } == 0;
+        let init = open_paths(1).expect("read pid 1 open paths");
         assert_eq!(init.is_ok(), root, "{init:?}");
         assert!(root || init == Err(Unread::Withheld), "{init:?}");
     }

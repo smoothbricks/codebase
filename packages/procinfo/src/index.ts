@@ -57,6 +57,20 @@ export type DescriptorNames =
   /** `gone`: the process exited or no process has the pid; `withheld`: the kernel withholds them from this user. */
   | { readonly unread: 'gone' | 'withheld' };
 
+/** One open descriptor of a process that names a file-system path. */
+export type OpenPath = {
+  readonly fd: number;
+  readonly path: Uint8Array;
+  /** Open for event notification only (`O_EVTONLY` on Darwin), which holds no data; always `false` on Linux. */
+  readonly eventOnly: boolean;
+};
+
+/** Another process's open file-system paths, or why they were not read. */
+export type OpenPaths =
+  | { readonly paths: readonly OpenPath[] }
+  /** `gone`: the process exited or no process has the pid; `withheld`: the kernel withholds them from this user. */
+  | { readonly unread: 'gone' | 'withheld' };
+
 /** `getloadavg(3)`: the average run-queue length over the last 1, 5 and 15 minutes. */
 export type HostLoad = { readonly one: number; readonly five: number; readonly fifteen: number };
 
@@ -117,6 +131,11 @@ interface ProcinfoAddon {
     readonly descriptors: readonly { readonly fd: number; readonly name: NativeDescriptorName }[];
     readonly unread?: string | null;
   };
+  processCwd(pid: number): Uint8Array | null | undefined;
+  openPaths(pid: number): {
+    readonly paths: readonly OpenPath[];
+    readonly unread?: string | null;
+  };
   sandboxed(pid: number): boolean;
   hostLoad(): HostLoad | null | undefined;
   lockHolders(path: string): {
@@ -144,6 +163,8 @@ const ADDON_EXPORTS = [
   'startedUs',
   'descriptorName',
   'descriptorNames',
+  'processCwd',
+  'openPaths',
   'sandboxed',
   'hostLoad',
   'lockHolders',
@@ -345,6 +366,34 @@ export function descriptorNames(
     case undefined:
     case null:
       return { descriptors: read.descriptors.map(({ fd, name }) => ({ fd, name: descriptorName(name) })) };
+    case 'gone':
+    case 'withheld':
+      return { unread: read.unread };
+    default:
+      throw new Error(`the procinfo addon answered an unknown reason ${read.unread}`);
+  }
+}
+
+/**
+ * The current working directory of the process `pid`, byte for byte, or `null` when no process holds the pid
+ * (`PROC_PIDVNODEPATHINFO` on Darwin, `readlink /proc/<pid>/cwd` on Linux). Throws `environment-missing` for a process
+ * this reader may not inspect.
+ */
+export function processCwd(pid: number): Uint8Array | null {
+  return addon().processCwd(int32(pid, 'process id')) ?? null;
+}
+
+/**
+ * The open descriptors of the process `pid` that name a file-system path, in descriptor order (`PROC_PIDFDVNODEPATHINFO`
+ * on Darwin, `readlink /proc/<pid>/fd/<n>` on Linux), or `gone`/`withheld` when they were not read. No target path is
+ * probed.
+ */
+export function openPaths(pid: number): OpenPaths {
+  const read = addon().openPaths(int32(pid, 'process id'));
+  switch (read.unread) {
+    case undefined:
+    case null:
+      return { paths: read.paths };
     case 'gone':
     case 'withheld':
       return { unread: read.unread };
