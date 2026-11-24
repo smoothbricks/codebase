@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:test';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -16,6 +17,16 @@ describe('Go test progress host proofs', () => {
   });
 
   const wrapper = join(import.meta.dir, '__tests__', 'go-link-barrier-toolexec.cjs');
+  const stdlibCache = join(import.meta.dir, '../../..', '.cache', 'go-progress-stdlib-cache');
+
+  async function copyStdlibCache(destination: string): Promise<void> {
+    if (!existsSync(stdlibCache)) {
+      throw new Error(
+        `missing Go stdlib cache at ${stdlibCache}; run \`nx run nx-plugin:go-progress-stdlib-cache\` first`,
+      );
+    }
+    await cp(stdlibCache, destination, { recursive: true });
+  }
 
   describe('held linking phases', () => {
     let root = '';
@@ -48,7 +59,7 @@ describe('Go test progress host proofs', () => {
         }
         endpoint = join(root, 'runner.sock');
         goCache = join(root, 'gocache');
-        await mkdir(goCache);
+        await copyStdlibCache(goCache);
       } catch (error) {
         failedPhase ??= { name: 'beforeAll fixture setup', error };
         throw error;
@@ -231,7 +242,7 @@ describe('Go test progress host proofs', () => {
   it('ends a real hanging Go test when its unchanged active-test budget expires', async () => {
     const root = await goFixture();
     const goCache = join(root, 'gocache');
-    await mkdir(goCache);
+    await copyStdlibCache(goCache);
     await writeFile(
       join(root, 'hang_test.go'),
       'package example\nimport ("runtime"; "testing")\nfunc TestHang(t *testing.T) { for { runtime.Gosched() } }\n',

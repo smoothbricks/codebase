@@ -545,6 +545,29 @@
           }
         }
       },
+      "go-progress-stdlib-cache": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "smooTaskKind": "test"
+        },
+        "inputs": [
+          "{projectRoot}/src/executors/bounded-exec/__tests__/go-link-barrier-toolexec.cjs",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh go version"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/.cache/go-progress-stdlib-cache/"
+        ],
+        "options": {
+          "command": "sh -eu -c 'out=\"$PWD/.cache/go-progress-stdlib-cache\"; stage=\"$out.tmp.$$\"; seed=$(mktemp -d); trap \"rm -rf \\\"$seed\\\" \\\"$stage\\\"\" EXIT; mkdir -p \"$stage\"; printf \"module seed\\n\\ngo 1.24\\n\" > \"$seed/go.mod\"; printf \"package seed\\nimport (\\\"runtime\\\"; \\\"testing\\\")\\nfunc TestSeed(t *testing.T) { runtime.Gosched() }\\n\" > \"$seed/seed_test.go\"; wrapper=\"$PWD/src/executors/bounded-exec/__tests__/go-link-barrier-toolexec.cjs\"; (cd \"$seed\" && GOCACHE=\"$stage\" GOWORK=off GOTOOLCHAIN=local GOPROXY=off go test -p=1 -count=1 -c -o /dev/null -toolexec=\"node $wrapper\" .); rm -rf \"$out\"; mv \"$stage\" \"$out\"'",
+          "cwd": "{projectRoot}"
+        }
+      },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
@@ -702,7 +725,8 @@
               "cowshed"
             ],
             "target": "ram-fixture"
-          }
+          },
+          "go-progress-stdlib-cache"
         ],
         "options": {
           "command": "bun test --timeout=0 ./src/executors/bounded-exec/ram-temp-host.test.ts ./src/executors/bounded-exec/executor-host.test.ts ./src/executors/bounded-exec/go-progress-host.test.ts ./src/executors/bounded-exec/cargo-progress-host.test.ts ./src/nx-daemon-stop-host.test.ts ./src/nx-daemon-watch-stream-host.test.ts ./src/executors/bounded-exec/hang-diagnostics-host.test.ts",
