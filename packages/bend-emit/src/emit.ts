@@ -2047,7 +2047,11 @@ function tsStmt(s: Stmt, ind: string, tco: TcoCtx | null): string {
   switch (s.k) {
     case 'ret':
       if (tco !== null && s.e.k === 'call' && s.e.f === tco.name) {
-        const temps = s.e.args.map((a, i) => `${ind}const __t${i} = ${tsExpr(a)};\n`).join('');
+        const temps = s.e.args
+          .map(
+            (a, i) => `${ind}const __t${i}: ${tsTy(tco.params[i]?.ty ?? refuse('tail call arity'))} = ${tsExpr(a)};\n`,
+          )
+          .join('');
         const assigns = tco.params.map((p, i) => `${ind}${p.name} = __t${i};\n`).join('');
         return `${temps}${assigns}${ind}continue tail;\n`;
       }
