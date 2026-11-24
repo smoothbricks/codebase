@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { readJson, type Tree, updateJson } from 'nx/src/devkit-exports.js';
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 import { FsTree, flushChanges } from 'nx/src/generators/tree.js';
+import { cargoCrossTestArchiveFile } from '../cross-check-policy.js';
 import type { PackageJson } from '../workspace-manifest.js';
+import { renderCiWorkflowYaml } from './ci-workflow.js';
 import type { WorkspaceProjects } from './context.js';
 import { generateManagedFiles } from './generator.js';
 import { INLINE_LOCAL_BEGIN, INLINE_LOCAL_END, LOCAL_SECTION_MARKER } from './managed-content.js';
@@ -56,6 +58,47 @@ function workflowSteps(yaml: string): Array<Map<string, unknown>> {
       : [],
   );
 }
+
+const readPermissions = { actions: 'read', contents: 'read' };
+const statusPermissions = { ...readPermissions, statuses: 'write' };
+
+describe('CI job permissions', () => {
+  for (const actionsProvider of ['github', 'forgejo'] as const) {
+    for (const deploy of [false, true]) {
+      it(`scopes writes to their consumers (${actionsProvider}, deploy=${deploy})`, () => {
+        const triple = 'aarch64-apple-darwin';
+        const workflow: unknown = Bun.YAML.parse(
+          renderCiWorkflowYaml({
+            actionsProvider,
+            deploy,
+            browserTests: false,
+            e2eDeployment: deploy,
+            productionOnPush: deploy,
+            pushBranches: ['main'],
+            crossTestArchives: [{ triple, path: cargoCrossTestArchiveFile(triple) }],
+          }),
+        );
+        expect(workflow).toHaveProperty('permissions', readPermissions);
+        expect(workflow).toHaveProperty('jobs.main.permissions', {
+          actions: 'write',
+          contents: 'read',
+          ...(deploy ? { deployments: 'write' } : {}),
+          statuses: 'write',
+        });
+        // This job runs the downloaded test archives without publishing commit statuses.
+        expect(workflow).toHaveProperty('jobs.macos-cross-tests');
+        expect(workflow).not.toHaveProperty('jobs.macos-cross-tests.permissions');
+        if (deploy) {
+          expect(workflow).toHaveProperty('jobs.e2e-deployment.permissions', statusPermissions);
+          expect(workflow).toHaveProperty('jobs.deploy-production.permissions', statusPermissions);
+        } else {
+          expect(workflow).not.toHaveProperty('jobs.e2e-deployment');
+          expect(workflow).not.toHaveProperty('jobs.deploy-production');
+        }
+      });
+    }
+  }
+});
 
 describe('managed-files generator', () => {
   it('generates workflows and packaged bootstrap assets in a virtual workspace', async () => {
@@ -111,6 +154,19 @@ describe('managed-files generator', () => {
       });
       expect(carriers.length).toBeGreaterThan(1);
       generated.write('.github/workflows/producer.yml', producer);
+      const triple = 'aarch64-apple-darwin';
+      generated.write(
+        '.github/workflows/ci-with-deploy.yml',
+        renderCiWorkflowYaml({
+          actionsProvider,
+          deploy: true,
+          browserTests: true,
+          e2eDeployment: true,
+          productionOnPush: true,
+          pushBranches: ['main'],
+          crossTestArchives: [{ triple, path: cargoCrossTestArchiveFile(triple) }],
+        }),
+      );
       flushChanges(root, generated.listChanges());
       const result = Bun.spawnSync(['jactionlint', '--no-online', '--config-file', '/dev/null', '--strict-exit'], {
         cwd: root,
