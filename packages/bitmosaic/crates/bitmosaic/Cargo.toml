@@ -62,6 +62,16 @@ item = "Image"
 consumer = "private"
 why = "a consumer that holds a set-typed value tells its format by the first byte and refuses by name what this version does not read"
 
+[[package.metadata.wiring.external]]
+item = "promote"
+consumer = "private"
+why = "a consumer hydrates a sealed Format 2 maplet back into a live mutable Maplet on first write"
+
+[[package.metadata.wiring.external]]
+item = "is_multi_value"
+consumer = "private"
+why = "a caller distinguishes unique-key and multi-value sealed maplets before routing lookups"
+
 [dependencies]
 
 [features]
