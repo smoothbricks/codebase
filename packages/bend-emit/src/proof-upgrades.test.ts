@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import ts from 'typescript';
 import { blake3Hex } from './blake3.js';
 import { run as runCli } from './cli.js';
 import { checkBendFile } from './emit.js';
@@ -800,5 +801,74 @@ law anc_depth_nonneg:
     const goRun = sh('./rec_go', [], dir);
     const tsRun = sh('bun', ['rec_tree.ts'], dir);
     expect({ rs: rsRun.code, go: goRun.code, ts: tsRun.code }).toEqual({ rs: 0, go: 0, ts: 0 });
+  });
+});
+
+/** The compiler's diagnostics for one emitted module, checked strictly in-process with nothing else in the program. */
+function typeErrors(file: string): string[] {
+  const program = ts.createProgram([file], {
+    strict: true,
+    noEmit: true,
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    lib: ['lib.es2022.d.ts'],
+    types: [],
+  });
+  return ts
+    .getPreEmitDiagnostics(program)
+    .map((d) => `${d.start ?? 0}: ${ts.flattenDiagnosticMessageText(d.messageText, '\n')}`);
+}
+
+// A tail call lowered to a loop reassigns its parameters, so each value it passes keeps the parameter's type: a
+// rebuilt `Con` and a user ADT constructor alike keep their literal tags.
+test('a tail call that passes a constructed List or ADT value emits a TS module that typechecks', async () => {
+  await withTempDir(async (dir) => {
+    const modelPath = join(dir, 'tco_ctor.bend');
+    writeFileSync(
+      modelPath,
+      `import Base
+
+type Path is Data:
+  Root{}
+  Step{depth: Nat, parent: Path}
+
+def last(l: +List<Nat>) -> Nat:
+  match l:
+    case Nil{}:
+      0n
+    case Con{h, t}:
+      match t:
+        case Nil{}:
+          h
+        case Con{g, u}:
+          last(Con{g, u})
+
+def climb(+n: Nat, p: Path) -> Path:
+  match n:
+    case 0n:
+      p
+    case 1n+k:
+      climb(k, Step{k, p})
+
+law last_of_one:
+  for n: Nat
+  {last(Con{n, Nil{}}) == n : Nat}
+
+law climb_none:
+  for p: Path
+  {climb(0n, p) == p : Path}
+`,
+    );
+    const book = await checkBendFile(modelPath);
+    const em = book.emit({
+      target: { kind: 'ts-module', modelName: 'tco_ctor.bend', flags: [] },
+      functions: ['last', 'climb'],
+      laws: ['last_of_one', 'climb_none'],
+    });
+    if (em.kind !== 'module') throw new Error('expected module');
+    expect(em.source.match(/continue tail;/g)?.length).toBe(2);
+    const file = join(dir, 'model.ts');
+    writeFileSync(file, em.source);
+    expect(typeErrors(file)).toEqual([]);
   });
 });

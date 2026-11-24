@@ -55,6 +55,9 @@
       "bin": {
         "bend-emit": "./bin/bend-emit.ts",
       },
+      "devDependencies": {
+        "typescript": "^6.0.3",
+      },
     },
     "packages/bitmosaic": {
       "name": "@smoothbricks/bitmosaic",
