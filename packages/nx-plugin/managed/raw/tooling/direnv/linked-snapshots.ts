@@ -176,7 +176,7 @@ type ProducerOutput = Extract<
 type ProducerRecord = Extract<EnsureBuiltProbeResult, { readonly disposition: 'hit' }>['receipt']['producer'];
 
 /** The producer protocol versions this consumer reads. */
-const PRODUCER_VERSION = 1;
+const PRODUCER_VERSION = 2;
 
 /**
  * A snapshot ID resolves from the consumer's store, which imports it from its main checkout's store when it lacks it.

@@ -79,7 +79,7 @@ export function receiptOf(root, target) {
   // A boundary control: the producer record a plugin publishes, shaped as its contract names it. The real-Nx
   // control in nx-plugin (linked-snapshots.nx.test.ts) proves the actual publication.
   const producer = {
-    version: 1, target, argv: ['nx', 'run', target], trackedTreeClean: true, environmentIdentity: 'fixture-environment',
+    version: 2, target, argv: ['nx', 'run', target], trackedTreeClean: true, environmentIdentity: 'fixture-environment',
     inputs: [{ taskId: target, overrides: {}, declared: [], expanded: {}, hashDetails: { command: target, nodes: {}, runtime: {} }, files: [] }],
     tools: [], outputSha256: createHash('sha256').update(JSON.stringify(tasks)).digest('hex'), wallTimeMs: 1,
   };
@@ -269,7 +269,7 @@ async function withEnv<T>(changes: Readonly<Record<string, string | undefined>>,
 }
 
 /** How the producer answers a capture: its live receipt, or that bent to a miss or to a malformed producer record. */
-type Mode = 'hit' | 'miss' | 'no-producer' | 'producer-v2' | 'other-argv';
+type Mode = 'hit' | 'miss' | 'no-producer' | 'producer-v1' | 'other-argv';
 
 /** Receipts the producer gave earlier, by target: answers that outlive the provider state they described. */
 type Receipts = Readonly<Record<string, EnsureBuiltReceipt>>;
@@ -299,7 +299,7 @@ function probeOf(checkout: Fixture, mode: Mode, frozen: Receipts | null): Produc
     const held = frozen?.[target];
     const receipt = held === undefined ? await hitOf(live, target, providerRoot) : structuredClone(held);
     if (mode === 'no-producer') Reflect.deleteProperty(receipt, 'producer');
-    if (mode === 'producer-v2') Reflect.set(receipt.producer, 'version', 2);
+    if (mode === 'producer-v1') Reflect.set(receipt.producer, 'version', 1);
     if (mode === 'other-argv') Reflect.set(receipt.producer, 'argv', [...receipt.producer.argv, '--skip-nx-cache']);
     return { disposition: 'hit', receipt };
   };
@@ -509,7 +509,7 @@ describe('linked package snapshots', () => {
   it('refuses a cache hit with no producer completion receipt, or one of an unknown version', async () => {
     const checkout = fixture();
     expect(refusalOf(await capture(checkout, 'no-producer'))).toContain('has no producer completion receipt');
-    expect(refusalOf(await capture(checkout, 'producer-v2'))).toContain('producer receipt of unknown version 2');
+    expect(refusalOf(await capture(checkout, 'producer-v1'))).toContain('producer receipt of unknown version 1');
   });
 
   it('names the same bytes anew under another production of them', async () => {

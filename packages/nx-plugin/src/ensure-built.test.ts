@@ -1113,7 +1113,6 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           await writeFile(
             toolRewriteEntry,
             `
-import { writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const fs = createRequire(import.meta.url)('node:fs');
 const openSync = fs.openSync;
@@ -1124,7 +1123,7 @@ fs.openSync = (...args: Parameters<typeof openSync>) => {
   return openSync(...args);
 };
 const { probeBuilt } = await import(${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))});
-writeFileSync(git, '#!/bin/sh\\nexit 2\\n');
+fs.writeFileSync(git, '#!/bin/sh\\nexit 2\\n');
 const refused = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ refused, gitOpens }) + "\\n", error => error ? reject(error) : resolve()));
 `,

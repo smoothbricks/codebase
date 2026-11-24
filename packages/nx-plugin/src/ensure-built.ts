@@ -215,6 +215,8 @@ export interface EnsureBuiltProducerTaskInputs {
   readonly hashDetails: Readonly<NxNative.TaskHashDetails>;
   readonly files: readonly EnsureBuiltProducerFileInput[];
 }
+/** A tool node recorded in a producer receipt: its content witness plus the stamp the producer's census read it at. */
+export type EnsureBuiltProducerToolNode = EnsureBuiltOutputReceipt & { readonly stamp: string };
 export interface EnsureBuiltProducerTool {
   readonly kind: 'module' | 'executable';
   readonly name: string;
@@ -224,11 +226,11 @@ export interface EnsureBuiltProducerTool {
   readonly missing: readonly string[];
   readonly resolutions: readonly { readonly name: string; readonly from: string; readonly target: string | null }[];
   /** Absolute node paths bind the physical closure, including package-owned build-volume aliases. */
-  readonly nodes: readonly EnsureBuiltOutputReceipt[];
+  readonly nodes: readonly EnsureBuiltProducerToolNode[];
   readonly sha256: string;
 }
 export interface EnsureBuiltProducerReceipt {
-  readonly version: 1;
+  readonly version: 2;
   readonly target: string;
   readonly argv: readonly string[];
   readonly trackedTreeClean: true;

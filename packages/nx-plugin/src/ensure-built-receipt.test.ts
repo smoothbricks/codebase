@@ -63,7 +63,7 @@ beforeEach(async () => {
   if (!captured.ok) throw new Error(captured.detail);
   source = captured.value;
   producer = {
-    version: 1,
+    version: 2,
     target: task.id,
     argv: ['nx', 'run', task.id],
     trackedTreeClean: true,

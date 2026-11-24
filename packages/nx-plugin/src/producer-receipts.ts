@@ -20,8 +20,10 @@ import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package
 import typia from 'typia';
 import {
   createWorkspaceNxRequire,
+  type EnsureBuiltOutputReceipt,
   type EnsureBuiltProducerReceipt,
   type EnsureBuiltProducerTool,
+  type EnsureBuiltProducerToolNode,
   type EnsureBuiltReceipt,
   parseTargetSelector,
   providerInputProof,
@@ -45,7 +47,9 @@ import {
   graphInstallationCensus,
   movedNodes,
   type NodeWitness,
+  nodeStamp,
   readInstallationCensus,
+  type StampFields,
   workspaceSnapshot,
   writeWitness,
 } from './ensure-built-witness.js';
@@ -93,6 +97,16 @@ interface PublishedReceipt {
   readonly projectGraph: ProjectGraph;
   readonly taskGraph: TaskGraph;
   readonly nxJson: NxJsonConfiguration;
+}
+/** Distinguishes a version 1 producer receipt (which predates tool stamps) from a corrupt contract on clean cutover. */
+interface LegacyPublishedReceiptHeader {
+  readonly version: 1;
+  readonly disposition: 'published';
+  readonly receipt: {
+    readonly producer: {
+      readonly version: 1;
+    };
+  };
 }
 interface RefusedReceipt {
   readonly version: 1;
@@ -144,6 +158,51 @@ function publish(root: string, target: string, record: ProducerRecord): ReceiptE
 function same(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
+/** The content witness a recorded tool node carries, without the producer census stamp it was read at. */
+function toolContent(node: EnsureBuiltProducerToolNode): EnsureBuiltOutputReceipt {
+  switch (node.type) {
+    case 'file':
+      return { path: node.path, type: 'file', mode: node.mode, sha256: node.sha256 };
+    case 'symlink':
+      return { path: node.path, type: 'symlink', mode: node.mode, linkText: node.linkText };
+    case 'directory':
+      return { path: node.path, type: 'directory', mode: node.mode, entries: node.entries, sha256: node.sha256 };
+  }
+}
+/**
+ * One tool node read for a producer receipt: its content witness together with the `NodeWitness` stamp
+ * `census` observed for it, `unproven` included ({@link recordedStamp}).
+ */
+function toolNode(
+  path: string,
+  census: { readonly start: bigint; readonly observed: NodeWitness[] },
+  recorded?: (path: string, stats: StampFields) => string | undefined,
+  known?: CensusRead,
+): EnsureBuiltProducerToolNode {
+  const node = receiptNode(path, path, census, recorded, known);
+  const witness = census.observed[census.observed.length - 1];
+  if (witness === undefined || witness.path !== path) throw new Error(`Lost census stamp for tool node ${path}`);
+  return { ...node, stamp: witness.stamp };
+}
+/**
+ * The hash a receipt's tool nodes recorded for each file whose recorded stamp is not `unproven`, while its current
+ * stamp still equals that recorded stamp; otherwise `undefined`, and the caller reads the bytes. Mirrors
+ * {@link censusFileHashes}: the stamp is the key, never a cheaper generation, and an unproven stamp is always re-read.
+ */
+function recordedToolHashes(
+  nodes: readonly EnsureBuiltProducerToolNode[],
+): (path: string, stats: StampFields) => string | undefined {
+  const recorded = new Map<string, { readonly stamp: string; readonly sha256: string }>();
+  for (const node of nodes) {
+    if (node.type === 'file' && !node.stamp.endsWith(':unproven')) {
+      recorded.set(node.path, { stamp: node.stamp, sha256: node.sha256 });
+    }
+  }
+  return (path, stats) => {
+    const entry = recorded.get(path);
+    return entry !== undefined && entry.stamp === nodeStamp(stats) ? entry.sha256 : undefined;
+  };
+}
 /**
  * Whether a tool node whose stamp does not prove it (its ctime alone moved, or it was read in the tick it changed in,
  * recordedStamp) still reads as `tools` recorded it: the same bytes, link text,
@@ -152,7 +211,7 @@ function same(left: unknown, right: unknown): boolean {
  * without changing it, and is no reason to refuse the run.
  */
 function recordedTool(tools: readonly EnsureBuiltProducerTool[]): (path: string) => boolean {
-  const recorded = new Map(tools.flatMap((tool) => tool.nodes.map((node) => [node.path, node] as const)));
+  const recorded = new Map(tools.flatMap((tool) => tool.nodes.map((node) => [node.path, toolContent(node)] as const)));
   return (path) => {
     const node = recorded.get(path);
     return node !== undefined && same(receiptNode(path, path), node);
@@ -269,7 +328,7 @@ export function installedClosureTool(
     }
   }
   const recorded = censusFileHashes(installation);
-  const nodes = [...paths].sort().map((path) => receiptNode(path, path, census, recorded, reads.get(path)));
+  const nodes = [...paths].sort().map((path) => toolNode(path, census, recorded, reads.get(path)));
   return {
     ok: true,
     value: {
@@ -281,7 +340,7 @@ export function installedClosureTool(
       nodes,
       missing: [...absent].sort(),
       resolutions,
-      sha256: sha(nodes),
+      sha256: sha(nodes.map(toolContent)),
     },
   };
 }
@@ -341,7 +400,7 @@ function toolsFor(
       }
       if (path === undefined) return { ok: false, detail: `Unbound producer executable ${name}` };
       const physicalPath = realpathSync(path);
-      const entries = [...new Set([path, physicalPath])].map((entry) => receiptNode(entry, entry, census));
+      const entries = [...new Set([path, physicalPath])].map((entry) => toolNode(entry, census));
       tools.push({
         kind: 'executable',
         name,
@@ -351,7 +410,7 @@ function toolsFor(
         nodes: entries,
         missing: skipped,
         resolutions: [],
-        sha256: sha(entries),
+        sha256: sha(entries.map(toolContent)),
       });
     }
     if (!missing(module.missing))
@@ -369,9 +428,15 @@ function verifyTools(tools: readonly EnsureBuiltProducerTool[]): ReceiptEvidence
     for (const tool of tools) {
       if (realpathSync(tool.path) !== tool.physicalPath || !missing(tool.missing))
         return { ok: false, detail: `Producer tool alias/namespace changed: ${tool.name}` };
-      const nodes = tool.nodes.map((node) => receiptNode(node.path, node.path, census));
-      if (!same(nodes, tool.nodes) || sha(nodes) !== tool.sha256)
-        return { ok: false, detail: `Producer tool/module bytes changed: ${tool.name}` };
+      const recorded = recordedToolHashes(tool.nodes);
+      const nodes = tool.nodes.map((node) => receiptNode(node.path, node.path, census, recorded));
+      const expected = tool.nodes.map(toolContent);
+      const changed = nodes.filter((node, index) => !same(node, expected[index])).map(({ path }) => path);
+      if (changed.length > 0) {
+        const named = `${changed.slice(0, 8).join(', ')}${changed.length > 8 ? ` and ${changed.length - 8} more` : ''}`;
+        return { ok: false, detail: `Producer tool/module bytes changed: ${tool.name} (${named})` };
+      }
+      if (sha(nodes) !== tool.sha256) return { ok: false, detail: `Producer tool/module bytes changed: ${tool.name}` };
     }
     const moved = movedToolNodes(observed, tools);
     return moved === null
@@ -591,7 +656,7 @@ export async function postTasksExecution(
       continue;
     }
     const producer: Omit<EnsureBuiltProducerReceipt, 'outputSha256'> = {
-      version: 1,
+      version: 2,
       target,
       argv: [...context.argv],
       trackedTreeClean: true,
@@ -680,12 +745,18 @@ function validatedReceipt(root: string, target: string): ReceiptEvidence<EnsureB
   }
   try {
     const record = typia.json.isParse<PublishedReceipt>(text);
-    if (record === null || record.version !== 1)
+    if (record === null || record.version !== 1) {
+      if (typia.json.isParse<LegacyPublishedReceiptHeader>(text) !== null)
+        return {
+          ok: false,
+          detail: `Producer completion receipt at ${path} is version 1, which predates tool stamps; rebuild the producer to publish a version 2 receipt`,
+        };
       return { ok: false, detail: `Corrupt producer completion contract at ${path}` };
+    }
     const receipt = record.receipt;
     if (
       receipt.workspaceRoot !== realpathSync(root) ||
-      receipt.producer.version !== 1 ||
+      receipt.producer.version !== 2 ||
       receipt.producer.target !== target ||
       !receipt.producer.trackedTreeClean
     )

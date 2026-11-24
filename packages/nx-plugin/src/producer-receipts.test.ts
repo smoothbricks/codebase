@@ -241,6 +241,29 @@ describe('actual producer completion evidence', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+  it('refuses a version 1 receipt cleanly, naming that it predates tool stamps', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'producer-v1-refusal-')));
+    try {
+      const records = join(root, PRODUCER_RECORDS);
+      await mkdir(records, { recursive: true });
+      const name = createHash('sha256').update(JSON.stringify(task.id)).digest('hex');
+      const receiptPath = join(records, `producer-receipt-${name}.json`);
+      await writeFile(
+        receiptPath,
+        JSON.stringify({
+          version: 1,
+          disposition: 'published',
+          receipt: { producer: { version: 1, target: task.id } },
+        }),
+      );
+      expect(readProducerReceipt(root, task.id)).toEqual({
+        ok: false,
+        detail: `Producer completion receipt at ${receiptPath} is version 1, which predates tool stamps; rebuild the producer to publish a version 2 receipt`,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 /**

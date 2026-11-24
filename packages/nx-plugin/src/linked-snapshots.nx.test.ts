@@ -200,7 +200,7 @@ describe('linked snapshots vouched for by the provider’s real Nx', () => {
         // The receipt the provider's own run published, retained verbatim and bound by the snapshot's name.
         expect(first.receipt?.provenance.producers.map(({ target }) => target)).toEqual(['linked-api:build']);
         const produced = first.receipt?.producerReceipts[0];
-        expect(produced?.version).toBe(1);
+        expect(produced?.version).toBe(2);
         expect(produced?.target).toBe('linked-api:build');
         expect(produced?.trackedTreeClean).toBe(true);
         expect(produced?.argv.join(' ')).toContain('linked-api:build');
