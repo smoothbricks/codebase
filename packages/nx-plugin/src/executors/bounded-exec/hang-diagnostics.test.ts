@@ -230,9 +230,9 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('/fixture/held-file');
     expect(capture.text).toContain('not proof of a contested lock');
     expect(capture.text).toContain('pid=101 pgid=101');
-    expect(calls.map((call) => call.file)).toEqual(['sudo', 'sudo']);
+    expect(calls.map((call) => call.file)).toEqual(['sudo']);
     expect(calls[0]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
-    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
+    expect(capture.text).toContain('a holder outside the tree is not looked up: /fixture/held-file');
     expect(capture.lockWaits).toEqual([]);
     expect(capture.offsetFromExpiryMs).toBeGreaterThan(0);
     expect(capture.capturedAtMs).toBeGreaterThanOrEqual(capture.startedAtMs);
@@ -327,7 +327,7 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.outcome, capture.text).toBe('holders');
     expect(capture.text).toContain("can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm");
     expect(capture.text).toContain('omits no descriptor of the selected processes');
-    expect(warned.calls.map((call) => call.file)).toEqual(['sudo', 'sudo']);
+    expect(warned.calls.map((call) => call.file)).toEqual(['sudo']);
     const empty = scriptedHost([[root]], [exited('', 1, fallback)]);
     expect((await captureHangDiagnostics(request(), empty.host)).outcome).toBe('none');
     for (const stderr of [`${fallback}lsof: WARNING: other\n`, 'lsof: WARNING: other\n']) {
@@ -338,30 +338,29 @@ describe('pre-expiry hang diagnostics', () => {
     }
   });
 
-  it('names a lock wait for a file the run holds and a process outside the run also holds', async () => {
-    // Pid 303 is the run's own grandchild, so its row in the holder census is not an outside holder.
-    const outside = 'p303\ncchild\nf7\nn/fixture/held-file\np505\ncperl\nf3\nn/fixture/held-file\n';
-    const { host, calls } = scriptedHost([HOST], [exited(fileObservation), exited(outside)]);
+  it('names a lock wait for a lockable file two processes of the tree hold, and looks up no holder outside it', async () => {
+    const shared =
+      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n' +
+      'grandchild 303 tester 5u REG 1,2 4 123 /fixture/held-file\n';
+    const { host, calls } = scriptedHost([HOST], [exited(shared)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome, capture.text).toBe('holders');
-    expect(capture.lockWaits).toEqual([
-      { path: '/fixture/held-file', waiters: [303], holders: [{ pid: 505, command: 'perl' }] },
-    ]);
+    expect(capture.lockWaits).toEqual([{ path: '/fixture/held-file', holders: [202, 303] }]);
     expect(capture.text).toContain(
-      'Lock wait (open-handle evidence, not a kernel lock owner): /fixture/held-file open in the run by pid 303 and outside it by pid 505 (perl)',
+      "Lock wait (open-handle evidence among the runner's tree, not a kernel lock owner): /fixture/held-file open by pid 202, 303",
     );
-    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
+    expect(calls.map((call) => call.file)).toEqual(['sudo']);
   });
 
-  it('stack-samples a named lock waiter that the leaf samples left out', async () => {
-    // Pid 202 has a child, so no leaf sample takes its stack, yet it is the run's process the lock wait names: its
-    // stack is what says whether it blocks in the lock call at all.
-    const opened =
-      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n';
-    const outside = 'p202\ncchild\nf7\nn/fixture/held-file\np505\ncperl\nf3\nn/fixture/held-file\n';
-    const { host, samples } = scriptedHost([HOST], [exited(opened), exited(outside)]);
+  it('stack-samples a holder of a named lock wait that the leaf samples left out', async () => {
+    // Pid 202 has a child, so no leaf sample takes its stack, yet it holds the file the lock wait names: its stack is
+    // what says whether it blocks in the lock call at all.
+    const shared =
+      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n' +
+      'grandchild 303 tester 5u REG 1,2 4 123 /fixture/held-file\n';
+    const { host, samples } = scriptedHost([HOST], [exited(shared)]);
     const capture = await captureHangDiagnostics(request(), host);
-    expect(capture.lockWaits.map((wait) => wait.waiters)).toEqual([[202]]);
+    expect(capture.lockWaits.map((wait) => wait.holders)).toEqual([[202, 303]]);
     expect(samples.map((sample) => sample.pid).sort((left, right) => left - right)).toEqual([ROOT, 202, 303, 404]);
     expect(capture.text).toContain('stack sample pid 202 (1s; binary image list omitted)');
   });
@@ -373,22 +372,6 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.outcome).toBe('holders');
     expect(capture.lockWaits).toEqual([]);
     expect(calls.map((call) => call.file)).toEqual(['sudo']);
-  });
-
-  it('marks the capture incomplete, with no lock wait, when the holder census does not answer', async () => {
-    const holders: HangProbeResult[] = [
-      { status: 'timed-out', detail: 'probe exceeded 1500ms', stdout: '', stderr: '' },
-      exited('p505\ncperl\nf3\nn/fixture/held-file\n', 0, 'lsof: WARNING: other\n'),
-      exited('n/fixture/held-file\n'),
-      exited('p505\ncperl\nq3\n'),
-    ];
-    for (const holder of holders) {
-      const { host } = scriptedHost([HOST], [exited(fileObservation), holder]);
-      const capture = await captureHangDiagnostics(request(), host);
-      expect(capture.outcome, capture.text).toBe('incomplete');
-      expect(capture.lockWaits).toEqual([]);
-      expect(capture.text).not.toContain('Lock wait (open-handle');
-    }
   });
 
   it('does not turn an exited root, reused pid, or changed descendant membership into no holders', async () => {
@@ -622,7 +605,7 @@ describe('pre-expiry hang diagnostics', () => {
     for (const answer of answers) answer(exited(SAMPLE_REPORT));
     const capture = await capturing;
     expect(capture.outcome, capture.text).toBe('holders');
-    expect(calls.map((call) => call.file)).toEqual(['sudo', 'sudo']);
+    expect(calls.map((call) => call.file)).toEqual(['sudo']);
     expect(samples[1]?.args).toEqual(['-n', 'sample', '303', '1', '-file', '/dev/stdout']);
     // Each sample may run until the closing reading has its one second left of the capture window.
     for (const sample of samples) expect(sample.timeoutMs).toBeLessThanOrEqual(HANG_CAPTURE_MS - 1_000);
@@ -777,13 +760,14 @@ describe('pre-expiry hang diagnostics', () => {
     }
   });
 
-  it('names the process outside the run that holds the file a run is blocked on in flock', async () => {
+  it('names the lock call a run blocks in by its stack, and looks up no holder outside the runner tree', async () => {
     if (process.platform !== 'darwin') return;
     const directory = await mkdtemp(join(tmpdir(), 'hang-lock-wait-'));
     const file = join(directory, 'package-cache');
     await writeFile(file, '');
     // The holder takes the exclusive lock and lives until the test kills it. The run opens the same file, prints
-    // `waiting`, and blocks in flock(2): the snapshot observes its open descriptor, not the blocked call itself.
+    // `waiting`, and blocks in flock(2). The holder is outside the runner's tree, so the snapshot names no lock wait and
+    // looks the holder up nowhere: it names the run's lockable file, and the run's stack shows the call it blocks in.
     const holderScript = 'open(F, ">>", $ARGV[0]) or die; flock(F, 2) or die; $| = 1; print "held\\n"; sleep';
     const runScript = 'open(F, ">>", $ARGV[0]) or die; $| = 1; print "waiting\\n"; flock(F, 2) or die; sleep';
     const holder = Bun.spawn(['perl', '-e', holderScript, file], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
@@ -799,12 +783,9 @@ describe('pre-expiry hang diagnostics', () => {
       );
       const path = await realpath(file);
       expect(capture.outcome, capture.text).toBe('holders');
-      expect(capture.lockWaits, capture.text).toEqual([
-        { path, waiters: [run.pid], holders: [{ pid: holder.pid, command: 'perl' }] },
-      ]);
-      expect(capture.text).toContain(
-        `Lock wait (open-handle evidence, not a kernel lock owner): ${path} open in the run by pid ${run.pid} and outside it by pid ${holder.pid} (perl)`,
-      );
+      expect(capture.lockWaits, capture.text).toEqual([]);
+      expect(capture.text).toContain(`a holder outside the tree is not looked up: ${path}`);
+      expect(capture.text).toMatch(/flock/);
     } catch (error) {
       failures.push(error);
     }

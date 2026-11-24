@@ -1,10 +1,13 @@
 /**
- * Lock-wait evidence from open-file tables. Pure: no I/O and no clock. `hang-diagnostics.ts` runs `lsof` and hands its
- * output here, so every decision is a function of the rows it was given.
+ * Lock-wait evidence from the open-file table of the runner's tree. Pure: no I/O and no clock. `hang-diagnostics.ts`
+ * runs `lsof -p` on the tree's pids and hands its output here, so every decision is a function of the rows it was
+ * given.
  *
- * A wait is open-handle evidence, not a kernel lock owner. flock(2) and fcntl(2) name no holder, so a regular file the
- * run holds on a numbered descriptor, and that another process also holds open, is the only candidate for the lock a
- * run blocks on. Nothing here observes the lock call itself.
+ * A wait is open-handle evidence, not a kernel lock owner. flock(2) and fcntl(2) name no holder, and who else on the
+ * host holds a file open is a question only a census of every process answers, which the snapshot never takes: a
+ * process stalled in the kernel holds such a census with it. So a wait is named only where the tree shows one, a
+ * regular file two or more of its processes hold on numbered descriptors, and a holder outside the tree is not looked
+ * up. Nothing here observes the lock call itself; a waiter's stack sample does.
  */
 
 /** One row of an `lsof -nP -p ...` table: a file a process holds open. */
@@ -15,25 +18,13 @@ export interface OpenFile {
   readonly path: string;
 }
 
-/** A process that holds a file open. */
-export interface Opener {
-  readonly pid: number;
-  readonly command: string;
-}
-
-/** An opener that `lsof -F` named for one path. */
-export interface PathOpener extends Opener {
-  readonly path: string;
-}
-
 /**
- * A regular file the run holds on a numbered descriptor while processes outside the run also hold it open. `waiters`
- * are the run's pids holding it; `holders` are the outside processes, never a run pid.
+ * A regular file two or more processes of the runner's tree hold on numbered descriptors: one may hold its lock while
+ * another waits on it. `holders` are those pids, ascending; which of them holds the lock the kernel does not say.
  */
 export interface LockWait {
   readonly path: string;
-  readonly waiters: readonly number[];
-  readonly holders: readonly Opener[];
+  readonly holders: readonly number[];
 }
 
 /** COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME; NAME is everything from the ninth column on, spaces included. */
@@ -70,72 +61,20 @@ export function lockCandidates(tree: readonly OpenFile[]): string[] {
 }
 
 /**
- * The lock waits in `tree`, the open files of the run's processes. A path is a wait only when some process outside
- * the run (`treePids` excludes the run) also holds it open. Sorted by path; holders deduplicated by pid and sorted.
+ * The lock waits in `tree`, the open files of the runner's tree: each lockable path two or more of its processes hold.
+ * Sorted by path, holders ascending.
  */
-export function lockWaits(
-  tree: readonly OpenFile[],
-  treePids: ReadonlySet<number>,
-  openers: readonly PathOpener[],
-): LockWait[] {
+export function lockWaits(tree: readonly OpenFile[]): LockWait[] {
   const waits: LockWait[] = [];
   for (const path of lockCandidates(tree)) {
-    const holders = new Map<number, Opener>();
-    for (const opener of openers) {
-      if (opener.path === path && !treePids.has(opener.pid) && !holders.has(opener.pid)) {
-        holders.set(opener.pid, { pid: opener.pid, command: opener.command });
-      }
-    }
-    if (holders.size === 0) continue;
-    const waiters = [...new Set(tree.filter((row) => isLockable(row) && row.path === path).map((row) => row.pid))];
-    waits.push({
-      path,
-      waiters: waiters.sort((a, b) => a - b),
-      holders: [...holders.values()].sort((a, b) => a.pid - b.pid),
-    });
+    const holders = [...new Set(tree.filter((row) => isLockable(row) && row.path === path).map((row) => row.pid))];
+    if (holders.length < 2) continue;
+    waits.push({ path, holders: holders.sort((a, b) => a - b) });
   }
   return waits;
 }
 
-/**
- * Parse `lsof -F pcn` output: `p<pid>` opens a process, `c<command>` names it, `f<fd>` opens a file (lsof always
- * emits one), and `n<path>` names the file. `null` for any other shape: the caller must then call the census
- * incomplete, never empty.
- */
-export function parseLsofFields(text: string): PathOpener[] | null {
-  const openers: PathOpener[] = [];
-  let pid: number | null = null;
-  let command: string | null = null;
-  for (const line of text.split('\n')) {
-    if (line === '') continue;
-    const value = line.slice(1);
-    switch (line.charAt(0)) {
-      case 'p': {
-        const next = Number(value);
-        if (!Number.isSafeInteger(next) || next <= 0) return null;
-        pid = next;
-        command = null;
-        break;
-      }
-      case 'c':
-        if (pid === null || command !== null) return null;
-        command = value;
-        break;
-      case 'f':
-        if (pid === null) return null;
-        break;
-      case 'n':
-        if (pid === null || command === null) return null;
-        openers.push({ pid, command, path: value });
-        break;
-      default:
-        return null;
-    }
-  }
-  return openers;
-}
-
-/** The holders as a reader names them: `pid 51234 (cargo), pid 9 (rustc)`. */
-export function describeHolders(holders: readonly Opener[]): string {
-  return holders.map(({ pid, command }) => `pid ${pid} (${command})`).join(', ');
+/** A wait as a reader names it: `/path open by pid 7, 9`. */
+export function describeLockWait(wait: LockWait): string {
+  return `${wait.path} open by pid ${wait.holders.join(', ')}`;
 }

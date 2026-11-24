@@ -5,7 +5,7 @@ import type { CpuGrantRecord } from './cpu-grant.js';
 import { parseCpuGrant } from './cpu-grant.js';
 import { CPU_RISING_CLASS, type CpuRise, describeCpuRises } from './cpu-rise.js';
 import type { CpuWaitRow } from './lease-wait.js';
-import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
+import { describeLockWait, type LockWait } from './lock-wait.js';
 import type { MbxQueuedRequest } from './mbx-queue.js';
 import type { NativeTestResult } from './test-result-writer.js';
 import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
@@ -23,8 +23,8 @@ import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
  *   chargeable test interval. This proves the suite's completion bound was exceeded, not that every process stopped:
  *   an expensive active fixture can exceed it too. The verdict names tests reported running but never finished and
  *   tests the report says were aborted; diagnostics distinguish a stalled wait from a progressing but oversized
- *   lifecycle. When the snapshot named a lock wait, `lockWaits` names the file the run holds on a numbered descriptor
- *   and the processes outside the run that also hold it open: open-handle evidence, not a kernel lock owner. When it
+ *   lifecycle. When the snapshot named a lock wait, `lockWaits` names a file two or more processes of the runner's tree
+ *   hold on numbered descriptors, and those processes: open-handle evidence, not a kernel lock owner. When it
  *   named a process whose CPU time rose, `cpuRising` names it: a build inside the test, which is a defect and not a
  *   hang. CPU never restarts the bound, which counts finished tests and the progress running tests report.
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
@@ -656,20 +656,19 @@ function isPids(value: unknown): value is number[] {
   return Array.isArray(value) && value.every(isPid);
 }
 
-/** Lock waits as recorded, or `null` when any part of them is malformed. */
+/**
+ * Lock waits as recorded, or `null` when any part of them is malformed. A record an earlier build wrote named the run's
+ * pids `waiters` beside the processes outside the run that also held the file; it reads as those run pids, since no
+ * holder outside the runner's tree is named any longer, and a task whose last verdict was such a wait still runs.
+ */
 function parseLockWaits(value: unknown): LockWait[] | null {
   if (!Array.isArray(value)) return null;
   const waits: LockWait[] = [];
   for (const wait of value) {
-    if (!isObject(wait) || typeof wait.path !== 'string' || !isPids(wait.waiters) || !Array.isArray(wait.holders)) {
-      return null;
-    }
-    const holders: Opener[] = [];
-    for (const holder of wait.holders) {
-      if (!isObject(holder) || !isPid(holder.pid) || typeof holder.command !== 'string') return null;
-      holders.push({ pid: holder.pid, command: holder.command });
-    }
-    waits.push({ path: wait.path, waiters: wait.waiters, holders });
+    if (!isObject(wait) || typeof wait.path !== 'string') return null;
+    const holders = isPids(wait.holders) ? wait.holders : isPids(wait.waiters) ? wait.waiters : null;
+    if (holders === null) return null;
+    waits.push({ path: wait.path, holders });
   }
   return waits;
 }
@@ -771,9 +770,7 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
           ? `its fixture outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`
           : `outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`;
     case 'wedged': {
-      const locks = verdict.lockWaits.map(
-        (wait) => `; waiting on a lock: ${wait.path} held open by ${describeHolders(wait.holders)}`,
-      );
+      const locks = verdict.lockWaits.map((wait) => `; a lock may be held among the run: ${describeLockWait(wait)}`);
       const cpu = verdict.cpuRising.length > 0 ? [`; ${CPU_RISING_CLASS}: ${describeCpuRises(verdict.cpuRising)}`] : [];
       const running =
         verdict.tests.length > 0

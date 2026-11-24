@@ -1,14 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
-import {
-  describeHolders,
-  lockCandidates,
-  lockWaits,
-  type OpenFile,
-  type PathOpener,
-  parseLsofFields,
-  parseLsofTable,
-} from './lock-wait.js';
+import { describeLockWait, lockCandidates, lockWaits, type OpenFile, parseLsofTable } from './lock-wait.js';
 
 // The rows of the 2026-10-21 cargo case: `cargo --frozen test` blocked on the package cache while another cargo held
 // it open. The cwd and txt rows are never lock candidates; the numbered REG row is the only one.
@@ -65,75 +57,32 @@ describe('lockCandidates', () => {
 });
 
 describe('lockWaits', () => {
-  it('names the outside process that holds the incident cache open', () => {
-    const openers: PathOpener[] = [{ pid: 51234, command: 'cargo', path: CACHE }];
-    expect(lockWaits(incidentRows, new Set([94769]), openers)).toEqual([
-      { path: CACHE, waiters: [94769], holders: [{ pid: 51234, command: 'cargo' }] },
-    ]);
+  it('names no wait in the 2026-10-21 tree, whose one process held the cache and whose holder ran outside it', () => {
+    expect(lockWaits(incidentRows)).toEqual([]);
   });
 
-  it('names no wait when only processes of the run hold the file', () => {
-    const openers: PathOpener[] = [{ pid: 94769, command: 'cargo', path: CACHE }];
-    expect(lockWaits(incidentRows, new Set([94769]), openers)).toEqual([]);
-  });
-
-  it('names no wait for a file the run holds only through an unnumbered descriptor', () => {
-    const openers: PathOpener[] = [{ pid: 51234, command: 'cargo', path: '/usr/lib/libobjc.A.dylib' }];
-    expect(lockWaits(incidentRows, new Set([94769]), openers)).toEqual([]);
-  });
-
-  it('deduplicates holders by pid and lists every waiter of the path', () => {
+  it('names a lockable file two processes of the tree hold, with both', () => {
     const tree: OpenFile[] = [...incidentRows, { pid: 94770, fd: '4u', type: 'REG', path: CACHE }];
-    const openers: PathOpener[] = [
-      { pid: 51234, command: 'cargo', path: CACHE },
-      { pid: 51234, command: 'cargo', path: CACHE },
-      { pid: 60000, command: 'rustc', path: CACHE },
+    expect(lockWaits(tree)).toEqual([{ path: CACHE, holders: [94769, 94770] }]);
+  });
+
+  it('names no wait for a file two processes hold only through an unnumbered descriptor', () => {
+    const tree: OpenFile[] = [
+      ...incidentRows,
+      { pid: 94770, fd: 'txt', type: 'REG', path: '/usr/lib/libobjc.A.dylib' },
     ];
-    expect(lockWaits(tree, new Set([94769, 94770]), openers)).toEqual([
-      {
-        path: CACHE,
-        waiters: [94769, 94770],
-        holders: [
-          { pid: 51234, command: 'cargo' },
-          { pid: 60000, command: 'rustc' },
-        ],
-      },
-    ]);
+    expect(lockWaits(tree)).toEqual([]);
+  });
+
+  it('counts a process once however many descriptors it holds the file on', () => {
+    const tree: OpenFile[] = [...incidentRows, { pid: 94769, fd: '6u', type: 'REG', path: CACHE }];
+    expect(lockWaits(tree)).toEqual([]);
   });
 });
 
-describe('parseLsofFields', () => {
-  it('reads the holders of a path from lsof -F pcn output, file records included', () => {
-    const text = 'p63368\ncperl\nf3\nn/private/tmp/held\np63372\ncperl\nf3\nn/private/tmp/held\n';
-    expect(parseLsofFields(text)).toEqual([
-      { pid: 63368, command: 'perl', path: '/private/tmp/held' },
-      { pid: 63372, command: 'perl', path: '/private/tmp/held' },
-    ]);
-    expect(parseLsofFields('')).toEqual([]);
-  });
-
-  it('refuses any output that is not that shape', () => {
-    for (const text of [
-      'n/x\n',
-      'p12\nn/x\n',
-      'pnope\ncsh\nn/x\n',
-      'p12\ncsh\nq1\n',
-      'p12\ncsh\nc sh\nn/x\n',
-      'p0\ncsh\nn/x\n',
-    ]) {
-      expect(parseLsofFields(text), JSON.stringify(text)).toBeNull();
-    }
-  });
-});
-
-describe('describeHolders', () => {
-  it('names each holder by pid and command', () => {
-    expect(
-      describeHolders([
-        { pid: 51234, command: 'cargo' },
-        { pid: 9, command: 'rustc' },
-      ]),
-    ).toBe('pid 51234 (cargo), pid 9 (rustc)');
+describe('describeLockWait', () => {
+  it('names the file and each process of the tree that holds it', () => {
+    expect(describeLockWait({ path: CACHE, holders: [94769, 94770] })).toBe(`${CACHE} open by pid 94769, 94770`);
   });
 });
 
@@ -154,31 +103,7 @@ describe('lsof reading properties', () => {
     fc.assert(fc.property(rows, (generated) => expect(parseLsofTable(renderTable(generated))).toEqual(generated)));
   });
 
-  it('reads back every process and path that renders as lsof -F prints it', () => {
-    const processes = fc.array(
-      fc.record({
-        pid: fc.integer({ min: 1, max: 99_999 }),
-        command: fc.stringMatching(/^[a-z][a-z0-9_.-]{0,15}$/),
-        paths: fc.array(paths, { minLength: 1, maxLength: 4 }),
-      }),
-      { maxLength: 8 },
-    );
-    fc.assert(
-      fc.property(processes, (generated) => {
-        const text = generated
-          .map(({ pid, command, paths: names }) =>
-            [`p${pid}`, `c${command}`, ...names.flatMap((name) => ['f3', `n${name}`])].join('\n'),
-          )
-          .join('\n');
-        const expected = generated.flatMap(({ pid, command, paths: names }) =>
-          names.map((path) => ({ pid, command, path })),
-        );
-        expect(parseLsofFields(`${text}\n`)).toEqual(expected);
-      }),
-    );
-  });
-
-  it('names a wait for exactly the paths an outside process holds, and never a process of the run', () => {
+  it('names a wait for exactly the lockable paths two or more processes of the tree hold', () => {
     const samplePaths = ['/a/x', '/a/y', '/b z'];
     const row = fc.record({
       pid: fc.integer({ min: 1, max: 12 }),
@@ -186,36 +111,25 @@ describe('lsof reading properties', () => {
       type: types,
       path: fc.constantFrom(...samplePaths),
     });
-    const opener = fc.record({
-      pid: fc.integer({ min: 1, max: 12 }),
-      command: fc.constantFrom('cargo', 'rustc', 'perl'),
-      path: fc.constantFrom(...samplePaths),
-    });
-    const treePids = fc.uniqueArray(fc.integer({ min: 1, max: 12 }), { maxLength: 12 });
     fc.assert(
-      fc.property(
-        fc.array(row, { maxLength: 12 }),
-        treePids,
-        fc.array(opener, { maxLength: 12 }),
-        (tree, pidList, openers) => {
-          const pids = new Set(pidList);
-          const waits = lockWaits(tree, pids, openers);
-          const names = waits.map((wait) => wait.path);
-          expect(names).toEqual([...names].sort());
-          expect(new Set(names).size).toBe(names.length);
-          for (const wait of waits) {
-            expect(wait.holders.length).toBeGreaterThan(0);
-            expect(wait.holders.some((holder) => pids.has(holder.pid))).toBe(false);
-            expect(new Set(wait.holders.map((holder) => holder.pid)).size).toBe(wait.holders.length);
-            expect(wait.waiters.length).toBeGreaterThan(0);
-            expect(wait.waiters.every((pid) => tree.some((file) => file.pid === pid))).toBe(true);
-          }
-          for (const path of lockCandidates(tree)) {
-            const outside = openers.some((opener) => opener.path === path && !pids.has(opener.pid));
-            expect(names.includes(path)).toBe(outside);
-          }
-        },
-      ),
+      fc.property(fc.array(row, { maxLength: 12 }), (tree) => {
+        const waits = lockWaits(tree);
+        const names = waits.map((wait) => wait.path);
+        expect(names).toEqual([...names].sort());
+        expect(new Set(names).size).toBe(names.length);
+        for (const wait of waits) {
+          expect(wait.holders).toEqual([...new Set(wait.holders)].sort((a, b) => a - b));
+          expect(wait.holders.every((pid) => tree.some((file) => file.pid === pid && file.path === wait.path))).toBe(
+            true,
+          );
+        }
+        for (const path of lockCandidates(tree)) {
+          const holders = new Set(
+            tree.filter((file) => file.path === path && file.type === 'REG' && /^\d/.test(file.fd)).map((f) => f.pid),
+          );
+          expect(names.includes(path)).toBe(holders.size >= 2);
+        }
+      }),
     );
   });
 });

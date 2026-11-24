@@ -4,14 +4,7 @@ import * as procinfo from '@smoothbricks/procinfo';
 import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from '../../process-group.js';
 import { atClockDeadline } from './awake-clock.js';
 import { CPU_RISE_MS, CPU_RISING_CLASS, type CpuRise, type CpuSample, cpuChange, describeCpuRise } from './cpu-rise.js';
-import {
-  describeHolders,
-  type LockWait,
-  lockCandidates,
-  lockWaits,
-  parseLsofFields,
-  parseLsofTable,
-} from './lock-wait.js';
+import { describeLockWait, type LockWait, lockCandidates, lockWaits, parseLsofTable } from './lock-wait.js';
 
 /**
  * The pre-expiry capture window. Stack samples set it: under load averages of 27-52 on 18 cores one `sudo -n sample`
@@ -28,7 +21,7 @@ const MAX_PROBE_BYTES = 4 * 1024 * 1024;
 const CPU_INTERVAL_MS = 5_000;
 /**
  * Stack samples: `sample` suspends a process every millisecond for one second and reports its threads' call graph. The
- * runner and at most this many leaf processes are sampled, all at once, and then at most this many named lock waiters
+ * runner and at most this many leaf processes are sampled, all at once, and then at most this many holders of a named lock wait
  * those left out. `-mayDie` is not passed: it reads symbols before sampling and measured about a second slower under
  * load, and a process that exits mid-sample is a raced capture all the same.
  */
@@ -337,33 +330,22 @@ export function captureHangDiagnostics(
           observed = resources.stdout.trim() !== '';
           if (!observed && answered(resources))
             lines.push('lsof reported no open-file matches within its stated visibility.');
-          // A lock wait needs a complete census of the run's files: a regular file the run holds on a numbered descriptor
-          // that another process also holds open. One privileged lsof names those holders; a probe that did not answer
-          // makes the capture incomplete, never an empty holder set.
+          // A lock wait is read from the tree's own open files: a lockable file two or more of its processes hold. Who
+          // else on the host holds a file is never looked up: only a census of every process answers that, and a
+          // process stalled in the kernel holds such a census with it. An incomplete census names no wait.
           const rows = incomplete ? [] : parseLsofTable(resources.stdout);
-          const candidates = lockCandidates(rows);
-          if (candidates.length > 0) {
-            const holders = await probe(
-              'lsof lock holders',
-              'sudo',
-              ['-n', 'lsof', '-nP', '-F', 'pcn', '--', ...candidates],
-              1_500,
+          waits = lockWaits(rows);
+          const shared = new Set(waits.map((wait) => wait.path));
+          const alone = lockCandidates(rows).filter((path) => !shared.has(path));
+          if (alone.length > 0)
+            lines.push(
+              `Lockable files one process of the runner's tree holds; a holder outside the tree is not looked up: ${alone.join(', ')}`,
             );
-            if (finished) return;
-            const openers =
-              answered(holders) && lsofFaults(holders.stderr) === '' ? parseLsofFields(holders.stdout) : null;
-            if (openers === null) {
-              incomplete = true;
-              lines.push('Lock holder census incomplete; no lock wait is named.');
-            } else {
-              waits = lockWaits(rows, new Set(before.map((entry) => entry.pid)), openers);
-              // A lock wait is open-handle evidence: only the waiter's own stack says whether it blocks in the lock
-              // call. Each named waiter the leaf samples left out is sampled the same way, inside the same window.
-              const stacked = new Set(leafSamples(before).sampled);
-              const waiters = [...new Set(waits.flatMap((wait) => wait.waiters))].filter((pid) => !stacked.has(pid));
-              await Promise.all(waiters.slice(0, MAX_SAMPLED_LEAVES).map(sampleStack));
-            }
-          }
+          // A lock wait is open-handle evidence: only a holder's own stack says whether it blocks in the lock call.
+          // Each holder the leaf samples left out is sampled the same way, inside the same window.
+          const stacked = new Set(leafSamples(before).sampled);
+          const holders = [...new Set(waits.flatMap((wait) => wait.holders))].filter((pid) => !stacked.has(pid));
+          await Promise.all(holders.slice(0, MAX_SAMPLED_LEAVES).map(sampleStack));
         };
         await Promise.all([openFiles(), stackSamples(before), kernelWaits(before)]);
         if (finished) return;
@@ -424,7 +406,7 @@ export function captureHangDiagnostics(
       if (!incomplete) {
         for (const wait of waits) {
           lines.push(
-            `Lock wait (open-handle evidence, not a kernel lock owner): ${wait.path} open in the run by pid ${wait.waiters.join(', ')} and outside it by ${describeHolders(wait.holders)}`,
+            `Lock wait (open-handle evidence among the runner's tree, not a kernel lock owner): ${describeLockWait(wait)}`,
           );
         }
       }
