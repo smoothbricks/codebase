@@ -2695,6 +2695,100 @@ async fn host_controller_each_selected_envrc_has_its_own_activation() {
     );
 }
 
+/// When something outside cowshed lowers a warm shell host's nice below the supervisor's own,
+/// macOS refuses `setpriority(PRIO_PROCESS)` for an interactive command with EACCES because a
+/// child cannot be raised above its parent host's nice (05_gateway.md "Classes"; 11_shell.md
+/// "Job admission and class placement"). The job's `priority` failure must name the host's pid,
+/// its observed nice, its parent pid and this supervisor's own nice so an external re-nice is
+/// self-explaining rather than only `observed None, errno Some(13)`.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_priority_refusal_on_a_lowered_warm_host_names_the_host_and_supervisor_nice()
+ {
+    use cowshed_core::runtime::placement::macos::{nice_from, own_nice};
+
+    let workspace = Workspace::new("shell-pool-lowered-host", 41_680);
+    workspace.envrc("");
+    let handle = workspace.supervisor(false);
+
+    // Warm one host and read its pid: the host forks `/bin/sh` directly, so `$PPID` is the host.
+    let warmed = run(&handle, sh("printf %s \"$PPID\"")).await.ok();
+    let host_pid: u32 = warmed
+        .stdout
+        .trim()
+        .parse()
+        .expect("warm command prints its shell host pid");
+    let supervisor_pid = std::process::id();
+    let supervisor_nice = own_nice();
+    let host_nice = nice_from(supervisor_nice, ExecClass::Background);
+    assert!(
+        host_nice > supervisor_nice,
+        "test supervisor at nice {supervisor_nice} cannot lower a warm host further"
+    );
+
+    // Lower the warm host externally, as `renice` on a shed's shell host did.
+    // SAFETY: plain setpriority on a live warm host owned by this test's supervisor.
+    assert_eq!(
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, host_pid, host_nice) },
+        0,
+        "lower warm host {host_pid} to nice {host_nice}: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: Darwin's thread-local errno pointer and plain getpriority read on the live host.
+    let observed_host_nice = unsafe {
+        *libc::__error() = 0;
+        libc::getpriority(libc::PRIO_PROCESS, host_pid)
+    };
+    assert_eq!(
+        observed_host_nice, host_nice,
+        "warm host {host_pid} should run at nice {host_nice}"
+    );
+
+    let interactive = ExecRequest {
+        class: ExecClass::Interactive,
+        ..sh("printf never")
+    };
+    let failed = run(&handle, interactive).await;
+    let counts = handle.shell_pool().await.expect("pool counts");
+    assert_eq!(
+        (counts.activated, counts.idle),
+        (1, 1),
+        "the interactive job must reuse the lowered warm host: {counts:?}"
+    );
+    assert_eq!(
+        (failed.info.state, failed.info.failure),
+        (JobState::Failed, Some(JobFailure::Priority)),
+        "stderr: {:?}",
+        failed.stderr
+    );
+    assert!(
+        failed.stdout.is_empty(),
+        "command never ran: {:?}",
+        failed.stdout
+    );
+    assert!(
+        failed
+            .stderr
+            .contains(&format!("errno Some({})", libc::EACCES)),
+        "expected EACCES in priority failure: {:?}",
+        failed.stderr
+    );
+    assert!(
+        failed
+            .stderr
+            .contains(&format!("shell host {host_pid} (parent {supervisor_pid})")),
+        "priority failure must name host pid {host_pid} and parent {supervisor_pid}: {:?}",
+        failed.stderr
+    );
+    assert!(
+        failed.stderr.contains(&format!(
+            "runs at nice {host_nice}, above this supervisor's nice {supervisor_nice}"
+        )),
+        "priority failure must name host nice {host_nice} and supervisor nice {supervisor_nice}: {:?}",
+        failed.stderr
+    );
+}
+
 /// This test process's census, as a fixture store's census reaches it, over a store that holds no
 /// lease.
 fn census() -> cowshed_core::census::CensusScope {
