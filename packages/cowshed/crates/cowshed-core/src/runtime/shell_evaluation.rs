@@ -499,4 +499,141 @@ mod tests {
         assert!(quoted.ends_with('…'));
         assert!(lines.partial.is_empty());
     }
+
+    /// A burst larger than a pipe buffer forwards every byte unchanged and in order to EOF even
+    /// when the job's stderr is drained by a task on the same `current_thread` runtime as the tee.
+    #[test]
+    fn a_large_evaluation_burst_forwards_in_order_on_a_single_thread_runtime() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt as _;
+
+        const PAYLOAD_BYTES: usize = 1 << 20;
+        const TEST_BOUND: Duration = Duration::from_secs(20);
+
+        let expected: Vec<u8> = (0_u8..=250).cycle().take(PAYLOAD_BYTES).collect();
+        let writer_bytes = expected.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current_thread runtime");
+            let received = runtime.block_on(async move {
+                let (job_read, job_write) = super::super::pipe().expect("job stderr pipe");
+                let mut job_reader = tokio::net::unix::pipe::Receiver::from_owned_fd(job_read)
+                    .expect("async job stderr reader");
+                let reader = tokio::spawn(async move {
+                    let mut collected = Vec::with_capacity(PAYLOAD_BYTES);
+                    job_reader
+                        .read_to_end(&mut collected)
+                        .await
+                        .expect("read job stderr to EOF");
+                    collected
+                });
+
+                let (eval_write, mut tee) = super::Tee::new(&job_write).expect("tee");
+                drop(job_write);
+
+                let producer = std::thread::spawn(move || {
+                    let mut eval_stderr = std::fs::File::from(eval_write);
+                    eval_stderr
+                        .write_all(&writer_bytes)
+                        .expect("write evaluation stderr burst");
+                });
+
+                while tee.open {
+                    tee.forward().await;
+                }
+                tee.finish();
+
+                let collected = reader.await.expect("reader task");
+                producer.join().expect("evaluation stderr producer");
+                collected
+            });
+            let _ = done_tx.send(received);
+        });
+
+        let received = done_rx.recv_timeout(TEST_BOUND).unwrap_or_else(|error| {
+            panic!(
+                "the tee wedged the current_thread runtime while forwarding a 1 MiB burst \
+                 ({error})"
+            )
+        });
+        assert_eq!(
+            received.len(),
+            expected.len(),
+            "every byte reaches job stderr"
+        );
+        assert!(received == expected, "bytes arrive unchanged and in order");
+    }
+
+    /// A full job stderr pipe whose reader never drains must not wedge the supervisor's
+    /// `current_thread` runtime: other tasks (standing in for `hello`) keep running and complete
+    /// while tee forwarding is stalled on backpressure.
+    #[test]
+    fn a_stalled_job_stderr_does_not_block_other_tasks_on_the_runtime() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const PAYLOAD_BYTES: usize = 1 << 20;
+        const TEST_BOUND: Duration = Duration::from_secs(20);
+
+        let payload: Vec<u8> = (0_u8..=250).cycle().take(PAYLOAD_BYTES).collect();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current_thread runtime");
+            runtime.block_on(async move {
+                let (job_read, job_write) = super::super::pipe().expect("job stderr pipe");
+                let (eval_write, mut tee) = super::Tee::new(&job_write).expect("tee");
+                drop(job_write);
+
+                let producer = std::thread::spawn(move || {
+                    let mut eval_stderr = std::fs::File::from(eval_write);
+                    let _ = eval_stderr.write_all(&payload);
+                });
+
+                let forwarder = tokio::spawn(async move {
+                    while tee.open {
+                        tee.forward().await;
+                    }
+                    tee.finish();
+                });
+
+                let ticker = tokio::spawn(async move {
+                    for _ in 0..20 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                });
+
+                ticker.await.expect("ticker task");
+                assert!(
+                    !forwarder.is_finished(),
+                    "forwarding must still be stalled while job stderr is unread"
+                );
+
+                // Drop the job's read end before the runtime shuts down so any blocked
+                // `spawn_blocking` write wakes with EPIPE and tears down cleanly.
+                drop(job_read);
+                let _ = forwarder.await;
+                let _ = producer.join();
+            });
+            drop(runtime);
+            let _ = done_tx.send(());
+        });
+
+        done_rx.recv_timeout(TEST_BOUND).unwrap_or_else(|error| {
+            panic!(
+                "the tee wedged the current_thread runtime while job stderr was unread; \
+                 the ticker never finished ({error})"
+            )
+        });
+    }
 }

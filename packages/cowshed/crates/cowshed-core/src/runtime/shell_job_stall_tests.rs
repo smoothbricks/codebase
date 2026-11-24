@@ -383,3 +383,82 @@ async fn a_silent_evaluation_while_a_build_runs_is_not_ended() {
     assert!(outcome(held).starts_with("ready"));
     assert!(!holder.fence.reaped(), "its host was not ended");
 }
+
+/// A stalled evaluation closes the job's stderr once its buffered output is forwarded, even when
+/// a descendant outside the host's process group keeps the evaluation's stderr pipe open, so the
+/// job can seal and fail visibly instead of hanging on output EOF.
+#[tokio::test]
+async fn a_stalled_evaluation_closes_job_stderr_even_when_a_descendant_keeps_its_pipe_open() {
+    let workspace = Workspace::new();
+    let clock = FakeClock::new();
+    let (probe, _) = FakeProbe::new(false);
+    let activator = workspace.activator(ActivationGate::new(clock.clone(), probe));
+    let (host, holder) = FakeHost::start();
+    let (holder_stderr, stdio) = job_stdio();
+    let holding = activate(&activator, host, 1, stdio);
+    let (holder, evaluation) = tokio::task::spawn_blocking(move || {
+        let mut evaluation = holder.evaluation();
+        evaluation.write_all(b"building mbx\n").unwrap();
+        // Kept open to stand for a descendant outside the host's process group.
+        (holder, evaluation)
+    })
+    .await
+    .unwrap();
+
+    // Read the job's stderr on a blocking thread: wait for the forwarded line first so
+    // `Tee::forward` has recorded it at the initial clock before advancing past `STALL_BOUND`,
+    // then keep reading to EOF.
+    let (saw_line, line_seen) = oneshot::channel();
+    let (eof_tx, eof_rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(holder_stderr);
+        let mut content = String::new();
+        let mut saw_line = Some(saw_line);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).unwrap();
+            if read == 0 {
+                break;
+            }
+            content.push_str(&line);
+            if line.contains("building mbx")
+                && let Some(notify) = saw_line.take()
+            {
+                let _ = notify.send(());
+            }
+        }
+        let _ = eof_tx.send(content);
+    });
+
+    tokio::time::timeout(TEST_BOUND, line_seen)
+        .await
+        .expect("the evaluation's line reaches job stderr")
+        .unwrap();
+
+    clock.advance(STALL_BOUND);
+
+    let Ok(held) = tokio::time::timeout(TEST_BOUND, holding).await else {
+        panic!("the silent evaluation was never ended");
+    };
+    let held = outcome(held.unwrap());
+    assert_eq!(
+        held,
+        "broken: the workspace shell evaluation wrote nothing for 5 min and no Nix build was \
+         running: \"building mbx\""
+    );
+    assert!(
+        holder.fence.reaped(),
+        "the stalled evaluation's host is ended"
+    );
+
+    let content = tokio::time::timeout(TEST_BOUND, eof_rx)
+        .await
+        .expect("job stderr reaches EOF even while a descendant keeps the evaluation pipe open")
+        .unwrap();
+    assert!(
+        content.contains("building mbx"),
+        "forwarded evaluation output reached job stderr: {content:?}"
+    );
+    drop(evaluation);
+}
