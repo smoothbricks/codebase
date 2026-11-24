@@ -10,6 +10,12 @@ left to end. The run that requested the job had died (a killed host test). A lan
 `await_other_build_retired` (`cowshed-core/src/runtime/supervisor_socket.rs:3496`) for `OTHER_BUILD_DRAIN_CEILING`,
 which is 1 h. That one wait used up the sweep's 30-minute budget.
 
+A second supervisor of the same build and age showed the same state on another dead project: pid 88028
+(`b5ea40bb052c93e50e13ab275bacfa97.drain`: `{"pid":88028,"waits":{"for":"jobs","running":[17]}}`), with no child
+process. An embedder's `cowshed controller` opening that project waited in `await_other_build_retired` until the
+supervisor was ended. Both supervisors were ended with SIGTERM, as the refusal's own hint says; no cowshed verb reaches
+a single workspace supervisor of another build.
+
 11_shell.md "Draining a supervisor of another build" says a drain waits for running jobs and for ends that are owed. A
 job whose process has exited has ended, and here every party it was owed to had exited too. So the drain should have
 read the job as ended and retired, without waiting out a bound. What to find out: how the supervisor's ledger came to
