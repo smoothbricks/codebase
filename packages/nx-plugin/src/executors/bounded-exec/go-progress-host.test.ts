@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:test';
-import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -15,10 +15,12 @@ describe('Go test progress host proofs', () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
+  const wrapper = join(import.meta.dir, '__tests__', 'go-link-barrier-toolexec.cjs');
+
   describe('held linking phases', () => {
     let root = '';
     let endpoint = '';
-    let wrapper = '';
+    let goCache = '';
     let failedPhase: { readonly name: string; readonly error: unknown } | null = null;
 
     async function runPhase(name: string, body: () => Promise<void>): Promise<void> {
@@ -45,36 +47,8 @@ describe('Go test progress host proofs', () => {
           );
         }
         endpoint = join(root, 'runner.sock');
-        wrapper = join(root, 'tool.cjs');
-        await writeFile(
-          wrapper,
-          [
-            '#!/usr/bin/env node',
-            "const { spawnSync } = require('node:child_process');",
-            "const { connect } = require('node:net');",
-            "const { basename } = require('node:path');",
-            'const [tool, ...args] = process.argv.slice(2);',
-            'function run() {',
-            "  const result = spawnSync(tool, args, { stdio: 'inherit' });",
-            '  if (result.error) throw result.error;',
-            '  if (result.signal) process.kill(process.pid, result.signal);',
-            '  else process.exit(result.status ?? 1);',
-            '}',
-            "if (basename(tool) !== 'link' || args.some(arg => arg.startsWith('-V'))) run();",
-            'else {',
-            `  const socket = connect(${JSON.stringify(endpoint)}, () => socket.write('link-ready\\n'));`,
-            "  socket.once('error', error => { throw error; });",
-            "  let answer = '';",
-            "  socket.on('data', data => { answer += data.toString(); });",
-            "  socket.once('end', () => {",
-            "    if (answer !== 'go\\n') throw new Error('unexpected link release');",
-            '    socket.end(); run();',
-            '  });',
-            '}',
-            '',
-          ].join('\n'),
-        );
-        await chmod(wrapper, 0o700);
+        goCache = join(root, 'gocache');
+        await mkdir(goCache);
       } catch (error) {
         failedPhase ??= { name: 'beforeAll fixture setup', error };
         throw error;
@@ -119,15 +93,28 @@ describe('Go test progress host proofs', () => {
         });
         await rm(endpoint, { force: true });
         await new Promise<void>((resolve) => server.listen(endpoint, resolve));
+        const toolLog = join(root, 'initial-tools.log');
         const stdout = process.stdout.write;
         const stderr = process.stderr.write;
         process.stdout.write = () => true;
         process.stderr.write = () => true;
         jest.useFakeTimers();
         try {
-          const command = `go test -p=1 -count=1 -toolexec=${JSON.stringify(wrapper)} ./first`;
+          const command = `go test -p=1 -count=1 -toolexec=${JSON.stringify(`node ${wrapper}`)} ./first`;
           const result = await runBoundedExec(
-            { command, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
+            {
+              command,
+              env: {
+                GOCACHE: goCache,
+                GOWORK: 'off',
+                GOTOOLCHAIN: 'local',
+                GOPROXY: 'off',
+                GO_PROGRESS_BARRIER_SOCKET: endpoint,
+                GO_PROGRESS_TOOL_LOG: toolLog,
+              },
+              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+              killAfterMs: 0,
+            },
             { root },
             createProcessTreeKiller(),
             null,
@@ -137,6 +124,15 @@ describe('Go test progress host proofs', () => {
           expect(exchangeErrors).toEqual([]);
           expect(links).toBe(1);
           expect(result.terminalOutput).not.toContain('Command made no progress');
+          const compiled = (await readFile(toolLog, 'utf8'))
+            .trim()
+            .split('\n')
+            .filter((line) => line.startsWith('compile\t'))
+            .map((line) => line.slice('compile\t'.length));
+          expect(
+            compiled.sort(),
+            'initial linking must compile only the fixture package, never the Go standard library inside the test',
+          ).toEqual(['example/first', 'main']);
         } finally {
           jest.useRealTimers();
           process.stdout.write = stdout;
@@ -195,10 +191,21 @@ describe('Go test progress host proofs', () => {
         jest.useFakeTimers();
         try {
           const command = ['first', 'second']
-            .map((name) => `go test -p=1 -count=1 -toolexec=${JSON.stringify(wrapper)} ./${name}`)
+            .map((name) => `go test -p=1 -count=1 -toolexec=${JSON.stringify(`node ${wrapper}`)} ./${name}`)
             .join(' && ');
           const result = await runBoundedExec(
-            { command, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
+            {
+              command,
+              env: {
+                GOCACHE: goCache,
+                GOWORK: 'off',
+                GOTOOLCHAIN: 'local',
+                GOPROXY: 'off',
+                GO_PROGRESS_BARRIER_SOCKET: endpoint,
+              },
+              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+              killAfterMs: 0,
+            },
             { root },
             createProcessTreeKiller(),
             null,
@@ -223,6 +230,8 @@ describe('Go test progress host proofs', () => {
 
   it('ends a real hanging Go test when its unchanged active-test budget expires', async () => {
     const root = await goFixture();
+    const goCache = join(root, 'gocache');
+    await mkdir(goCache);
     await writeFile(
       join(root, 'hang_test.go'),
       'package example\nimport ("runtime"; "testing")\nfunc TestHang(t *testing.T) { for { runtime.Gosched() } }\n',
@@ -243,7 +252,17 @@ describe('Go test progress host proofs', () => {
     jest.useFakeTimers();
     try {
       const result = await runBoundedExec(
-        { command: 'go test -p=1 -count=1 .', idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
+        {
+          command: 'go test -p=1 -count=1 .',
+          env: {
+            GOCACHE: goCache,
+            GOWORK: 'off',
+            GOTOOLCHAIN: 'local',
+            GOPROXY: 'off',
+          },
+          idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          killAfterMs: 0,
+        },
         { root },
         createProcessTreeKiller(),
         null,
