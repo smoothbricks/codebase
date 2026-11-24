@@ -2105,11 +2105,17 @@ mod tests {
         write_record(&forged, foreign.id(), &scratch.join("refusing.sock"));
         std::fs::rename(&forged, &record).unwrap();
         let outcome = stop_owned_daemon(process, watch).await.unwrap();
-        let owned_exited = owned.try_wait().unwrap().is_some();
-        if !owned_exited {
-            owned.kill().unwrap();
-        }
-        owned.wait_bounded().unwrap();
+        // The stop wakes on kqueue's NOTE_EXIT, and XNU posts NOTE_EXIT before the exiting process
+        // can be reaped: bsd/kern/kern_exit.c `proc_exit` calls `proc_knote(p, NOTE_EXIT | …)` and
+        // only later sets `p->p_stat = SZOMB`. A WNOHANG `try_wait` right after the stop can still
+        // find the owned leader exiting, which failed loaded gates. So the bounded wait reaps it, and
+        // its end proves the stop: that wait closes the leader's stdin, which ends `read _` with a
+        // plain exit, so only a signal says the stop's SIGTERM reached it.
+        let owned_status = {
+            use std::os::unix::process::ExitStatusExt as _;
+            owned.wait_bounded().unwrap().signal()
+        };
+        let owned_exited = owned_status == Some(libc::SIGTERM);
         let foreign_alive = foreign.try_wait().unwrap().is_none();
         if foreign_alive {
             foreign.kill().unwrap();
@@ -2118,7 +2124,7 @@ mod tests {
         assert_eq!(outcome.pid, owned_pid);
         assert!(
             outcome.exited && owned_exited,
-            "the owned process exits: {outcome:?}"
+            "the owned process exits on the stop's SIGTERM: {outcome:?}, its end signal {owned_status:?}"
         );
         assert!(
             foreign_alive,
