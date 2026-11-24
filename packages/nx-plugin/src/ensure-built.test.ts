@@ -937,19 +937,35 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           );
           expect(published.code, published.stdout + published.stderr).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+          const modulesLink = join(workspace, 'node_modules');
+          const modulesReal = await realpath(modulesLink);
           const probeEntry = join(root, 'probe-receipt.ts');
           await writeFile(
             probeEntry,
             `
 import { readFile, stat, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const fs = createRequire(import.meta.url)('node:fs');
+const openSync = fs.openSync;
+const prefixes = [${JSON.stringify(`${modulesLink}/`)}, ${JSON.stringify(`${modulesReal}/`)}];
+let countingToolOpens = false;
+let toolFileOpens = 0;
+fs.openSync = (...args: Parameters<typeof openSync>) => {
+  if (countingToolOpens && typeof args[0] === 'string' && prefixes.some((prefix) => args[0].startsWith(prefix))) {
+    toolFileOpens += 1;
+  }
+  return openSync(...args);
+};
+const { probeBuilt } = await import(${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))});
 const output = join(process.cwd(), 'packages/app/dist/marker.txt');
 const source = join(process.cwd(), 'packages/lib/source.txt');
 const originalOutput = await readFile(output, 'utf8');
 const originalSource = await readFile(source, 'utf8');
 const before = await stat(output, { bigint: true });
+countingToolOpens = true;
 const hit = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
+countingToolOpens = false;
 const after = await stat(output, { bigint: true });
 process.env.NX_DAEMON = 'false';
 const daemonless = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
@@ -961,7 +977,7 @@ await writeFile(source, 'new uncached source');
 const uncached = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 const outputAfterMiss = await readFile(output, 'utf8');
 await writeFile(source, originalSource);
-await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }) + "\\n", error => error ? reject(error) : resolve()));
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ hit, daemonless, stale, uncached, toolFileOpens, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }) + "\\n", error => error ? reject(error) : resolve()));
 `,
           );
           const probed = await run('bun', probeEntry, workspace, [], {
@@ -976,10 +992,12 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
             daemonless: EnsureBuiltProbeResult;
             stale: EnsureBuiltProbeResult;
             uncached: EnsureBuiltProbeResult;
+            toolFileOpens: number;
             outputUnwritten: boolean;
             outputAfterMiss: string;
           }>(probed.stdout);
           expect(receipts.hit.disposition, probed.stderr).toBe('hit');
+          expect(receipts.toolFileOpens).toBe(0);
           if (receipts.hit.disposition === 'hit') {
             expect(receipts.hit.receipt.tasks.map(({ id }) => id).sort()).toEqual(['app:build', 'lib:build']);
             expect(
@@ -1086,6 +1104,48 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
             reason: {
               kind: 'provider-proof',
               detail: `Producer tool namespace changed during independent product validation: ${fixtureGit}`,
+            },
+          });
+
+          // A tool file rewritten in place before the probe starts moves its stamp: readonly validation must read that
+          // file and refuse, naming the rewritten node.
+          const toolRewriteEntry = join(root, 'tool-node-rewrite.ts');
+          await writeFile(
+            toolRewriteEntry,
+            `
+import { writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+const fs = createRequire(import.meta.url)('node:fs');
+const openSync = fs.openSync;
+const git = ${JSON.stringify(fixtureGit)};
+let gitOpens = 0;
+fs.openSync = (...args: Parameters<typeof openSync>) => {
+  if (args[0] === git) gitOpens += 1;
+  return openSync(...args);
+};
+const { probeBuilt } = await import(${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))});
+writeFileSync(git, '#!/bin/sh\\nexit 2\\n');
+const refused = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ refused, gitOpens }) + "\\n", error => error ? reject(error) : resolve()));
+`,
+          );
+          const toolRewrite = await run('bun', toolRewriteEntry, workspace, [], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+          });
+          expect(toolRewrite.code, toolRewrite.stdout + toolRewrite.stderr).toBe(0);
+          const toolRewrites = typia.json.assertParse<{
+            refused: EnsureBuiltProbeResult;
+            gitOpens: number;
+          }>(toolRewrite.stdout);
+          expect(toolRewrites.gitOpens).toBeGreaterThan(0);
+          expect(toolRewrites.refused).toMatchObject({
+            disposition: 'failed',
+            reason: {
+              kind: 'provider-proof',
+              detail: expect.stringContaining(fixtureGit),
             },
           });
         },
