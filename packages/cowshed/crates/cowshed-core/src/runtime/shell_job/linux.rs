@@ -49,6 +49,7 @@ impl Handoff {
     /// The cgroup the command enters carries its class, so nothing is placed here.
     pub(super) async fn sent(
         self,
+        _host_pid: i32,
         _placement: &CommandPlacement,
         _monitor: &ProcessMonitor,
     ) -> Result<Placed> {

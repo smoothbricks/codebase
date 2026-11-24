@@ -936,7 +936,9 @@ impl ExecHost {
         drop(descriptors);
         // What the handoff placed and observed of the command before it ran anything. A refusal
         // fails the launch; this host is then dropped, which ends the held command.
-        let placed = handoff.sent(&command.placement, &command.monitor).await?;
+        let placed = handoff
+            .sent(self.fence.pid(), &command.placement, &command.monitor)
+            .await?;
         let payload = self.receive().await?;
         let (tag, mut fields) =
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;

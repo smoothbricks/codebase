@@ -7,7 +7,7 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
 use super::{pipe_error, protocol_error};
-use crate::error::{CowshedError, Result};
+use crate::error::{CowshedError, PriorityHostContext, Result};
 use crate::runtime::job_groups::Birth;
 use crate::runtime::process_fence::{HeldEnds, LeaderGate, leader_gate};
 use crate::runtime::process_monitor::ProcessMonitor;
@@ -65,6 +65,7 @@ impl Handoff {
     /// release it. A refused placement fails the launch.
     pub(super) async fn sent(
         self,
+        host_pid: i32,
         placement: &CommandPlacement,
         monitor: &ProcessMonitor,
     ) -> Result<Placed> {
@@ -89,12 +90,38 @@ impl Handoff {
         .await
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
         let placed = match placed {
-            Some(Err(failure)) => return Err(CowshedError::priority(failure)),
+            Some(Err(failure)) => {
+                return Err(CowshedError::priority_in_host(
+                    failure,
+                    host_priority_context(host_pid),
+                ));
+            }
             Some(Ok(nice)) => Some(nice),
             None => None,
         };
         observed.map_err(pipe_error)?;
         Ok(Placed(placed))
+    }
+}
+
+/// Read the warm host's nice, parent pid and this supervisor's own nice on a refused placement.
+/// Never called on the success path; failed reads stay explicit, never guessed.
+fn host_priority_context(host_pid: i32) -> PriorityHostContext {
+    let host_nice = u32::try_from(host_pid)
+        .map_err(|_| format!("invalid pid {host_pid}"))
+        .and_then(|pid| {
+            crate::runtime::placement::macos::nice_of(pid).map_err(|error| error.to_string())
+        });
+    let host_ppid = match crate::runtime::job_groups::process_record(host_pid) {
+        Ok(Some(record)) => Ok(record.ppid),
+        Ok(None) => Err("process exited".to_owned()),
+        Err(error) => Err(error.to_string()),
+    };
+    PriorityHostContext {
+        host_pid,
+        host_nice,
+        host_ppid,
+        supervisor_nice: crate::runtime::placement::macos::own_nice(),
     }
 }
 

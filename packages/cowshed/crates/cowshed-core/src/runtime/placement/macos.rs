@@ -44,6 +44,21 @@ pub fn own_nice() -> i32 {
     nice
 }
 
+/// The nice `pid` runs at (`getpriority(PRIO_PROCESS)`), clearing `errno` first so a real `-1`
+/// nice is never mistaken for an error.
+pub fn nice_of(pid: u32) -> io::Result<i32> {
+    crate::runtime::shell_host::clear_errno();
+    // SAFETY: a plain read of `pid`'s priority.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+    if nice == -1
+        && let Some(errno) = io::Error::last_os_error().raw_os_error()
+        && errno != 0
+    {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    Ok(nice)
+}
+
 /// Set the held command `pid` -- forked, leading its own group, not yet running anything of the
 /// job's -- to `nice`, and read back what its kernel entry holds: the nice the command is
 /// observed at. Only a child held at its observation fence is placed here, never a host or this
@@ -59,15 +74,7 @@ pub fn place_nice(pid: u32, nice: i32) -> Result<i32, PriorityFailure> {
     if unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, nice) } == -1 {
         return Err(failure(None, io::Error::last_os_error().raw_os_error()));
     }
-    crate::runtime::shell_host::clear_errno();
-    // SAFETY: as above.
-    let observed = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
-    if observed == -1
-        && let Some(errno) = io::Error::last_os_error().raw_os_error()
-        && errno != 0
-    {
-        return Err(failure(None, Some(errno)));
-    }
+    let observed = nice_of(pid).map_err(|error| failure(None, error.raw_os_error()))?;
     if observed == nice {
         Ok(observed)
     } else {

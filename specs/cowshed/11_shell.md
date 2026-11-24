@@ -1764,9 +1764,11 @@ supervisor's own nice — not the reusable host's or supervisor's. On macOS the 
 `setpriority(PRIO_PROCESS)` and reads it back while the existing observation fence holds the child; it never applies
 `PRIO_DARWIN_BG`, a QoS clamp or a disk I/O policy (05_gateway.md, "On macOS nothing cowshed starts is throttled for
 I/O"). A refusal fails the job `priority` supervisor-side, and observed nice stays absent until placement succeeds;
-absence is explicit, not a guessed nice. On Linux no nice is placed: the job's first process enters its class cgroup's
-job cgroup through the placement descriptor before exec (05_gateway.md, "Classes"), and the job's record carries no
-nice.
+absence is explicit, not a guessed nice. For a pooled command, the refusal also names its shell host's pid, parent pid,
+observed nice and this supervisor's own nice — and when the host's nice is above the supervisor's, notes that something
+outside cowshed lowered it, since every warm host runs at the supervisor's own nice ("One spare and a SIEVE cache"). On
+Linux no nice is placed: the job's first process enters its class cgroup's job cgroup through the placement descriptor
+before exec (05_gateway.md, "Classes"), and the job's record carries no nice.
 
 HostGate is an explicitly authorized argv host one-shot of any class on this same server, without ExecutedChild or
 activation; it preserves the real-APFS host boundary and refuses scripts, read-only mode and sessions, never custom

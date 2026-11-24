@@ -227,6 +227,17 @@ pub struct PriorityFailure {
     pub errno: Option<i32>,
 }
 
+/// Diagnostic context of the warm shell host whose child could not be placed at its class nice.
+/// Carried only into the refusal message, never on the wire.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PriorityHostContext {
+    pub host_pid: i32,
+    pub host_nice: std::result::Result<i32, String>,
+    pub host_ppid: std::result::Result<u32, String>,
+    pub supervisor_nice: i32,
+}
+
 /// Why a `Conflict` is safe to retry unchanged: the call planned against state a concurrent
 /// operation changed before it acted, and changed nothing itself. Retrying is the remedy; no
 /// other repair is needed.
@@ -530,18 +541,53 @@ impl CowshedError {
         }
     }
 
-    pub fn priority(failure: PriorityFailure) -> Self {
+    fn priority_with_message(failure: PriorityFailure, message: String) -> Self {
         let error = Self::sandbox_denied(
-            format!(
-                "cannot place owned job pid {} at nice {}: observed {:?}, errno {:?}",
-                failure.pid, failure.requested, failure.observed, failure.errno
-            ),
+            message,
             "interactive runs at the supervisor's own nice and every other class only lower (05_gateway.md \"Classes\"); never request an elevated priority",
         );
         Self {
             cold: Some(Box::new(ColdRefusal::Priority { priority: failure })),
             ..error
         }
+    }
+
+    pub fn priority(failure: PriorityFailure) -> Self {
+        let message = format!(
+            "cannot place owned job pid {} at nice {}: observed {:?}, errno {:?}",
+            failure.pid, failure.requested, failure.observed, failure.errno
+        );
+        Self::priority_with_message(failure, message)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn priority_in_host(failure: PriorityFailure, host: PriorityHostContext) -> Self {
+        let parent = match &host.host_ppid {
+            Ok(ppid) => format!("parent {ppid}"),
+            Err(reason) => format!("parent unreadable: {reason}"),
+        };
+        let nice_detail = match &host.host_nice {
+            Ok(host_nice) if *host_nice > host.supervisor_nice => format!(
+                "runs at nice {host_nice}, above this supervisor's nice {}: \
+                 EACCES, a process cannot be raised above an externally lowered nice; \
+                 something outside cowshed re-niced the host",
+                host.supervisor_nice
+            ),
+            Ok(host_nice) => format!(
+                "runs at nice {host_nice}, this supervisor at {}",
+                host.supervisor_nice
+            ),
+            Err(reason) => format!(
+                "nice unreadable ({reason}), this supervisor at {}",
+                host.supervisor_nice
+            ),
+        };
+        let message = format!(
+            "cannot place owned job pid {} at nice {}: observed {:?}, errno {:?}; \
+             its shell host {} ({parent}) {nice_detail}",
+            failure.pid, failure.requested, failure.observed, failure.errno, host.host_pid
+        );
+        Self::priority_with_message(failure, message)
     }
 
     pub fn cpu_admission_source(&self) -> Option<&CpuAdmissionRefusal> {
@@ -1126,6 +1172,82 @@ mod tests {
         let decoded: CowshedError = serde_json::from_value(value).expect("decode priority");
         assert_eq!(decoded.priority_source(), priority.priority_source());
         assert!(decoded.cpu_admission_source().is_none());
+
+        let hosted = CowshedError::priority_in_host(
+            PriorityFailure {
+                pid: 200,
+                requested: 0,
+                observed: None,
+                errno: Some(libc::EACCES),
+            },
+            super::PriorityHostContext {
+                host_pid: 100,
+                host_nice: Ok(10),
+                host_ppid: Ok(50),
+                supervisor_nice: 0,
+            },
+        );
+        assert_eq!(
+            hosted.message,
+            format!(
+                "cannot place owned job pid 200 at nice 0: observed None, errno Some({}); \
+                 its shell host 100 (parent 50) runs at nice 10, above this supervisor's nice 0: \
+                 EACCES, a process cannot be raised above an externally lowered nice; \
+                 something outside cowshed re-niced the host",
+                libc::EACCES
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&hosted).expect("serialize hosted")["priority"],
+            serde_json::json!({"pid":200, "requested":0, "observed":null, "errno":libc::EACCES})
+        );
+
+        let equal_nice = CowshedError::priority_in_host(
+            PriorityFailure {
+                pid: 201,
+                requested: 0,
+                observed: None,
+                errno: Some(libc::EPERM),
+            },
+            super::PriorityHostContext {
+                host_pid: 100,
+                host_nice: Ok(0),
+                host_ppid: Ok(50),
+                supervisor_nice: 0,
+            },
+        );
+        assert_eq!(
+            equal_nice.message,
+            format!(
+                "cannot place owned job pid 201 at nice 0: observed None, errno Some({}); \
+                 its shell host 100 (parent 50) runs at nice 0, this supervisor at 0",
+                libc::EPERM
+            )
+        );
+
+        let unreadable = CowshedError::priority_in_host(
+            PriorityFailure {
+                pid: 202,
+                requested: 0,
+                observed: None,
+                errno: Some(libc::EACCES),
+            },
+            super::PriorityHostContext {
+                host_pid: 100,
+                host_nice: Err("ESRCH".to_owned()),
+                host_ppid: Err("process exited".to_owned()),
+                supervisor_nice: 0,
+            },
+        );
+        assert_eq!(
+            unreadable.message,
+            format!(
+                "cannot place owned job pid 202 at nice 0: observed None, errno Some({}); \
+                 its shell host 100 (parent unreadable: process exited) \
+                 nice unreadable (ESRCH), this supervisor at 0",
+                libc::EACCES
+            )
+        );
         for cause in [
             serde_json::json!({"cpuAdmission":{"reason":"futureRefusal"}}),
             serde_json::json!({"priority":{"future":true}}),
