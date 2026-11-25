@@ -868,4 +868,96 @@ mod tests {
             })
         ));
     }
+
+    /// Drives the real `GroupLedgerWriter` thread across a burst of 20 byte-identical cuts and a
+    /// burst of 20 distinct cuts: identical cuts never trigger a second temp+rename rewrite,
+    /// distinct cuts within 1 s coalesce to at most 2 rewrites (including final flush), and
+    /// `finish` flushes the newest cut at once.
+    #[tokio::test]
+    async fn a_burst_of_cuts_renames_the_ledger_at_most_once_a_second_and_never_for_an_identical_one()
+     {
+        use crate::runtime::job_groups::GroupLeader;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = crate::temp_root::TempRoot::new("group-ledger-burst");
+        let ledger = root.join("supervisor.groups");
+        let mut writer = GroupLedgerWriter::start(Recorder::new(ledger.clone()), Vec::new(), None)
+            .expect("start group ledger writer");
+
+        let sample_inode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .ok()
+                .map(|metadata| metadata.ino())
+        };
+        let record_inode = |path: &Path, last: &mut Option<u64>, rewrites: &mut usize| {
+            if let Some(inode) = sample_inode(path)
+                && *last != Some(inode)
+            {
+                *last = Some(inode);
+                *rewrites += 1;
+            }
+        };
+
+        // Burst 1: 20 byte-identical cuts over ~200 ms. Wait for the first write to land, then
+        // pace the remaining 19 so an unthrottled writer would rewrite on every cut.
+        let same = GroupLeader::from_parts(42, 1, 100).expect("valid group leader");
+        writer
+            .publish([JobGroupClaim::group(1, same)].into_iter())
+            .expect("publish initial cut");
+        let first_inode = loop {
+            if let Some(inode) = sample_inode(&ledger) {
+                break inode;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let mut last_inode = Some(first_inode);
+        let mut identical_rewrites = 1_usize;
+        for _ in 1..20 {
+            writer
+                .publish([JobGroupClaim::group(1, same)].into_iter())
+                .expect("publish identical cut");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            record_inode(&ledger, &mut last_inode, &mut identical_rewrites);
+        }
+        assert!(
+            identical_rewrites <= 1,
+            "20 byte-identical cuts must cause at most 1 rewrite, observed {identical_rewrites}"
+        );
+
+        // Burst 2: 20 distinct cuts over ~500 ms, then finish immediately.
+        let mut distinct_rewrites = 0_usize;
+        for step in 0..20_u64 {
+            let pgid = i32::try_from(100 + step).expect("pgid");
+            let leader = GroupLeader::from_parts(pgid, 1 + step, 1000 + step).expect("leader");
+            writer
+                .publish([JobGroupClaim::group(10 + step, leader)].into_iter())
+                .expect("publish distinct cut");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            record_inode(&ledger, &mut last_inode, &mut distinct_rewrites);
+        }
+
+        writer
+            .finish()
+            .await
+            .expect("writer answers final flush")
+            .expect("final flush succeeds");
+        record_inode(&ledger, &mut last_inode, &mut distinct_rewrites);
+
+        assert!(
+            distinct_rewrites <= 2,
+            "20 distinct cuts within 1 s plus final flush must cause at most 2 rewrites, observed {distinct_rewrites}"
+        );
+        let published: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger).expect("read final ledger"))
+                .expect("parse final ledger");
+        let groups = published["groups"].as_array().expect("groups array");
+        assert_eq!(
+            groups.len(),
+            1,
+            "final ledger holds the last cut: {published}"
+        );
+        assert_eq!(groups[0]["jobId"].as_u64(), Some(29));
+        assert_eq!(groups[0]["pgid"].as_i64(), Some(119));
+        assert_eq!(groups[0]["leaderStart"].as_u64(), Some(1019));
+    }
 }
