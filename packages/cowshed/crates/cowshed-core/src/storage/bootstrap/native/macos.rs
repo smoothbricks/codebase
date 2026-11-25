@@ -10652,15 +10652,17 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             Duration::from_millis(250),
         )
         .expect_err("deadline");
-        assert!(error.to_string().contains("was signalled"), "{error}");
         assert_eq!(error.kind, crate::storage::bootstrap::HostErrorKind::Other);
         let message = error.to_string();
         assert!(
             message.contains("produced no result within 250ms"),
             "{message}"
         );
+        // Either the deadline's kill ended the child, which the report names, or the deadline ran
+        // out before exec (a loaded host), and no child existed to signal.
         assert!(
-            message.contains("child reaped with") || message.contains("no disk tool was started"),
+            (message.contains("was signalled") && message.contains("child reaped with"))
+                || message.contains("no disk tool was started"),
             "{message}"
         );
         assert!(!message.contains("arbitration"), "{message}");
