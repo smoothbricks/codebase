@@ -232,6 +232,24 @@ pub fn held_exclusive() -> bool {
     )
 }
 
+/// Holds the process-wide fork lock exclusive until dropped, so a test can stall concurrent
+/// spawns and prove that a runtime thread stays responsive while they wait.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug)]
+#[must_use = "the fork lock is released the moment this guard is dropped"]
+pub struct ExclusiveHold {
+    _guard: RwLockWriteGuard<'static, ()>,
+}
+
+/// Acquire the fork lock exclusive for a test; every [`Spawn`] waits until the returned guard
+/// drops.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hold_exclusive() -> ExclusiveHold {
+    ExclusiveHold {
+        _guard: releasing(),
+    }
+}
+
 /// The children this thread has spawned through [`Spawn`], by the program each command names.
 ///
 /// Every spawn of a cowshed process goes through [`Spawn`] (each crate's `clippy.toml` refuses

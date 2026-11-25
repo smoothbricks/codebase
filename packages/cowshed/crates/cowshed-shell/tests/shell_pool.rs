@@ -2789,6 +2789,89 @@ async fn host_controller_a_priority_refusal_on_a_lowered_warm_host_names_the_hos
     );
 }
 
+/// Cold-spawning a warm shell host must never block the supervisor's `current_thread` runtime:
+/// while another thread holds the fork lock exclusive, a sibling ticker task on the same runtime
+/// keeps ticking (specs/cowshed/05_gateway.md "Deadlines", 11_shell.md "Supervisor").
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_cold_shell_host_spawn_does_not_block_runtime_thread() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workspace = Workspace::new("shell-spawn-off-runtime", 41_680);
+    workspace.envrc("export FROM_ENVRC=root\n");
+    std::fs::create_dir(workspace.mount().join("nested")).expect("nested shell directory");
+    std::fs::write(
+        workspace.mount().join("nested/.envrc"),
+        format!("{COUNT}export FROM_ENVRC=nested\n"),
+    )
+    .expect("nested envrc");
+    let handle = workspace.supervisor(false);
+    // Warm the root pool first so the shell-host binary is already staged on disk; the nested
+    // command below selects a distinct pool and goes straight to a cold host spawn.
+    assert_eq!(
+        run(&handle, sh("printf %s \"$FROM_ENVRC\""))
+            .await
+            .ok()
+            .stdout,
+        "root"
+    );
+
+    // Park a thread holding the fork lock exclusive so any spawn (or fenced pipe creation) on
+    // the supervisor's current_thread runtime blocks until the hold ends.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _hold = cowshed_os::fork_lock::hold_exclusive();
+        held_tx.send(()).expect("signal fork lock held");
+        // Release as soon as the runtime proves liveness, or after 3 s if the runtime is wedged
+        // behind the lock so a red run fails cleanly rather than hanging.
+        let _ = release_rx.recv_timeout(Duration::from_secs(3));
+    });
+    held_rx.recv().expect("fork lock acquired");
+
+    let ticks_while_held = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&ticks_while_held);
+    let ticker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        // The first tick completes immediately; count subsequent ticks while the lock is held.
+        interval.tick().await;
+        while cowshed_os::fork_lock::held_exclusive() {
+            interval.tick().await;
+            if cowshed_os::fork_lock::held_exclusive() {
+                let count = observed.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= 30 {
+                    let _ = release_tx.send(());
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut nested = sh("printf %s \"$FROM_ENVRC\"");
+    nested.cwd = Some(cowshed_core::api::dto::WorkspacePath::new("nested").expect("nested cwd"));
+    let job = handle
+        .exec(None, None, nested, AdmissionSource::Worker)
+        .await
+        .expect("admit pooled job");
+    assert_eq!(ran(&handle, job).await.ok().stdout, "nested");
+    assert_eq!(
+        workspace.activations(),
+        2,
+        "nested shell performed a cold host spawn and activation"
+    );
+
+    ticker.await.expect("ticker task");
+    holder.join().expect("fork lock holder thread");
+
+    let ticks = ticks_while_held.load(Ordering::Relaxed);
+    assert!(
+        ticks >= 20,
+        "supervisor current_thread runtime ticked only {ticks} times while fork lock was held \
+         exclusive during cold shell-host spawn (expected at least 20)"
+    );
+}
+
 /// This test process's census, as a fixture store's census reaches it, over a store that holds no
 /// lease.
 fn census() -> cowshed_core::census::CensusScope {
