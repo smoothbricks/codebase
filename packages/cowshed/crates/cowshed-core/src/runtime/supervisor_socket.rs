@@ -504,6 +504,10 @@ struct ExecWire {
     stderr_copy: Option<OutputPublication>,
     admission_key: Option<AdmissionKey>,
     class: ExecClass,
+    /// The land process running a gate job (05_gateway.md "A land's gate takes tokens back");
+    /// omitted when absent, so a supervisor built before the field still decodes the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lander: Option<crate::api::dto::JobLander>,
     want: Option<NonZeroUsize>,
     /// Whether the job is held (05_gateway.md "Held jobs"), omitted when it is not, so a supervisor
     /// built before the field still decodes the call.
@@ -542,9 +546,14 @@ impl AdmissionSource {
     /// interactive and either resident's work in the workspace sandbox and nothing else -- none of
     /// them claims anything a worker may not -- and anything more is refused as the typed
     /// class-not-permitted error, before any record or process exists.
-    pub fn admit(self, class: ExecClass, scope: ExecScope) -> Result<()> {
-        match (self, class, scope) {
-            (Self::Coordinator, _, _)
+    pub fn admit(
+        self,
+        class: ExecClass,
+        scope: ExecScope,
+        lander: Option<crate::api::dto::JobLander>,
+    ) -> Result<()> {
+        match (self, class, scope, lander) {
+            (Self::Coordinator, _, _, _)
             | (
                 Self::Worker,
                 ExecClass::Background
@@ -552,8 +561,9 @@ impl AdmissionSource {
                 | ExecClass::Resident
                 | ExecClass::InteractiveResident,
                 ExecScope::Workspace,
+                None,
             ) => Ok(()),
-            (Self::Worker, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
+            (Self::Worker, _, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
         }
     }
 }
@@ -3253,6 +3263,7 @@ async fn answer(
                 stderr_copy: request.stderr_copy,
                 admission_key: request.admission_key,
                 class: request.class,
+                lander: request.lander,
                 want: request.want,
                 hold: request.hold,
                 scope: request.scope,
@@ -4350,6 +4361,7 @@ async fn forward_exec(
             stderr_copy: request.stderr_copy,
             admission_key: request.admission_key,
             class: request.class,
+            lander: request.lander,
             want: request.want,
             hold: request.hold,
             scope: request.scope,
@@ -5180,7 +5192,7 @@ mod admission_source_tests {
             ExecClass::InteractiveResident,
         ] {
             for scope in [ExecScope::Workspace, ExecScope::HostGate] {
-                let worker = AdmissionSource::Worker.admit(class, scope);
+                let worker = AdmissionSource::Worker.admit(class, scope, None);
                 if scope == ExecScope::Workspace && class != ExecClass::Gate {
                     worker.expect("a worker admits its workspace's non-gate work");
                 } else {
@@ -5191,9 +5203,20 @@ mod admission_source_tests {
                         Some(&CpuAdmissionRefusal::ClassNotPermitted { class, scope })
                     );
                 }
+                let lander = Some(crate::api::dto::JobLander { pid: 42, start: 99 });
+                let worker_lander = AdmissionSource::Worker.admit(class, scope, lander);
+                assert_eq!(
+                    worker_lander
+                        .expect_err("a worker never carries a lander")
+                        .cpu_admission_source(),
+                    Some(&CpuAdmissionRefusal::ClassNotPermitted { class, scope })
+                );
                 AdmissionSource::Coordinator
-                    .admit(class, scope)
+                    .admit(class, scope, None)
                     .expect("the coordinator admits every pairing");
+                AdmissionSource::Coordinator
+                    .admit(class, scope, lander)
+                    .expect("the coordinator admits a lander");
             }
         }
     }
@@ -6221,6 +6244,7 @@ mod held_turn_tests {
             stderr_copy: None,
             admission_key: None,
             class: ExecClass::Background,
+            lander: None,
             want: Some(std::num::NonZeroUsize::MIN),
             hold: false,
             scope: ExecScope::Workspace,

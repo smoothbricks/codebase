@@ -1126,6 +1126,8 @@ impl Serves<CoordinatorExec> for Coordinator {
             #[serde(default)]
             class: ExecClass,
             #[serde(default)]
+            lander: Option<JobLander>,
+            #[serde(default)]
             want: Option<NonZeroUsize>,
             #[serde(default)]
             hold: bool,
@@ -1149,6 +1151,7 @@ impl Serves<CoordinatorExec> for Coordinator {
             stderr_copy,
             admission_key,
             class,
+            lander,
             want,
             hold,
             scope,
@@ -1170,6 +1173,7 @@ impl Serves<CoordinatorExec> for Coordinator {
             stderr_copy,
             admission_key,
             class,
+            lander,
             want,
             hold,
             scope,
@@ -1224,6 +1228,8 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             #[serde(default)]
             class: ExecClass,
             #[serde(default)]
+            lander: Option<JobLander>,
+            #[serde(default)]
             want: Option<NonZeroUsize>,
             #[serde(default)]
             hold: bool,
@@ -1245,6 +1251,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stderr_copy,
             admission_key,
             class,
+            lander,
             want,
             hold,
             scope,
@@ -1266,6 +1273,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stderr_copy,
             admission_key,
             class,
+            lander,
             want,
             hold,
             scope,

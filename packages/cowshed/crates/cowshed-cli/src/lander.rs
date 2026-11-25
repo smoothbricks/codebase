@@ -49,6 +49,20 @@ impl Lander {
         })
     }
 
+    /// The lander named in this process's `COWSHED_LANDER`, if present and valid.
+    pub(crate) fn inherited() -> Option<Self> {
+        let named = std::env::var_os(VARIABLE)?;
+        Self::named(&named).ok()
+    }
+
+    /// This lander as the typed [`cowshed_core::api::JobLander`] carried on a gate exec request.
+    pub(crate) fn as_job_lander(self) -> cowshed_core::api::JobLander {
+        cowshed_core::api::JobLander {
+            pid: self.pid.unsigned_abs(),
+            start: self.started,
+        }
+    }
+
     /// Watch this lander's exit from now. The watch is registered before the process holding the
     /// pid is identified, so a lander that ends in between is seen ended; a pid nothing holds,
     /// or that another process holds, is a lander that has ended already.

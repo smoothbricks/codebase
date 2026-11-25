@@ -2236,6 +2236,7 @@ pub fn project_tool_request(mount: &Path, cwd: &Path, argv: Vec<OsString>) -> Re
         stderr_copy: None,
         admission_key: None,
         class: ExecClass::Background,
+        lander: None,
         want: Some(std::num::NonZeroUsize::MIN),
         hold: false,
         scope: ExecScope::Workspace,
@@ -7099,7 +7100,7 @@ impl SupervisorActor {
                     Ok(())
                 }
             })?;
-        source.admit(request.class, request.scope)?;
+        source.admit(request.class, request.scope, request.lander)?;
         // The host boundary takes no session overlay a worker controls. Environment names do
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
@@ -7270,6 +7271,7 @@ impl SupervisorActor {
             stderr_copy,
             admission_key: _,
             class: _,
+            lander: _,
             want: _,
             hold: _,
             scope: _,

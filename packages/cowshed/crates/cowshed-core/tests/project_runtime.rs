@@ -2298,6 +2298,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            lander: None,
             record: JobRecord::Cowshed,
         })
         .await
@@ -2862,6 +2863,7 @@ fn gated_request(class: ExecClass) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
+        lander: None,
         record: JobRecord::Cowshed,
     }
 }
@@ -3545,6 +3547,7 @@ async fn exec_in(
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            lander: None,
             record: JobRecord::Cowshed,
         })
         .await
@@ -3629,6 +3632,7 @@ async fn a_keyed_lookup_reaches_one_job_or_proven_absence_over_the_controller() 
         stdout_copy: None,
         stderr_copy: None,
         admission_key: Some(key.clone()),
+        lander: None,
         record: JobRecord::Cowshed,
     };
     let job = worker.exec(request()).await.expect("admit the keyed job");
@@ -4927,6 +4931,7 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: Some(cowshed_core::api::AdmissionKey::new("session-op").unwrap()),
+        lander: None,
         record: JobRecord::Cowshed,
     };
     let job = supervisor
@@ -5307,6 +5312,7 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            lander: None,
             record: JobRecord::Cowshed,
         })
         .await
@@ -5468,6 +5474,7 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            lander: None,
             record: JobRecord::Cowshed,
         })
         .await
@@ -5763,6 +5770,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            lander: None,
             record: JobRecord::Cowshed,
         })
         .await

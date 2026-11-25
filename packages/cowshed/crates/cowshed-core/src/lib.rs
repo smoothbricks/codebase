@@ -12,6 +12,7 @@ pub mod developer_links;
 pub mod doctor;
 pub mod error;
 pub mod exec;
+pub mod gate_watch;
 mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;

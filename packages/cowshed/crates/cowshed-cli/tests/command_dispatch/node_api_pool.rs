@@ -193,6 +193,7 @@ async fn exec_true(client: OwnedFd, checkout: &Path) -> cowshed_core::Result<Job
             hold: false,
             scope: cowshed_core::api::ExecScope::Workspace,
             record: cowshed_core::api::JobRecord::Cowshed,
+            lander: None,
         })
         .await?;
     job.wait().await

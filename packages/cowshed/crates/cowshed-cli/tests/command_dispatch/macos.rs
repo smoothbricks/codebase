@@ -9503,6 +9503,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
             hold: false,
             scope: cowshed_core::api::ExecScope::Workspace,
             record: cowshed_core::api::JobRecord::Cowshed,
+            lander: None,
         })
         .await
         .expect("start bun install as a covered job");
@@ -10451,6 +10452,7 @@ async fn directory_injected_memory_pressure_holds_and_releases_a_background_job(
         hold: false,
         scope: ExecScope::Workspace,
         record: JobRecord::Cowshed,
+        lander: None,
     };
 
     // The shed is open under a calm source; the injected source alone now reports Warning.

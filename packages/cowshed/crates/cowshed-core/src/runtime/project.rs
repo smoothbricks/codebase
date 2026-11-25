@@ -2352,7 +2352,7 @@ impl ProjectActor {
         upload: Option<Bytes>,
         demand: crate::media_room::AttachDemand,
     ) -> Result<JobId> {
-        source.admit(params.class, params.scope)?;
+        source.admit(params.class, params.scope, params.lander)?;
         let (scope, session, exec) = exec_request(params, upload)?;
         self.require_scoped_workspace(authority, &scope.repo_id, &scope.workspace)
             .await?;
@@ -3085,6 +3085,7 @@ fn exec_request(
             stderr_copy: params.stderr_copy,
             admission_key: params.admission_key,
             class: params.class,
+            lander: params.lander,
             want: params.want,
             hold: params.hold,
             scope: params.scope,
@@ -7164,6 +7165,7 @@ self.finish_retire_intent(&workspace).await?;
                     stderr_copy: None,
                     admission_key: None,
                     class: crate::api::dto::ExecClass::Background,
+                    lander: None,
                     want: Some(std::num::NonZeroUsize::MIN),
                     hold: false,
                     scope: crate::api::dto::ExecScope::Workspace,
@@ -7274,6 +7276,7 @@ self.finish_retire_intent(&workspace).await?;
                 stderr_copy: None,
                 admission_key: None,
                 class: crate::api::dto::ExecClass::Background,
+                lander: None,
                 want: Some(std::num::NonZeroUsize::MIN),
                 hold: false,
                 scope: crate::api::dto::ExecScope::Workspace,
@@ -22174,6 +22177,7 @@ mod removal_supervisor_tests {
                     stderr_copy: None,
                     admission_key: None,
                     class: crate::api::dto::ExecClass::Background,
+                    lander: None,
                     want: Some(std::num::NonZeroUsize::MIN),
                     hold: false,
                     scope: crate::api::dto::ExecScope::Workspace,
@@ -23860,6 +23864,7 @@ fn land_check_request(check: &str) -> ExecRequest {
         stderr_copy: None,
         admission_key: None,
         class: crate::api::dto::ExecClass::Gate,
+        lander: None,
         want: Some(NonZeroUsize::MIN),
         hold: false,
         scope: crate::api::dto::ExecScope::Workspace,
@@ -24061,6 +24066,7 @@ fn nx_probe_request(
         stderr_copy: None,
         admission_key: None,
         class,
+        lander: None,
         want: Some(NonZeroUsize::MIN),
         hold: false,
         scope: crate::api::dto::ExecScope::Workspace,

@@ -379,7 +379,7 @@ impl ControllerRuntime for ActorRuntime {
         request: ExecRequest,
         source: AdmissionSource,
     ) -> Result<JobId> {
-        source.admit(request.class, request.scope)?;
+        source.admit(request.class, request.scope, request.lander)?;
         request.command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
         })?;
@@ -395,6 +395,7 @@ impl ControllerRuntime for ActorRuntime {
             stderr_copy,
             admission_key,
             class,
+            lander,
             want,
             hold,
             scope,
@@ -429,6 +430,7 @@ impl ControllerRuntime for ActorRuntime {
             stderr_copy,
             admission_key,
             class,
+            lander,
             want,
             hold,
             scope,
@@ -4357,6 +4359,7 @@ mod tests {
             stderr_copy: None,
             admission_key: None,
             class: ExecClass::Background,
+            lander: None,
             want: None,
             hold: false,
             scope: ExecScope::Workspace,

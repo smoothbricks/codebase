@@ -376,6 +376,7 @@ async fn an_ungated_land_keeps_a_folded_peer_with_a_live_supervisor_or_running_j
                         stderr_copy: None,
                         admission_key: None,
                         class: ExecClass::Background,
+                        lander: None,
                         want: None,
                         hold: false,
                         scope: ExecScope::HostGate,

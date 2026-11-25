@@ -719,6 +719,11 @@ export const assertJobJournalCursorList = typia.createAssertEquals<readonly Api.
 export const parseJobJournalCursorList = (json: string): readonly Api.JobJournalCursor[] =>
   assertJobJournalCursorList(JSON.parse(json));
 
+export const assertJobLander = typia.createAssertEquals<Api.JobLander>();
+export const parseJobLander = (json: string): Api.JobLander => assertJobLander(JSON.parse(json));
+export const assertJobLanderList = typia.createAssertEquals<readonly Api.JobLander[]>();
+export const parseJobLanderList = (json: string): readonly Api.JobLander[] => assertJobLanderList(JSON.parse(json));
+
 export const assertJobLeafAttribution = typia.createAssertEquals<Api.JobLeafAttribution>();
 export const parseJobLeafAttribution = (json: string): Api.JobLeafAttribution =>
   assertJobLeafAttribution(JSON.parse(json));

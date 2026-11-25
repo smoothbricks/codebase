@@ -761,6 +761,7 @@ fn request(stdin: StdinSource) -> ExecRequest {
         stderr_copy: None,
         admission_key: None,
         class: ExecClass::Background,
+        lander: None,
         want: None,
         hold: false,
         scope: ExecScope::Workspace,

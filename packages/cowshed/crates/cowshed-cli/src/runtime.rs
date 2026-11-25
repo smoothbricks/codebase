@@ -2669,6 +2669,11 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
                 .transpose()?,
             admission_key: None,
             class: args.class,
+            lander: (args.class == cowshed_core::api::ExecClass::Gate)
+                .then(|| {
+                    crate::lander::Lander::inherited().map(crate::lander::Lander::as_job_lander)
+                })
+                .flatten(),
             want: args.want,
             // Naming a count declares the job heavy (05_gateway.md "Held jobs").
             hold: args.want.is_some(),
@@ -6230,6 +6235,7 @@ mod tests {
                     stderr_copy: None,
                     admission_key: None,
                     class: cowshed_core::api::ExecClass::Background,
+                    lander: None,
                     want: None,
                     hold: false,
                     scope: cowshed_core::api::ExecScope::Workspace,

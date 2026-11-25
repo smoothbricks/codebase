@@ -769,6 +769,11 @@ export type ExecParams = {
    */
   readonly class?: ExecClass;
   /**
+   * The land process running this gate job (05_gateway.md "A land's gate takes tokens back");
+   * omitted when absent. Only `coordinator.exec` may carry it.
+   */
+  readonly lander?: JobLander;
+  /**
    * The count the job's jobserver holds, at most the host's cores; omitted for the host's cores
    * (05_gateway.md "Parallelism inside a job").
    */
@@ -1567,6 +1572,15 @@ export type JobInfoRef = {
 export type JobJournalCursor = {
   readonly stdout: number & tags.Type<'uint64'>;
   readonly stderr: number & tags.Type<'uint64'>;
+};
+
+/**
+ * The land process (`COWSHED_LANDER=<pid>:<start>`) whose declared gate submitted an exec
+ * (05_gateway.md "Gates and lands", "A land's gate takes tokens back").
+ */
+export type JobLander = {
+  readonly pid: number & tags.Type<'uint32'>;
+  readonly start: number & tags.Type<'uint64'>;
 };
 
 /**

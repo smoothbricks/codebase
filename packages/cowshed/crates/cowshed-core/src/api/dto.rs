@@ -3174,6 +3174,10 @@ pub struct ExecRequest {
     /// interactive when its requester awaits its result, a gate when a trusted coordinator route
     /// asks for one, or a resident.
     pub class: ExecClass,
+    /// The land process running this gate job (05_gateway.md "A land's gate takes tokens back").
+    /// Only the trusted coordinator route that grants `ExecClass::Gate` may carry it; `None` for
+    /// trains, operators and non-gate jobs.
+    pub lander: Option<JobLander>,
     /// The most compiler and test threads the command's jobserver holds; `None` holds the host's
     /// cores, and a larger want is held to them (`JobScheduling::requested`, 05_gateway.md
     /// "Parallelism inside a job").
@@ -3187,6 +3191,15 @@ pub struct ExecRequest {
     /// Who keeps the job's record: cowshed, in the workspace's protected records, or the caller,
     /// in its own log, with no disk record kept here (11_shell.md, "Caller-owned jobs").
     pub record: JobRecord,
+}
+
+/// The land process (`COWSHED_LANDER=<pid>:<start>`) whose declared gate submitted an exec
+/// (05_gateway.md "Gates and lands", "A land's gate takes tokens back").
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobLander {
+    pub pid: u32,
+    pub start: u64,
 }
 
 /// Where an exec's command runs (07_api.md "Exec and grants").

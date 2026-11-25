@@ -13,12 +13,12 @@ use super::dto::StoreSubstrate;
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CommandArg, DefragmentResult, DoctorReport,
     EmptyResult, ExecClass, ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet,
-    JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobRecord, JobTail, JobTailLimits,
-    LandOptions, LandReport, MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta,
-    PushOptions, PushReport, RebaseOptions, RebaseReport, RekeyResult, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    JobId, JobInfo, JobJournalCursor, JobLander, JobListeningPorts, JobRecord, JobTail,
+    JobTailLimits, LandOptions, LandReport, MirrorInfo, NxStateClearResult, OutputPublication,
+    ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RekeyResult,
+    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
+    ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext,
+    UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::dto::{
     BinaryData, BuildStateListing, CredentialReport, DiskCommandEvent, DiskCommandTool,
@@ -788,6 +788,10 @@ pub struct ExecParams {
     /// coordinator.exec route admits the gate class.
     #[serde(default, skip_serializing_if = "is_background")]
     pub class: ExecClass,
+    /// The land process running this gate job (05_gateway.md "A land's gate takes tokens back");
+    /// omitted when absent. Only `coordinator.exec` may carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lander: Option<JobLander>,
     /// The count the job's jobserver holds, at most the host's cores; omitted for the host's cores
     /// (05_gateway.md "Parallelism inside a job").
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -297,6 +297,7 @@ fn request(argv: &[&str]) -> ExecRequest {
         hold: false,
         scope: ExecScope::Workspace,
         record: JobRecord::Cowshed,
+        lander: None,
     }
 }
 

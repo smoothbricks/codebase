@@ -199,6 +199,9 @@ pub struct ExecRequest {
 
     pub class: ExecClass,                 // Background by default; Interactive for work its requester awaits;
                                           // Gate requires trusted coordinator (05_gateway.md "Classes")
+    pub lander: Option<JobLander>,        // The land process running a gate job (05_gateway.md "A land's gate
+                                          // takes tokens back"); trusted coordinator route only, None for
+                                          // trains, operators and non-gate jobs
     pub want: Option<NonZeroUsize>,       // the job's jobserver count, min(want, cores); None: cores
                                           // (05_gateway.md "Parallelism inside a job")
     pub hold: bool,                       // with mbx, the job holds up to its count of the host's pool for its
@@ -206,6 +209,9 @@ pub struct ExecRequest {
     pub scope: ExecScope,                 // Workspace default; HostGate: coordinator route only, any class
     pub record: JobRecord,                // Cowshed default; Caller: no disk records (11_shell.md "Caller-owned jobs")
 }
+
+/// The land process (`COWSHED_LANDER=<pid>:<start>`) whose declared gate submitted this exec.
+pub struct JobLander { pub pid: u32, pub start: u64 }
 
 /// The exec's own class: one row of 05_gateway.md "Classes" (nice, Linux class cgroup, memory-pressure
 /// wait). InteractiveResident is Resident at nice 0 and differs from it in nothing else.

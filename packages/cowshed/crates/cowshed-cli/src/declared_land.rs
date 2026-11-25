@@ -372,6 +372,7 @@ async fn start_after<S: CliService>(
             stderr_copy: None,
             admission_key: None,
             class: cowshed_core::api::ExecClass::Background,
+            lander: None,
             want: None,
             hold: false,
             scope: cowshed_core::api::ExecScope::HostGate,

@@ -2555,6 +2555,7 @@ mod tests {
                     hold: false,
                     scope: crate::api::dto::ExecScope::Workspace,
                     record: crate::api::dto::JobRecord::Cowshed,
+                    lander: None,
                 },
                 crate::runtime::supervisor_socket::AdmissionSource::Worker,
             )
