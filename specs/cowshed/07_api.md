@@ -1684,7 +1684,7 @@ supervisor that ran the job retires.
   `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume, folded }`;
   `FoldedWorkspace = { workspace, head, outcome: { kind: "retired" } | { kind: "kept", reason: { kind: "dirty", files } | { kind: "refused", code, message } } }`;
   preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`.
-- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, scheduling?, pendingInstall?, landTurns, landTurnsError? }`;
+- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, scheduling?, pendingInstall?, landTurns, waitingInstalls?, parkedAsks?, landTurnsError? }`;
   `pendingInstall?: true` says an install holds the install slot (`dev.cowshed/install.lock`, read without taking it),
   absent while the slot is free (05_gateway.md "A pending install is visible");
   `healing = { mounting: { projects } } | "restoringSessions"` says how far the daemon's startup pass has got — the
@@ -1705,8 +1705,11 @@ supervisor that ran the job retires.
   `[{ class: ExecClass, state: "queued" | "running" | "draining", jobs }]`, one row per class and state with at least
   one job, and `unanswered` is `[{ socket, error }]` for a supervisor whose list failed, whose jobs are in no count.
   `imageCleanup: ImageCleanup = { waiting, unread? }`: the entries a listing of the store's `.deleting` directories
-  finds ("Deleting released images"), and each directory that listing could not read. `landTurns`/`landTurnsError` are
-  05_gateway.md "Land turns"'s.
+  finds ("Deleting released images"), and each directory that listing could not read. `landTurns`/`waitingInstalls`/
+  `parkedAsks`/`landTurnsError` are 05_gateway.md "Land turns"'s (`WaitingInstall = { pid?, waitingUnixMs }`,
+  `ParkedLandTurn = { repo, workspace, pid, askedUnixMs, command }`, both omitted when empty);
+  `WithdrawInstallReport = { withdrawnInstalls: WithdrawnInstall[] }` where
+  `WithdrawnInstall = { pid?, waitingUnixMs, waitedMs }`.
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and
@@ -2397,6 +2400,7 @@ environment, working directory and standard streams, as the CLI verb does, and a
 | `spawnSubtreeRoot({ argv })`                              | `subtree-root --handle-fd 3 -- argv`                      | `SubtreeRootRun { admission, exit }`                   |
 | `spawnLandTurn({ repo, workspace?, outsideLock?, argv })` | `land-turn <repo> [--workspace] [--outside-lock] -- argv` | `LandTurnRun { exit }`                                 |
 | `spawnAwaitTurns({ gatewaySocket?, argv })`               | `gateway await-turns [--gateway-socket] -- argv`          | `AwaitTurnsRun { exit }`                               |
+| `spawnWithdrawInstall({ gatewaySocket? })`                | `gateway withdraw-install [--gateway-socket]`             | `WithdrawInstallRun { exit }`                          |
 
 No run exposes the process or a way to signal it freely; each holder is reached only through its verb's documented
 requests. `LockRun.forward` sends INT, HUP or TERM, which cowshed forwards to the command once it holds the lock (before

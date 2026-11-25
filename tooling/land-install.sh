@@ -351,6 +351,15 @@ while :; do
 done
 case $outcome in
 installed) record installed ;;
+withdrawn\ *)
+  # An operator withdrew the waiting install (`cowshed gateway withdraw-install`): defer with the rerun command so a
+  # later rerun re-judges readiness and waits in order again. Never retry immediately (that would re-park asks).
+  gateway_blockers "$binary"
+  case $readiness in
+  busy\ *) record deferred "${outcome#withdrawn } (${readiness#busy })" "$rerun" ;;
+  *) record deferred "${outcome#withdrawn }" "$rerun" ;;
+  esac
+  ;;
 refused\ *)
   # Work that began after the status was read: name it from a fresh status, never from the words of the refusal.
   gateway_blockers "$binary"

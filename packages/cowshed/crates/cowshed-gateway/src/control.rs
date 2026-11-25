@@ -125,12 +125,40 @@ impl GatewayControlClient {
         &self,
         abandoned_since_unix_ms: u64,
     ) -> Result<Vec<cowshed_core::api::dto::LandTurnQueue>, ControlError> {
-        self.send(&ControlRequest::LandTurns {
-            abandoned_since_unix_ms,
+        Ok(self
+            .land_turns_status(abandoned_since_unix_ms)
+            .await?
+            .queues)
+    }
+
+    /// Atomic unfenced snapshot of every repository's land turns, any installs waiting for the
+    /// queues to empty, and any parked asks (`cowshed gateway status`, 05_gateway.md:392, 700-704).
+    pub async fn land_turns_status(
+        &self,
+        abandoned_since_unix_ms: u64,
+    ) -> Result<LandTurnsStatus, ControlError> {
+        let response = self
+            .send(&ControlRequest::LandTurns {
+                abandoned_since_unix_ms,
+            })
+            .await?;
+        let queues = response.land_turns.ok_or(ControlError::InvalidResponse)?;
+        Ok(LandTurnsStatus {
+            queues,
+            waiting_installs: response.waiting_installs,
+            parked_asks: response.parked_asks,
         })
-        .await?
-        .land_turns
-        .ok_or(ControlError::InvalidResponse)
+    }
+
+    /// Withdraw every install currently waiting for the land turns (`fence: "wait"`), never one
+    /// already holding a fence (05_gateway.md "The read fences the turns").
+    pub async fn withdraw_waiting_installs(
+        &self,
+    ) -> Result<Vec<cowshed_core::api::dto::WithdrawnInstall>, ControlError> {
+        self.send(&ControlRequest::LandTurnsWithdraw)
+            .await?
+            .withdrawn_installs
+            .ok_or(ControlError::InvalidResponse)
     }
 
     /// The install's read of the land turns with the fence (05_gateway.md "The read fences the
@@ -182,7 +210,7 @@ impl GatewayControlClient {
         &self,
         abandoned_since_unix_ms: u64,
         waiting: impl FnOnce(&[cowshed_core::api::dto::LandTurnQueue]),
-    ) -> Result<TurnFence, ControlError> {
+    ) -> Result<TurnWait, ControlError> {
         #[derive(Serialize)]
         struct WaitingRead {
             op: &'static str,
@@ -209,9 +237,14 @@ impl GatewayControlClient {
             // The gateway heartbeats while the install waits, so a wait of any length is read.
             let response: ControlResponse = read_answer_line(&mut connection).await?;
             check_response(&response)?;
+            if response.withdrawn == Some(true) {
+                return Ok(TurnWait::Withdrawn {
+                    by_pid: response.withdrawn_by_pid,
+                });
+            }
             let queues = response.land_turns.ok_or(ControlError::InvalidResponse)?;
             if response.fenced.ok_or(ControlError::InvalidResponse)? {
-                return Ok(TurnFence { connection });
+                return Ok(TurnWait::Fenced(Box::new(TurnFence { connection })));
             }
             // Told once, when the install begins to wait.
             let told = waiting.take().ok_or(ControlError::InvalidResponse)?;
@@ -470,6 +503,24 @@ struct AuthenticatedControlRequestOut<'a, R: Serialize> {
     request: &'a R,
 }
 
+/// Unfenced snapshot of the gateway's land turns, waiting installs and parked asks
+/// ([`GatewayControlClient::land_turns_status`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandTurnsStatus {
+    pub queues: Vec<cowshed_core::api::dto::LandTurnQueue>,
+    pub waiting_installs: Vec<cowshed_core::api::dto::WaitingInstall>,
+    pub parked_asks: Vec<cowshed_core::api::dto::ParkedLandTurn>,
+}
+
+/// How an install's wait for the land turns ended ([`GatewayControlClient::wait_land_turns`]).
+#[derive(Debug)]
+pub enum TurnWait {
+    /// Every ticket queued before the install ended, and the gateway fenced every queue for it.
+    Fenced(Box<TurnFence>),
+    /// The install was withdrawn while waiting (`land-turns-withdraw`), running no fence.
+    Withdrawn { by_pid: Option<u32> },
+}
+
 /// An install's fenced read of the land turns ([`GatewayControlClient::fence_land_turns`]).
 #[derive(Debug)]
 pub struct FencedLandTurns {
@@ -575,6 +626,8 @@ enum ControlRequest {
         #[serde(rename = "abandonedSinceUnixMs")]
         abandoned_since_unix_ms: u64,
     },
+    /// Withdraw every install currently waiting for the land turns (never one already fenced).
+    LandTurnsWithdraw,
     /// The task server's queue.
     TaskQueue,
     /// Clear one project's Nx accepted-task store.
@@ -615,6 +668,7 @@ impl ControlRequest {
             Self::FirstLaunch => FIRST_LAUNCH_OP,
             Self::Released => cowshed_gateway_types::RELEASED_OP,
             Self::LandTurns { .. } => cowshed_core::land_turn::LAND_TURNS_OP,
+            Self::LandTurnsWithdraw => cowshed_core::land_turn::LAND_TURNS_WITHDRAW_OP,
         }
     }
 }
@@ -741,9 +795,24 @@ struct ControlResponse {
     /// Every repository's land turns, as `land-turns` lists them.
     #[serde(skip_serializing_if = "Option::is_none")]
     land_turns: Option<Vec<cowshed_core::api::dto::LandTurnQueue>>,
+    /// Installs currently waiting for the land turns to empty (`fence: "wait"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    waiting_installs: Vec<cowshed_core::api::dto::WaitingInstall>,
+    /// Land-turn asks currently parked behind a waiting install or fence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parked_asks: Vec<cowshed_core::api::dto::ParkedLandTurn>,
     /// Whether an install's fenced `land-turns` read fenced every queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     fenced: Option<bool>,
+    /// True on a waiting install's connection when `land-turns-withdraw` withdrew its wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withdrawn: Option<bool>,
+    /// The pid that sent `land-turns-withdraw`, when the kernel named its Unix peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withdrawn_by_pid: Option<u32>,
+    /// The waiting installs withdrawn by `land-turns-withdraw`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withdrawn_installs: Option<Vec<cowshed_core::api::dto::WithdrawnInstall>>,
     /// The whole disk a `ram-lease` attached and the registry entry it registers as.
     #[serde(skip_serializing_if = "Option::is_none")]
     ram_disk: Option<RamDiskAttached>,
@@ -1247,13 +1316,15 @@ async fn serve<R, W>(
         Ok(Incoming::WaitingLandTurns {
             abandoned_since_unix_ms,
         }) => {
-            serve_waiting_fence(reader, writer, abandoned_since_unix_ms, &services).await;
+            let peer_pid = pid.and_then(|pid| u32::try_from(pid).ok());
+            serve_waiting_fence(reader, writer, abandoned_since_unix_ms, peer_pid, &services).await;
         }
         Ok(Incoming::Request(request)) => {
+            let peer_pid = pid.and_then(|pid| u32::try_from(pid).ok());
             let request = expect_eof(&mut reader).await.map(|()| request);
-            serve_request(writer, request, services).await;
+            serve_request(writer, request, peer_pid, services).await;
         }
-        Err(error) => serve_request(writer, Err(error), services).await,
+        Err(error) => serve_request(writer, Err(error), None, services).await,
     }
 }
 
@@ -1300,6 +1371,7 @@ async fn serve_waiting_fence<R, W>(
     mut reader: R,
     mut writer: W,
     abandoned_since_unix_ms: u64,
+    peer_pid: Option<u32>,
     services: &ControlServices,
 ) where
     R: AsyncRead + Unpin,
@@ -1311,7 +1383,10 @@ async fn serve_waiting_fence<R, W>(
             "the gateway's land turns have stopped".to_owned(),
         )
     };
-    let Some((queues, now, waiting)) = services.land_turns.wait(abandoned_since_unix_ms).await
+    let Some((queues, now, waiting)) = services
+        .land_turns
+        .wait(abandoned_since_unix_ms, peer_pid)
+        .await
     else {
         let _ = write_response(&mut writer, &stopped()).await;
         return;
@@ -1327,23 +1402,35 @@ async fn serve_waiting_fence<R, W>(
         }
     }
     let mut more = [0_u8; 1];
-    let fenced = tokio::select! {
-        fenced = answered(&mut writer, &services.handle, waiting.fenced()) => fenced,
+    let resolved = tokio::select! {
+        resolved = answered(&mut writer, &services.handle, waiting.wait()) => resolved,
         // End of file, a broken socket or bytes an install never sends: it is gone or confused,
         // and either way it leaves the wait.
         _ = reader.read(&mut more) => return,
     };
-    let Some((queues, fence)) = fenced else {
-        let _ = write_response(&mut writer, &stopped()).await;
-        return;
-    };
-    let answer = ControlResponse {
-        land_turns: Some(queues),
-        fenced: Some(true),
-        ..success()
-    };
-    let answered = write_response(&mut writer, &answer).await;
-    hold_fence(reader, writer, fence, answered.is_ok()).await;
+    match resolved {
+        Some(crate::land_turn::WaitResolution::Fenced(queues, fence)) => {
+            let answer = ControlResponse {
+                land_turns: Some(queues),
+                fenced: Some(true),
+                ..success()
+            };
+            let answered = write_response(&mut writer, &answer).await;
+            hold_fence(reader, writer, fence, answered.is_ok()).await;
+        }
+        Some(crate::land_turn::WaitResolution::Withdrawn { by_pid }) => {
+            let answer = ControlResponse {
+                withdrawn: Some(true),
+                withdrawn_by_pid: by_pid,
+                ..success()
+            };
+            let _ = write_response(&mut writer, &answer).await;
+            let _ = writer.shutdown().await;
+        }
+        None => {
+            let _ = write_response(&mut writer, &stopped()).await;
+        }
+    }
 }
 
 /// Hold an install's `fence` until its connection ends, then lift it and close the connection only
@@ -1454,6 +1541,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-list" => &["op", "repoId"],
         "sim-boot" => &["op", "repoId", "device"],
         cowshed_core::land_turn::LAND_TURNS_OP => &["op", "abandonedSinceUnixMs", "fence"],
+        cowshed_core::land_turn::LAND_TURNS_WITHDRAW_OP => &["op"],
         cowshed_core::land_turn::LAND_TURN_OP => &["op", "repo", "workspace", "command"],
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
@@ -1624,14 +1712,24 @@ pub(crate) fn admitted_class(line: &[u8]) -> Option<TaskClass> {
 async fn serve_request<W>(
     mut writer: W,
     request: Result<ControlRequest, ControlError>,
+    peer_pid: Option<u32>,
     services: ControlServices,
 ) where
     W: AsyncWrite + Unpin,
 {
     let (response, mut subscription) = match request {
-        // `land-turns` answers from the queues at once, so it is never heartbeated.
-        Ok(request @ ControlRequest::LandTurns { .. }) => dispatch(request, &services).await,
-        Ok(request) => answered(&mut writer, &services.handle, dispatch(request, &services)).await,
+        // `land-turns` and `land-turns-withdraw` answer from the actor at once, never heartbeated.
+        Ok(request @ (ControlRequest::LandTurns { .. } | ControlRequest::LandTurnsWithdraw)) => {
+            dispatch(request, peer_pid, &services).await
+        }
+        Ok(request) => {
+            answered(
+                &mut writer,
+                &services.handle,
+                dispatch(request, peer_pid, &services),
+            )
+            .await
+        }
         Err(error) => {
             let code = if matches!(error, ControlError::Unauthorized) {
                 ControlFailureCode::Unauthorized
@@ -1761,6 +1859,7 @@ async fn answered<T, W: AsyncWrite + Unpin>(
 
 async fn dispatch(
     request: ControlRequest,
+    peer_pid: Option<u32>,
     services: &ControlServices,
 ) -> (ControlResponse, Option<mpsc::Receiver<AuditEvent>>) {
     match request {
@@ -1919,9 +2018,24 @@ async fn dispatch(
         ControlRequest::LandTurns {
             abandoned_since_unix_ms,
         } => (
-            match services.land_turns.queues(abandoned_since_unix_ms).await {
-                Some(queues) => ControlResponse {
-                    land_turns: Some(queues),
+            match services.land_turns.snapshot(abandoned_since_unix_ms).await {
+                Some(snapshot) => ControlResponse {
+                    land_turns: Some(snapshot.queues),
+                    waiting_installs: snapshot.waiting_installs,
+                    parked_asks: snapshot.parked_asks,
+                    ..success()
+                },
+                None => failure(
+                    ControlFailureCode::Rejected,
+                    "the gateway's land turns have stopped".to_owned(),
+                ),
+            },
+            None,
+        ),
+        ControlRequest::LandTurnsWithdraw => (
+            match services.land_turns.withdraw_waiting(peer_pid).await {
+                Some(withdrawn) => ControlResponse {
+                    withdrawn_installs: Some(withdrawn),
                     ..success()
                 },
                 None => failure(
@@ -2357,7 +2471,12 @@ fn success() -> ControlResponse {
         task_queue: None,
         nx_cache_cleared: None,
         land_turns: None,
+        waiting_installs: Vec::new(),
+        parked_asks: Vec::new(),
         fenced: None,
+        withdrawn: None,
+        withdrawn_by_pid: None,
+        withdrawn_installs: None,
         ram_disk: None,
         ram_detach: None,
         first_launch: None,

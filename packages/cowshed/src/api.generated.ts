@@ -1094,6 +1094,16 @@ export type GatewayStatus = {
    */
   readonly landTurns?: ReadonlyArray<LandTurnQueue>;
   /**
+   * Installs currently waiting for the queued land turns to empty (`fence: "wait"`), in wait
+   * order; absent on the wire when none waits.
+   */
+  readonly waitingInstalls?: ReadonlyArray<WaitingInstall>;
+  /**
+   * Land-turn asks currently parked behind a waiting install or an install fence, in arrival
+   * order; absent on the wire when none is parked.
+   */
+  readonly parkedAsks?: ReadonlyArray<ParkedLandTurn>;
+  /**
    * Why `land_turns` could not be read, when reading it failed; the rest of the status is still
    * served.
    */
@@ -2532,6 +2542,17 @@ export type OutputSummary = {
   readonly truncated: boolean;
 };
 
+/**
+ * A land-turn ask currently parked behind a waiting install or an install fence.
+ */
+export type ParkedLandTurn = {
+  readonly repo: LandTurnName;
+  readonly workspace: string;
+  readonly pid: number & tags.Type<'uint32'>;
+  readonly askedUnixMs: number & tags.Type<'uint64'>;
+  readonly command: string;
+};
+
 export type PortBlock = {
   readonly base: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly size: number & tags.Type<'uint32'> & tags.Maximum<65535>;
@@ -3741,6 +3762,20 @@ export type VolumeUsedBytesDelta = number &
   tags.Maximum<9007199254740991>;
 
 /**
+ * An install currently waiting for the gateway's land turns to empty (`fence: "wait"`).
+ */
+export type WaitingInstall = {
+  /**
+   * The waiting install's pid, as the kernel named its Unix control-socket peer.
+   */
+  readonly pid?: number & tags.Type<'uint32'>;
+  /**
+   * When the install began waiting, in milliseconds since the Unix epoch.
+   */
+  readonly waitingUnixMs: number & tags.Type<'uint64'>;
+};
+
+/**
  * Elapsed wall time since the job's first owned process spawned, in microseconds.
  */
 export type WallMicros = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
@@ -3749,6 +3784,22 @@ export type WallMicros = number & tags.Type<'uint64'> & tags.Maximum<90071992547
  * Elapsed wall time in whole milliseconds; only [`WallMicros::millis`] makes one.
  */
 export type WallMillis = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * The result of `cowshed gateway withdraw-install --json`.
+ */
+export type WithdrawInstallReport = {
+  readonly withdrawnInstalls: ReadonlyArray<WithdrawnInstall>;
+};
+
+/**
+ * One waiting install withdrawn by `land-turns-withdraw` (`cowshed gateway withdraw-install`).
+ */
+export type WithdrawnInstall = {
+  readonly pid?: number & tags.Type<'uint32'>;
+  readonly waitingUnixMs: number & tags.Type<'uint64'>;
+  readonly waitedMs: number & tags.Type<'uint64'>;
+};
 
 /**
  * One workspace incarnation: the fence every worker request carries.

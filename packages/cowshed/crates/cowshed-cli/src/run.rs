@@ -337,6 +337,10 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     if let args::Command::AwaitTurns(wait) = &parsed.command {
         return Ok(crate::await_turns::dispatch(wait, &mut output, interrupts).await);
     }
+    if let args::Command::WithdrawInstall(withdraw) = &parsed.command {
+        let outcome = crate::await_turns::dispatch_withdraw(withdraw, json, &mut output).await;
+        return Ok(finish(outcome, &mut output, json, &waits));
+    }
     // A doc commit edits main under its ref turn alone: no daemon, no gateway, no project open,
     // so a hung gateway never holds it (02_workspaces.md "`cowshed doc-commit`").
     if let args::Command::DocCommit(doc) = &parsed.command {

@@ -153,7 +153,7 @@ impl Pair {
             Op::TWait => {
                 let install = self.installs;
                 self.installs += 1;
-                if !self.turns.wait_fence(install) {
+                if !self.turns.wait_fence(install, None, self.now_unix_ms) {
                     self.waiting.push_back(install);
                 }
                 None

@@ -277,6 +277,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
         | Command::AwaitTurns(_)
+        | Command::WithdrawInstall(_)
         | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
@@ -350,6 +351,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
         | Command::AwaitTurns(_)
+        | Command::WithdrawInstall(_)
         | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
@@ -477,6 +479,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
         | Command::AwaitTurns(_)
+        | Command::WithdrawInstall(_)
         | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
@@ -2385,6 +2388,9 @@ where
         )),
         Command::AwaitTurns(_) => Err(CowshedError::internal(
             "gateway await-turns names no project and is dispatched before the runtime bridge",
+        )),
+        Command::WithdrawInstall(_) => Err(CowshedError::internal(
+            "gateway withdraw-install names no project and is dispatched before the runtime bridge",
         )),
         Command::DocCommit(_) => Err(CowshedError::internal(
             "doc-commit opens no project and is dispatched before the runtime bridge",
@@ -7327,6 +7333,8 @@ mod tests {
             scheduling: None,
             pending_install: false,
             land_turns: Vec::new(),
+            waiting_installs: Vec::new(),
+            parked_asks: Vec::new(),
             land_turns_error: None,
         };
 
@@ -7358,6 +7366,8 @@ mod tests {
             scheduling: None,
             pending_install: false,
             land_turns: Vec::new(),
+            waiting_installs: Vec::new(),
+            parked_asks: Vec::new(),
             land_turns_error: None,
         });
         let draining = findings
@@ -7384,6 +7394,8 @@ mod tests {
             scheduling: None,
             pending_install: false,
             land_turns: Vec::new(),
+            waiting_installs: Vec::new(),
+            parked_asks: Vec::new(),
             land_turns_error: None,
         });
         assert_eq!(gateway[0].code, "gateway-down");

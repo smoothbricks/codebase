@@ -352,6 +352,8 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
             scheduling: None,
             pending_install: false,
             land_turns: Vec::new(),
+            waiting_installs: Vec::new(),
+            parked_asks: Vec::new(),
             land_turns_error: None,
         },
     )
@@ -406,6 +408,8 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
                 scheduling: None,
                 pending_install: false,
                 land_turns: Vec::new(),
+                waiting_installs: Vec::new(),
+                parked_asks: Vec::new(),
                 land_turns_error: None,
             },
         )
@@ -444,6 +448,8 @@ fn answering_status() -> CliGatewayStatus {
         scheduling: None,
         pending_install: false,
         land_turns: Vec::new(),
+        waiting_installs: Vec::new(),
+        parked_asks: Vec::new(),
         land_turns_error: None,
     }
 }

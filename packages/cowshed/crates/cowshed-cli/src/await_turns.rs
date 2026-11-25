@@ -17,11 +17,13 @@ use std::io::Write;
 use std::time::Instant;
 
 use cowshed_core::CowshedError;
-use cowshed_core::api::dto::LandTurnQueue;
+use cowshed_core::api::dto::{LandTurnQueue, WithdrawInstallReport};
 use cowshed_core::storage::bootstrap::CanonicalRoots;
-use cowshed_gateway::{ControlError, ControlFailureCode, GatewayControlClient, TurnFence};
+use cowshed_gateway::{
+    ControlError, ControlFailureCode, GatewayControlClient, TurnFence, TurnWait,
+};
 
-use crate::args::AwaitTurnsArgs;
+use crate::args::{AwaitTurnsArgs, WithdrawInstallArgs};
 use crate::land_turn::{PreparedCommand, exit_code};
 use crate::output::Output;
 use crate::run::InterruptPolicy;
@@ -122,7 +124,7 @@ where
         .await;
     written?;
     let fence = match waited {
-        Ok(fence) => {
+        Ok(TurnWait::Fenced(fence)) => {
             output
                 .guidance(&format!(
                     "await-turns: the land turns are fenced for the install after {} s; lands that \
@@ -130,7 +132,21 @@ where
                     started.elapsed().as_secs()
                 ))
                 .map_err(write_failed)?;
-            Some(fence)
+            Some(*fence)
+        }
+        Ok(TurnWait::Withdrawn { by_pid }) => {
+            let message = match by_pid {
+                Some(pid) => format!(
+                    "the install's wait for the land turns was withdrawn by {pid}; nothing ran"
+                ),
+                None => {
+                    "the install's wait for the land turns was withdrawn; nothing ran".to_owned()
+                }
+            };
+            return Err(CowshedError::conflict(
+                message,
+                "rerun the install once the held land turn(s) have ended",
+            ));
         }
         Err(ControlError::Rejected {
             code: ControlFailureCode::InvalidRequest,
@@ -155,6 +171,61 @@ where
         }
     };
     Ok(fence)
+}
+
+/// `cowshed gateway withdraw-install [--gateway-socket <path>]`: withdraw every install currently
+/// waiting for the gateway's land turns (never one already fenced), naming each withdrawn install
+/// by pid and how long it waited.
+pub(crate) async fn dispatch_withdraw<W, E>(
+    args: &WithdrawInstallArgs,
+    json: bool,
+    output: &mut Output<W, E>,
+) -> Result<i32, CowshedError>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let socket = args
+        .gateway_socket
+        .clone()
+        .unwrap_or_else(|| CanonicalRoots::global().control_socket());
+    let client = GatewayControlClient::new(socket).map_err(|error| {
+        CowshedError::internal(format!("cannot name the gateway's socket: {error}"))
+    })?;
+    let withdrawn_installs = client.withdraw_waiting_installs().await.map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot withdraw waiting installs from the gateway: {error}"),
+            "check the host gateway (`cowshed gateway status`), then try again",
+        )
+    })?;
+    if json {
+        output
+            .success(WithdrawInstallReport { withdrawn_installs })
+            .map_err(write_failed)?;
+        return Ok(0);
+    }
+    if withdrawn_installs.is_empty() {
+        output
+            .guidance("withdraw-install: no waiting install to withdraw")
+            .map_err(write_failed)?;
+        return Ok(0);
+    }
+    for install in &withdrawn_installs {
+        let who = install
+            .pid
+            .map_or_else(|| "unknown pid".to_owned(), |pid| format!("pid {pid}"));
+        let waited = if install.waited_ms >= 1000 {
+            format!("{} s ({} ms)", install.waited_ms / 1000, install.waited_ms)
+        } else {
+            format!("{} ms", install.waited_ms)
+        };
+        output
+            .guidance(&format!(
+                "withdraw-install: withdrew waiting install ({who}, waited {waited})"
+            ))
+            .map_err(write_failed)?;
+    }
+    Ok(0)
 }
 
 /// What the install waits behind, from the queues the gateway answered as it began to wait: how

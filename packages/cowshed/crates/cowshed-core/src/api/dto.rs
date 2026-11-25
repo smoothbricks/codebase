@@ -4733,6 +4733,14 @@ pub struct GatewayStatus {
     /// turn. Read without taking a turn; empty when no land is queued or the queues could not be read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub land_turns: Vec<LandTurnQueue>,
+    /// Installs currently waiting for the queued land turns to empty (`fence: "wait"`), in wait
+    /// order; absent on the wire when none waits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_installs: Vec<WaitingInstall>,
+    /// Land-turn asks currently parked behind a waiting install or an install fence, in arrival
+    /// order; absent on the wire when none is parked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parked_asks: Vec<ParkedLandTurn>,
     /// Why `land_turns` could not be read, when reading it failed; the rest of the status is still
     /// served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4748,6 +4756,45 @@ pub struct LandTurnQueue {
     pub tickets: Vec<Ticket>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub abandoned: Vec<crate::land_turn::Abandonment>,
+}
+
+/// An install currently waiting for the gateway's land turns to empty (`fence: "wait"`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WaitingInstall {
+    /// The waiting install's pid, as the kernel named its Unix control-socket peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// When the install began waiting, in milliseconds since the Unix epoch.
+    pub waiting_unix_ms: u64,
+}
+
+/// A land-turn ask currently parked behind a waiting install or an install fence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ParkedLandTurn {
+    pub repo: LandTurnName,
+    pub workspace: String,
+    pub pid: u32,
+    pub asked_unix_ms: u64,
+    pub command: String,
+}
+
+/// One waiting install withdrawn by `land-turns-withdraw` (`cowshed gateway withdraw-install`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WithdrawnInstall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub waiting_unix_ms: u64,
+    pub waited_ms: u64,
+}
+
+/// The result of `cowshed gateway withdraw-install --json`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WithdrawInstallReport {
+    pub withdrawn_installs: Vec<WithdrawnInstall>,
 }
 
 /// The daemon and CLI executables, when their contents differ.
@@ -4967,6 +5014,7 @@ result_bodies!(
     GrantSet,
     ProjectGrants,
     GatewayStatus,
+    WithdrawInstallReport,
     MirrorInfo,
     AuditEvent,
     SkillInstallReport,

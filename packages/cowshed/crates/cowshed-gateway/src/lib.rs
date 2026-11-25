@@ -43,7 +43,8 @@ pub use config::{
     MirrorCacheConfig, StartupProbe,
 };
 pub use control::{
-    ControlError, ControlFailureCode, FencedLandTurns, GatewayControlClient, TurnFence,
+    ControlError, ControlFailureCode, FencedLandTurns, GatewayControlClient, LandTurnsStatus,
+    TurnFence, TurnWait,
 };
 /// The control-plane data model is re-exported at this root so `cowshed_gateway::WorkspaceSession`
 /// and friends name the same items whether a caller links the daemon or only the types crate.

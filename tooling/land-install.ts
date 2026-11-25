@@ -254,16 +254,22 @@ function landTurnHolders(queues: unknown): readonly string[] | undefined {
 /** What one run of setup came to. */
 export type SetupOutcome =
   | { readonly kind: 'installed' }
+  | { readonly kind: 'withdrawn'; readonly why: string }
   | { readonly kind: 'refused'; readonly why: string }
   | { readonly kind: 'failed'; readonly why: string };
 
 /**
- * status and stdout are those of 'cowshed --json setup'. A failure says its typed error, never a scan of its text. The
- * typed code 'conflict' is a refusal, and it covers two things: work the install refuses under, which a fresh gateway
- * status names and which ends, and a build that lacks the installed one, which waiting does not change.
+ * status and stdout are those of 'cowshed --json setup' run under 'cowshed gateway await-turns'. A
+ * failure says its typed error, never a scan of its text. Exit 103 with empty stdout is await-turns'
+ * documented withdrawn Conflict wrapper code (nothing ran, never setup, which only exits 0-7). The
+ * typed code 'conflict' in setup's JSON error envelope is a refusal, covering work the install
+ * refuses under (named by a fresh status) and a build that lacks the installed one.
  */
 export function setupOutcome(status: number, stdout: string): SetupOutcome {
   if (status === 0) return { kind: 'installed' };
+  if (status === 103 && stdout.trim() === '') {
+    return { kind: 'withdrawn', why: "the install's wait for the land turns was withdrawn" };
+  }
   const parsed = parseJson(stdout);
   const error = parsed.parsed && isRecord(parsed.value) ? errorFields(parsed.value.error) : undefined;
   return {

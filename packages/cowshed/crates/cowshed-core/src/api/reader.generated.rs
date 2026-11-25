@@ -248,6 +248,8 @@ static GATEWAY_STATUS: Reader = Reader::Record(&[
     ("scheduling", &HOST_SCHEDULING),
     ("pendingInstall", &LEAF),
     ("landTurns", &SEQ__LAND_TURN_QUEUE),
+    ("waitingInstalls", &SEQ__WAITING_INSTALL),
+    ("parkedAsks", &SEQ__PARKED_LAND_TURN),
     ("landTurnsError", &LEAF),
 ]);
 static GC_CANDIDATE: Reader = Reader::Record(&[
@@ -708,6 +710,13 @@ static OUTPUT_STORAGE__REDIRECT: Reader =
 static OUTPUT_STORAGE__STREAMED: Reader = Reader::Record(&[]);
 static OUTPUT_SUMMARY: Reader =
     Reader::Record(&[("version", &LEAF), ("text", &LEAF), ("truncated", &LEAF)]);
+static PARKED_LAND_TURN: Reader = Reader::Record(&[
+    ("repo", &LEAF),
+    ("workspace", &LEAF),
+    ("pid", &LEAF),
+    ("askedUnixMs", &LEAF),
+    ("command", &LEAF),
+]);
 static PORT_BLOCK: Reader = Reader::Record(&[("base", &LEAF), ("size", &LEAF)]);
 static PRESERVED_REF: Reader =
     Reader::Record(&[("name", &LEAF), ("tip", &LEAF), ("reference", &LEAF)]);
@@ -921,6 +930,7 @@ static SEQ__JOB_PROCESS_SAMPLE: Reader = Reader::Seq(&JOB_PROCESS_SAMPLE);
 static SEQ__LAND_TURN_QUEUE: Reader = Reader::Seq(&LAND_TURN_QUEUE);
 static SEQ__LOCK_DESCRIPTOR: Reader = Reader::Seq(&LOCK_DESCRIPTOR);
 static SEQ__OUTLIVED_PROCESS: Reader = Reader::Seq(&OUTLIVED_PROCESS);
+static SEQ__PARKED_LAND_TURN: Reader = Reader::Seq(&PARKED_LAND_TURN);
 static SEQ__PORT_BLOCK: Reader = Reader::Seq(&PORT_BLOCK);
 static SEQ__PRESERVED_REF: Reader = Reader::Seq(&PRESERVED_REF);
 static SEQ__PROCESS_COVERAGE_GAP: Reader = Reader::Seq(&PROCESS_COVERAGE_GAP);
@@ -934,6 +944,7 @@ static SEQ__UNANSWERED_SUPERVISOR: Reader = Reader::Seq(&UNANSWERED_SUPERVISOR);
 static SEQ__UNATTRIBUTED_CHECK: Reader = Reader::Seq(&UNATTRIBUTED_CHECK);
 static SEQ__UNLANDED_PATH: Reader = Reader::Seq(&UNLANDED_PATH);
 static SEQ__UNPROVEN_WORKSPACE: Reader = Reader::Seq(&UNPROVEN_WORKSPACE);
+static SEQ__WAITING_INSTALL: Reader = Reader::Seq(&WAITING_INSTALL);
 static SEQ__WORKSPACE_INFO: Reader = Reader::Seq(&WORKSPACE_INFO);
 static SEQ__WORKSPACE_VIEW: Reader = Reader::Seq(&WORKSPACE_VIEW);
 static SIM_VERB: Reader = Reader::External(&[("openurl", &LEAF), ("install", &LEAF)]);
@@ -1096,6 +1107,7 @@ static VOLUME_USAGE: Reader = Reader::Internal {
 };
 static VOLUME_USAGE__READ: Reader = Reader::Record(&[("deltaBytes", &LEAF)]);
 static VOLUME_USAGE__UNAVAILABLE: Reader = Reader::Record(&[("reason", &VOLUME_UNAVAILABLE)]);
+static WAITING_INSTALL: Reader = Reader::Record(&[("pid", &LEAF), ("waitingUnixMs", &LEAF)]);
 static WORKSPACE_INFO: Reader = Reader::Record(&[
     ("repoId", &LEAF),
     ("workspace", &LEAF),

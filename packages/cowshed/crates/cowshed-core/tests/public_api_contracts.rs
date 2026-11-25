@@ -1345,6 +1345,8 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         stale_daemon: None,
         pending_install: false,
         land_turns: Vec::new(),
+        waiting_installs: Vec::new(),
+        parked_asks: Vec::new(),
         land_turns_error: None,
         scheduling: None,
     };

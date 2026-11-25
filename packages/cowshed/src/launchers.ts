@@ -552,6 +552,29 @@ export async function spawnAwaitTurns(options: SpawnAwaitTurnsOptions): Promise<
   return { exit: ended(child, [], () => []) };
 }
 
+/** `gateway withdraw-install [--gateway-socket]`: withdraw every install currently waiting for land turns. */
+export type SpawnWithdrawInstallOptions = {
+  /** The gateway whose waiting installs to withdraw; absent asks the host gateway. */
+  readonly gatewaySocket?: string;
+};
+
+/** A running `cowshed gateway withdraw-install`. */
+export interface WithdrawInstallRun {
+  readonly exit: Promise<LauncherExit>;
+}
+
+export async function spawnWithdrawInstall(options: SpawnWithdrawInstallOptions = {}): Promise<WithdrawInstallRun> {
+  const child = await launch(
+    [
+      'gateway',
+      'withdraw-install',
+      ...(options.gatewaySocket === undefined ? [] : ['--gateway-socket', options.gatewaySocket]),
+    ],
+    'inherit',
+  );
+  return { exit: ended(child, [], () => []) };
+}
+
 /** The message of `doc-commit`: given (`-m`), or read from a file (`-F`, `-` for stdin). */
 export type DocCommitMessage =
   | { readonly message: string; readonly messageFile?: never }

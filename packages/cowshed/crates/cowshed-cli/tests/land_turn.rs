@@ -6,7 +6,9 @@
 //! the lands wait.
 #![cfg(unix)]
 
-use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
+use cowshed_os::test_backstop::{
+    ChildBackstop as _, CommandBackstop as _, UnixStreamBackstop as _,
+};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, ErrorKind, Write as _};
@@ -880,7 +882,8 @@ fn gateway_status_names_a_waiting_install_and_each_parked_ask() {
         "cowshed: land turn {REPO}: parked behind an install"
     ));
 
-    let mut stream = UnixStream::connect(&home.gateway.socket).expect("connect to test gateway");
+    let mut stream =
+        UnixStream::connect_bounded(&home.gateway.socket).expect("connect to test gateway");
     let request = serde_json::json!({
         "op": cowshed_core::land_turn::LAND_TURNS_OP,
         "abandonedSinceUnixMs": u64::MAX,

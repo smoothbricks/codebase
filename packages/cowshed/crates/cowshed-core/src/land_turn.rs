@@ -42,6 +42,9 @@ use crate::held_lock::{HeldLock, Opened};
 pub const LAND_TURN_OP: &str = "land-turn";
 /// The one-shot gateway control operation that lists every repository's land turns.
 pub const LAND_TURNS_OP: &str = "land-turns";
+/// The one-shot gateway control operation that withdraws every install currently waiting for the
+/// land turns (never one already fenced).
+pub const LAND_TURNS_WITHDRAW_OP: &str = "land-turns-withdraw";
 
 /// The directory of every repository's land records: a declared land's `lands.log` and its
 /// commands' output (02_workspaces.md "A declared land"), beside the install slot in the host's

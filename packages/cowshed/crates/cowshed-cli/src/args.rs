@@ -138,6 +138,9 @@ pub enum Command {
     /// `gateway await-turns -- <cmd...>`: one command, an install, run once the host gateway has
     /// fenced its land turns for it in its order among the lands: no project, no daemon, no runtime.
     AwaitTurns(AwaitTurnsArgs),
+    /// `gateway withdraw-install`: withdraw every install currently waiting for the gateway's land
+    /// turns (never one already fenced): no project, no daemon, no runtime.
+    WithdrawInstall(WithdrawInstallArgs),
     /// Admit this live wrapper, report its handle, then replace it with the child command.
     SubtreeRoot(SubtreeRootArgs),
     /// Retire only the retained subtree identified by one handle on standard input.
@@ -215,6 +218,7 @@ impl Command {
             | Self::DiskCommand(_)
             | Self::LandTurn(_)
             | Self::AwaitTurns(_)
+            | Self::WithdrawInstall(_)
             | Self::DocCommit(_)
             | Self::SubtreeRoot(_)
             | Self::RetireDescendants(_)
@@ -291,6 +295,14 @@ pub struct AwaitTurnsArgs {
     /// An explicitly selected gateway; absent waits for the host gateway's turns.
     pub gateway_socket: Option<PathBuf>,
     pub argv: Vec<OsString>,
+}
+
+/// `gateway withdraw-install [--gateway-socket <path>]`: withdraw every install currently waiting
+/// for the gateway's land turns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawInstallArgs {
+    /// An explicitly selected gateway; absent asks the host gateway.
+    pub gateway_socket: Option<PathBuf>,
 }
 
 /// `lock <path> [--state-fd <n>] [--owned-pid <pid>]... -- <cmd...>`: the lock file, the descriptor
@@ -1191,7 +1203,8 @@ pub fn cli_command() -> ClapCommand {
                             .last(true)
                             .allow_hyphen_values(true),
                     ),
-                ),
+                )
+                .subcommand(leaf("withdraw-install").arg(value("gateway-socket"))),
         )
         .subcommand(leaf("controller"))
         .subcommand(leaf("host"))
@@ -2281,14 +2294,15 @@ const HOST: CommandSpec = CommandSpec {
 const GATEWAY: CommandSpec = CommandSpec {
     name: "gateway",
     missing: "gateway action is required",
-    args: "<start|stop|status|run|await-turns>",
+    args: "<start|stop|status|run|await-turns|withdraw-install>",
     trailing: "",
     summary: "manage the host gateway",
     about: &[
         "The gateway is the one trusted process outside every sandbox: workspaces reach the network, main's repository, and each other only through its authenticated Unix socket. `start` installs and loads the gateway's per-user service — a LaunchAgent on macOS, a systemd user unit on Linux — and waits until that socket answers; `stop` unloads it; `status` reports health without starting anything. Both mutations are idempotent.",
         "`run` is that service's own foreground entrypoint. It validates already-mounted storage and never creates any, so a background start can report missing setup but can never raise an authorization prompt.",
         "An ordinary `stop` leaves the installed cowshed the agent ran — the content-addressed copies and the stable name linking to one of them: that is host state rather than agent state, and keeping it makes the next `start` a write of the service's definition instead of a file copy. `stop --purge` deletes them, and the `cowshed` links on your `PATH` that name them, for a host that is done with the gateway rather than pausing it. `start` installs the running build as the installed cowshed the way `setup` does, and refuses a build that does not contain the installed one.",
-        "`await-turns -- <cmd...>` runs one command, an install, once the gateway has fenced its land turns for it, in its order among the lands: every land queued when it asked ends its turn first, a land that asks meanwhile waits behind it, and the gateway fences every queue the moment the last ticket before it ends. It says on stderr how many turns it waits for and who holds them, runs the command under the fence, holds the fence until the command exits and exits with the command's status. A gateway that cannot wait, a build from before it, is said and the command runs unfenced. `--json` is refused, since its output is the command's own bytes and cowshed's stderr lines.",
+        "`await-turns -- <cmd...>` runs one command, an install, once the gateway has fenced its land turns for it, in its order among the lands: every land queued when it asked ends its turn first, a land that asks meanwhile waits behind it, and the gateway fences every queue the moment the last ticket before it ends. It says on stderr how many turns it waits for and who holds them, runs the command under the fence, holds the fence until the command exits and exits with the command's status. If withdrawn while waiting (`withdraw-install`), it runs nothing, writes nothing to stdout and exits 103. A gateway that cannot wait, a build from before it, is said and the command runs unfenced. `--json` is refused, since its output is the command's own bytes and cowshed's stderr lines.",
+        "`withdraw-install` withdraws every install currently waiting for the gateway's land turns (`await-turns`), never an install already holding a fence, so parked land-turn asks are numbered in arrival order at once. It names each withdrawn install by pid and how long it waited.",
     ],
     options: &[
         Opt {
@@ -2297,7 +2311,7 @@ const GATEWAY: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--gateway-socket <absolute path>",
-            meaning: "`await-turns` only, before --: the gateway whose land turns to wait for instead of the host gateway",
+            meaning: "`await-turns` (before --) and `withdraw-install`: the gateway whose land turns to address instead of the host gateway",
         },
     ],
 };
@@ -2328,6 +2342,21 @@ fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
         return Ok(Command::AwaitTurns(AwaitTurnsArgs {
             gateway_socket,
             argv: command_argv(child, USAGE)?,
+        }));
+    }
+    if action == "withdraw-install" {
+        let gateway_socket = os(child, "gateway-socket").map(PathBuf::from);
+        if gateway_socket
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(UsageError::new(
+                "--gateway-socket must be an absolute path",
+                USAGE,
+            ));
+        }
+        return Ok(Command::WithdrawInstall(WithdrawInstallArgs {
+            gateway_socket,
         }));
     }
     let command = match action {

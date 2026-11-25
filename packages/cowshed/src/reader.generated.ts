@@ -172,6 +172,7 @@ type ReaderName =
   | 'OUTPUT_STORAGE__REDIRECT'
   | 'OUTPUT_STORAGE__STREAMED'
   | 'OUTPUT_SUMMARY'
+  | 'PARKED_LAND_TURN'
   | 'PORT_BLOCK'
   | 'PRESERVED_REF'
   | 'PROCESS_BLOCKED_ON'
@@ -244,6 +245,7 @@ type ReaderName =
   | 'SEQ__LAND_TURN_QUEUE'
   | 'SEQ__LOCK_DESCRIPTOR'
   | 'SEQ__OUTLIVED_PROCESS'
+  | 'SEQ__PARKED_LAND_TURN'
   | 'SEQ__PORT_BLOCK'
   | 'SEQ__PRESERVED_REF'
   | 'SEQ__PROCESS_COVERAGE_GAP'
@@ -259,6 +261,7 @@ type ReaderName =
   | 'SEQ__UNATTRIBUTED_CHECK'
   | 'SEQ__UNLANDED_PATH'
   | 'SEQ__UNPROVEN_WORKSPACE'
+  | 'SEQ__WAITING_INSTALL'
   | 'SEQ__WORKSPACE_INFO'
   | 'SEQ__WORKSPACE_VIEW'
   | 'SIM_VERB'
@@ -313,6 +316,7 @@ type ReaderName =
   | 'VOLUME_USAGE'
   | 'VOLUME_USAGE__READ'
   | 'VOLUME_USAGE__UNAVAILABLE'
+  | 'WAITING_INSTALL'
   | 'WORKSPACE_INFO'
   | 'WORKSPACE_LANDING'
   | 'WORKSPACE_LIST_VIEW'
@@ -738,6 +742,8 @@ const READERS: Readers<ReaderName> = {
       ['scheduling', 'HOST_SCHEDULING'],
       ['pendingInstall', 'LEAF'],
       ['landTurns', 'SEQ__LAND_TURN_QUEUE'],
+      ['waitingInstalls', 'SEQ__WAITING_INSTALL'],
+      ['parkedAsks', 'SEQ__PARKED_LAND_TURN'],
       ['landTurnsError', 'LEAF'],
     ],
   },
@@ -1444,6 +1450,16 @@ const READERS: Readers<ReaderName> = {
       ['truncated', 'LEAF'],
     ],
   },
+  PARKED_LAND_TURN: {
+    kind: 'record',
+    fields: [
+      ['repo', 'LEAF'],
+      ['workspace', 'LEAF'],
+      ['pid', 'LEAF'],
+      ['askedUnixMs', 'LEAF'],
+      ['command', 'LEAF'],
+    ],
+  },
   PORT_BLOCK: {
     kind: 'record',
     fields: [
@@ -1758,6 +1774,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__LAND_TURN_QUEUE: { kind: 'seq', element: 'LAND_TURN_QUEUE' },
   SEQ__LOCK_DESCRIPTOR: { kind: 'seq', element: 'LOCK_DESCRIPTOR' },
   SEQ__OUTLIVED_PROCESS: { kind: 'seq', element: 'OUTLIVED_PROCESS' },
+  SEQ__PARKED_LAND_TURN: { kind: 'seq', element: 'PARKED_LAND_TURN' },
   SEQ__PORT_BLOCK: { kind: 'seq', element: 'PORT_BLOCK' },
   SEQ__PRESERVED_REF: { kind: 'seq', element: 'PRESERVED_REF' },
   SEQ__PROCESS_COVERAGE_GAP: { kind: 'seq', element: 'PROCESS_COVERAGE_GAP' },
@@ -1773,6 +1790,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__UNATTRIBUTED_CHECK: { kind: 'seq', element: 'UNATTRIBUTED_CHECK' },
   SEQ__UNLANDED_PATH: { kind: 'seq', element: 'UNLANDED_PATH' },
   SEQ__UNPROVEN_WORKSPACE: { kind: 'seq', element: 'UNPROVEN_WORKSPACE' },
+  SEQ__WAITING_INSTALL: { kind: 'seq', element: 'WAITING_INSTALL' },
   SEQ__WORKSPACE_INFO: { kind: 'seq', element: 'WORKSPACE_INFO' },
   SEQ__WORKSPACE_VIEW: { kind: 'seq', element: 'WORKSPACE_VIEW' },
   SIM_VERB: {
@@ -2032,6 +2050,13 @@ const READERS: Readers<ReaderName> = {
   },
   VOLUME_USAGE__READ: { kind: 'record', fields: [['deltaBytes', 'LEAF']] },
   VOLUME_USAGE__UNAVAILABLE: { kind: 'record', fields: [['reason', 'VOLUME_UNAVAILABLE']] },
+  WAITING_INSTALL: {
+    kind: 'record',
+    fields: [
+      ['pid', 'LEAF'],
+      ['waitingUnixMs', 'LEAF'],
+    ],
+  },
   WORKSPACE_INFO: {
     kind: 'record',
     fields: [

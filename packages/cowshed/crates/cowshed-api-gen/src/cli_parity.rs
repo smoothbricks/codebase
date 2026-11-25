@@ -376,6 +376,8 @@ pub const PARITY: &[Row] = &[
     row("gateway await-turns", "", input(member("spawnAwaitTurns"))),
     row("gateway await-turns", "gateway-socket", input(argument("spawnAwaitTurns", 0, "gatewaySocket"))),
     row("gateway await-turns", "argv", input(argument("spawnAwaitTurns", 0, "argv"))),
+    row("gateway withdraw-install", "", input(member("spawnWithdrawInstall"))),
+    row("gateway withdraw-install", "gateway-socket", input(argument("spawnWithdrawInstall", 0, "gatewaySocket"))),
 
     row("controller", "", Counterpart::Composed { recipe: "an embedding process starts `cowshed controller` on one end of a socketpair and passes the other to coordinatorEndpoint (07_api.md, \"cowshed-napi\")", facade: &[member("coordinatorEndpoint")] }),
     row("host", "", Counterpart::Composed { recipe: "an embedding process calls openHost, which starts `cowshed host` through the package launcher on a socketpair and connects to it (07_api.md, Host operations)", facade: &[member("openHost")] }),

@@ -1148,6 +1148,12 @@ export const assertOutputSummaryList = typia.createAssertEquals<readonly Api.Out
 export const parseOutputSummaryList = (json: string): readonly Api.OutputSummary[] =>
   assertOutputSummaryList(JSON.parse(json));
 
+export const assertParkedLandTurn = typia.createAssertEquals<Api.ParkedLandTurn>();
+export const parseParkedLandTurn = (json: string): Api.ParkedLandTurn => assertParkedLandTurn(JSON.parse(json));
+export const assertParkedLandTurnList = typia.createAssertEquals<readonly Api.ParkedLandTurn[]>();
+export const parseParkedLandTurnList = (json: string): readonly Api.ParkedLandTurn[] =>
+  assertParkedLandTurnList(JSON.parse(json));
+
 export const assertPortBlock = typia.createAssertEquals<Api.PortBlock>();
 export const parsePortBlock = (json: string): Api.PortBlock => assertPortBlock(JSON.parse(json));
 export const assertPortBlockList = typia.createAssertEquals<readonly Api.PortBlock[]>();
@@ -1856,6 +1862,12 @@ export const assertVolumeUsedBytesDeltaList = typia.createAssertEquals<readonly 
 export const parseVolumeUsedBytesDeltaList = (json: string): readonly Api.VolumeUsedBytesDelta[] =>
   assertVolumeUsedBytesDeltaList(JSON.parse(json));
 
+export const assertWaitingInstall = typia.createAssertEquals<Api.WaitingInstall>();
+export const parseWaitingInstall = (json: string): Api.WaitingInstall => assertWaitingInstall(JSON.parse(json));
+export const assertWaitingInstallList = typia.createAssertEquals<readonly Api.WaitingInstall[]>();
+export const parseWaitingInstallList = (json: string): readonly Api.WaitingInstall[] =>
+  assertWaitingInstallList(JSON.parse(json));
+
 export const assertWallMicros = typia.createAssertEquals<Api.WallMicros>();
 export const parseWallMicros = (json: string): Api.WallMicros => assertWallMicros(JSON.parse(json));
 export const assertWallMicrosList = typia.createAssertEquals<readonly Api.WallMicros[]>();
@@ -1865,6 +1877,19 @@ export const assertWallMillis = typia.createAssertEquals<Api.WallMillis>();
 export const parseWallMillis = (json: string): Api.WallMillis => assertWallMillis(JSON.parse(json));
 export const assertWallMillisList = typia.createAssertEquals<readonly Api.WallMillis[]>();
 export const parseWallMillisList = (json: string): readonly Api.WallMillis[] => assertWallMillisList(JSON.parse(json));
+
+export const assertWithdrawInstallReport = typia.createAssertEquals<Api.WithdrawInstallReport>();
+export const parseWithdrawInstallReport = (json: string): Api.WithdrawInstallReport =>
+  assertWithdrawInstallReport(JSON.parse(json));
+export const assertWithdrawInstallReportList = typia.createAssertEquals<readonly Api.WithdrawInstallReport[]>();
+export const parseWithdrawInstallReportList = (json: string): readonly Api.WithdrawInstallReport[] =>
+  assertWithdrawInstallReportList(JSON.parse(json));
+
+export const assertWithdrawnInstall = typia.createAssertEquals<Api.WithdrawnInstall>();
+export const parseWithdrawnInstall = (json: string): Api.WithdrawnInstall => assertWithdrawnInstall(JSON.parse(json));
+export const assertWithdrawnInstallList = typia.createAssertEquals<readonly Api.WithdrawnInstall[]>();
+export const parseWithdrawnInstallList = (json: string): readonly Api.WithdrawnInstall[] =>
+  assertWithdrawnInstallList(JSON.parse(json));
 
 export const assertWorkerScope = typia.createAssertEquals<Api.WorkerScope>();
 export const parseWorkerScope = (json: string): Api.WorkerScope => assertWorkerScope(JSON.parse(json));

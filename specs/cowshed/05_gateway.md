@@ -376,10 +376,18 @@ is parked. So no ask from outside lengthens an install's wait: it is fenced once
 the turns their holders took inside them, have ended, however many lands ask meanwhile
 (`waiting_install_numbers_no_ask`, `install_fenced_when_queue_empties`, "Land-turn laws"). Its command runs under that
 fence and holds it until it exits: the after-land install runs `setup` that way, and setup's own read under the slot
-finds no ticket, since a parked ask is none, and fences again. A waiting install whose connection closes leaves the
-wait. A gateway that refuses the waiting form, a build from before it, is said, and the command runs unfenced, its
-`setup` reading the turns as before. Recorded 2026-11-10: land 124380eca9's after-land install, which deferred whenever
-it found a turn held or queued, deferred at 12:16, 12:48 and 13:17Z, each rerun losing the gap to the next land's ask
+finds no ticket, since a parked ask is none, and fences again. A waiting install whose connection closes leaves the wait
+(`TWaitLeave`), and `{"op":"land-turns-withdraw"}` (`cowshed gateway withdraw-install`) withdraws every install still
+waiting in the same actor turn (`TWaitLeave` per waiting install, never touching an install that already holds a fence):
+the op answers `{"ok":true,"withdrawnInstalls":[{pid?,waitingUnixMs,waitedMs}]}`, tells each withdrawn waiting install
+`{"ok":true,"withdrawn":true,"withdrawnByPid":<pid>}` and closes its connection, and admits parked asks in arrival order
+at once once no install waits and no fence holds. A withdrawn `await-turns` runs nothing, writes nothing to stdout,
+reports `"the install's wait for the land turns was withdrawn by <pid>; nothing ran"` on stderr and exits 103
+(`Conflict` wrapper code); `tooling/land-install.sh` classifies exit 103 with empty stdout as withdrawn and records
+`deferred` with its rerun command, exiting 0, so a later rerun re-judges readiness and waits in order again. A gateway
+that refuses the waiting form, a build from before it, is said, and the command runs unfenced, its `setup` reading the
+turns as before. Recorded 2026-11-10: land 124380eca9's after-land install, which deferred whenever it found a turn held
+or queued, deferred at 12:16, 12:48 and 13:17Z, each rerun losing the gap to the next land's ask
 (`laws/land_turn_open.bend`). Once no install waits and no fence holds, the parked asks are numbered in the order they
 arrived, and each asker is told its turn on the connection it asked on (`parked_asks_enter_in_order`). A parked asker —
 `land-turn`, a declared land, a ref-turn writer — says it waits behind an install and keeps reading; one whose
@@ -698,10 +706,16 @@ ended (`exited <code>`, `killed by signal <n>`, `did not start: <reason>`) and e
 `abandoned` when its asker went without an end: `it left the queue before its turn`, or
 `it held the turn, and its asker went without ending it` (cowshed failed, was killed or crashed, its session gone). The
 gateway keeps the last 256 abandonments. `cowshed gateway status` asks it, `{"op":"land-turns","abandonedSinceUnixMs"}`,
-and lists each repository's tickets, the holder first, and the tickets abandoned in the last day, as
-`landTurns: [{ repo, tickets: [{ number, pid, workspace, askedUnixMs, command, bound? }], abandoned?: [{ atUnixMs, ticket, reason }] }]`,
-read without taking a turn; a gateway that does not answer `land-turns` lists none, and status says why
-(`landTurnsError`). A gateway that is not running holds no turn.
+without setting a fence, and lists each repository's tickets (the holder first), the tickets abandoned in the last day,
+every install currently waiting for the turns to empty (`waitingInstalls?: [{ pid?, waitingUnixMs }]`) and every ask
+currently parked behind a waiting install or a fence (`parkedAsks?: [{ repo, workspace, pid, askedUnixMs, command }]`),
+as
+`landTurns: [{ repo, tickets: [{ number, pid, workspace, askedUnixMs, command, bound? }], abandoned?: [{ atUnixMs, ticket, reason }] }]`
+beside `waitingInstalls?` and `parkedAsks?`, read without taking a turn; in text mode it prints each waiting install's
+pid, since when it has waited, how many tickets it waits for and who holds them (with the
+`cowshed gateway withdraw-install` hint) and each parked ask's repo, workspace, pid, command and asked time. A gateway
+that does not answer `land-turns` lists none, and status says why (`landTurnsError`). A gateway that is not running
+holds no turn.
 
 **Build records and the basis.** A release distribution carries its record beside its binary, `<binary>.build`: the JSON
 `{"commit","commitTime","sha256"}`, the commit `HEAD` names, that commit's committer time (read from that one commit, so

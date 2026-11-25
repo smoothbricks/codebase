@@ -65,6 +65,7 @@ export {
   type SpawnLandTurnOptions,
   type SpawnLockOptions,
   type SpawnSubtreeRootOptions,
+  type SpawnWithdrawInstallOptions,
   type SubtreeAdmissionOutcome,
   type SubtreeRootRun,
   spawnAwaitTurns,
@@ -73,6 +74,8 @@ export {
   spawnLandTurn,
   spawnLock,
   spawnSubtreeRoot,
+  spawnWithdrawInstall,
+  type WithdrawInstallRun,
 } from './launchers.js';
 export type * from './types.js';
 export { CowshedError } from './types.js';

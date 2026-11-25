@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
 use cowshed_core::api::{
     EmptyResult, ExecClass, GatewayStatus as CliGatewayStatus, HostJobs, HostScheduling,
-    ImageCleanup, JobCount, JobState, LandTurnQueue, StaleDaemonBinary, UnansweredSupervisor,
+    ImageCleanup, JobCount, JobState, LandTurnQueue, ParkedLandTurn, StaleDaemonBinary,
+    UnansweredSupervisor, WaitingInstall,
 };
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
@@ -1431,13 +1432,16 @@ where
     } else {
         None
     };
-    let (land_turns, land_turns_error) = observe_land_turns(&socket, installed).await;
+    let (land_turns, waiting_installs, parked_asks, land_turns_error) =
+        observe_land_turns(&socket, installed).await;
     let scheduling = read_scheduling(roots.store()).await;
     let cli_sha256 = executable_digest(&running_executable()?)?;
     Ok(Ok(CliGatewayStatus {
         scheduling: Some(scheduling),
         pending_install,
         land_turns,
+        waiting_installs,
+        parked_asks,
         land_turns_error,
         ..cli_status(installed, socket, answered.as_ref(), cli_sha256.as_str())
     }))
@@ -1446,16 +1450,22 @@ where
 /// How far back `gateway status` lists tickets found abandoned: a day of lands.
 const LAND_TURN_ABANDONED_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The land queues the gateway at `socket` keeps and the tickets abandoned in the last day, read
-/// without taking a turn; none when no gateway is loaded, since the queues live in it. A gateway
-/// that does not answer `land-turns` is the status's error string, not a failed status: the rest
-/// of the status still answers.
+/// The land queues the gateway at `socket` keeps, the tickets abandoned in the last day, any
+/// installs waiting for the turns to empty and any parked asks, read without taking a turn or
+/// setting a fence (05_gateway.md:392, 700-704); empty when no gateway is loaded, since the queues
+/// live in it. A gateway that does not answer `land-turns` is the status's error string, not a
+/// failed status: the rest of the status still answers.
 async fn observe_land_turns(
     socket: &Path,
     installed: bool,
-) -> (Vec<LandTurnQueue>, Option<String>) {
+) -> (
+    Vec<LandTurnQueue>,
+    Vec<WaitingInstall>,
+    Vec<ParkedLandTurn>,
+    Option<String>,
+) {
     if !installed {
-        return (Vec::new(), None);
+        return (Vec::new(), Vec::new(), Vec::new(), None);
     }
     let since = std::time::SystemTime::now()
         .checked_sub(LAND_TURN_ABANDONED_WINDOW)
@@ -1464,12 +1474,17 @@ async fn observe_land_turns(
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
     let listed = match GatewayControlClient::new(socket.to_path_buf()) {
-        Ok(client) => client.land_turns(since).await,
+        Ok(client) => client.land_turns_status(since).await,
         Err(error) => Err(error),
     };
     match listed {
-        Ok(queues) => (queues, None),
-        Err(error) => (Vec::new(), Some(error.to_string())),
+        Ok(status) => (
+            status.queues,
+            status.waiting_installs,
+            status.parked_asks,
+            None,
+        ),
+        Err(error) => (Vec::new(), Vec::new(), Vec::new(), Some(error.to_string())),
     }
 }
 
@@ -2122,6 +2137,8 @@ fn cli_status(
         pending_install: false,
         // The land queues are read beside the daemon, not asked of it.
         land_turns: Vec::new(),
+        waiting_installs: Vec::new(),
+        parked_asks: Vec::new(),
         land_turns_error: None,
     }
 }
@@ -2226,6 +2243,16 @@ pub fn emit_gateway_status<W: Write, E: Write>(
                 .map_err(output_error)?;
         }
     }
+    for install in &status.waiting_installs {
+        output
+            .guidance(&waiting_install_line(install, &status.land_turns))
+            .map_err(output_error)?;
+    }
+    for parked in &status.parked_asks {
+        output
+            .guidance(&parked_ask_line(parked))
+            .map_err(output_error)?;
+    }
     if let Some(error) = &status.land_turns_error {
         output
             .guidance(&format!("gateway land turns unavailable: {error}"))
@@ -2263,6 +2290,51 @@ fn land_turn_line(queue: &LandTurnQueue) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("land turn {}: {holds}; waiting: {behind}", queue.repo)
+}
+
+/// One waiting install in the operator's words: its pid, since when it has waited, how many
+/// tickets it waits for and who holds them (derived from the same snapshot's `queues`), and the
+/// verb that withdraws it.
+fn waiting_install_line(install: &WaitingInstall, queues: &[LandTurnQueue]) -> String {
+    let who = install
+        .pid
+        .map_or_else(|| "unknown pid".to_owned(), |pid| format!("pid {pid}"));
+    let ahead: usize = queues.iter().map(|queue| queue.tickets.len()).sum();
+    let holders = queues
+        .iter()
+        .filter_map(|queue| {
+            queue.tickets.first().map(|holder| {
+                format!(
+                    "{} holds {} (ticket {}, pid {})",
+                    holder.workspace, queue.repo, holder.number, holder.pid
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if holders.is_empty() {
+        String::new()
+    } else {
+        format!(": {holders}")
+    };
+    format!(
+        "land turns waiting install: {who}, waiting since {} for {ahead} ticket(s){suffix} \
+         (withdraw: cowshed gateway withdraw-install)",
+        local_clock(install.waiting_unix_ms),
+    )
+}
+
+/// One parked land-turn ask in the operator's words: repository, workspace, pid, asked time and
+/// command.
+fn parked_ask_line(parked: &ParkedLandTurn) -> String {
+    format!(
+        "land turn {} parked: {} (pid {}, asked {}): {}",
+        parked.repo,
+        parked.workspace,
+        parked.pid,
+        local_clock(parked.asked_unix_ms),
+        parked.command,
+    )
 }
 
 /// The host's scheduling in the operator's words (05_gateway.md "Status"): load, memory pressure
