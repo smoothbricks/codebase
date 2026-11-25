@@ -104,7 +104,11 @@ pub fn copy_leaf(source: &Path, destination: &Path) -> io::Result<LeafMaterializ
 
 pub fn directory_metadata(source: &Path, destination: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
-    fs::set_permissions(destination, metadata.permissions())?;
+    if !metadata.file_type().is_symlink()
+        && !fs::symlink_metadata(destination)?.file_type().is_symlink()
+    {
+        fs::set_permissions(destination, metadata.permissions())?;
+    }
     set_times(destination, &metadata)
 }
 
@@ -131,5 +135,59 @@ mod tests {
                 code
             )));
         }
+    }
+
+    #[test]
+    fn directory_metadata_preserves_symlink_times_without_touching_its_target() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-linux-symlink-meta-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).expect("source dir");
+        std::fs::create_dir_all(&destination).expect("destination dir");
+
+        let target = destination.join("target");
+        std::fs::write(&target, b"keep").expect("target file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("target mode");
+        let target_before = std::fs::symlink_metadata(&target).expect("target meta");
+
+        symlink("payload", source.join("dangling")).expect("source dangling");
+        symlink("missing", destination.join("dangling")).expect("dest dangling");
+        super::directory_metadata(&source.join("dangling"), &destination.join("dangling"))
+            .expect("dangling symlink metadata must not fail ENOENT");
+        assert_eq!(
+            std::fs::symlink_metadata(source.join("dangling"))
+                .expect("source dangling meta")
+                .modified()
+                .expect("source mtime"),
+            std::fs::symlink_metadata(destination.join("dangling"))
+                .expect("dest dangling meta")
+                .modified()
+                .expect("dest mtime"),
+        );
+
+        symlink("payload", source.join("live")).expect("source live");
+        symlink("target", destination.join("live")).expect("dest live");
+        super::directory_metadata(&source.join("live"), &destination.join("live"))
+            .expect("live symlink metadata");
+        let target_after = std::fs::symlink_metadata(&target).expect("target meta after");
+        assert_eq!(
+            target_after.permissions().mode() & 0o777,
+            target_before.permissions().mode() & 0o777,
+            "symlink metadata must not chmod the symlink target"
+        );
+        assert_eq!(
+            target_after.modified().expect("after mtime"),
+            target_before.modified().expect("before mtime"),
+            "symlink metadata must not change the symlink target's mtime"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }
