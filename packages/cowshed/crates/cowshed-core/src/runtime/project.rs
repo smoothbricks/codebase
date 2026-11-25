@@ -10862,6 +10862,7 @@ self.finish_retire_intent(&workspace).await?;
                 &self.workspace_mount_path(&main_name())?,
             )?
             .nx_daemon_idle(),
+            host_job_path: super::supervisor::HostJobPath::Host,
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this

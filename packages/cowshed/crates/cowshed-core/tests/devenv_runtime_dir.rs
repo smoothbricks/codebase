@@ -1139,6 +1139,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
             nice: 0,
         },
         membership: None,
+        host_job_path: cowshed_core::runtime::HostJobPath::Host,
     }
 }
 

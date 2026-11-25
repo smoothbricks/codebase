@@ -565,6 +565,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+        host_job_path: cowshed_core::runtime::HostJobPath::Host,
     }
 }
 
@@ -8612,6 +8613,9 @@ fn nx_project_with_config(
     // process-table walks, whose cost grows with the host's process count (one ran past a land
     // gate's 180 s progress bound). Sampling at the probe cadence keeps the steps few.
     supervisor_config.job_sampling.cpu_sample_period = NX_PROBES;
+    // Pin the host job PATH empty so the fixture observes only its own `.cowshed` tools and never
+    // a `node` installed in the runner's system profile (e.g. `/run/current-system/sw/bin/node`).
+    supervisor_config.host_job_path = cowshed_core::runtime::HostJobPath::Pinned(Vec::new());
     std::fs::write(supervisor_config.workspace_root.join("nx.json"), "{}").unwrap();
     let node = fixture_node(&supervisor_config.workspace_root);
     std::fs::create_dir_all(node.parent().unwrap()).unwrap();

@@ -237,6 +237,7 @@ impl Workspace {
             build_volume_released: None,
             memory_pressure: calm_pressure::calm(),
             nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+            host_job_path: cowshed_core::runtime::HostJobPath::Host,
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),

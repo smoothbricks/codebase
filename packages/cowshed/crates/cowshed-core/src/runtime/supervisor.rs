@@ -160,6 +160,19 @@ impl std::fmt::Debug for BuildVolumeReleased {
     }
 }
 
+/// The host directories appended to a shell-less job's bootstrap `PATH`
+/// ([`crate::host_path::job_directories`]). Production uses [`Self::Host`]; a test fixture that
+/// must not observe whatever tools happen to be installed in the runner's system profiles pins
+/// the list explicitly.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum HostJobPath {
+    /// Read the platform's host system directories (`host_path::job_directories`).
+    #[default]
+    Host,
+    /// Use these directories in place of the host's system directories.
+    Pinned(Vec<PathBuf>),
+}
+
 /// Production construction inputs for exactly one mounted workspace incarnation.
 #[derive(Clone, Debug)]
 pub struct WorkspaceSupervisorConfig {
@@ -222,6 +235,8 @@ pub struct WorkspaceSupervisorConfig {
     /// How long the shed may go unused before the keeper stops its Nx daemon: main's
     /// `.cowshed.toml` `[nx] daemon_idle` (04_sandbox.md, "The Nx daemon stays on").
     pub nx_daemon_idle: NxDaemonIdle,
+    /// The host directories appended to a shell-less job's bootstrap `PATH`.
+    pub host_job_path: HostJobPath,
 }
 
 /// How the supervisor samples its jobs' resources (07_api.md, "Job monitoring"): policy values,
@@ -417,6 +432,7 @@ impl Default for WorkspaceSupervisorConfig {
             build_volume_released: None,
             memory_pressure: crate::calm_pressure::calm(),
             nx_daemon_idle: NxDaemonIdle::DEFAULT,
+            host_job_path: HostJobPath::Host,
         }
     }
 }
@@ -647,6 +663,8 @@ pub struct ProcessSpawnRequest {
     /// in before the command can start. `None` where the platform has none, and from an injected
     /// sink that runs no native process.
     pub membership: Option<JobMembership>,
+    /// The host directories appended to a shell-less job's bootstrap `PATH`.
+    pub host_job_path: HostJobPath,
 }
 
 /// What a spawn places a job's owned command under (05_gateway.md "Classes", "Parallelism inside
@@ -1616,7 +1634,7 @@ fn one_shot_plan(
 /// the exec host re-leads those two routes after project shell activation. The host's system
 /// `PATH` ends it ([`crate::host_path::job_directories`]), never the `PATH` that started this
 /// process.
-fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
+fn bootstrap_path(sandbox: &SandboxConfig, host_job_path: &HostJobPath) -> Result<OsString> {
     let tools = match sandbox.mode {
         crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools"),
         crate::sandbox::RunSandboxMode::ReadWrite => sandbox.workspace_mount.join(".cowshed/tools"),
@@ -1635,11 +1653,14 @@ fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     }
     paths.push(tools.join("bin"));
     paths.push(sandbox.workspace_mount.join(".cowshed/bin"));
-    let host = crate::host_path::job_directories(&sandbox.home).map_err(|error| {
-        CowshedError::internal(format!(
-            "name the user of the sandbox PATH's per-user directories: {error}"
-        ))
-    })?;
+    let host = match host_job_path {
+        HostJobPath::Host => crate::host_path::job_directories(&sandbox.home).map_err(|error| {
+            CowshedError::internal(format!(
+                "name the user of the sandbox PATH's per-user directories: {error}"
+            ))
+        })?,
+        HostJobPath::Pinned(directories) => directories.clone(),
+    };
     for directory in host {
         if !paths.contains(&directory) {
             paths.push(directory);
@@ -1655,6 +1676,7 @@ fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
 /// blocking pool.
 async fn on_job_path<T: Send + 'static>(
     policy: &SandboxPolicy,
+    host_job_path: &HostJobPath,
     find: fn(super::job_program::JobPath<'_>) -> T,
 ) -> Result<T> {
     let (read_write, _) = policy.child(crate::api::dto::RunSandboxMode::ReadWrite);
@@ -1664,11 +1686,11 @@ async fn on_job_path<T: Send + 'static>(
         .shell
         .is_none()
         .then(|| read_write.clone());
+    let host_job_path = host_job_path.clone();
     off_actor::run(move || match bootstrap {
         None => Ok(find(super::job_program::JobPath::Shell)),
-        Some(sandbox) => {
-            bootstrap_path(&sandbox).map(|path| find(super::job_program::JobPath::Bootstrap(&path)))
-        }
+        Some(sandbox) => bootstrap_path(&sandbox, &host_job_path)
+            .map(|path| find(super::job_program::JobPath::Bootstrap(&path))),
     })
     .await
 }
@@ -2449,6 +2471,7 @@ pub(super) async fn read_job_stream(
 pub(super) async fn sandbox_environment(
     sandbox: &SandboxConfig,
     caller: &BTreeMap<String, String>,
+    host_job_path: &HostJobPath,
 ) -> Result<SandboxEnvironment> {
     let private_root = sandbox.workspace_mount.join(".cowshed");
     // This directory contains controller-published credentials and Git policy. Reject an
@@ -2521,7 +2544,7 @@ pub(super) async fn sandbox_environment(
     // before capture existed keeps the empty device and fails an authorless commit loudly,
     // rather than silently borrowing whatever the controller's user happens to be.
     let git_identity = crate::git::workspace_git_identity_config(&sandbox.workspace_mount)?;
-    let path = bootstrap_path(sandbox)?;
+    let path = bootstrap_path(sandbox, host_job_path)?;
     // What the workspace records: a block's base is its gateway and the block is exported; a
     // workspace with none names its launch's connector and exports no port variable.
     let gateway =
@@ -2914,7 +2937,7 @@ async fn prepare_spawn(
     let environment = cowshed_os::timing::spanned(
         "spawn",
         "environment",
-        sandbox_environment(sandbox, &request.env),
+        sandbox_environment(sandbox, &request.env, &request.host_job_path),
     )
     .await?;
     let monitor = ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?;
@@ -4234,6 +4257,7 @@ impl WorkspaceSupervisor {
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
             policy,
+            host_job_path: config.host_job_path,
             build_volume_layout: config.build_volume_layout,
             volume_labels: config.volume_labels,
             workspace_volume: config.workspace_volume,
@@ -5350,6 +5374,8 @@ struct SupervisorActor {
     default_cwd: Option<WorkspacePath>,
     /// The sandbox of the authority served, rendered once when it was taken.
     policy: SandboxPolicy,
+    /// See [`WorkspaceSupervisorConfig::host_job_path`].
+    host_job_path: HostJobPath,
     build_volume_layout: Option<crate::build_volume::BuildVolumeLayout>,
     /// See [`WorkspaceSupervisorConfig::volume_labels`].
     volume_labels: Option<VolumeLabels>,
@@ -6622,17 +6648,21 @@ impl SupervisorActor {
             Command::StopNxKeeper { authority, reply } => self.stop_nx_keeper(&authority, reply),
             Command::ScriptRuntime { authority, reply } => {
                 let runtime = match self.validate_authority(&authority) {
-                    Ok(()) => on_job_path(&self.policy, super::job_program::script_runtime)
-                        .await
-                        .and_then(|found| {
-                            found.map_err(|missing| {
-                                CowshedError::environment_missing(
-                                    format!("no runtime can run the land's Nx helpers: {missing}"),
-                                    "give the workspace a `node` or a `bun`: its shell's, or one \
+                    Ok(()) => on_job_path(
+                        &self.policy,
+                        &self.host_job_path,
+                        super::job_program::script_runtime,
+                    )
+                    .await
+                    .and_then(|found| {
+                        found.map_err(|missing| {
+                            CowshedError::environment_missing(
+                                format!("no runtime can run the land's Nx helpers: {missing}"),
+                                "give the workspace a `node` or a `bun`: its shell's, or one \
                                      in the host's conventional installation directories",
-                                )
-                            })
-                        }),
+                            )
+                        })
+                    }),
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(runtime);
@@ -7678,6 +7708,7 @@ impl SupervisorActor {
                     mode,
                     scope,
                     cpu,
+                    host_job_path: self.host_job_path.clone(),
                 },
                 self.events.clone(),
             )
@@ -7958,7 +7989,12 @@ impl SupervisorActor {
             return true;
         }
         // The job's `node` is found as its own exec would find it: on the PATH it gets.
-        let found = on_job_path(&self.policy, super::nx_daemon::daemon_node).await;
+        let found = on_job_path(
+            &self.policy,
+            &self.host_job_path,
+            super::nx_daemon::daemon_node,
+        )
+        .await;
         let node = match found {
             Ok(node) => node,
             Err(error) => {
@@ -10483,7 +10519,7 @@ mod workspace_toolchain_tests {
             "caller-stale-token".to_owned(),
         );
 
-        let environment = sandbox_environment(&sandbox, &env)
+        let environment = sandbox_environment(&sandbox, &env, &HostJobPath::Host)
             .await
             .expect("environment");
         let child = environment.child(&env);
@@ -10693,7 +10729,7 @@ mod workspace_toolchain_tests {
             shell: &Path,
         ) -> (BTreeMap<OsString, OsString>, Vec<PathBuf>) {
             let (sandbox, _) = policy.child(mode);
-            let environment = sandbox_environment(sandbox, &BTreeMap::new())
+            let environment = sandbox_environment(sandbox, &BTreeMap::new(), &HostJobPath::Host)
                 .await
                 .expect("environment");
             let baseline = super::super::shell_job::inherited_baseline(&environment.base(), shell);
@@ -10931,7 +10967,7 @@ mod workspace_toolchain_tests {
             .expect("detect capabilities");
         assert!(sandbox.capabilities.active.is_empty());
 
-        let environment = sandbox_environment(&sandbox, &BTreeMap::new())
+        let environment = sandbox_environment(&sandbox, &BTreeMap::new(), &HostJobPath::Host)
             .await
             .expect("environment");
         let mut child = environment.child(&BTreeMap::new());
@@ -11026,6 +11062,7 @@ mod workspace_toolchain_tests {
                 nice: 0,
             },
             membership: None,
+            host_job_path: HostJobPath::Host,
         };
         let (events, _received) = mpsc::channel(16);
         let spawned = SystemSpawnSink::default().spawn(request, events).await;
@@ -11090,7 +11127,7 @@ mod workspace_toolchain_tests {
                 configured.port_block,
             )
             .expect("publish host environment");
-            let environment = sandbox_environment(&configured, &caller)
+            let environment = sandbox_environment(&configured, &caller, &HostJobPath::Host)
                 .await
                 .expect("environment");
             let child = environment.child(&caller);
@@ -11197,7 +11234,7 @@ mod workspace_toolchain_tests {
             return;
         };
         let sandbox = sandbox_at(Path::new(&mount));
-        let environment = sandbox_environment(&sandbox, &BTreeMap::new())
+        let environment = sandbox_environment(&sandbox, &BTreeMap::new(), &HostJobPath::Host)
             .await
             .expect("environment");
         for (name, value) in environment.child(&BTreeMap::new()) {
@@ -11554,7 +11591,7 @@ mod workspace_toolchain_tests {
             let link = environment_root.join("tools/bin/npm");
             assert_eq!(std::fs::read_link(&link).expect("command link"), target);
 
-            let path = bootstrap_path(&sandbox).expect("bootstrap PATH");
+            let path = bootstrap_path(&sandbox, &HostJobPath::Host).expect("bootstrap PATH");
             let mut expected = vec![
                 crate::host_dirs::installed_binary_directory(&sandbox.home),
                 environment_root.join("tools/manager-bin"),
@@ -11770,7 +11807,7 @@ mod workspace_toolchain_tests {
         // Without an Nx project, the caller's endpoint and store bound are withheld.
         let mut plain = sandbox.clone();
         plain.configure_capabilities().expect("detect capabilities");
-        let plain_environment = sandbox_environment(&plain, &caller)
+        let plain_environment = sandbox_environment(&plain, &caller, &HostJobPath::Host)
             .await
             .expect("environment");
         let without_nx = plain_environment.child(&caller);
@@ -11794,7 +11831,7 @@ mod workspace_toolchain_tests {
         configured
             .configure_capabilities()
             .expect("detect capabilities");
-        let child = sandbox_environment(&configured, &caller)
+        let child = sandbox_environment(&configured, &caller, &HostJobPath::Host)
             .await
             .expect("environment")
             .child(&caller);
@@ -11931,7 +11968,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
             configured
                 .configure_capabilities()
                 .expect("detect capabilities");
-            let environment = sandbox_environment(&configured, &caller)
+            let environment = sandbox_environment(&configured, &caller, &HostJobPath::Host)
                 .await
                 .expect("environment");
             let child = environment.child(&caller);
@@ -12373,6 +12410,7 @@ mod lifecycle_commitment_tests {
             build_volume_released: None,
             memory_pressure: crate::calm_pressure::calm(),
             nx_daemon_idle: defaults.nx_daemon_idle,
+            host_job_path: defaults.host_job_path,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every
@@ -12676,9 +12714,26 @@ mod sandbox_environment_tests {
             ];
             expected.extend(crate::host_path::job_directories(&sandbox.home).unwrap());
             assert_eq!(
-                std::env::split_paths(&bootstrap_path(&sandbox).unwrap()).collect::<Vec<_>>(),
+                std::env::split_paths(&bootstrap_path(&sandbox, &HostJobPath::Host).unwrap())
+                    .collect::<Vec<_>>(),
                 expected,
                 "{mode:?}"
+            );
+            let pinned = vec![PathBuf::from("/pinned/bin")];
+            let mut pinned_expected = vec![
+                crate::host_dirs::installed_binary_directory(&sandbox.home),
+                tools.join("manager-bin"),
+                tools.join("bin"),
+                sandbox.workspace_mount.join(".cowshed/bin"),
+            ];
+            pinned_expected.extend(pinned.iter().cloned());
+            assert_eq!(
+                std::env::split_paths(
+                    &bootstrap_path(&sandbox, &HostJobPath::Pinned(pinned)).unwrap()
+                )
+                .collect::<Vec<_>>(),
+                pinned_expected,
+                "{mode:?} pinned"
             );
         }
     }
@@ -12962,6 +13017,7 @@ mod sandbox_environment_tests {
                 nice: 0,
             },
             membership: None,
+            host_job_path: HostJobPath::Host,
         };
         let command = host_gate_command(&request, &mount).expect("host gate command");
         let environment: BTreeMap<&OsStr, Option<&OsStr>> = command.as_std().get_envs().collect();
