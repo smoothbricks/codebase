@@ -482,13 +482,17 @@ async fn host_controller_commands_reuse_one_activation_until_a_watched_file_chan
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_warm_commands_take_an_idle_host_within_their_bound() {
     const COMMANDS: usize = 20;
-    // Measured 2026-10-30: the warm path takes about 6 ms in a debug build; a command that
-    // spawns per exec again (mbx, git) or lists every package tree lands well above this.
-    const BOUND: Duration = Duration::from_millis(60);
+    // The work is the pool's counts. The clock is only a backstop against a warm path that
+    // spawns per exec again (mbx, git) or lists every package tree: measured 2026-10-30 at about
+    // 6 ms in a debug build, and 2026-11-25 at a p50 of 15-89 ms on SB main itself at host load
+    // ~80, where the old 60 ms p50 bound failed with nothing wrong. Ten times that bound still
+    // catches a per-exec spawn of seconds.
+    const BACKSTOP: Duration = Duration::from_millis(600);
     let workspace = Workspace::new("warm-bound", 41_904);
     workspace.envrc("export FROM_ENVRC=loaded\n");
     let handle = workspace.supervisor(false);
     run(&handle, request(&["/usr/bin/true"])).await.ok();
+    let before = handle.shell_pool().await.expect("pool counts");
     let mut elapsed = Vec::with_capacity(COMMANDS);
     for _ in 0..COMMANDS {
         let started = std::time::Instant::now();
@@ -502,17 +506,27 @@ async fn host_controller_warm_commands_take_an_idle_host_within_their_bound() {
         p50.as_secs_f64() * 1e3,
         p90.as_secs_f64() * 1e3
     );
-    let counts = handle.shell_pool().await.expect("pool counts");
+    let after = handle.shell_pool().await.expect("pool counts");
     assert_eq!(
-        counts.activated, 1,
-        "only the first command activates: {counts:?}"
+        (before.activated, before.pools),
+        (1, 1),
+        "only the first command activates, in one pool: {before:?}"
     );
     assert_eq!(
-        usize::try_from(counts.idle).unwrap(),
-        COMMANDS,
-        "every later command reaches an idle host: {counts:?}"
+        (
+            after.idle - before.idle,
+            after.activated - before.activated,
+            after.spare - before.spare,
+            after.pools - before.pools,
+        ),
+        (u64::try_from(COMMANDS).unwrap(), 0, 0, 0),
+        "every warm command took an idle host; none activated one, took the spare or replaced \
+         the pool: before {before:?}, after {after:?}"
     );
-    assert!(p50 <= BOUND, "warm p50 {p50:?} above {BOUND:?}");
+    assert!(
+        p50 <= BACKSTOP,
+        "warm p50 {p50:?} above the backstop {BACKSTOP:?}"
+    );
     assert_eq!(workspace.activations(), 1);
 }
 
