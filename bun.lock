@@ -102,7 +102,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.24-next.0",
+      "version": "0.13.24",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -332,12 +332,13 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.23-next.0",
+      "version": "0.7.23",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
         "smoo-nx-cargo-toolchain": "./dist/bin/smoo-nx-cargo-toolchain.js",
         "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
+        "smoo-nx-suite-minimum": "./dist/bin/smoo-nx-suite-minimum.js",
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
         "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
         "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
