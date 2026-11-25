@@ -2100,9 +2100,10 @@ the order between classes is admission, not OS priority"), and the pool admits b
   `interactive-resident` job once its asks have left the `interactive` band. That is the decay's own clock, 120 s from
   the job's first admitted ask (above), read from mbx's record of that admission through its published inspection
   (`mbx stats --scheduler --json` names each job key's first admission); a job mbx has not yet admitted is still inside
-  it. An interactive job inside its first band is above the gate in §Classes' order and keeps its tokens; one that has
-  decayed is crowding the gate, as the decay itself says, and is withdrawn from like background. A gate-class job is
-  never withdrawn from, a train's proof included.
+  it. A supervisor reads that inspection only during a span, once per heartbeat for all its jobs, never per job, so a
+  host with no land's gate running pays nothing for it. An interactive job inside its first band is above the gate in
+  §Classes' order and keeps its tokens; one that has decayed is crowding the gate, as the decay itself says, and is
+  withdrawn from like background. A gate-class job is never withdrawn from, a train's proof included.
 - **The fifo drained by its server, no count beside it.** The supervisor already holds each job's fifo open read-write
   ("The fifo is the job's free count"). To withdraw, it reads every token byte the fifo holds and every one a holder
   returns, and keeps them; at the span's end it writes them all back. Only the implicit first token cannot be taken, so
