@@ -3297,13 +3297,18 @@ impl StdAccept for std::os::unix::net::UnixListener {
     }
 }
 
+struct Accepted<L: StdAccept> {
+    stream: L::StdStream,
+    addr: L::Addr,
+}
+
 /// Keeps listener readiness on the runtime thread while running the `accept` syscall and its
 /// close-on-exec marking under `fork_lock::create` on the blocking pool. Retaining the in-flight
 /// `JoinHandle` across `tokio::select!` turns keeps [`Self::accept`] cancel-safe when another
 /// select arm fires mid-accept.
 pub(crate) struct AsyncAccept<L: StdAccept> {
     listener: tokio::io::unix::AsyncFd<SharedListener<L>>,
-    pending: Option<JoinHandle<std::io::Result<(L::StdStream, L::Addr)>>>,
+    pending: Option<JoinHandle<std::io::Result<Accepted<L>>>>,
 }
 
 impl<L: StdAccept> AsyncAccept<L> {
@@ -3325,7 +3330,7 @@ impl<L: StdAccept> AsyncAccept<L> {
                 self.pending = Some(tokio::task::spawn_blocking(move || {
                     let (stream, addr) = fork_lock::create(|| shared.accept_std())?;
                     L::set_nonblocking(&stream)?;
-                    Ok((stream, addr))
+                    Ok(Accepted { stream, addr })
                 }));
             }
             let outcome = self
@@ -3336,7 +3341,7 @@ impl<L: StdAccept> AsyncAccept<L> {
                 .map_err(|error| std::io::Error::other(format!("accept task failed: {error}")))?;
             self.pending = None;
             match outcome {
-                Ok((stream, addr)) => return Ok((L::into_async(stream)?, addr)),
+                Ok(Accepted { stream, addr }) => return Ok((L::into_async(stream)?, addr)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     self.listener.readable().await?.clear_ready();
                 }

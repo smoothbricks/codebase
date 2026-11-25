@@ -226,6 +226,8 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
         let placement = CommandPlacement::from(JobMembership::from(Arc::clone(&cgroup)));
         #[cfg(not(target_os = "linux"))]
         let placement = CommandPlacement::at_nice(10);
+        let handoff = platform::Handoff::prepare(&placement)
+            .expect("prepare handoff before exhausting descriptors");
         let (stdin, stdin_writer) = pipe().expect("job stdin");
         let (stdout_reader, stdout) = pipe().expect("job stdout");
         let (stderr_reader, stderr) = pipe().expect("job stderr");
@@ -246,6 +248,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 stdin,
                 stdout,
                 stderr,
+                handoff,
             },
             RunCommand {
                 command: HostCommand::Argv(vec![OsString::from("true")]),

@@ -2764,8 +2764,12 @@ impl SpawnSink for SystemSpawnSink {
         let placement = CommandPlacement::of(&request)?;
         // Everything a spawn prepares host-side reads or writes the file system, so it is made
         // on the blocking pool ([`prepare_spawn`]); only the spawn itself is made here.
-        let prepared =
-            off_actor::drive(prepare_spawn(request.clone(), self.shells.is_some())).await?;
+        let prepared = off_actor::drive(prepare_spawn(
+            request.clone(),
+            placement.clone(),
+            self.shells.is_some(),
+        ))
+        .await?;
         match prepared {
             PreparedSpawn::HostGate { command, monitor } => {
                 spawn_fenced(command, request.job_id, placement, monitor, events).await
@@ -2776,6 +2780,7 @@ impl SpawnSink for SystemSpawnSink {
                 policy,
                 environment,
                 monitor,
+                io,
             } => {
                 let Some(shells) = self.shells.as_mut() else {
                     return Err(CowshedError::internal(
@@ -2783,30 +2788,29 @@ impl SpawnSink for SystemSpawnSink {
                     ));
                 };
                 let (sandbox, profile) = policy.child(request.mode);
-                shells
-                    .spawn(
-                        super::shell_job::PooledSpawn {
-                            job_id: request.job_id,
-                            command,
-                            cwd,
-                            profile,
-                            read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
-                            workspace_mount: sandbox.workspace_mount.clone(),
-                            envrc_directory: shell_directory(sandbox),
-                            environment,
-                            caller: &request.env,
-                            grant_revision: request.authority.grant_revision,
-                            cpu: &request.cpu,
-                            mbx: sandbox
-                                .capabilities
-                                .active
-                                .contains(&crate::capabilities::CapabilityId::Mbx),
-                            placement,
-                            monitor,
-                        },
-                        events,
-                    )
-                    .await
+                shells.spawn(
+                    super::shell_job::PooledSpawn {
+                        job_id: request.job_id,
+                        command,
+                        cwd,
+                        profile,
+                        read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
+                        workspace_mount: sandbox.workspace_mount.clone(),
+                        envrc_directory: shell_directory(sandbox),
+                        environment,
+                        caller: &request.env,
+                        grant_revision: request.authority.grant_revision,
+                        cpu: &request.cpu,
+                        mbx: sandbox
+                            .capabilities
+                            .active
+                            .contains(&crate::capabilities::CapabilityId::Mbx),
+                        placement,
+                        monitor,
+                        io,
+                    },
+                    events,
+                )
             }
             PreparedSpawn::OneShot {
                 plan,
@@ -2840,6 +2844,7 @@ enum PreparedSpawn {
         policy: SandboxPolicy,
         environment: SandboxEnvironment,
         monitor: ProcessMonitor,
+        io: super::shell_job::PreparedWarmIo,
     },
     /// A one-shot child that enters the workspace shell itself.
     OneShot {
@@ -2852,10 +2857,15 @@ enum PreparedSpawn {
 /// Prepare `request`'s spawn host-side, all but the spawn itself: the contained cwd, the
 /// capability snapshot of that cwd, the private environment with the store's Git routes, the
 /// process observer, the command's start check and its profile; `warm` when warm exec hosts can
-/// take the command. Each step reads or writes the file system, and the Git routes await a
-/// sandboxed probe between them, so the supervisor drives this on the blocking pool
-/// ([`off_actor::drive`]), never on its actor.
-async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<PreparedSpawn> {
+/// take the command (also preparing its stdio pipes and pre-exec handoff under the fork lock so
+/// the warm path pays no extra blocking-pool hop). Each step reads or writes the file system, and
+/// the Git routes await a sandboxed probe between them, so the supervisor drives this on the
+/// blocking pool ([`off_actor::drive`]), never on its actor.
+async fn prepare_spawn(
+    request: ProcessSpawnRequest,
+    placement: CommandPlacement,
+    warm: bool,
+) -> Result<PreparedSpawn> {
     let cwd = crate::exec::contained_cwd(&request.policy.ceiling().workspace_mount, &request.cwd)
         .map_err(map_exec_error)?;
     if request.scope == ExecScope::HostGate {
@@ -2883,12 +2893,14 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
                     "run the script through the cowshed CLI",
                 ));
             }
+            let io = super::shell_job::PreparedWarmIo::prepare(&placement)?;
             return Ok(PreparedSpawn::Warm {
                 command: super::shell_job::HostCommand::Script(script),
                 cwd,
                 policy,
                 environment,
                 monitor,
+                io,
             });
         }
         SpawnCommand::Argv(argv) => argv,
@@ -2900,12 +2912,14 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
         if let Some(program) = argv.first() {
             refuse_unstartable(program, &cwd, None)?;
         }
+        let io = super::shell_job::PreparedWarmIo::prepare(&placement)?;
         return Ok(PreparedSpawn::Warm {
             command: super::shell_job::HostCommand::Argv(argv),
             cwd,
             policy,
             environment,
             monitor,
+            io,
         });
     }
     let mut environment = environment.child(&request.env);

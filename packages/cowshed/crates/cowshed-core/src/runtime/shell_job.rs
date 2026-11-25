@@ -128,6 +128,37 @@ pub(super) enum HostCommand {
     Script(crate::script::RenderedScript),
 }
 
+/// The job's stdio pipes and pre-exec handoff prepared on the blocking pool inside
+/// `prepare_spawn`, keeping every Darwin `fork_lock::create` and Linux `cgroup.procs` open off
+/// the supervisor's runtime thread without adding a blocking-pool hop to the warm path.
+pub(super) struct PreparedWarmIo {
+    stdin_read: OwnedFd,
+    stdin_write: OwnedFd,
+    stdout_read: OwnedFd,
+    stdout_write: OwnedFd,
+    stderr_read: OwnedFd,
+    stderr_write: OwnedFd,
+    handoff: platform::Handoff,
+}
+
+impl PreparedWarmIo {
+    pub(super) fn prepare(placement: &CommandPlacement) -> Result<Self> {
+        let (stdin_read, stdin_write) = pipe().map_err(pipe_error)?;
+        let (stdout_read, stdout_write) = pipe().map_err(pipe_error)?;
+        let (stderr_read, stderr_write) = pipe().map_err(pipe_error)?;
+        let handoff = platform::Handoff::prepare(placement)?;
+        Ok(Self {
+            stdin_read,
+            stdin_write,
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+            handoff,
+        })
+    }
+}
+
 /// One command admitted to run in a warm shell.
 pub(super) struct PooledSpawn<'a> {
     pub job_id: JobId,
@@ -149,6 +180,7 @@ pub(super) struct PooledSpawn<'a> {
     /// Whether the project has the mbx capability, which names the job's pool priority.
     pub mbx: bool,
     pub monitor: super::process_monitor::ProcessMonitor,
+    pub io: PreparedWarmIo,
 }
 
 impl WorkspaceShells {
@@ -169,7 +201,7 @@ impl WorkspaceShells {
             .fold(self.retired, |sum, (_, pool)| sum + pool.counts())
     }
 
-    pub(super) async fn spawn(
+    pub(super) fn spawn(
         &mut self,
         spawn: PooledSpawn<'_>,
         events: mpsc::Sender<ProcessEvent>,
@@ -189,6 +221,16 @@ impl WorkspaceShells {
             mbx,
             placement,
             monitor,
+            io:
+                PreparedWarmIo {
+                    stdin_read,
+                    stdin_write,
+                    stdout_read,
+                    stdout_write,
+                    stderr_read,
+                    stderr_write,
+                    handoff,
+                },
         } = spawn;
         let base = environment.base();
         let key = pool_key(
@@ -225,23 +267,6 @@ impl WorkspaceShells {
         // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
         let mut overlay = environment.overlay(caller);
         overlay.extend(cpu.environment(caller, mbx));
-        let (stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) =
-            tokio::task::spawn_blocking(|| -> io::Result<_> {
-                let (stdin_read, stdin_write) = pipe()?;
-                let (stdout_read, stdout_write) = pipe()?;
-                let (stderr_read, stderr_write) = pipe()?;
-                Ok((
-                    stdin_read,
-                    stdin_write,
-                    stdout_read,
-                    stdout_write,
-                    stderr_read,
-                    stderr_write,
-                ))
-            })
-            .await
-            .map_err(|error| CowshedError::internal(format!("job pipe task failed: {error}")))?
-            .map_err(pipe_error)?;
         let stdout =
             tokio::net::unix::pipe::Receiver::from_owned_fd(stdout_read).map_err(pipe_error)?;
         let stderr =
@@ -275,6 +300,7 @@ impl WorkspaceShells {
                 stdin: stdin_read,
                 stdout: stdout_write,
                 stderr: stderr_write,
+                handoff,
             },
             RunCommand {
                 command,
@@ -464,6 +490,7 @@ struct JobIo {
     stdin: OwnedFd,
     stdout: OwnedFd,
     stderr: OwnedFd,
+    handoff: platform::Handoff,
 }
 
 /// Chunks buffered ahead of a job's stderr writer task: at 4 KiB per tee read, one pipe's
@@ -644,7 +671,7 @@ async fn signal_failed(events: &mpsc::Sender<ProcessEvent>, job_id: JobId, deliv
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "one job's run: its pool, streams, command, control, release and event lane"
+    reason = "one job's run: its pool, streams, command, control, release, diagnostics and event lane"
 )]
 async fn run_pooled(
     pool: ShellPool<HostActivator>,
@@ -746,10 +773,11 @@ async fn run_pooled(
         stdin,
         stdout,
         stderr,
+        handoff,
     } = io;
     // The descriptors travel to the host and are closed here once sent, so end of output is
     // decided by the command's process tree alone.
-    let started = host.run(&command, [stdin, stdout, stderr]).await;
+    let started = host.run(&command, [stdin, stdout, stderr], handoff).await;
     // The host forked the command just before it replied: this is the first moment this
     // process knows of it.
     let spawned = Instant::now();
@@ -938,7 +966,12 @@ impl ExecHost {
         receive_frame(&mut self.control, &mut self.closed).await
     }
 
-    async fn run(&mut self, command: &RunCommand, descriptors: [OwnedFd; 3]) -> Result<Started> {
+    async fn run(
+        &mut self,
+        command: &RunCommand,
+        descriptors: [OwnedFd; 3],
+        handoff: platform::Handoff,
+    ) -> Result<Started> {
         let frame = match &command.command {
             HostCommand::Argv(argv) => {
                 FrameWriter::new(REQUEST_RUN).list(argv.iter().map(|argument| argument.as_bytes()))
@@ -959,10 +992,6 @@ impl ExecHost {
             })
             .and_then(FrameWriter::finish)
             .map_err(|error| protocol_error("request", error))?;
-        let placement = command.placement.clone();
-        let handoff = tokio::task::spawn_blocking(move || platform::Handoff::prepare(&placement))
-            .await
-            .map_err(|error| CowshedError::internal(format!("handoff task failed: {error}")))??;
         let raw = handoff.descriptors(descriptors.each_ref().map(AsRawFd::as_raw_fd));
         self.send(frame, &raw).await?;
         drop(descriptors);
