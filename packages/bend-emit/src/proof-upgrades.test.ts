@@ -1169,3 +1169,153 @@ law hub_id:
     expect(r.err).toMatch(/bend-emit refuses:.*0xdeadbeef\/mod:id_nat.*digit/);
   });
 });
+
+test('book_load parse/syntax errors format cleanly via err_show instead of dumping raw AST', async () => {
+  await withTempDir(async (dir) => {
+    const badPath = join(dir, 'computed_scrutinee.bend');
+    const outDir = join(dir, 'out');
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(
+      badPath,
+      `import Base
+
+def flip(+b: Bool) -> Bool:
+  match b:
+    case True{}:
+      False{}
+    case False{}:
+      True{}
+
+def bad(+b: Bool) -> Bool:
+  match flip(b):
+    case True{}:
+      True{}
+    case False{}:
+      False{}
+`,
+    );
+
+    // 1. Direct API throws a formatted Error, never a raw Bend.Err AST object.
+    let caught: unknown;
+    try {
+      await checkBendFile(badPath);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const msg = caught instanceof Error ? caught.message : '';
+    expect(msg).toContain('a parameter or field scrutinee');
+    expect(msg).not.toContain('type Empty is Data:');
+    expect(msg.length).toBeLessThan(2000);
+
+    // 2. CLI (both skeleton and emit) prints concise stderr with no raw Base.bend dump or stack trace.
+    const cli = join(import.meta.dir, '../bin/bend-emit.ts');
+    for (const args of [
+      [cli, 'skeleton', badPath, '--all'],
+      [cli, badPath, outDir, '--fns', 'bad'],
+    ]) {
+      const r = sh('bun', args, dir);
+      expect(r.code).not.toBe(0);
+      expect(r.out).toBe('');
+      expect(r.err).toContain('a parameter or field scrutinee');
+      expect(r.err).not.toContain('type Empty is Data:');
+      expect(r.err).not.toContain('tlds:');
+      expect(r.err).not.toContain('at run (');
+      expect(r.err.length).toBeLessThan(2000);
+    }
+  });
+});
+
+test('cap 0 and --no-corpus all / * / bare flag omit static corpus rows cleanly without div-by-zero', async () => {
+  await withTempDir(async (dir) => {
+    const modelPath = join(dir, 'tiny.bend');
+    const outDir = join(dir, 'out');
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(
+      modelPath,
+      `import Base
+
+def id_bool(+b: Bool) -> Bool:
+  b
+
+law law_a:
+  for +b: Bool
+  {id_bool(b) == b : Bool}
+
+def law_a(b):
+  match b:
+    case False{}:
+      {==}
+    case True{}:
+      {==}
+
+law law_b:
+  for +a: Bool
+  for +b: Bool
+  {id_bool(a) == a : Bool}
+
+def law_b(a, b):
+  match a:
+    case False{}:
+      {==}
+    case True{}:
+      {==}
+`,
+    );
+
+    const book = await checkBendFile(modelPath);
+
+    // 1. cap: 0 produces 0 corpus rows and does not divide by zero.
+    const emCap0 = book.emit({
+      target: { kind: 'ts-module', modelName: 'tiny.bend', flags: [] },
+      functions: ['id_bool'],
+      laws: ['law_a', 'law_b'],
+      cap: 0,
+      properties: 8,
+    });
+    if (emCap0.kind !== 'module') throw new Error('expected module');
+    expect(emCap0.manifest.laws.map((l) => l.corpusCount)).toEqual([0, 0]);
+    expect(emCap0.source).toContain('export function corpus_law_a(): [boolean][] { return []; }');
+    expect(emCap0.source).toContain('export function corpus_law_b(): [boolean, boolean][] { return []; }');
+
+    // 2. noCorpus: ['all'] and ['*'] skip static corpus for every law.
+    for (const noCorpus of [['all'], ['*']] as const) {
+      const em = book.emit({
+        target: { kind: 'ts-module', modelName: 'tiny.bend', flags: [] },
+        functions: ['id_bool'],
+        laws: ['law_a', 'law_b'],
+        cap: 400,
+        properties: 8,
+        noCorpus,
+      });
+      if (em.kind !== 'module') throw new Error('expected module');
+      expect(em.manifest.laws.map((l) => l.corpusCount)).toEqual([0, 0]);
+    }
+
+    // 3. CLI accepts --cap 0, --no-corpus all, --no-corpus *, and bare --no-corpus before another flag or at EOF.
+    const cli = join(import.meta.dir, '../bin/bend-emit.ts');
+    for (const [label, extra] of [
+      ['cap0', ['--cap', '0']],
+      ['all', ['--no-corpus', 'all']],
+      ['star', ['--no-corpus', '*']],
+      ['bare_mid', ['--no-corpus', '--props', '8']],
+      ['bare_eof', ['--props', '8', '--no-corpus']],
+    ] as const) {
+      const modOut = join(outDir, `${label}.ts`);
+      const manifestOut = join(outDir, `${label}.json`);
+      const r = sh(
+        'bun',
+        [cli, modelPath, outDir, '--ts-module', modOut, '--manifest', manifestOut, '--laws', 'law_a,law_b', ...extra],
+        dir,
+      );
+      expect({ label, code: r.code, err: r.err }).toEqual({ label, code: 0, err: '' });
+      const parsed: unknown = JSON.parse(readFileSync(manifestOut, 'utf8'));
+      expect(parsed).toMatchObject({
+        laws: [
+          { name: 'law_a', corpusCount: 0 },
+          { name: 'law_b', corpusCount: 0 },
+        ],
+      });
+    }
+  });
+});

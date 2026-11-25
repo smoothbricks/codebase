@@ -87,12 +87,28 @@ export async function run(argv: readonly string[]): Promise<void> {
   const [file, outdir, ...rest] = argv;
   if (file === undefined || outdir === undefined) {
     throw new Error(
-      'bend-emit refuses: usage: bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--machine name:init=f,step=g,input=T[,handled=h]] [--cap N] [--manifest path]',
+      'bend-emit refuses: usage: bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--machine name:init=f,step=g,input=T[,handled=h]] [--cap N] [--no-corpus [all|a,b]] [--manifest path]',
     );
   }
   const opt = (name: string): string => {
     const i = rest.indexOf(name);
     return i >= 0 ? (rest[i + 1] ?? '') : '';
+  };
+  const parseNoCorpus = (): string[] => {
+    const i = rest.indexOf('--no-corpus');
+    if (i < 0) return [];
+    const next = rest[i + 1];
+    if (next === undefined || next === '' || next.startsWith('-')) return ['*'];
+    return next.split(',').filter(Boolean);
+  };
+  const parseNonNegativeInt = (name: string, fallback: number): number => {
+    const raw = opt(name);
+    if (raw === '') return fallback;
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error(`bend-emit refuses: ${name} must be a non-negative integer, got ${JSON.stringify(raw)}`);
+    }
+    return parsed;
   };
   const opts = (name: string): string[] => {
     const values: string[] = [];
@@ -132,12 +148,12 @@ export async function run(argv: readonly string[]): Promise<void> {
     functions: opt('--fns').split(',').filter(Boolean),
     laws: opt('--laws').split(',').filter(Boolean),
     machines,
-    cap: Number(opt('--cap') || '400'),
-    listLength: Number(opt('--len') || '3'),
-    adtDepth: Number(opt('--adt-depth') || '2'),
-    properties: Number(opt('--props') || '200'),
-    propertyLength: Number(opt('--prop-len') || '12'),
-    noCorpus: opt('--no-corpus').split(',').filter(Boolean),
+    cap: parseNonNegativeInt('--cap', 400),
+    listLength: parseNonNegativeInt('--len', 3),
+    adtDepth: parseNonNegativeInt('--adt-depth', 2),
+    properties: parseNonNegativeInt('--props', 200),
+    propertyLength: parseNonNegativeInt('--prop-len', 12),
+    noCorpus: parseNoCorpus(),
   });
   if (manifestPath) {
     mkdirSync(dirname(manifestPath), { recursive: true });

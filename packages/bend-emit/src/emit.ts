@@ -1403,6 +1403,7 @@ function baseCtorsOf(t: AdtTy): CtorInfo[] {
 }
 
 function corpus(params: Param[], cap: number): Val[][] {
+  if (cap <= 0) return [];
   // The cross product is never materialised: its rows are decoded by index, the first parameter most
   // significant, so a law of several structured parameters costs `cap` rows and not their product.
   const sets = params.map((p) => enumerate(p.ty, 0));
@@ -1864,7 +1865,9 @@ function emitRustCorpus(p: Program): string {
         : row.length === 1
           ? `(${rsExpr(valExpr(row[0] as Val))},)`
           : `(${row.map((v) => rsExpr(valExpr(v))).join(', ')})`;
-    o += `\n/// ${l.name} (${l.proven ? 'proven' : 'open'}): ${rows.length} enumerated cases.\npub fn corpus_${id(l.name)}() -> Vec<${tuple}> {\n  vec![\n${rows.map((row) => `    ${formatRow(row)},\n`).join('')}  ]\n}\n`;
+    const corpusBlock =
+      rows.length === 0 ? '{ vec![] }' : `{\n  vec![\n${rows.map((row) => `    ${formatRow(row)},\n`).join('')}  ]\n}`;
+    o += `\n/// ${l.name} (${l.proven ? 'proven' : 'open'}): ${rows.length} enumerated cases.\npub fn corpus_${id(l.name)}() -> Vec<${tuple}> ${corpusBlock}\n`;
     o += `/// ${l.name}'s seed and draw size: the same stream every target draws.\npub const SEED_${id(l.name).toUpperCase()}: u64 = ${seedOf(li)};\npub const PROPS_${id(l.name).toUpperCase()}: u64 = ${p.props};\npub const PROP_LEN_${id(l.name).toUpperCase()}: u64 = ${p.propLen};\n`;
     const pat =
       l.params.length === 0
@@ -2257,7 +2260,11 @@ function emitTsCorpus(p: Program): string {
   p.laws.forEach((l, li) => {
     const tuple = `[${l.params.map((x) => tsTy(x.ty)).join(', ')}]`;
     const rows = p.cases.get(l.name) ?? [];
-    o += `\n/** ${l.name} (${l.proven ? 'proven' : 'open'}): ${rows.length} enumerated cases. */\nexport function corpus_${id(l.name)}(): ${tuple}[] {\n  return [\n${rows.map((row) => `    [${row.map((v) => tsExpr(valExpr(v))).join(', ')}],\n`).join('')}  ];\n}\n`;
+    const corpusBlock =
+      rows.length === 0
+        ? '{ return []; }'
+        : `{\n  return [\n${rows.map((row) => `    [${row.map((v) => tsExpr(valExpr(v))).join(', ')}],\n`).join('')}  ];\n}`;
+    o += `\n/** ${l.name} (${l.proven ? 'proven' : 'open'}): ${rows.length} enumerated cases. */\nexport function corpus_${id(l.name)}(): ${tuple}[] ${corpusBlock}\n`;
     o += `/** ${l.name}'s seed and draw size: the same stream every target draws. */\nexport const SEED_${id(l.name).toUpperCase()} = ${seedOf(li)}n;\nexport const PROPS_${id(l.name).toUpperCase()} = ${p.props};\nexport const PROP_LEN_${id(l.name).toUpperCase()} = ${p.propLen};\n`;
     const pat = `[${l.params.map((x) => x.name).join(', ')}]`;
     const argList = l.params.map((x) => x.name).join(', ');
@@ -2961,7 +2968,10 @@ function emitBook({
     return { name: m.name, init: initFn, step: stepFn, handled: handledFn, stateTy, inputTy, inputs };
   });
   // A law whose arguments are structured data the driver builds itself lists no enumerated rows.
-  const cases = new Map(laws.map((l) => [l.name, noCorpus.includes(l.name) ? [] : corpus(l.params, cap)]));
+  const skipAllCorpus = noCorpus.includes('*') || (noCorpus.includes('all') && !laws.some((l) => l.name === 'all'));
+  const cases = new Map(
+    laws.map((l) => [l.name, skipAllCorpus || noCorpus.includes(l.name) ? [] : corpus(l.params, cap)]),
+  );
   const base = { fns: lowered, laws, cases };
   const prog: Program = {
     ...base,
@@ -3131,17 +3141,18 @@ function isBendErr(err: unknown): err is Bend.Err {
   );
 }
 
+function formatBendError(err: unknown): unknown {
+  return isBendErr(err) ? new Error(Bend.err_show(err)) : err;
+}
+
 /** Load a model and its imports, and accept it only after the bundled checker validates the book. */
 export async function checkBendFile(file: string): Promise<CheckedBendBook> {
   const book = Bend.book_nil();
-  await Bend.book_load(book, file, '', new Map());
   try {
+    await Bend.book_load(book, file, '', new Map());
     Bend.book_valid(book, 0);
   } catch (err) {
-    if (isBendErr(err)) {
-      throw new Error(Bend.err_show(err));
-    }
-    throw err;
+    throw formatBendError(err);
   }
   return {
     emit(options) {
@@ -3163,7 +3174,11 @@ export async function checkBendFile(file: string): Promise<CheckedBendBook> {
       }
     },
     skeleton(options) {
-      return generateSkeletons(book, options);
+      try {
+        return generateSkeletons(book, options);
+      } catch (err) {
+        throw formatBendError(err);
+      }
     },
   };
 }
