@@ -1065,7 +1065,10 @@ Find the symptom in the left column and follow the link.
 - **Rule.** A release is judged by a waiter's grant, never by the spawn's return: the descriptors whose release a peer
   observes (the supervisor's and the gateway's listeners and leases, the image lease and pin, the lifecycle locks) are
   fenced from creation by a process-wide fork lock that their close takes exclusively and that the spawns of
-  cowshed-core and the gateway hold shared, and only a descriptor handed across `exec` on purpose keeps custody.
+  cowshed-core and the gateway hold shared, and only a descriptor handed across `exec` on purpose keeps custody. For the
+  supervisor's socket lease (`.sock.lock`), the holder additionally unlinks the lease file under the lock on release, so
+  a transient copy holds only the unlinked inode and no longer delays a rebind on a fresh inode; the waiter path remains
+  for a holder whose release has not yet completed (11_shell.md §Protocol).
 - **Owners.** [11_shell.md §Protocol](./11_shell.md#protocol);
   [02_workspaces.md §Held locks: `cowshed lock` and `cowshed lock-holders`](./02_workspaces.md#held-locks-cowshed-lock-and-cowshed-lock-holders);
   [docs/disk-image-lifetime.md §Apple's expectations and close ownership](../../packages/cowshed/docs/disk-image-lifetime.md#apples-expectations-and-close-ownership)

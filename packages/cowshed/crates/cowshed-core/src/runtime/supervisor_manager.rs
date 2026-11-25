@@ -367,18 +367,26 @@ impl SupervisorManager {
     /// claimed the host.
     ///
     /// The same listing names the drain reports, and their temps, that supervisors killed while
-    /// they held their sockets left (11_shell.md "Recovering at daemon start"). Those beside no
-    /// listed socket have no recovery to wait for and are cleared here, each under its socket's
-    /// lease taken free; the rest are cleared by their socket's recovery once it found nothing
-    /// serving there.
+    /// they held their sockets left (11_shell.md "Recovering at daemon start"), and any orphan
+    /// socket lease files (`<digest>.sock.lock`, `<digest>.members.sock.lock`, `manager.sock.lock`)
+    /// a killed holder left with its socket absent. Drain residue beside no listed socket is
+    /// cleared here under its socket's lease taken free; orphan leases whose paired socket is
+    /// absent are swept under the named-lease protocol without creating or following links.
     pub fn recovery(self: &Arc<Self>) -> Recovery {
         let run = self.store_root.join("run");
         let mut sockets = BTreeSet::new();
+        let mut present_sockets = BTreeSet::new();
         let mut drains = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+        let mut orphan_leases = Vec::new();
         for entry in std::fs::read_dir(&run).into_iter().flatten().flatten() {
             let name = entry.file_name();
             if supervisor_socket::is_socket_name(&name) {
                 sockets.insert(entry.path());
+                present_sockets.insert(name);
+            } else if supervisor_socket::is_managed_socket_name(&name) {
+                present_sockets.insert(name);
+            } else if let Some(socket_name) = supervisor_socket::lease_socket_name(&name) {
+                orphan_leases.push((name, socket_name));
             } else if let Some(socket) = supervisor_socket::drain_residue(&run, &name) {
                 drains.entry(socket).or_default().push(entry.path());
             }
@@ -388,6 +396,11 @@ impl SupervisorManager {
             .partition(|(socket, _)| sockets.contains(socket));
         for (socket, residue) in unserved {
             supervisor_socket::clear_dead_drain(&socket, &residue);
+        }
+        for (lease_name, socket_name) in orphan_leases {
+            if !present_sockets.contains(&socket_name) {
+                supervisor_socket::sweep_orphan_lease(&run, &lease_name, &socket_name);
+            }
         }
         self.recovering
             .lock()
@@ -1570,7 +1583,7 @@ mod tests {
     /// The startup pass's one listing of `run` names the drain reports, and their temps, that
     /// supervisors killed while serving left. Beside no listed socket each is cleared then, under
     /// its socket's lease taken free. Beside a lease another process holds, or a listed socket
-    /// whose recovery has not found it unserved, it is kept; every lease file stays.
+    /// whose recovery has not found it unserved, it is kept; the released lease goes with it.
     #[test]
     fn the_startup_listing_clears_only_the_drain_residue_no_holder_owns() {
         let store = recovery_store("cowshed-drain-residue", &["raven"]);
@@ -1603,8 +1616,8 @@ mod tests {
             assert!(path.exists(), "{} was kept", path.display());
         }
         assert!(
-            gone_socket.with_extension("sock.lock").exists(),
-            "the lease stays"
+            !gone_socket.with_extension("sock.lock").exists(),
+            "the released lease is unlinked"
         );
         drop((recovery, holder));
     }
@@ -2019,7 +2032,10 @@ mod tests {
             })
             .collect();
         left.sort();
-        assert_eq!(left, ["other.sock.lock"], "no socket file is left behind");
+        assert!(
+            left.is_empty(),
+            "neither socket nor lease file is left behind: {left:?}"
+        );
     }
 
     /// A land step that meets a supervisor of another build waits on that process's exit: past

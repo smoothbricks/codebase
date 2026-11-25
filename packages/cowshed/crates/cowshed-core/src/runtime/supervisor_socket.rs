@@ -128,6 +128,13 @@ pub fn socket_path(
         .join(format!("{}.sock", &digest[..SOCKET_DIGEST_HEX]))
 }
 
+fn is_hex_digest(bytes: &[u8]) -> bool {
+    bytes.len() == SOCKET_DIGEST_HEX
+        && bytes
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Whether `name`, an entry of the store's `run` directory, is a workspace supervisor's socket:
 /// exactly the name [`socket_path`] gives one, its digest's first 32 lowercase hex digits and then
 /// `.sock`. Nothing else there is one: not the manager's `manager.sock`, not a supervisor's
@@ -137,12 +144,31 @@ pub fn is_socket_name(name: &OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     name.as_bytes()
         .strip_suffix(b".sock")
-        .is_some_and(|digest| {
-            digest.len() == SOCKET_DIGEST_HEX
-                && digest
-                    .iter()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        })
+        .is_some_and(is_hex_digest)
+}
+
+/// Whether `name` is a socket file managed through [`bind`]: a workspace supervisor socket
+/// (`<digest>.sock`), its membership twin (`<digest>.members.sock`), or `manager.sock`.
+pub(crate) fn is_managed_socket_name(name: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = name.as_bytes();
+    if bytes == b"manager.sock" {
+        return true;
+    }
+    if let Some(prefix) = bytes.strip_suffix(b".members.sock") {
+        return is_hex_digest(prefix);
+    }
+    bytes.strip_suffix(b".sock").is_some_and(is_hex_digest)
+}
+
+/// The paired socket file name for a socket lease entry of `<store>/run`:
+/// `<digest>.sock.lock` -> `<digest>.sock`, `<digest>.members.sock.lock` ->
+/// `<digest>.members.sock`, and `manager.sock.lock` -> `manager.sock`.
+pub(crate) fn lease_socket_name(name: &OsStr) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let socket = name.as_bytes().strip_suffix(b".lock")?;
+    let socket = std::ffi::OsString::from_vec(socket.to_vec());
+    is_managed_socket_name(&socket).then_some(socket)
 }
 /// Only the membership endpoint is exported to admitted children, never coordinator authority.
 pub const MEMBERSHIP_SOCKET_ENV: &str = "COWSHED_SUPERVISOR_SOCKET";
@@ -1022,27 +1048,70 @@ type Streams = Arc<Mutex<BTreeMap<JobId, mpsc::Sender<io::Result<Bytes>>>>>;
 /// workspace's grants and compile the profile for them.
 pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>>;
 
+/// Exclusive custody of a socket's named file lease (`<socket>.lock`). Dropping it unlinks the
+/// lease file under the held lock after verifying the name still names the locked inode, and then
+/// closes the fenced descriptor to release the flock (11_shell.md "Protocol").
+#[derive(Debug)]
+#[must_use = "dropping the socket lease unlinks and releases it"]
+pub(crate) struct SocketLease {
+    /// Held parent directory so the unlink cannot follow a replaced parent.
+    directory: std::fs::File,
+    /// Lease file leaf name beneath `directory`.
+    name: CString,
+    /// Full path, for diagnostics only.
+    path: PathBuf,
+    /// Locked descriptor, declared last so it drops — releasing the flock — only after
+    /// `Drop::drop` has unlinked the name under the lock.
+    file: Fenced<std::fs::File>,
+}
+
+impl Drop for SocketLease {
+    fn drop(&mut self) {
+        match flock::names_file(&self.directory, &self.name, &self.file) {
+            Ok(true) => {
+                if let Err(error) = flock::unlink_at(&self.directory, &self.name, 0)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    cowshed_os::eprintln!(
+                        "cowshed: cannot remove released socket lease {}: {error}",
+                        self.path.display()
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => cowshed_os::eprintln!(
+                "cowshed: cannot inspect released socket lease {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+}
+
 /// Shared custody of one supervisor socket's existing fenced file lease.
 ///
-/// The last drop releases that flock. Cloning does not take a new lock, path, or marker.
+/// The last drop unlinks the lease file under the lock and releases that flock. Cloning does not
+/// take a new lock, path, or marker.
 #[derive(Clone, Debug)]
 #[must_use = "dropping the last clone releases the supervisor socket lease"]
 pub struct PublicationLease {
-    _lease: Arc<Fenced<std::fs::File>>,
+    _lease: Arc<SocketLease>,
 }
 
 /// Exclusive ownership of a workspace's supervisor socket, held while serving it or changing
-/// its substrate. The persistent file lease, the inode its name names, serializes binders; an older build is drained before
-/// a new build binds, and the occupant probe still refuses any live inherited listener. The
-/// listener and the lease are fenced: once either is closed, no child still being spawned holds
-/// it, so the next binder finds the socket stopped and the lease free (`fork_lock`), unless a
-/// [`PublicationLease`] still shares that same lease.
+/// its substrate. The named file lease, the inode its name names, serializes binders; an older
+/// build is drained before a new build binds, and the occupant probe still refuses any live
+/// inherited listener. The listener and the lease are fenced: once either is closed, no child
+/// still being spawned holds it, so the next binder finds the socket stopped and the lease free
+/// (`fork_lock`), unless a [`PublicationLease`] still shares that same lease. When the last owner
+/// of the lease drops — after `Drop::drop` removes the socket inode and drain report and after
+/// `listener` closes — [`SocketLease::drop`] unlinks the lease file under the lock before
+/// releasing it.
 #[derive(Debug)]
 #[must_use = "hold the socket until serving or the workspace mutation has finished"]
 pub struct BoundSocket {
     pub(super) listener: Fenced<UnixListener>,
     /// The socket flock, shared with every [`PublicationLease`] taken from it.
-    _lease: Arc<Fenced<std::fs::File>>,
+    _lease: Arc<SocketLease>,
     /// Where its socket file is: the workspace's socket path once published, a private name
     /// before.
     path: PathBuf,
@@ -1227,27 +1296,32 @@ fn lease_error<L>(
 fn take_lease(
     path: &Path,
     open: impl FnMut(&std::fs::File, &std::ffi::CStr) -> io::Result<Fenced<std::fs::File>>,
-) -> Result<Option<Fenced<std::fs::File>>> {
+) -> Result<Option<SocketLease>> {
     let (directory, lease, name) = lease_name(path)?;
-    flock::lock_named(
+    match flock::lock_named(
         || cowshed_os::fsio::open_directory_nofollow(directory),
         &name,
         LeaseMode::Exclusive,
         open,
-    )
-    .map(|taken| taken.map(|(_, lease)| lease))
-    .map_err(|error| {
-        lease_error(path, &lease, error, |error| {
+    ) {
+        Ok(Some((directory, file))) => Ok(Some(SocketLease {
+            directory,
+            name,
+            path: lease,
+            file,
+        })),
+        Ok(None) => Ok(None),
+        Err(error) => Err(lease_error(path, &lease, error, |error| {
             socket_error(path, "lock the socket lease of", error)
-        })
-    })
+        })),
+    }
 }
 
 /// The lease beside the socket at `path`, taken as [`take_lease`] takes it but as a waiter
 /// ([`flock::lock_named_within`]) within the no-progress bound
 /// ([`cowshed_os::test_backstop::NO_PROGRESS`]), once, with no retry. A holder past the bound is
 /// refused as [`bind`] refuses one, named as `census` reads it.
-fn await_lease(path: &Path, census: &CensusScope) -> Result<Fenced<std::fs::File>> {
+fn await_lease(path: &Path, census: &CensusScope) -> Result<SocketLease> {
     let (directory, lease, name) = lease_name(path)?;
     let deadline = cowshed_os::deadline::start(
         "supervisor-socket-lease",
@@ -1256,17 +1330,21 @@ fn await_lease(path: &Path, census: &CensusScope) -> Result<Fenced<std::fs::File
             cowshed_os::test_backstop::NO_PROGRESS,
         ),
     );
-    flock::lock_named_within(
+    match flock::lock_named_within(
         || cowshed_os::fsio::open_directory_nofollow(directory),
         &name,
         &lease,
         &deadline,
         |lock| crate::held_lock::holders(census, lock),
         flock::open_lock,
-    )
-    .map(|(_, lease)| lease)
-    .map_err(|error| {
-        lease_error(path, &lease, error, |error| match error {
+    ) {
+        Ok((directory, file)) => Ok(SocketLease {
+            directory,
+            name,
+            path: lease,
+            file,
+        }),
+        Err(error) => Err(lease_error(path, &lease, error, |error| match error {
             flock::LockError::Expired(expired) => CowshedError::conflict(
                 format!(
                     "a supervisor or lifecycle operation owns {}: {expired}",
@@ -1277,15 +1355,15 @@ fn await_lease(path: &Path, census: &CensusScope) -> Result<Fenced<std::fs::File
             flock::LockError::Io { source, .. } => {
                 socket_error(path, "lock the socket lease of", source)
             }
-        })
-    })
+        })),
+    }
 }
 
 /// The lease of the supervisor socket at `path`, taken without waiting while no supervisor
 /// serves it, so that none binds there until it is dropped; `None` while a supervisor serves it
 /// or another lifecycle operation holds the lease. Making room for an attach detaches a workspace
 /// only under it (media_room.rs).
-pub(crate) fn lease_unserved(path: &Path) -> Result<Option<Fenced<std::fs::File>>> {
+pub(crate) fn lease_unserved(path: &Path) -> Result<Option<SocketLease>> {
     let Some(lease) = take_lease(path, flock::open_lock)? else {
         return Ok(None);
     };
@@ -1294,6 +1372,98 @@ pub(crate) fn lease_unserved(path: &Path) -> Result<Option<Fenced<std::fs::File>
     {
         Occupant::Live => Ok(None),
         Occupant::Absent | Occupant::Stopped => Ok(Some(lease)),
+    }
+}
+
+/// Sweep an orphan socket lease file `lease_name` in `run` whose paired `socket_name` is absent,
+/// under the named-lease protocol without creating or following links: open no-follow without
+/// `O_CREAT`, try the exclusive lock non-blocking, recheck that `lease_name` still names the
+/// locked inode and that `socket_name` is still absent, and unlink while holding the lock.
+pub(crate) fn sweep_orphan_lease(run: &Path, lease_name: &OsStr, socket_name: &OsStr) {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let (Ok(lease_cstr), Ok(socket_cstr)) = (
+        CString::new(lease_name.as_bytes()),
+        CString::new(socket_name.as_bytes()),
+    ) else {
+        return;
+    };
+    let directory = match cowshed_os::fsio::open_directory_nofollow(run) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: cannot open {} to sweep orphan lease {}: {error}",
+                run.display(),
+                run.join(lease_name).display()
+            );
+            return;
+        }
+    };
+    let file = match flock::open_existing_lock(&directory, &lease_cstr) {
+        Ok(Some(file)) => file,
+        Ok(None) => return,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: kept orphan lease {}: {error}",
+                run.join(lease_name).display()
+            );
+            return;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return,
+        Err(std::fs::TryLockError::Error(error)) => {
+            cowshed_os::eprintln!(
+                "cowshed: cannot lock orphan lease {}: {error}",
+                run.join(lease_name).display()
+            );
+            return;
+        }
+    }
+    match flock::names_file(&directory, &lease_cstr, &file) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: cannot inspect orphan lease {}: {error}",
+                run.join(lease_name).display()
+            );
+            return;
+        }
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `directory` and NUL-terminated `socket_cstr` outlive the call;
+    // AT_SYMLINK_NOFOLLOW checks the entry itself without following links.
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            socket_cstr.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        return;
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::NotFound {
+        cowshed_os::eprintln!(
+            "cowshed: cannot inspect socket {} before sweeping orphan lease {}: {error}",
+            run.join(socket_name).display(),
+            run.join(lease_name).display()
+        );
+        return;
+    }
+    if let Err(error) = flock::unlink_at(&directory, &lease_cstr, 0)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        cowshed_os::eprintln!(
+            "cowshed: cannot remove orphan lease {}: {error}",
+            run.join(lease_name).display()
+        );
     }
 }
 
@@ -1333,7 +1503,7 @@ pub async fn bind_released(path: &Path, census: &CensusScope) -> Result<BoundSoc
 }
 
 /// Bind the supervisor's socket at `path` under `lease`, its lease, already held.
-fn bind_leased(path: &Path, lease: Fenced<std::fs::File>) -> Result<BoundSocket> {
+fn bind_leased(path: &Path, lease: SocketLease) -> Result<BoundSocket> {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = path.parent().ok_or_else(|| {
         CowshedError::internal(format!(
@@ -4382,15 +4552,19 @@ mod socket_ownership_tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// A released socket's lease can stay held after its owner's close by a spawn's transient
-    /// copy (01c_macos.md, "`posix_spawnp` leaves transient descriptor copies"). The forked child
-    /// here is that copy: a probe is refused while it lives, and the released binder is granted
-    /// the lease once it closes.
+    /// A spawn's transient copy of a released socket lease (`01c_macos.md`, "`posix_spawnp` leaves
+    /// transient descriptor copies") holds the flock only on the unlinked inode its owner removed
+    /// on release. Because the copy is not a binder and never acts on the lease, and the holder
+    /// unlinks the name under the lock before releasing it, a probe `bind` succeeds at once on a
+    /// fresh inode while the copy still lives, and the rebinding waiter path (`bind_released`)
+    /// succeeds the same way.
     #[tokio::test]
-    async fn a_released_socket_is_rebound_once_a_transient_copy_of_its_lease_closes() {
+    async fn a_transient_copy_of_a_released_lease_no_longer_delays_its_rebind() {
         use std::os::fd::AsRawFd as _;
         let path = path();
+        let lease_path = path.with_extension("sock.lock");
         let socket = bind(&path).await.unwrap();
+        let old_inode = inode(&lease_path);
         let (gate, release) = cowshed_os::fork_lock::create(std::io::pipe).unwrap();
         let (gate_fd, release_fd) = (gate.as_raw_fd(), release.as_raw_fd());
         // SAFETY: the child calls only `close`, `read` and `_exit`, which are async-signal-safe,
@@ -4408,32 +4582,30 @@ mod socket_ownership_tests {
         }
         drop(gate);
         drop(socket);
-        assert_eq!(
-            bind(&path).await.unwrap_err().code,
-            crate::ErrorCode::Conflict,
-            "a probe finds the copy holding the lease"
-        );
-        // The binder starts while the copy holds the lease: its task runs until it awaits its
-        // blocking take, already handed to another thread, before the copy is let go. The copy's
-        // exit, a process teardown, then follows that take in practice, though nothing orders the
-        // two; the probe's refusal above is the ordered half.
-        let (started, start) = tokio::sync::oneshot::channel();
-        let rebound = tokio::spawn({
-            let path = path.clone();
-            async move {
-                let _ = started.send(());
-                bind_released(&path, &crate::census::this_test()).await
-            }
-        });
-        start.await.unwrap();
-        drop(release);
-        let rebound = rebound
+
+        let probed = bind(&path)
             .await
-            .unwrap()
-            .expect("the copy's close grants the released binder the lease");
+            .expect("a probe binds at once while a transient copy holds only the unlinked inode");
+        let fresh_inode = inode(&lease_path);
+        assert_ne!(
+            fresh_inode, old_inode,
+            "the rebind must take a fresh lease inode, not the unlinked one held by the copy"
+        );
+        drop(probed);
+
+        let rebound = bind_released(&path, &crate::census::this_test())
+            .await
+            .expect("the rebinding waiter path succeeds on a fresh lease inode");
+        assert_ne!(
+            inode(&lease_path),
+            old_inode,
+            "the waiter path also takes a fresh lease inode"
+        );
+        drop(release);
         cowshed_os::test_backstop::waitpid(copy, 0).unwrap();
         drop(rebound);
         assert!(!path.exists());
+        assert!(entries(&path).is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -4507,7 +4679,7 @@ mod socket_ownership_tests {
         assert_eq!(inode(&path), before);
         let listener = held.listen(8).unwrap();
         accepts(&listener, &path).await;
-        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+        assert_eq!(entries(&path), ["s.sock"]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -4567,7 +4739,7 @@ mod socket_ownership_tests {
         accepts(&socket.listener, &path).await;
         assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
         drop(socket);
-        assert_eq!(entries(&path), ["s.sock.lock"]);
+        assert!(entries(&path).is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -4701,7 +4873,7 @@ mod socket_ownership_tests {
             crate::ErrorCode::Conflict
         );
         assert_eq!(inode(&path), held);
-        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+        assert_eq!(entries(&path), ["s.sock"]);
 
         drop(holder_input);
         while !matches!(occupant(&path), Ok(Occupant::Stopped)) {
@@ -4712,7 +4884,7 @@ mod socket_ownership_tests {
         assert_ne!(inode(&path), held);
         accepts(&socket.listener, &path).await;
         drop(socket);
-        assert_eq!(entries(&path), ["s.sock.lock"]);
+        assert!(entries(&path).is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -4747,7 +4919,7 @@ mod socket_ownership_tests {
             crate::ErrorCode::EnvironmentMissing
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
-        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+        assert_eq!(entries(&path), ["s.sock"]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -4796,7 +4968,7 @@ mod socket_ownership_tests {
             match (replacement.is_some(), taken) {
                 (true, None) => {}
                 (false, Some(lease)) => {
-                    let locked = lease.metadata().unwrap().ino();
+                    let locked = lease.file.metadata().unwrap().ino();
                     assert_eq!(locked, inode(&lease_at), "{case}");
                     assert_ne!(locked, removed, "{case}");
                 }
@@ -4811,8 +4983,8 @@ mod socket_ownership_tests {
     }
 
     /// A supervisor's drain report is written only while its socket is held: releasing the
-    /// socket withdraws the report, and a task of the supervisor that publishes after the release,
-    /// as a requester's exit watch can, writes nothing. The lease itself stays.
+    /// socket withdraws the report and unlinks the lease, and a task of the supervisor that
+    /// publishes after the release, as a requester's exit watch can, writes nothing.
     #[tokio::test]
     async fn a_released_socket_withdraws_its_drain_report_and_lets_no_later_one_be_written() {
         let path = path();
@@ -4825,14 +4997,13 @@ mod socket_ownership_tests {
         assert_eq!(entries(&path), ["s.drain", "s.sock", "s.sock.lock"]);
 
         drop(socket);
-        assert_eq!(entries(&path), ["s.sock.lock"]);
+        assert!(entries(&path).is_empty());
         report.stuck(
             "retire",
             &CowshedError::internal("published after the release"),
         );
-        assert_eq!(
-            entries(&path),
-            ["s.sock.lock"],
+        assert!(
+            entries(&path).is_empty(),
             "a publication after the release writes nothing"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -4874,7 +5045,7 @@ mod socket_ownership_tests {
 
     /// A killed supervisor's drain report and temps go only under its socket's lease, taken free,
     /// with no socket attached: a holder of the lease and a live listener each keep them. A file
-    /// named like a temp that is no regular file is kept, and so is the lease.
+    /// named like a temp that is no regular file is kept; the lease goes when it is released.
     #[tokio::test]
     async fn a_dead_drain_report_is_cleared_only_under_its_free_lease_with_nothing_serving() {
         let root = path().parent().unwrap().to_owned();
@@ -4922,8 +5093,8 @@ mod socket_ownership_tests {
             "the report and its temp go; a link named like a temp is kept"
         );
         assert!(
-            socket.with_extension("sock.lock").exists(),
-            "the lease stays"
+            !socket.with_extension("sock.lock").exists(),
+            "the lease is unlinked on release"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

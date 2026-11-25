@@ -381,6 +381,38 @@ pub fn open_lock(directory: &File, name: &CStr) -> io::Result<Fenced<File>> {
     Ok(lock)
 }
 
+/// Open an existing lock file `name` beneath `directory` without creating it and without
+/// following a link, fenced from the open on (`fork_lock`). Returns `Ok(None)` when absent; a
+/// symlink (`ELOOP`) or non-regular file is an error, never followed or created.
+pub fn open_existing_lock(directory: &File, name: &CStr) -> io::Result<Option<Fenced<File>>> {
+    // SAFETY: the held directory fd and NUL-terminated leaf outlive the call. NOFOLLOW refuses a
+    // link at the leaf without creating anything.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: a successful openat returned a new owned file descriptor.
+    let lock = Fenced::new(unsafe { File::from_raw_fd(fd) });
+    if !lock.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lock is not a regular file",
+        ));
+    }
+    Ok(Some(lock))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
