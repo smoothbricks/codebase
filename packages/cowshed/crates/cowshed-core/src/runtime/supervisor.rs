@@ -661,8 +661,9 @@ pub struct CpuPlacement {
     /// A held job (05_gateway.md "Held jobs"): its tree runs under the hold its supervisor took,
     /// so its own mbx work takes no permits of its own.
     pub held: bool,
-    /// When the job was admitted, in milliseconds since 1970: interactive work names it to mbx,
-    /// whose pool decays the job's later asks as it ages ([`super::placement::DecayStep`]).
+    /// When the job was admitted, in milliseconds since 1970: interactive work names it beside its
+    /// host-unique id to mbx, whose pool records the job's first admitted ask under that key and
+    /// decays its later asks from it ([`super::placement::DecayStep`]).
     pub started_ms: u64,
     /// The nice the job's class is placed at ([`super::placement::placed_nice`]): on the command
     /// itself, or on the class cgroup its job's own cgroup sits in.
@@ -675,12 +676,14 @@ impl CpuPlacement {
     /// are sized to the count where the caller named none (05_gateway.md "Cargo reads its holder's
     /// jobserver"). In a project with the mbx capability (`mbx`), the job's priority in mbx's one
     /// pool follows its class ([`super::job_admission::PoolPriority`]), interactive work names its
-    /// start, from which mbx decays its asks, and its count is each Cargo build's ceiling,
-    /// `CARGO_BUILD_JOBS`, not a reservation around it (05_gateway.md, "Classes", "Parallelism
-    /// inside a job"). Cargo keeps the job's fifo: it bounds that build tree's own fan-out, never
-    /// host capacity, which only mbx's pool admits.
+    /// start and host-unique id so mbx decays its asks from its first admitted ask, and its count
+    /// is each Cargo build's ceiling, `CARGO_BUILD_JOBS`, not a reservation around it
+    /// (05_gateway.md, "Classes", "Parallelism inside a job"). Cargo keeps the job's fifo: it
+    /// bounds that build tree's own fan-out, never host capacity, which only mbx's pool admits.
     pub(super) fn environment(
         &self,
+        incarnation: &WorkspaceIncarnation,
+        job_id: JobId,
         caller: &BTreeMap<String, String>,
         mbx: bool,
     ) -> Vec<(OsString, OsString)> {
@@ -714,16 +717,19 @@ impl CpuPlacement {
                 priority.clone(),
             ));
             environment.push((OsString::from("MBX_SCHEDULER_PRIORITY"), priority));
-            // Only interactive work decays from its start; every other job names an empty one, which
-            // mbx reads as none, so a job never inherits the start of the interactive job that ran it.
-            environment.push((
-                OsString::from("MBX_SCHEDULER_JOB_STARTED_MS"),
-                if super::placement::decays(self.class) {
-                    OsString::from(self.started_ms.to_string())
-                } else {
-                    OsString::new()
-                },
-            ));
+            // Only interactive work decays from its first admitted ask; every other job names
+            // empty start and id, which mbx reads as none, so a job never inherits the clock of
+            // the interactive job that ran it.
+            let (started_ms, mbx_job_id) = if super::placement::decays(self.class) {
+                (
+                    OsString::from(self.started_ms.to_string()),
+                    OsString::from(super::placement::host_job_id(incarnation, job_id)),
+                )
+            } else {
+                (OsString::new(), OsString::new())
+            };
+            environment.push((OsString::from("MBX_SCHEDULER_JOB_STARTED_MS"), started_ms));
+            environment.push((OsString::from("MBX_SCHEDULER_JOB_ID"), mbx_job_id));
             environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens.clone()));
             if self.held {
                 // What `mbx reserve` gives its own command: nested mbx work runs under the hold,
@@ -760,6 +766,9 @@ mod cpu_placement_tests {
     /// "Parallelism inside a job").
     #[test]
     fn an_mbx_job_names_its_pool_priority_and_cargo_ceiling_and_a_plain_job_neither() {
+        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+            .expect("static incarnation");
+        let job_id = JobId::new(7).expect("seven");
         for (class, mbx, held, priority) in [
             (ExecClass::Interactive, true, false, Some("interactive")),
             (ExecClass::Gate, true, false, Some("normal")),
@@ -783,7 +792,7 @@ mod cpu_placement_tests {
                 nice: 10,
             };
             let exported: BTreeMap<OsString, OsString> = placement
-                .environment(&BTreeMap::new(), mbx)
+                .environment(&incarnation, job_id, &BTreeMap::new(), mbx)
                 .into_iter()
                 .collect();
             let read = |name: &str| {
@@ -855,12 +864,18 @@ mod cpu_placement_tests {
             started_ms: 0,
             nice: 10,
         };
+        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+            .expect("static incarnation");
+        let job_id = JobId::new(1).expect("one");
         let exported = |caller: &[(&str, &str)]| -> BTreeMap<OsString, OsString> {
             let caller = caller
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect();
-            placement.environment(&caller, false).into_iter().collect()
+            placement
+                .environment(&incarnation, job_id, &caller, false)
+                .into_iter()
+                .collect()
         };
         let read = |exported: &BTreeMap<OsString, OsString>, name: &str| {
             exported
@@ -916,25 +931,33 @@ mod cpu_placement_tests {
             None,
         )
         .expect("the workspace environment");
-        for (class, priority) in [
-            (ExecClass::Gate, "normal"),
-            (ExecClass::Interactive, "interactive"),
-            (ExecClass::Background, "low"),
+        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+            .expect("static incarnation");
+        let job_id = JobId::new(7).expect("seven");
+        for (class, priority, started, mbx_job_id) in [
+            (ExecClass::Gate, "normal", "", ""),
+            (
+                ExecClass::Interactive,
+                "interactive",
+                "1700000000000",
+                "job-0198f2c0b7e34dc795f17b238b331c80-7",
+            ),
+            (ExecClass::Background, "low", "", ""),
         ] {
             let placement = CpuPlacement {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::new(4).expect("four"),
                 class,
                 held: false,
-                started_ms: 0,
+                started_ms: 1_700_000_000_000,
                 nice: 10,
             };
             let output = std::process::Command::new("/bin/sh")
                 .env_clear()
-                .envs(placement.environment(&BTreeMap::new(), true))
+                .envs(placement.environment(&incarnation, job_id, &BTreeMap::new(), true))
                 .args([
                     "-c",
-                    ". \"$1\"; printf %s \"$MBX_SCHEDULER_PRIORITY\"",
+                    ". \"$1\"; printf '%s|%s|%s' \"$MBX_SCHEDULER_PRIORITY\" \"$MBX_SCHEDULER_JOB_STARTED_MS\" \"$MBX_SCHEDULER_JOB_ID\"",
                     "job",
                 ])
                 .arg(root.join(crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH))
@@ -943,7 +966,7 @@ mod cpu_placement_tests {
             assert!(output.status.success(), "{output:?}");
             assert_eq!(
                 String::from_utf8_lossy(&output.stdout),
-                priority,
+                format!("{priority}|{started}|{mbx_job_id}"),
                 "{class:?}"
             );
         }
@@ -2801,6 +2824,7 @@ impl SpawnSink for SystemSpawnSink {
                 shells.spawn(
                     super::shell_job::PooledSpawn {
                         job_id: request.job_id,
+                        incarnation: &request.authority.workspace_incarnation,
                         command,
                         cwd,
                         profile,
@@ -2938,7 +2962,12 @@ async fn prepare_spawn(
         .capabilities
         .active
         .contains(&crate::capabilities::CapabilityId::Mbx);
-    environment.extend(request.cpu.environment(&request.env, mbx));
+    environment.extend(request.cpu.environment(
+        &request.authority.workspace_incarnation,
+        request.job_id,
+        &request.env,
+        mbx,
+    ));
     if let Some(program) = argv.first() {
         // Shell activation, when the profile has one, sets PATH inside the sandbox.
         let path = sandbox
@@ -3004,6 +3033,8 @@ fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio:
         .envs(caller_environment(&request.env))
         .envs(
             request.cpu.environment(
+                &request.authority.workspace_incarnation,
+                request.job_id,
                 &request.env,
                 request
                     .policy

@@ -13,7 +13,8 @@
 //! What a caller asks of either is the same: the nice a class is placed at ([`placed_nice`]) and
 //! a step of interactive work's decay ([`decay_group`]).
 
-use crate::api::dto::ExecClass;
+use crate::api::dto::{ExecClass, JobId};
+use crate::metadata::WorkspaceIncarnation;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -43,9 +44,10 @@ pub const fn class_nice(class: ExecClass) -> i32 {
 pub const INTERACTIVE_TO_GATE: Duration = Duration::from_secs(120);
 /// When interactive work runs at background's nice: work this long is no edit's quick feedback.
 pub const INTERACTIVE_TO_BACKGROUND: Duration = Duration::from_secs(240);
-/// A step of interactive work's decay (05_gateway.md "Classes"): when after the job's start it
-/// comes, and the class whose nice the job's group runs at from then. mbx decays the job's asks in
-/// its pool from the start the job names (`MBX_SCHEDULER_JOB_STARTED_MS`).
+/// A step of interactive work's decay (05_gateway.md "Classes"): when after the job's start its
+/// kernel nice steps, and the class whose nice the job's group runs at from then. mbx decays the
+/// job's asks in its pool from the job's first admitted ask, keyed by (`MBX_SCHEDULER_JOB_ID`,
+/// `MBX_SCHEDULER_JOB_STARTED_MS`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecayStep {
     ToGate,
@@ -77,4 +79,13 @@ impl DecayStep {
 /// short requests over a long life, and its age says nothing of any one request's.
 pub const fn decays(class: ExecClass) -> bool {
     matches!(class, ExecClass::Interactive)
+}
+
+/// The prefix of every host-unique job name (`job-<incarnation>-<id>`).
+pub(crate) const JOB_NAME_PREFIX: &str = "job-";
+
+/// The host-unique name of `job_id` in `incarnation`: `job-<incarnation>-<id>`, shared by the
+/// Linux job cgroup (05_gateway.md "Classes") and `MBX_SCHEDULER_JOB_ID`.
+pub(crate) fn host_job_id(incarnation: &WorkspaceIncarnation, job_id: JobId) -> String {
+    format!("{JOB_NAME_PREFIX}{}-{}", incarnation.as_str(), job_id.get())
 }

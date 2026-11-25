@@ -1832,33 +1832,41 @@ and its nice, never its class, its cgroup or its record's class). The table owns
 pressure policy. With mbx selected, all classes use its admission and pressure policy ("Memory pressure"). mbx's pool
 has three bands, `interactive` before `normal` before `low`, each ordered shortest predicted first with aging ("Held
 jobs", Order). The land gate has `MBX_SCHEDULER_PRIORITY=normal`; background and resident work has `low`; interactive
-work has `interactive` and decays by how long its job has run when it asks: its asks are `interactive` for its job's
-first 120 s, then `normal`, the gate's band, until 240 s, then `low`. So a check, lint or test an agent waits on after
-an edit runs ahead of the gate's waiting leaves, and a run that turns out long stops crowding interactive work and then
-gates. The decay is stateless: the supervisor exports an interactive job's start as `MBX_SCHEDULER_JOB_STARTED_MS`
-(every other job exports it empty, so a job started inside an interactive one never inherits its clock), mbx computes
-each ask's band from it when the ask enters the queue and names a decayed band in its decision record, and nothing
-already granted is re-ranked, since nothing is preempted. The kernel follows at the same bounds: the supervisor re-nices
-the job's process group to the gate's nice at 120 s and to background's at 240 s. A step writes nothing to the job's
-output: it is one `info` row of the job's span (`job.decayed.gate`, `job.decayed.background`; 13_telemetry.md, "Job span
-segments"), a transition recorded for its own reason, and mbx's decision row names each decayed ask (on Linux, where a
-job's cgroup cannot move between class cgroups, the nice step is skipped, its row still recorded, and the pool band
-alone decays). An interactive-resident's age says nothing of any one request it serves, so its requests decay, each from
-its own start: it names a request's start to the work that request starts, as `MBX_SCHEDULER_JOB_STARTED_MS`, and mbx
-decays that request's asks as it decays an interactive job's, so a long check a live turn awaits stops outranking a
-land's gate at the same bounds. Its process's nice does not step, since it goes on to serve later requests and a nice is
-never raised again: its decay is the pool band's alone. Interactive work is never held: like a gate, its leaves are
-admitted one by one (`cowshed exec --class interactive` refuses `--want`). The owner's rulings, 2026-11-10: "a coding
-agent must be able to execute 1 test under interactive, above background", with the decay through the gate's band to
-background, at bounds the measurements choose. Measured 2026-11-10 (edit-feedback runs from agent transcripts replayed
-through the lane model, 12 configurations of 24 paired seeds): against 30 s and 120 s, 120 s and 240 s cut the p95 from
-edit to result by 27 s and raised the share of runs that finish within 240 s, the window a coder's prompt cache stays
-warm, from 97.9 to 98.8 %, for 2.8 % more gate span; the p95 is flat for a first bound from 115 to 145 s, and the gate's
-span prices a second bound past 240 to 280 s. The same mapping supplies `mbx reserve --priority` and the priority of a
-leaf's request to its Nx run's reservation endpoint. The supervisor exports the job's value again as
-`COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical `low`, so a shell activation
-inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31 every reservation of a
-downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create another pool.
+work has `interactive` and decays by how long its job has run since its first admitted ask: its asks are `interactive`
+for 120 s from that first admission, then `normal`, the gate's band, until 240 s, then `low`. So a check, lint or test
+an agent waits on after an edit runs ahead of the gate's waiting leaves, and a run that turns out long stops crowding
+interactive work and then gates — and crowding needs cores, so time spent before a job's first grant does not count
+against it (measured: a job 274 s old at its first ask entered at `low` and waited 13 min; replaying the 2026-11-10
+calibration with the first-admission clock moves gate span +0.1 % and edit-to-result p95 +0.1 s, within noise). Given
+that recorded first admission, the decay is stateless per ask: the supervisor exports an interactive job's start as
+`MBX_SCHEDULER_JOB_STARTED_MS` and its incarnation-qualified id (`job-<incarnation>-<id>`, unique across the host's
+supervisors) as `MBX_SCHEDULER_JOB_ID` (every other job exports both empty, so a job started inside an interactive one
+never inherits its clock); mbx records the job's first admission in its pool state keyed by `(id, start)`, computes each
+ask's band from it when the ask enters the queue, and names a decayed band in its decision record, and nothing already
+granted is re-ranked, since nothing is preempted. That record expires with the last lease or waiter carrying the job's
+key, and a restart of mbx's pool state loses nothing but the band of jobs already running past their bound. The
+supervisor's kernel nice step stays on the job's start, since the supervisor sees no mbx grant: it re-nices the job's
+process group to the gate's nice at 120 s and to background's at 240 s. A step writes nothing to the job's output: it is
+one `info` row of the job's span (`job.decayed.gate`, `job.decayed.background`; 13_telemetry.md, "Job span segments"), a
+transition recorded for its own reason, and mbx's decision row names each decayed ask (on Linux, where a job's cgroup
+cannot move between class cgroups, the nice step is skipped, its row still recorded, and the pool band alone decays). An
+interactive-resident's age says nothing of any one request it serves, so its requests decay, each from its own first
+admitted ask: it names a request's start and id to the work that request starts, as `MBX_SCHEDULER_JOB_STARTED_MS` and
+`MBX_SCHEDULER_JOB_ID`, and mbx decays that request's asks as it decays an interactive job's, so a long check a live
+turn awaits stops outranking a land's gate at the same bounds. Its process's nice does not step, since it goes on to
+serve later requests and a nice is never raised again: its decay is the pool band's alone. Interactive work is never
+held: like a gate, its leaves are admitted one by one (`cowshed exec --class interactive` refuses `--want`). The owner's
+rulings, 2026-11-10: "a coding agent must be able to execute 1 test under interactive, above background", with the decay
+through the gate's band to background, at bounds the measurements choose. Measured 2026-11-10 (edit-feedback runs from
+agent transcripts replayed through the lane model, 12 configurations of 24 paired seeds): against 30 s and 120 s, 120 s
+and 240 s cut the p95 from edit to result by 27 s and raised the share of runs that finish within 240 s, the window a
+coder's prompt cache stays warm, from 97.9 to 98.8 %, for 2.8 % more gate span; the p95 is flat for a first bound from
+115 to 145 s, and the gate's span prices a second bound past 240 to 280 s. The same mapping supplies
+`mbx reserve --priority` and the priority of a leaf's request to its Nx run's reservation endpoint. The supervisor
+exports the job's value again as `COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical
+`low`, so a shell activation inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31
+every reservation of a downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create
+another pool.
 
 | Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Without mbx: waits on memory pressure | Without mbx: ended at macOS Critical |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------ |

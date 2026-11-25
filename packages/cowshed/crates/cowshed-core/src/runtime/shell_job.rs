@@ -162,6 +162,7 @@ impl PreparedWarmIo {
 /// One command admitted to run in a warm shell.
 pub(super) struct PooledSpawn<'a> {
     pub job_id: JobId,
+    pub incarnation: &'a crate::metadata::WorkspaceIncarnation,
     /// Where the command is placed before it runs anything of the job's.
     pub placement: CommandPlacement,
     pub command: HostCommand,
@@ -207,6 +208,7 @@ impl WorkspaceShells {
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
         let PooledSpawn {
+            incarnation,
             job_id,
             command,
             cwd,
@@ -266,7 +268,7 @@ impl WorkspaceShells {
         };
         // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
         let mut overlay = environment.overlay(caller);
-        overlay.extend(cpu.environment(caller, mbx));
+        overlay.extend(cpu.environment(incarnation, job_id, caller, mbx));
         let stdout =
             tokio::net::unix::pipe::Receiver::from_owned_fd(stdout_read).map_err(pipe_error)?;
         let stderr =

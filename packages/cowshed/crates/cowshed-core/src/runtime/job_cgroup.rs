@@ -78,6 +78,7 @@ use crate::api::resources::{
 use crate::metadata::WorkspaceIncarnation;
 use crate::runtime::live_membership::{LiveMember, LiveMembership};
 use crate::runtime::placement::linux::ClassCgroup;
+use crate::runtime::placement::{JOB_NAME_PREFIX as JOB_PREFIX, host_job_id};
 
 /// Where the unified cgroup hierarchy is mounted.
 pub const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
@@ -88,8 +89,6 @@ pub const CONTROLLER_LEAF: &str = "controller";
 /// `CGROUP2_SUPER_MAGIC` from `include/uapi/linux/magic.h`. A 32-bit kernel constant: glibc types
 /// `statfs.f_type` as signed `__fsword_t` and musl as `c_ulong`, so it is compared by value.
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
-
-const JOB_PREFIX: &str = "job-";
 
 /// A cgroup v2 controller job cgroups use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -576,11 +575,9 @@ impl IncarnationCgroups {
     }
 
     fn job_path(&self, job_id: JobId, class: ClassCgroup) -> PathBuf {
-        self.root.join(class.name()).join(format!(
-            "{JOB_PREFIX}{}-{}",
-            self.incarnation.as_str(),
-            job_id.get()
-        ))
+        self.root
+            .join(class.name())
+            .join(host_job_id(&self.incarnation, job_id))
     }
 
     /// Create `job_id`'s cgroup in its class's cgroup, with what a job of `class` carries written
