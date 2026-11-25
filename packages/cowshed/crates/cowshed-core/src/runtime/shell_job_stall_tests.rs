@@ -83,9 +83,11 @@ impl Workspace {
         Self(root)
     }
 
+    /// The activator never starts its program: each test hands it a [`FakeHost`]. It binds `/bin/sh`,
+    /// which every runner has at that path, as the stand-in host does.
     fn activator(&self, gate: ActivationGate) -> Arc<HostActivator> {
         Arc::new(HostActivator {
-            program: ShellHostProgram::dedicated("/usr/bin/false").expect("/usr/bin/false"),
+            program: ShellHostProgram::dedicated("/bin/sh").expect("/bin/sh"),
             workspace_mount: self.0.clone(),
             profile: crate::runtime::supervisor::ChildProfile::unbound(
                 "",
