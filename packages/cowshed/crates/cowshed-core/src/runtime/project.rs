@@ -30073,6 +30073,10 @@ mod port_reservation_tests {
             .expect("a fixture store holds claims");
         claims.hold(claim, reservation.listeners.remove(service));
         drop(reservation);
+        // A concurrent allocator binds the lowest free port it finds, as the gate's other tests
+        // and live workspaces do (sb-batch-4 gate 2, 2026-11-25): a port of this block the store
+        // let go of is one.
+        let _intruder = TcpListener::bind((Ipv4Addr::LOCALHOST, block.base())).ok();
 
         let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, claim))
             .expect_err("the store holds its detached block's claim");
