@@ -32,6 +32,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[path = "../../cowshed-core/tests/support/calm_pressure.rs"]
+mod calm_pressure;
+
 #[test]
 fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
     let parsed = parse_args(["gateway", "status", "--json"]).expect("valid gateway status");
@@ -263,6 +266,7 @@ fn the_daemons_control_socket_is_its_storages_own() {
         CanonicalRoots::fixture(
             TestNamespace::mint().expect("a test namespace"),
             store.clone(),
+            calm_pressure::calm(),
         ),
     );
 

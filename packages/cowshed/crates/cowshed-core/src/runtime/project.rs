@@ -10793,7 +10793,7 @@ self.finish_retire_intent(&workspace).await?;
             // A job's end releases the volume it held when an adoption or reseed superseded it
             // while the job ran: inside this controller, awaited before the job is told ended,
             // and a release that cannot run or fails is that job's terminal failure.
-            memory_pressure: crate::host_pressure::Source::Kernel,
+            memory_pressure: self.descriptor.storage.memory_pressure(),
             build_volume_released: Some({
                 let host = self.substrate.shared_host();
                 let layout = self.build_volume_layout()?;
@@ -22029,7 +22029,7 @@ mod removal_supervisor_tests {
             },
             term_grace: Duration::from_millis(10),
             // The job is a background start: the host's own memory pressure must not hold it.
-            memory_pressure: crate::host_pressure::Source::calm(),
+            memory_pressure: crate::calm_pressure::calm(),
             ..defaults
         };
         let signals = Arc::new(Mutex::new(Vec::new()));
@@ -29260,6 +29260,7 @@ mod port_reservation_tests {
         let roots = CanonicalRoots::fixture(
             TestNamespace::mint().expect("a test namespace"),
             root.join("store"),
+            crate::calm_pressure::calm(),
         );
         std::fs::create_dir_all(roots.store()).expect("store");
         let repo = RepoId::parse("acme/widget").expect("repo");
@@ -29683,6 +29684,7 @@ mod port_reservation_tests {
             CanonicalRoots::fixture(
                 TestNamespace::mint().expect("a test namespace"),
                 fixture.store().to_owned(),
+                crate::calm_pressure::calm(),
             ),
         ));
         let staging = fixture.store().join(".staging");

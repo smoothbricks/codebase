@@ -35,6 +35,9 @@ use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::TestNamespace;
 use serde_json::{Value, json};
 
+#[path = "../support/calm_pressure.rs"]
+mod calm_pressure;
+
 #[path = "../support/refusing_gateway.rs"]
 mod refusing_gateway;
 
@@ -1100,7 +1103,7 @@ fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostSto
     ValidatedHostStorage::new(
         scratch.to_path_buf(),
         Vec::new(),
-        CanonicalRoots::fixture(namespace, scratch.join("store")),
+        CanonicalRoots::fixture(namespace, scratch.join("store"), calm_pressure::calm()),
     )
 }
 
@@ -4452,7 +4455,7 @@ async fn gc_process() {
     let storage = ValidatedHostStorage::new(
         variable(GC_HOME_ENV),
         Vec::new(),
-        CanonicalRoots::fixture(namespace, variable(GC_STORE_ENV)),
+        CanonicalRoots::fixture(namespace, variable(GC_STORE_ENV), calm_pressure::calm()),
     );
     let repo = fixture_repo();
     let gc = ProjectRuntime::open_directory_existing_at(

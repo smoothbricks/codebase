@@ -1913,8 +1913,9 @@ cowshed implementation.
 **Without mbx, a background start waits while the host reports memory pressure**: on Linux while `/proc/pressure/memory`
 reads `some avg10` above 10.00%, on macOS while `kern.memorystatus_vm_pressure_level` reads Warning or Critical. The
 supervisor is told the pressure by the kernel, never polls it ("Admission"): it keeps the job `queued` until the
-kernel's report lets it start. The wait has no deadline and is never a refusal: it ends when a report drops below the
-threshold or the requester kills the job. The job's stderr says so, with the reading, as
+kernel's report lets it start. A test fixture's supervisor is told by the pressure source its fixture injects
+(`CanonicalRoots::fixture`), never the real host's kernel. The wait has no deadline and is never a refusal: it ends when
+a report drops below the threshold or the requester kills the job. The job's stderr says so, with the reading, as
 `cowshed: jobserver wait start queue=memory pressure=<reading>` and then
 `cowshed: jobserver wait done elapsed=<waited> status=ok|err`. A reading that cannot be taken fails the job (`failed`,
 failure `cpuAdmission`, naming the file or sysctl and its error): a host whose pressure cannot be read is not shown to
@@ -1978,10 +1979,11 @@ The policy it holds:
   [Machine-wide compile scheduling](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling)). A held
   job keeps its grant for its life on purpose, bounded by its own declared `g` ("Held jobs", Tradeoff).
 
-**The kernel tells the supervisor the pressure.** Each supervisor opens one feed (`host_pressure::Feed`) when it starts:
-one reading, then a new reading each time the kernel notifies a change. On macOS the notification is libdispatch's
-memory-pressure source (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`, every level), and each notification reads
-`kern.memorystatus_vm_pressure_level` again. On Linux it is a PSI trigger on `/proc/pressure/memory`,
+**The kernel tells the supervisor the pressure.** Each production supervisor opens one kernel feed
+(`host_pressure::Feed`) when it starts: one reading, then a new reading each time the kernel notifies a change; a test
+fixture's supervisor opens the feed its fixture injected into its `CanonicalRoots::fixture` store instead. On macOS the
+notification is libdispatch's memory-pressure source (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`, every level), and each
+notification reads `kern.memorystatus_vm_pressure_level` again. On Linux it is a PSI trigger on `/proc/pressure/memory`,
 `some 1000000 10000000` (1 s of stall in a 10 s window, the 10% threshold above). PSI notifies a rise only, so while the
 last reading holds a start the feed reads again at each window's end, the first moment a drop can show; an unpressured
 host is read again only when the trigger fires. A kernel that refuses the subscription leaves a feed whose one reading

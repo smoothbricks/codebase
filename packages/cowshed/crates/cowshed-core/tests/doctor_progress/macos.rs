@@ -15,6 +15,9 @@ use cowshed_os::timing::{Step, StepSink};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+#[path = "../support/calm_pressure.rs"]
+mod calm_pressure;
+
 #[path = "../support/refusing_gateway.rs"]
 mod refusing_gateway;
 
@@ -108,7 +111,7 @@ async fn a_probe_that_waits_for_an_answer_is_the_doctor_step_its_call_is_in() {
     let storage = ValidatedHostStorage::new(
         scratch.path().to_path_buf(),
         Vec::new(),
-        CanonicalRoots::fixture(namespace, store),
+        CanonicalRoots::fixture(namespace, store, calm_pressure::calm()),
     );
     let repo = RepoId::parse("fixture/doctor").expect("repository identity");
 

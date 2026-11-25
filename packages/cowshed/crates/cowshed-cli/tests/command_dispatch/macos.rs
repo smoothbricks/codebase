@@ -51,6 +51,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
+#[path = "../../../cowshed-core/tests/support/calm_pressure.rs"]
+mod calm_pressure;
 #[path = "../../../cowshed-core/tests/support/nx_reads.rs"]
 mod nx_dependencies;
 #[path = "../../../cowshed-core/tests/support/progress.rs"]
@@ -109,6 +111,16 @@ impl Fixture {
         Self::with_directory(Project::Plain)
     }
 
+    fn directory_with_pressure(memory_pressure: cowshed_core::host_pressure::Source) -> Self {
+        Self::with_root_and_pressure(
+            Project::Plain,
+            FixtureRoot::Directory(
+                scratch_directory::ScratchRoot::new("cli").expect("scratch directory root"),
+            ),
+            memory_pressure,
+        )
+    }
+
     fn with_directory(project: Project<'_>) -> Self {
         Self::with_root(
             project,
@@ -128,6 +140,14 @@ impl Fixture {
     }
 
     fn with_root(project: Project<'_>, scratch: FixtureRoot) -> Self {
+        Self::with_root_and_pressure(project, scratch, calm_pressure::calm())
+    }
+
+    fn with_root_and_pressure(
+        project: Project<'_>,
+        scratch: FixtureRoot,
+        memory_pressure: cowshed_core::host_pressure::Source,
+    ) -> Self {
         let checkout = scratch.path().join("checkout");
         let store = scratch.path().join("store");
         let granted = scratch.path().join("granted");
@@ -157,7 +177,7 @@ impl Fixture {
         let storage = ValidatedHostStorage::new(
             home,
             program_directories,
-            CanonicalRoots::fixture(namespace, store),
+            CanonicalRoots::fixture(namespace, store, memory_pressure),
         );
         Self {
             _scratch: scratch,
@@ -10386,4 +10406,125 @@ async fn directory_a_declared_land_refuses_a_main_diverged_from_its_push_remote_
         .shutdown()
         .await
         .expect("stop the real directory project");
+}
+
+/// A fixture's supervisor reads the memory-pressure source its fixture injected, never the real
+/// host's kernel: driving that source to Warning holds a background job while a gate passes it,
+/// and driving it back to Normal starts the held job (05_gateway.md "Memory pressure",
+/// 08_testing.md "Fixtures").
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_injected_memory_pressure_holds_and_releases_a_background_job() {
+    use cowshed_core::api::dto::{ExecClass, ExecCommand, ExitStatus, JobState};
+    use cowshed_core::api::{
+        CommandArg, ExecRequest, ExecScope, JobRecord, JobStream, RunSandboxMode, StdinSource,
+    };
+    use cowshed_core::host_pressure::{Reading, Source};
+    use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
+
+    let (pressure, reports) = tokio::sync::watch::channel(Reading::Known(MemoryPressure::Darwin {
+        level: DarwinPressureLevel::Normal,
+    }));
+    let mut fixture = Fixture::directory_with_pressure(Source::Driven(reports));
+    let service = serve_project(&mut fixture, &[]).await;
+    let coordinator = service.coordinator().expect("fixture coordinator");
+    let worker = coordinator.worker("main").await.expect("main worker");
+    let request = |class, script: &str| ExecRequest {
+        command: ExecCommand::Argv(vec![
+            CommandArg::from("/bin/sh"),
+            CommandArg::from("-c"),
+            CommandArg::from(script),
+        ]),
+        cwd: None,
+        mode: RunSandboxMode::ReadWrite,
+        env: std::collections::HashMap::new(),
+        trace: None,
+        stdin: StdinSource::Empty,
+        stdout_copy: None,
+        stderr_copy: None,
+        admission_key: None,
+        class,
+        want: None,
+        hold: false,
+        scope: ExecScope::Workspace,
+        record: JobRecord::Cowshed,
+    };
+
+    // The shed is open under a calm source; the injected source alone now reports Warning.
+    pressure.send_replace(Reading::Known(MemoryPressure::Darwin {
+        level: DarwinPressureLevel::Warning,
+    }));
+    let held = coordinator
+        .exec(&worker, request(ExecClass::Background, "printf 'ran\\n'"))
+        .await
+        .expect("submit background job under injected Warning");
+
+    // Wait for the supervisor's own memory-pressure wait line on stderr (event-driven, no sleep):
+    // if the supervisor ignored the injected source on a calm host, the job runs to EOF without
+    // emitting this line and the assertion fails immediately.
+    let mut stderr_stream = held
+        .logs(JobStream::Stderr, 0, true)
+        .await
+        .expect("follow background job stderr");
+    let mut stderr = String::new();
+    while !stderr.contains("cowshed: jobserver wait start queue=memory pressure=level=warning\n") {
+        let Some(chunk) = stderr_stream.next().await else {
+            panic!(
+                "background job was not held by the fixture's Warning source; stderr: {stderr:?}"
+            );
+        };
+        stderr.push_str(&String::from_utf8_lossy(
+            &chunk.expect("background stderr chunk"),
+        ));
+    }
+
+    // A gate job is never held behind memory pressure and proves the supervisor is live.
+    let gate = coordinator
+        .exec(&worker, request(ExecClass::Gate, "printf 'gate\\n'"))
+        .await
+        .expect("submit gate job");
+    let gate_end = gate.wait().await.expect("wait for gate job");
+    assert_eq!(gate_end.exit, Some(ExitStatus::Exited { code: 0 }));
+    let held_status = held.status().await.expect("status of held background job");
+    assert!(
+        !held_status.state.is_terminal(),
+        "background job must stay held while injected pressure is Warning: {held_status:?}"
+    );
+
+    // Dropping the injected source to Normal releases the held background job.
+    pressure.send_replace(Reading::Known(MemoryPressure::Darwin {
+        level: DarwinPressureLevel::Normal,
+    }));
+    let ended = held.wait().await.expect("wait for released background job");
+    assert_eq!(ended.state, JobState::Exited, "{ended:?}");
+    assert_eq!(
+        ended.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "{ended:?}"
+    );
+
+    while let Some(chunk) = stderr_stream.next().await {
+        stderr.push_str(&String::from_utf8_lossy(
+            &chunk.expect("background stderr tail chunk"),
+        ));
+    }
+    assert!(
+        stderr.contains("cowshed: jobserver wait done elapsed=") && stderr.contains("status=ok\n"),
+        "expected memory wait completion line on stderr: {stderr:?}"
+    );
+
+    let mut stdout_stream = held
+        .logs(JobStream::Stdout, 0, false)
+        .await
+        .expect("read background job stdout");
+    let mut stdout = Vec::new();
+    while let Some(chunk) = stdout_stream.next().await {
+        stdout.extend_from_slice(&chunk.expect("background stdout chunk"));
+    }
+    assert_eq!(stdout, b"ran\n");
+
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+    fixture.stop_gateway().await;
 }

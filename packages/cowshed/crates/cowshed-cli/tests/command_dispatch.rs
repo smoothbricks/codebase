@@ -3,6 +3,10 @@
 mod macos;
 
 #[cfg(not(target_os = "macos"))]
+#[path = "../../cowshed-core/tests/support/calm_pressure.rs"]
+mod calm_pressure;
+
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn native_dispatch_refuses_unsupported_host_before_opening_storage() {
     use cowshed_core::ErrorCode;
@@ -17,6 +21,7 @@ async fn native_dispatch_refuses_unsupported_host_before_opening_storage() {
         CanonicalRoots::fixture(
             TestNamespace::mint().expect("a test namespace"),
             PathBuf::from("/tmp/store"),
+            calm_pressure::calm(),
         ),
     );
     match ProjectRuntime::open_for_adopt_at(

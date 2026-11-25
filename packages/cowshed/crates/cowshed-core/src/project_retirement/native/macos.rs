@@ -383,7 +383,7 @@ mod tests {
             ValidatedHostStorage::new(
                 root.join("home"),
                 Vec::new(),
-                CanonicalRoots::fixture(namespace, store),
+                CanonicalRoots::fixture(namespace, store, crate::calm_pressure::calm()),
             ),
             project,
         )

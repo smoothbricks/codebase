@@ -399,6 +399,11 @@ Host-controller tests that need the global identities of the real host (the shar
 the host's own store) name each such identity explicitly in the test. No blanket bypass of the workspace's block or
 grants is permitted.
 
+Every fixture store (`CanonicalRoots::fixture`) injects its own `host_pressure::Source` — a calm source from the shared
+`calm_pressure.rs` helper by default, or a driven source in pressure tests — so a test supervisor is told by its
+fixture's source rather than the real host's kernel memory pressure. Production's `CanonicalRoots::global()` cannot hold
+an injected source and always opens `Source::Kernel`.
+
 A fixture that waits for a file or directory to change waits on a kernel watch it armed itself, never on a timer and
 never on Bun's `fs.watch`. On darwin, Bun 1.4.3's `fs.watch` is one FSEvents stream per process. The stream starts
 since-now after the call returns and restarts whenever a watcher is added or removed; it missed 24 of 1000 single

@@ -614,6 +614,7 @@ mod tests {
         let census = crate::storage::bootstrap::CanonicalRoots::fixture(
             cowshed_os::namespace::TestNamespace::of(std::process::id(), 0).unwrap(),
             root.join("store"),
+            crate::calm_pressure::calm(),
         )
         .census();
         let censuses = || {
@@ -678,6 +679,7 @@ mod tests {
         let census = crate::storage::bootstrap::CanonicalRoots::fixture(
             cowshed_os::namespace::TestNamespace::of(std::process::id(), 0).unwrap(),
             fixture_store,
+            crate::calm_pressure::calm(),
         )
         .census();
         let mut opened = Vec::new();

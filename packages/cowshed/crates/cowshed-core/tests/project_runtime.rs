@@ -321,6 +321,7 @@ impl FakeHost {
                     cowshed_core::storage::bootstrap::CanonicalRoots::fixture(
                         TestNamespace::mint().expect("a test namespace"),
                         root.join("store"),
+                        calm_pressure::calm(),
                     ),
                 ),
             },

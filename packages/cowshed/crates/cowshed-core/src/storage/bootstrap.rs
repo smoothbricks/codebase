@@ -1326,12 +1326,19 @@ impl CanonicalRoots {
     }
 
     /// `namespace`'s fixture store at `store`; it holds the claims on its detached blocks for as
-    /// long as any handle to it lives.
-    pub fn fixture(namespace: TestNamespace, store: PathBuf) -> Self {
+    /// long as any handle to it lives, and delivers `memory_pressure` to supervisors opened on it.
+    pub fn fixture(
+        namespace: TestNamespace,
+        store: PathBuf,
+        memory_pressure: crate::host_pressure::Source,
+    ) -> Self {
         Self::new(
             store,
             HostNamespace::Test(namespace),
-            PortPartition::Fixture(Arc::default()),
+            PortPartition::Fixture {
+                claims: Arc::default(),
+                memory_pressure,
+            },
         )
     }
 
@@ -1383,7 +1390,7 @@ impl CanonicalRoots {
     pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
         match self.ports {
             PortPartition::Host => crate::metadata::PortAllocation::Host,
-            PortPartition::Fixture(_) => crate::metadata::PortAllocation::Fixture,
+            PortPartition::Fixture { .. } => crate::metadata::PortAllocation::Fixture,
         }
     }
 
@@ -1391,7 +1398,19 @@ impl CanonicalRoots {
     pub fn fixture_port_claims(&self) -> Option<&FixturePortClaims> {
         match &self.ports {
             PortPartition::Host => None,
-            PortPartition::Fixture(claims) => Some(claims),
+            PortPartition::Fixture { claims, .. } => Some(claims),
+        }
+    }
+
+    /// Where supervisors opened on this store receive memory-pressure reports: always the kernel
+    /// for production's host store, and the source the fixture injected for a fixture store
+    /// (05_gateway.md "Memory pressure", 08_testing.md "Fixtures").
+    pub fn memory_pressure(&self) -> crate::host_pressure::Source {
+        match &self.ports {
+            PortPartition::Host => crate::host_pressure::Source::Kernel,
+            PortPartition::Fixture {
+                memory_pressure, ..
+            } => memory_pressure.clone(),
         }
     }
 }
@@ -1399,19 +1418,23 @@ impl CanonicalRoots {
 /// The gateway control socket's name at its store's root.
 pub const GATEWAY_SOCKET_NAME: &str = "gateway.sock";
 
-/// A store's port allocation partition. Two handles on one partition are equal whatever claims
-/// each holds: the claims are the store's kernel state, not its identity.
+/// A store's port allocation partition and fixture-only host handles. Two handles on one
+/// partition are equal whatever claims or injected pressure feed each holds: those are the
+/// store's runtime handles, not its identity.
 #[derive(Clone, Debug)]
 enum PortPartition {
     Host,
-    Fixture(Arc<FixturePortClaims>),
+    Fixture {
+        claims: Arc<FixturePortClaims>,
+        memory_pressure: crate::host_pressure::Source,
+    },
 }
 
 impl PartialEq for PortPartition {
     fn eq(&self, other: &Self) -> bool {
         matches!(
             (self, other),
-            (Self::Host, Self::Host) | (Self::Fixture(_), Self::Fixture(_))
+            (Self::Host, Self::Host) | (Self::Fixture { .. }, Self::Fixture { .. })
         )
     }
 }
@@ -1555,6 +1578,12 @@ impl ValidatedHostStorage {
     }
     pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
         self.roots.port_allocation()
+    }
+
+    /// Where supervisors opened on this storage receive memory-pressure reports
+    /// ([`CanonicalRoots::memory_pressure`]).
+    pub fn memory_pressure(&self) -> crate::host_pressure::Source {
+        self.roots.memory_pressure()
     }
 }
 

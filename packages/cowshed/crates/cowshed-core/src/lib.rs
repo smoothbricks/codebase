@@ -61,11 +61,16 @@ use cowshed_apfs::{
     SystemCommandRunner,
 };
 #[cfg(test)]
+extern crate self as cowshed_core;
+#[cfg(test)]
 #[path = "../tests/support/alloc_census.rs"]
 mod alloc_census;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
+#[cfg(test)]
+#[path = "../tests/support/calm_pressure.rs"]
+pub(crate) mod calm_pressure;
 #[cfg(test)]
 #[path = "../tests/support/lock_program.rs"]
 mod lock_program;

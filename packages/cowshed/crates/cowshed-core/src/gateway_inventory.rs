@@ -3265,6 +3265,7 @@ mod tests {
             let roots = CanonicalRoots::fixture(
                 TestNamespace::mint().expect("a test namespace"),
                 root.join("store"),
+                crate::calm_pressure::calm(),
             );
             fs::create_dir_all(roots.store()).expect("fixture store");
             fs::create_dir_all(roots.telemetry()).expect("fixture telemetry");

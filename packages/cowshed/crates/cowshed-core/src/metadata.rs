@@ -1826,6 +1826,7 @@ mod tests {
             CanonicalRoots::fixture(
                 TestNamespace::mint().expect("a test namespace"),
                 PathBuf::from("/fixture/store"),
+                crate::calm_pressure::calm(),
             ),
         );
         assert_eq!(host.port_allocation(), PortAllocation::Host);

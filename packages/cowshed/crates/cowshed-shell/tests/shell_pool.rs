@@ -41,6 +41,9 @@ use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::process::ExitWatch;
 use procinfo::HostLoad;
 
+#[path = "../../cowshed-core/tests/support/calm_pressure.rs"]
+mod calm_pressure;
+
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
 
 /// The exec host binary under test, read when the test runs. `env!` would bake in the path of
@@ -232,7 +235,7 @@ impl Workspace {
             workspace_volume: None,
             job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
             build_volume_released: None,
-            memory_pressure: cowshed_core::host_pressure::Source::Kernel,
+            memory_pressure: calm_pressure::calm(),
             nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
         };
         let artifacts = ArtifactStoreSink::open(

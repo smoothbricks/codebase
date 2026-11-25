@@ -5969,7 +5969,7 @@ mod held_turn_tests {
                 store_root: root.join(".cowshed").join("store"),
                 ..defaults.sandbox
             },
-            memory_pressure: crate::host_pressure::Source::calm(),
+            memory_pressure: crate::calm_pressure::calm(),
             ..defaults
         };
         (Workspace(root), config)
