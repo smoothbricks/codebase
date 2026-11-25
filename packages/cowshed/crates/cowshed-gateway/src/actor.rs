@@ -5137,8 +5137,8 @@ mod tests {
         struct ArrivingMidAccept {
             inner: std::net::TcpListener,
             addr: std::net::SocketAddr,
-            injected: std::sync::atomic::AtomicBool,
-            client: Arc<std::sync::Mutex<Option<std::net::TcpStream>>>,
+            calls: std::sync::atomic::AtomicUsize,
+            client_b: Arc<std::sync::Mutex<Option<std::net::TcpStream>>>,
         }
 
         impl std::os::fd::AsFd for ArrivingMidAccept {
@@ -5159,18 +5159,17 @@ mod tests {
             type Addr = std::net::SocketAddr;
 
             fn accept_std(&self) -> std::io::Result<(Self::StdStream, Self::Addr)> {
-                if !self
-                    .injected
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if call == 1 {
+                    // Second accept models a syscall that saw an empty backlog just before client B
+                    // arrived: connect B, wait long enough for the parked current_thread runtime's
+                    // I/O driver to observe B and advance the listener's readiness tick, then
+                    // return WouldBlock.
                     let client = std::net::TcpStream::connect_timeout(
                         &self.addr,
                         cowshed_os::test_backstop::NO_PROGRESS,
                     )?;
-                    *self.client.lock().expect("client slot") = Some(client);
-                    // Hold the blocking accept long enough for the current_thread runtime to park
-                    // and let its I/O driver observe the new connection and advance the listener's
-                    // readiness tick before WouldBlock is returned.
+                    *self.client_b.lock().expect("client B slot") = Some(client);
                     std::thread::sleep(Duration::from_millis(200));
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
@@ -5186,8 +5185,8 @@ mod tests {
             }
         }
 
-        let client_slot = Arc::new(std::sync::Mutex::new(None));
-        let client_for_listener = Arc::clone(&client_slot);
+        let client_b_slot = Arc::new(std::sync::Mutex::new(None));
+        let client_b_for_listener = Arc::clone(&client_b_slot);
         let listener = Fenced::create(|| {
             let inner = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
             inner.set_nonblocking(true)?;
@@ -5195,14 +5194,35 @@ mod tests {
             Ok(ArrivingMidAccept {
                 inner,
                 addr,
-                injected: std::sync::atomic::AtomicBool::new(false),
-                client: client_for_listener,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                client_b: client_b_for_listener,
             })
         })
         .expect("bind test listener");
+        let addr = listener.addr;
 
         let mut accept = AsyncAccept::new(listener).expect("register test listener");
-        let (stream, peer) = tokio::time::timeout(
+
+        // Connect client A first so the listener becomes readable (tick 1) and the first accept
+        // returns A while leaving readiness set at tick 1.
+        let client_a =
+            std::net::TcpStream::connect_timeout(&addr, cowshed_os::test_backstop::NO_PROGRESS)
+                .expect("connect client A");
+        let (stream_a, peer_a) =
+            tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, accept.accept())
+                .await
+                .expect("accept client A before backstop")
+                .expect("accept client A");
+        let client_a_addr = client_a.local_addr().expect("client A local addr");
+        assert_eq!(peer_a, client_a_addr);
+        assert_eq!(
+            stream_a.peer_addr().expect("accepted A peer addr"),
+            client_a_addr
+        );
+
+        // Second accept starts from tick 1, hits the injected WouldBlock after client B arrives
+        // (tick 2), and must still wake and accept client B.
+        let (stream_b, peer_b) = tokio::time::timeout(
             cowshed_os::test_backstop::NO_PROGRESS,
             accept.accept(),
         )
@@ -5210,15 +5230,18 @@ mod tests {
         .expect(
             "accept must not lose the readiness wakeup for a connection arriving during WouldBlock",
         )
-        .expect("accept the arriving connection");
+        .expect("accept client B");
 
-        let client = client_slot
+        let client_b = client_b_slot
             .lock()
-            .expect("client slot")
+            .expect("client B slot")
             .take()
-            .expect("first accept_std connected a client");
-        let client_addr = client.local_addr().expect("client local addr");
-        assert_eq!(peer, client_addr);
-        assert_eq!(stream.peer_addr().expect("accepted peer addr"), client_addr);
+            .expect("second accept_std connected client B");
+        let client_b_addr = client_b.local_addr().expect("client B local addr");
+        assert_eq!(peer_b, client_b_addr);
+        assert_eq!(
+            stream_b.peer_addr().expect("accepted B peer addr"),
+            client_b_addr
+        );
     }
 }
