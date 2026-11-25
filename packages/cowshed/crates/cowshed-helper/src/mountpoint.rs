@@ -158,11 +158,17 @@ mod tests {
             permit(&scratch.0.join("real"), stranger),
             Err(Denied::Owner { owner, caller: refused, .. }) if owner == caller && refused == stranger
         ));
-        // A path whose deepest existing ancestor is root's.
-        if caller != 0 {
+        // A path whose deepest existing ancestor is `/`. Inside a Linux user namespace host root
+        // may map to the overflow uid rather than 0, so read `/`'s actual owner.
+        let root_owner = std::fs::metadata("/").unwrap().uid();
+        if caller != root_owner {
             assert!(matches!(
                 permit(Path::new("/cowshed-helper-absent/x"), caller),
-                Err(Denied::Owner { owner: 0, .. })
+                Err(Denied::Owner {
+                    path,
+                    owner,
+                    caller: refused,
+                }) if path == Path::new("/") && owner == root_owner && refused == caller
             ));
         }
         for host in HOST_MOUNTPOINTS {
