@@ -1874,9 +1874,36 @@ effect on threads already running. Both files are writable inside the delegation
 Until that is measured, the static weights stand.
 
 **macOS.** macOS has no cgroups, so the class is the job's nice, `setpriority(PRIO_PROCESS)` alone, placed on the job's
-first process and read back before the command runs (11_shell.md, "Job admission and class placement"). The Clutch
-scheduler runs threads of a higher base priority first and bounds a lower bucket's lateness, so a background thread at
-+10 is late but never starved, and +10 (base priority 21) stays in the non-UI band, eligible for performance cores.
+first process and read back before the command runs (11_shell.md, "Job admission and class placement"). Nice orders only
+threads without a QoS class: XNU derives a QoS-tagged thread's priority from its QoS alone (`thread_recompute_priority`,
+`osfmk/kern/thread_policy.c`), and every thread measured in a job's processes, main and worker, carried QoS `DEFAULT`,
+base priority 31, whatever its process's nice. For a thread without one, the Clutch scheduler runs a higher base
+priority first and bounds a lower bucket's lateness, so a background thread at +10 is late but never starved, and +10
+(base priority 21) stays in the non-UI band, eligible for performance cores.
+
+**On macOS the order between classes is admission, not OS priority.** Where threads contend, what a gate gets over
+background work is decided by who holds capacity: mbx's pool bands where mbx is selected, a job's jobserver tokens where
+it is not ("Host scheduling"). No lever the supervisor can apply to another process orders their CPU without throttling
+their I/O, which the next paragraph forbids. Measured 2026-11-25 (edb4ffaaa4) at host load 40 to 110: each lever's
+effect read first from the kernel (each thread's priority, ceiling and QoS from `PROC_PIDTHREADINFO`, and the effective
+disk tier), then a gate's CPU against a background child's, and the child's unlink phase, timed in interleaved pairs
+against a baseline, with each arm's host load recorded:
+
+- nice +5 against +10: priority 31 for both threads, CPU 1.0 : 1;
+- a `utility` QoS clamp at spawn with disk policy IMPORTANT: priority 20 and CPU 15 : 1, but the clamp's disk tier
+  overrides IMPORTANT (`qos_iotier`, `osfmk/kern/task_policy.c`) and the child's unlinks took 26 times as long per file;
+- `PRIO_DARWIN_BG` set on a running process: priority 31 to 4 within 0.1 ms and back as fast when cleared, CPU 25 : 1,
+  unlinks 105 times as long per file, and 79 times with its I/O at UTILITY, the mildest `IOPOL_SCOPE_DARWIN_BG` accepts
+  (IMPORTANT is `EINVAL`);
+- throughput and latency tiers (`taskpolicy -t -l`) on a running process: no priority change, CPU 1.0 : 1;
+- `PRIO_DARWIN_ROLE`: `ENOTSUP` for a process that is not an application.
+
+A thread can opt itself out of its QoS: `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_IMPORTANT)` strips
+it, the thread keeps disk tier 0 and then honours nice (priority 21, CPU 2.7 : 1). Only the process itself can do that.
+Two readbacks do not report what the kernel applies, so neither verifies a lever:
+`getpriority(PRIO_DARWIN_PROCESS, pid)` reads the process's own setting and returns 0 for a process another one
+backgrounded, and `getiopolicy_np` reports the requested disk policy, not the tier a QoS clamp imposes. A thread's
+priority and ceiling from `PROC_PIDTHREADINFO` show both.
 
 **On macOS nothing cowshed starts is throttled for I/O.** No process cowshed spawns that opens a path under the store or
 a workspace runs under `PRIO_DARWIN_BG`, a QoS clamp (`taskpolicy -b`, `taskpolicy -c utility|background`) or a disk I/O
