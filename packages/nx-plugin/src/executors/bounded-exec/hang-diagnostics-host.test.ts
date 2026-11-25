@@ -25,8 +25,12 @@ describe('privileged hang probe host proofs', () => {
       const listed = await Promise.race([once(probe.stdout, 'data').then(() => true), exited.then(() => false)]);
       expect(listed, `sudo -n ${command} ended before listing: ${stderr}`).toBe(true);
       if (probe.pid === undefined) throw new Error('sudo has no pid');
-      // What sudo runs as root, its lsof included: recorded while sudo still holds it as its own.
-      const commands = (await processTree([probe.pid])).filter((entry) => entry.pid !== probe.pid);
+      // The command sudo runs as root, recorded while sudo still holds it as its own. Only sudo's direct child: lsof
+      // forks helpers of its own for kernel reads that may block (lsof -O disables them), and at its exit it sends each
+      // SIGKILL and goes on without waiting. A helper listed here may therefore still be dying, reparented to launchd,
+      // when sudo's exit is observed (sb-batch-6 gate 1: `lsof -r 30 …` left with ppid 1, state RN). Sudo itself exits
+      // only after reaping its command, so the command's end is ordered before sudo's exit event.
+      const commands = (await processTree([probe.pid])).filter((entry) => entry.ppid === probe.pid);
       expect(
         commands.some((entry) => entry.command.includes('lsof')),
         `no lsof under sudo: ${JSON.stringify(commands)}`,
