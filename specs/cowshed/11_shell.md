@@ -1636,14 +1636,18 @@ The supervisor tracks its descendants (process group) precisely so this is deter
 layer is not optional glue but core to correct lifecycle.
 
 Lost-supervisor groups that cannot be safely identified do not block ordinary supervisor startup or new admission. They
-do block destroying or replacing the canonical image: `rm` and adopted-main restore reconcile the ledger **after**
-stopping the supervisor while holding the exclusive socket/listener lease across the mutation. Unknown hello,
-retirement, or exit outcomes are errors, not proof of absence; no group takeover runs beside a live supervisor. The
-adopted-main refusal guard runs before recording any mutation intent, so a clean refusal cannot lock later safe
-admission out through intent replay. Neither `--force` nor an ended marker authorizes detaching beneath an
-unaccounted-for writer. Ordinary detach and resize use idle-only unmounting without a force fallback. Grant changes
-retain their existing contract above: running jobs keep their original profiles; a revision change never claims every
-old-authority process died.
+do block destroying or replacing the canonical image: every workspace removal (`rm`, adopted-main restore, land fold,
+`forget`, and `gc` of abandoned or retired workspaces) reconciles the workspace's ledger through lost-group recovery
+(`take_lost`) while holding the exclusive socket/listener lease — retiring the ledger once nothing unresolved remains
+and keeping unresolved evidence when anything remains unaccounted for. A removed workspace's digest never gets a next
+supervisor to inherit its ledger (measured: 473 of 500 ledgers on disk had no live supervisor, many from removed
+workspaces). For a retired or orphan workspace record collected by `gc`, ledger retirement runs only when no
+authoritative, pending or in-flight workspace reuses that name. Unknown hello, retirement, or exit outcomes are errors,
+not proof of absence; no group takeover runs beside a live supervisor. The adopted-main refusal guard runs before
+recording any mutation intent, so a clean refusal cannot lock later safe admission out through intent replay. Neither
+`--force` nor an ended marker authorizes detaching beneath an unaccounted-for writer. Ordinary detach and resize use
+idle-only unmounting without a force fallback. Grant changes retain their existing contract above: running jobs keep
+their original profiles; a revision change never claims every old-authority process died.
 
 ## doctor awareness
 

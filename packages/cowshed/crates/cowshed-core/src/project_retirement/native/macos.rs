@@ -95,6 +95,10 @@ fn contents(project: &Path) -> Result<Contents> {
                     device: metadata.dev(),
                     inode: metadata.ino(),
                 });
+            } else if let Some(image) = crate::metadata::image_from_sidecar_path(&path)
+                && let Ok(meta) = crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+            {
+                found.workspaces.insert(meta.workspace);
             }
         }
     }
@@ -612,7 +616,7 @@ mod tests {
             &repo,
         );
 
-        let write_sidecar = |image: &Path, ws: &str, inc: &str, state| {
+        let write_sidecar = |image: &Path, ws: &str, inc: &str, state, port_base: u16| {
             fs::create_dir_all(image.parent().unwrap()).unwrap();
             fs::write(image, b"partial image evidence").unwrap();
             crate::metadata::DetachedWorkspaceMetadata {
@@ -623,7 +627,10 @@ mod tests {
                 platform: crate::metadata::Platform::Macos,
                 publication_state: state,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
-                grants: crate::metadata::GrantSet::default(),
+                grants: crate::metadata::GrantSet {
+                    port_block: Some(crate::metadata::PortBlock::new(port_base, 16).unwrap()),
+                    ..crate::metadata::GrantSet::default()
+                },
                 info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
                     project_root: PathBuf::from("/project"),
                     role: crate::metadata::WorkspaceRole::Workspace,
@@ -645,12 +652,14 @@ mod tests {
             "retired",
             "0198f2c0b7e34dc795f17b238b331c80",
             crate::metadata::PublicationState::Active,
+            40_960,
         );
         write_sidecar(
             &project.join(".staging/staged-0198f2c0b7e34dc795f17b238b331c81.dmg"),
             "staged",
             "0198f2c0b7e34dc795f17b238b331c81",
             crate::metadata::PublicationState::PendingFence,
+            40_976,
         );
 
         let ledger_of = |ws: &str| {

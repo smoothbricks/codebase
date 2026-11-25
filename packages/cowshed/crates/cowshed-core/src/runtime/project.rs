@@ -8325,9 +8325,8 @@ self.finish_retire_intent(&workspace).await?;
                     "let the owner finish the job, then explicitly land or remove the workspace",
                 ));
             }
-        } else {
-            require_lost_groups_released(workspace, &stopped, "remove").await?;
         }
+        require_lost_groups_released(workspace, &stopped, "remove").await?;
         let current = self.current(workspace).await?;
         Self::require_exact_incarnation(&current, &initial.incarnation)?;
         if mounted(&current) {
@@ -11732,7 +11731,7 @@ self.finish_retire_intent(&workspace).await?;
         let mount_point = self.workspace_mount_path(workspace)?;
         self.require_mount_unheld_before_stop(workspace, &mount_point)
             .await?;
-        let _stopped = self
+        let stopped = self
             .stop_supervisor_with_mode(
                 workspace,
                 if options.force {
@@ -11743,6 +11742,7 @@ self.finish_retire_intent(&workspace).await?;
                 NxDaemonRetirement::Recorded,
             )
             .await?;
+        require_lost_groups_released(workspace, &stopped, "remove").await?;
         let result = async {
             let (retired, (abandoned, tips, mount, forced)) = substrate
                 .execute_pending_clone_retirement(metadata, identity, |stage| {
@@ -17137,7 +17137,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         // Old build state a refresh moved aside and did not live to delete (`discard`): gc is
         // the verb that waits for it, saying what it deletes.
-        for workspace in self.authoritative().await? {
+        let authoritative = self.authoritative().await?;
+        for workspace in &authoritative {
             if !matches!(
                 workspace.derived.mount_state,
                 crate::storage::lifecycle::MountState::Mounted { .. }
@@ -17172,13 +17173,33 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 )
             })?;
         }
+        let mut live_or_pending: std::collections::BTreeSet<WorkspaceName> = authoritative
+            .iter()
+            .map(|workspace| workspace.derived.workspace.name().clone())
+            .collect();
+        live_or_pending.extend(
+            self.pending_metadata()
+                .await?
+                .into_iter()
+                .map(|(_, metadata)| metadata.workspace),
+        );
+        live_or_pending.extend(
+            self.lifecycle_intents
+                .records()
+                .filter(|(_, record)| record.completion.is_none())
+                .map(|(workspace, _)| workspace.clone()),
+        );
+        let mut retired_ledgers = std::collections::BTreeSet::new();
         // Host-side state goes before the image does here too, for the same reason retirement
         // orders it that way: an image `gc` has already deleted leaves no authority to clean up
         // what it left behind in main. The authority is the retired image's own revalidated
         // sidecar — never the observation that a registered worktree's path is missing, which is
         // also what a merely detached workspace looks like.
         for candidate in plan.candidates() {
-            if !matches!(candidate.reason(), StorageGcReason::RetiredWorkspace) {
+            if !matches!(
+                candidate.reason(),
+                StorageGcReason::RetiredWorkspace | StorageGcReason::OrphanSessionImage
+            ) {
                 continue;
             }
             let Ok(metadata) =
@@ -17186,10 +17207,61 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             else {
                 continue;
             };
-            if metadata.info_snapshot.git_worktree {
+            if matches!(candidate.reason(), StorageGcReason::RetiredWorkspace)
+                && metadata.info_snapshot.git_worktree
+            {
                 self.unregister_workspace_in_main(&metadata.workspace, true)
                     .await?;
             }
+            if !live_or_pending.contains(&metadata.workspace) {
+                retired_ledgers.insert(metadata.workspace);
+            }
+        }
+        for workspace in retired_ledgers {
+            if !self.claim_intent_lease(&workspace)? {
+                continue;
+            }
+            let socket = super::supervisor_socket::socket_path(
+                self.descriptor.storage.store(),
+                &self.descriptor.repo_id,
+                &workspace,
+            );
+            let lease = match super::supervisor_socket::lease_unserved(&socket) {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => None,
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: gc kept retired workspace {workspace}'s ledger: {}",
+                        error.message
+                    );
+                    None
+                }
+            };
+            if let Some(_lease) = lease {
+                let ledger = super::job_groups::ledger_path(&socket);
+                let taken = ledger.clone();
+                match crate::storage::lifecycle::dispatch_blocking(move || {
+                    super::job_groups::take_lost(&taken, LOST_JOB_GRACE)
+                })
+                .await
+                {
+                    Ok(Ok(unresolved)) if !unresolved.is_empty() => cowshed_os::eprintln!(
+                        "cowshed: gc kept retired workspace {workspace}'s ledger {}: {} unresolved process group(s) remain",
+                        ledger.display(),
+                        unresolved.len()
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => cowshed_os::eprintln!(
+                        "cowshed: gc kept retired workspace {workspace}'s ledger {}: {error}",
+                        ledger.display()
+                    ),
+                    Err(error) => cowshed_os::eprintln!(
+                        "cowshed: gc kept retired workspace {workspace}'s ledger {}: {error}",
+                        ledger.display()
+                    ),
+                }
+            }
+            self.intent_leases.release(&workspace);
         }
         // An abandon bundle is deleted only once main's repository keeps every tip it advertises:
         let report = timed_async("gc", "substrate", self.substrate.execute_gc(plan))
