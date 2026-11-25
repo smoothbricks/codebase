@@ -1,8 +1,95 @@
 diff --git a/driver/emit_plugin.go b/driver/emit_plugin.go
-index 3793b3a406c2bf2643567a755d34e66a26eac5c8..3c690ac3d9a99be7914ad9aed76e5890d236ea9b 100644
+index 3793b3a..4d34807 100644
 --- a/driver/emit_plugin.go
 +++ b/driver/emit_plugin.go
-@@ -427,7 +427,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+@@ -228,7 +228,7 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+   if err := p.ApplyLinkedPlugins(); err != nil {
+     return nil, err
+   }
+-  linked, err := p.plugins.emitTransforms()
++  linked, err := p.LinkedEmitTransforms()
+   if err != nil {
+     return nil, err
+   }
+@@ -247,8 +247,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+   }
+   // noEmit returned above, so this applies exactly noEmitOnError's
+   // whole-program diagnostic gate.
++  preEmitWithdrawn := false
+   if result := handleNoEmit(context.Background(), p.TSProgram); result != nil {
+-    return p.pluginEmitDiagnostics("pre-emit checking", result.Diagnostics)
++    diagnostics, err := p.pluginEmitDiagnostics("pre-emit checking", result.Diagnostics)
++    if err != nil || len(diagnostics) != 0 {
++      return diagnostics, err
++    }
++    preEmitWithdrawn = true
+   }
+   hasTransform := false
+   for _, transform := range transforms {
+@@ -379,7 +384,10 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+   // that has no declarations to write at all.
+   if !options.GetEmitDeclarations() && !p.emitsBuildInfo() {
+     if result := handleNoEmit(context.Background(), p.TSProgram); result != nil {
+-      return p.pluginEmitDiagnostics("JavaScript emit", result.Diagnostics)
++      diagnostics, err := p.pluginEmitDiagnostics("JavaScript emit", result.Diagnostics)
++      if err != nil || len(diagnostics) != 0 {
++        return diagnostics, err
++      }
+     }
+     return nil, output.flush()
+   }
+@@ -400,25 +408,32 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+   // `shimcompiler.EmitFreshWithBuildInfo`), so this asymmetry costs a ttsc
+   // rebuild nothing.
+   var wfMu sync.Mutex
+-  result := p.emitProgram(shimcompiler.EmitOptions{
+-    EmitOnly: shimcompiler.EmitOnlyDts,
+-    WriteFile: func(fileName shimtspath.RootedFilePath, text string, data *shimcompiler.WriteFileData) error {
+-      wfMu.Lock()
+-      defer wfMu.Unlock()
+-      if p.outputEscapesOutDir(fileName) {
+-        if data != nil {
+-          data.SkippedDtsWrite = true
++  result := func() *shimcompiler.EmitResult {
++    if preEmitWithdrawn && options.NoEmitOnError.IsTrue() {
++      prevNoEmitOnError := options.NoEmitOnError
++      options.NoEmitOnError = shimcore.TSFalse
++      defer func() { options.NoEmitOnError = prevNoEmitOnError }()
++    }
++    return p.emitProgram(shimcompiler.EmitOptions{
++      EmitOnly: shimcompiler.EmitOnlyDts,
++      WriteFile: func(fileName shimtspath.RootedFilePath, text string, data *shimcompiler.WriteFileData) error {
++        wfMu.Lock()
++        defer wfMu.Unlock()
++        if p.outputEscapesOutDir(fileName) {
++          if data != nil {
++            data.SkippedDtsWrite = true
++          }
++          return nil
+         }
+-        return nil
+-      }
+-      corrected, err := correctSourceMap(string(fileName), text)
+-      if err != nil {
+-        return err
+-      }
+-      text = corrected
+-      return output.write(fileName, text, data)
+-    },
+-  })
++        corrected, err := correctSourceMap(string(fileName), text)
++        if err != nil {
++          return err
++        }
++        text = corrected
++        return output.write(fileName, text, data)
++      },
++    })
++  }()
+   var diagnostics []Diagnostic
+   if result != nil && len(result.Diagnostics) != 0 {
+     var err error
+@@ -427,7 +442,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
        return diagnostics, err
      }
    }
@@ -17,9 +104,25 @@ index 3793b3a406c2bf2643567a755d34e66a26eac5c8..3c690ac3d9a99be7914ad9aed76e5890
  }
  
  // writePluginEmitOutput writes one artifact of the hand-assembled emit, passing
+diff --git a/driver/emit_plugin_output.go b/driver/emit_plugin_output.go
+index 7ea3ab9..b4fd6b8 100644
+--- a/driver/emit_plugin_output.go
++++ b/driver/emit_plugin_output.go
+@@ -56,6 +56,11 @@ func (e *PluginEmitError) Error() string {
+ }
+ 
+ func (p *Program) pluginEmitDiagnostics(phase string, raw []*shimast.Diagnostic) ([]Diagnostic, error) {
++  raw = filterDiagnostics(raw)
++  raw, withdrawn := p.plugins.dropLoweredDiagnostics(p, raw)
++  if err := p.recordWithdrawnDiagnostics(withdrawn); err != nil {
++    return nil, err
++  }
+   diagnostics := p.convertProgramDiagnostics(raw)
+   if CountErrors(diagnostics) == 0 {
+     return diagnostics, nil
 diff --git a/driver/force_emit_analysis_options_test.go b/driver/force_emit_analysis_options_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..97d1522f7979b488dc62b86cc1d78d72f1913cb5
+index 0000000..97d1522
 --- /dev/null
 +++ b/driver/force_emit_analysis_options_test.go
 @@ -0,0 +1,69 @@
@@ -93,7 +196,7 @@ index 0000000000000000000000000000000000000000..97d1522f7979b488dc62b86cc1d78d72
 +	}
 +}
 diff --git a/driver/plugins.go b/driver/plugins.go
-index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6dde7856d8 100644
+index 3224cea..b749d2f 100644
 --- a/driver/plugins.go
 +++ b/driver/plugins.go
 @@ -9,6 +9,8 @@ import (
@@ -105,7 +208,19 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
  )
  
  // LinkedPluginsEnv is the environment variable ttsc sets to pass the JSON
-@@ -171,6 +173,7 @@ type PluginContext struct {
+@@ -157,6 +159,11 @@ type PluginContext struct {
+   // Entry is this registration's JSON-decoded manifest value.
+   Entry PluginEntry
+ 
++  // Program is the loaded compiler Program for hooks bound to a Program
++  // generation (ProgramPlugin, EmitTransformPlugin, DiagnosticPlugin), or nil
++  // for pre-load hooks such as SourcePreamblePlugin.
++  Program *Program
++
+   // Tsconfig names the compiler configuration selected for this project.
+   Tsconfig string
+ 
+@@ -171,6 +178,7 @@ type PluginContext struct {
    reportFileComplete             func(string)
    reportEveryFileComplete        func()
    readEnvironment                func(string) (string, bool)
@@ -113,7 +228,7 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
  }
  
  // ReportObservationIncomplete declares that this hook's input population could
-@@ -233,6 +236,24 @@ func (ctx PluginContext) Env(name string) (string, bool) {
+@@ -233,6 +241,24 @@ func (ctx PluginContext) Env(name string) (string, bool) {
    return ctx.readEnvironment(name)
  }
  
@@ -138,7 +253,7 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
  // ReportHostInputHash declares the exact file state consumed by a native
  // plugin. hash is a lowercase SHA-256 digest for an observed file and nil for
  // a missing candidate. Conflicting observations are retained as host inputs
-@@ -544,11 +565,29 @@ type EmitTransformPlugin interface {
+@@ -544,11 +570,29 @@ type EmitTransformPlugin interface {
    EmitTransform(PluginContext) (PluginTransform, error)
  }
  
@@ -168,7 +283,7 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
    tsconfig     string
  }
  
-@@ -895,6 +934,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+@@ -895,6 +939,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
        cwd:          cwd,
        declarations: newPluginFileDeclarations(),
        inputs:       newPluginHostInputScopes(),
@@ -176,7 +291,7 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
        tsconfig:     tsconfigPath,
      }, nil
    }
-@@ -907,6 +947,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+@@ -907,6 +952,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
      declarations: newPluginFileDeclarations(),
      entries:      entries,
      inputs:       newPluginHostInputScopes(),
@@ -184,7 +299,43 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
      tsconfig:     tsconfigPath,
    }, nil
  }
-@@ -991,6 +1032,46 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+@@ -925,7 +971,7 @@ func (state linkedPluginState) sourcePreamble() (string, error) {
+     if !ok {
+       continue
+     }
+-    text, err := preamble.SourcePreamble(state.contextAt(index, entry))
++    text, err := preamble.SourcePreamble(state.contextAt(index, entry, nil))
+     if err != nil {
+       return "", err
+     }
+@@ -946,7 +992,7 @@ func (state linkedPluginState) apply(prog *Program) error {
+     if !ok {
+       continue
+     }
+-    if err := transform.ApplyProgram(prog, state.contextAt(index, entry)); err != nil {
++    if err := transform.ApplyProgram(prog, state.contextAt(index, entry, prog)); err != nil {
+       return err
+     }
+   }
+@@ -969,7 +1015,7 @@ func (state linkedPluginState) hasProgramPlugins() bool {
+ // emitTransforms collects an emit-phase PluginTransform from every registered
+ // EmitTransformPlugin, in registration order. Entries that do not implement
+ // EmitTransformPlugin, or whose transform is nil, are skipped.
+-func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
++func (state linkedPluginState) emitTransforms(prog *Program) ([]PluginTransform, error) {
+   var out []PluginTransform
+   for index, entry := range state.entries {
+     plugin, ok := registeredPlugin(index)
+@@ -980,7 +1026,7 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+     if !ok {
+       continue
+     }
+-    transform, err := emitter.EmitTransform(state.contextAt(index, entry))
++    transform, err := emitter.EmitTransform(state.contextAt(index, entry, prog))
+     if err != nil {
+       return nil, err
+     }
+@@ -991,6 +1037,46 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
    return out, nil
  }
  
@@ -209,7 +360,7 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
 +      continue
 +    }
 +    lowered := map[*ast.Diagnostic]struct{}{}
-+    for _, diagnostic := range judge.LoweredDiagnostics(prog, state.contextAt(index, entry), kept) {
++    for _, diagnostic := range judge.LoweredDiagnostics(prog, state.contextAt(index, entry, prog), kept) {
 +      lowered[diagnostic] = struct{}{}
 +    }
 +    if len(lowered) == 0 {
@@ -231,7 +382,28 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
  // registeredPlugin returns the plugin registered at position index, or
  // (nil, false) when the index is out of range. Registration order matches
  // the order of linked Go init() calls.
-@@ -1028,7 +1109,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
+@@ -1010,12 +1096,19 @@ func registeredPlugin(index int) (any, bool) {
+ // and program hooks are the same plugin's claim and must not be attributed
+ // separately. Environment reads go to the generation ledger, which fixes one
+ // value per name for every hook.
+-func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginContext {
++func (state *linkedPluginState) resetGeneration() {
++  state.declarations = newPluginFileDeclarations()
++  state.inputs = newPluginHostInputScopes()
++  state.outputs = newPluginHostOutputs()
++}
++
++func (state linkedPluginState) contextAt(index int, entry PluginEntry, prog *Program) PluginContext {
+   inputs := state.inputs.newScope()
+   declaration := state.declarations.forPlugin(index)
+   return PluginContext{
+     Cwd:                            state.cwd,
+     Entry:                          entry,
++    Program:                        prog,
+     Tsconfig:                       state.tsconfig,
+     reportHostInput:                inputs.add,
+     reportHostInputHash:            inputs.addHash,
+@@ -1028,7 +1121,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
      reportFileComplete:             declaration.addComplete,
      reportEveryFileComplete:        declaration.completeEveryFile,
      readEnvironment:                state.inputs.readEnvironment,
@@ -276,7 +448,7 @@ index 3224cea63290e7b90629e2814143ccc94ef0ba86..aff211cb9b6c3e06191eccd322bf7c6d
  
  // hostInputs returns the exact native configuration inputs reported in this
 diff --git a/driver/program.go b/driver/program.go
-index 8dc486a3b147754fb30cb87ef1eb3ffccbbda780..7babe76685f9072efeeea184711339720e5faa68 100644
+index 8dc486a..e49a37a 100644
 --- a/driver/program.go
 +++ b/driver/program.go
 @@ -801,6 +801,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
@@ -292,7 +464,26 @@ index 8dc486a3b147754fb30cb87ef1eb3ffccbbda780..7babe76685f9072efeeea18471133972
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
-@@ -1246,6 +1252,13 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
+@@ -1019,6 +1025,18 @@ func (p *Program) HasLinkedProgramPlugins() bool {
+   return p != nil && p.plugins.hasProgramPlugins()
+ }
+ 
++// LinkedEmitTransforms collects the per-file PluginTransform returned by every
++// registered EmitTransformPlugin for this Program generation, in registration
++// order. Hosts that transform and print TypeScript outside
++// EmitWithPluginTransformers use this to run linked per-file transforms without
++// mutating the Program's parsed ASTs.
++func (p *Program) LinkedEmitTransforms() ([]PluginTransform, error) {
++  if p == nil || p.TSProgram == nil {
++    return nil, errors.New("driver: nil program")
++  }
++  return p.plugins.emitTransforms(p)
++}
++
+ // PluginHostInputs returns the union of native file paths reported by linked
+ // hooks while this Program was loaded or transformed. Each scope is copied
+ // separately; this is not an atomic snapshot across concurrently reporting hooks
+@@ -1246,6 +1264,13 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
      }
    }
    raw = filterDiagnostics(raw)
@@ -307,7 +498,7 @@ index 8dc486a3b147754fb30cb87ef1eb3ffccbbda780..7babe76685f9072efeeea18471133972
    // tsgo recorded, which only makes sense against the tree tsgo parsed. The
    // preamble correction happens inside convertProgramDiagnostics, once the
 diff --git a/driver/rewrite.go b/driver/rewrite.go
-index 79be74d24e879da216ad680d23ecfeb5f11a29db..6db9dddba05bd50e13ed92535ca442c3a4f0b28a 100644
+index 79be74d..6db9ddd 100644
 --- a/driver/rewrite.go
 +++ b/driver/rewrite.go
 @@ -204,6 +204,9 @@ func (p *Program) EmitAllRaw(writeFile shimcompiler.WriteFile) (*shimcompiler.Em
@@ -411,9 +602,228 @@ index 79be74d24e879da216ad680d23ecfeb5f11a29db..6db9dddba05bd50e13ed92535ca442c3
  }
  
  func defaultWriteFile(fileName, text string) error {
+diff --git a/driver/session.go b/driver/session.go
+index 6d4b492..b7128ae 100644
+--- a/driver/session.go
++++ b/driver/session.go
+@@ -84,8 +84,10 @@ func NewSession(cwd, tsconfig string, options LoadProgramOptions) (*Session, []D
+ func (s *Session) Apply(absPath, content string) bool {
+   s.overlay.Set(absPath, content)
+   name := absPath
+-  if file := s.prog.SourceFile(absPath); file != nil {
+-    name = string(file.FileName())
++  if s.prog != nil && s.prog.TSProgram != nil && absPath != "" {
++    if file := s.prog.TSProgram.GetSourceFile(shimtspath.ToRootedFilePath(absPath, s.prog.TSProgram.GetCurrentDirectory())); file != nil {
++      name = string(file.FileName())
++    }
+   }
+   changed := shimcompiler.ProgramPathKey(s.prog.TSProgram, shimtspath.ToRootedFilePath(name, s.prog.TSProgram.GetCurrentDirectory()))
+   // The new host keeps the Program's content mappers, so a mapped file is
+@@ -104,6 +106,9 @@ func (s *Session) Apply(absPath, content string) bool {
+     s.prog.Checker = checker
+     s.prog.checkerRelease = release
+     s.prog.Host = newHost
++    s.prog.pluginsApplied = false
++    s.prog.pluginsApplyErr = nil
++    s.prog.plugins.resetGeneration()
+     e2etrace.Program("program-load-outcome", "driver-update", "facade-installed", reused, newProg)
+   }
+   return reused
+diff --git a/driver/session_linked_plugins_test.go b/driver/session_linked_plugins_test.go
+new file mode 100644
+index 0000000..d9afae2
+--- /dev/null
++++ b/driver/session_linked_plugins_test.go
+@@ -0,0 +1,186 @@
++package driver
++
++import (
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	shimast "github.com/microsoft/typescript-go/shim/ast"
++	shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
++	shimprinter "github.com/microsoft/typescript-go/shim/printer"
++	shimtspath "github.com/microsoft/typescript-go/shim/tspath"
++)
++
++type sessionTestPlugin struct {
++	applyCalls int
++	lastProg   *Program
++	emitProg   *Program
++	failText   string
++}
++
++func (p *sessionTestPlugin) ApplyProgram(prog *Program, ctx PluginContext) error {
++	p.applyCalls++
++	p.lastProg = ctx.Program
++	for _, sf := range prog.TSProgram.SourceFiles() {
++		if !sf.IsDeclarationFile && p.failText != "" && strings.Contains(sf.Text(), p.failText) {
++			return errors.New("forbidden marker present")
++		}
++	}
++	return nil
++}
++
++func (p *sessionTestPlugin) EmitTransform(ctx PluginContext) (PluginTransform, error) {
++	p.emitProg = ctx.Program
++	return func(ec *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
++		var visitor *shimast.NodeVisitor
++		visitor = ec.NewNodeVisitor(func(node *shimast.Node) *shimast.Node {
++			if node.Kind == shimast.KindStringLiteral && node.Text() == "before-emit" {
++				return ec.Factory.NewStringLiteral("after-emit", shimast.TokenFlagsNone)
++			}
++			return visitor.VisitEachChild(node)
++		})
++		return visitor.VisitSourceFile(sf)
++	}, nil
++}
++
++func TestSessionApplyResetsLinkedPluginsAndExposesProgramToEmitTransform(t *testing.T) {
++	savedRegistry := append([]any(nil), pluginRegistry...)
++	t.Cleanup(func() { pluginRegistry = savedRegistry })
++
++	plugin := &sessionTestPlugin{failText: "FORBIDDEN"}
++	pluginRegistry = []any{plugin}
++	payload, _ := json.Marshal([]PluginEntry{{Name: "session-test", Stage: "transform", Config: map[string]any{}}})
++	t.Setenv(LinkedPluginsEnv, string(payload))
++
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	mainPath := filepath.Join(root, "main.ts")
++	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"compilerOptions":{"target":"ES2022","module":"ESNext","strict":true,"outDir":"out"},"files":["main.ts"]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(mainPath, []byte(`export const label = "FORBIDDEN";`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	session, diags, err := NewSession(root, "tsconfig.json", LoadProgramOptions{})
++	if err != nil || CountErrors(diags) != 0 {
++		t.Fatalf("NewSession failed: err=%v diags=%v", err, diags)
++	}
++	defer session.Close()
++
++	if err := session.Program().ApplyLinkedPlugins(); err == nil || !strings.Contains(err.Error(), "forbidden marker") {
++		t.Fatalf("expected generation 1 ApplyProgram error, got %v", err)
++	}
++	if plugin.applyCalls != 1 || plugin.lastProg != session.Program() {
++		t.Fatalf("unexpected generation 1 hook state: calls=%d progMatch=%t", plugin.applyCalls, plugin.lastProg == session.Program())
++	}
++
++	session.Apply(mainPath, `export const label = "before-emit";`)
++	if plugin.applyCalls != 1 {
++		t.Fatalf("Session.Apply must not invoke ApplyProgram eagerly: calls=%d", plugin.applyCalls)
++	}
++	if err := session.Program().ApplyLinkedPlugins(); err != nil {
++		t.Fatalf("generation 2 ApplyProgram should succeed after fixing file: %v", err)
++	}
++	if plugin.applyCalls != 2 {
++		t.Fatalf("expected ApplyProgram to re-run on generation 2, calls=%d", plugin.applyCalls)
++	}
++
++	transforms, err := session.Program().LinkedEmitTransforms()
++	if err != nil || len(transforms) != 1 {
++		t.Fatalf("LinkedEmitTransforms: len=%d err=%v", len(transforms), err)
++	}
++	if plugin.emitProg != session.Program() {
++		t.Fatal("PluginContext.Program in EmitTransform did not match the active Program")
++	}
++
++	emitted := map[string]string{}
++	if _, err := session.Program().EmitWithPluginTransformers(nil, func(name shimtspath.RootedFilePath, text string, _ *shimcompiler.WriteFileData) error {
++		emitted[filepath.Base(string(name))] = text
++		return nil
++	}); err != nil {
++		t.Fatalf("EmitWithPluginTransformers failed: %v", err)
++	}
++	if !strings.Contains(emitted["main.js"], `"after-emit"`) {
++		t.Fatalf("emitted JS lacks EmitTransform rewrite:\n%s", emitted["main.js"])
++	}
++	sf := session.Program().TSProgram.GetSourceFile(shimtspath.ToRootedFilePath(mainPath, session.Program().TSProgram.GetCurrentDirectory()))
++	if sf == nil || !strings.Contains(sf.Text(), `"before-emit"`) {
++		t.Fatalf("source file missing or corrupted")
++	}
++	printed, _ := shimprinter.EmitSourceFileWithSourceMap(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, nil, sf)
++	if !strings.Contains(printed, `"before-emit"`) || strings.Contains(printed, `"after-emit"`) {
++		t.Fatalf("program SourceFile was mutated by emit transform:\n%s", printed)
++	}
++}
++
++type loweringDiagnosticPlugin struct{}
++
++func (loweringDiagnosticPlugin) LoweredDiagnostics(_ *Program, _ PluginContext, diagnostics []*shimast.Diagnostic) []*shimast.Diagnostic {
++	var lowered []*shimast.Diagnostic
++	for _, d := range diagnostics {
++		if d.Code() == 1103 {
++			lowered = append(lowered, d)
++		}
++	}
++	return lowered
++}
++
++func (loweringDiagnosticPlugin) EmitTransform(_ PluginContext) (PluginTransform, error) {
++	return func(ec *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
++		var visitor *shimast.NodeVisitor
++		visitor = ec.NewNodeVisitor(func(node *shimast.Node) *shimast.Node {
++			if node.Kind == shimast.KindForOfStatement && node.AsForInOrOfStatement().AwaitModifier != nil {
++				return ec.Factory.NewEmptyStatement()
++			}
++			return visitor.VisitEachChild(node)
++		})
++		return visitor.VisitSourceFile(sf)
++	}, nil
++}
++
++func TestEmitWithPluginTransformersHonorsDiagnosticPluginUnderNoEmitOnError(t *testing.T) {
++	savedRegistry := append([]any(nil), pluginRegistry...)
++	t.Cleanup(func() { pluginRegistry = savedRegistry })
++
++	pluginRegistry = []any{loweringDiagnosticPlugin{}}
++	payload, _ := json.Marshal([]PluginEntry{{Name: "lowering-diag", Stage: "transform", Config: map[string]any{}}})
++	t.Setenv(LinkedPluginsEnv, string(payload))
++
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"compilerOptions":{"target":"ES2022","module":"ESNext","strict":true,"noEmitOnError":true,"declaration":true,"outDir":"out"},"files":["main.ts"]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "main.ts"), []byte("export function* gen(xs: AsyncIterable<number>) {\n  for await (const x of xs) { yield x; }\n}\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	prog, diags, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{})
++	if err != nil || CountErrors(diags) != 0 {
++		t.Fatalf("LoadProgram failed: err=%v diags=%v", err, diags)
++	}
++	defer prog.Close()
++
++	emitted := map[string]string{}
++	emitDiags, err := prog.EmitWithPluginTransformers(nil, func(name shimtspath.RootedFilePath, text string, _ *shimcompiler.WriteFileData) error {
++		emitted[filepath.Base(string(name))] = text
++		return nil
++	})
++	if err != nil || CountErrors(emitDiags) != 0 {
++		t.Fatalf("EmitWithPluginTransformers should succeed when DiagnosticPlugin withdraws TS1103: err=%v diags=%v", err, emitDiags)
++	}
++	if emitted["main.js"] == "" || emitted["main.d.ts"] == "" {
++		t.Fatalf("expected both main.js and main.d.ts emitted, got keys=%v", emitted)
++	}
++	if strings.Contains(emitted["main.js"], "for await") {
++		t.Fatalf("expected emit transform to lower for await:\n%s", emitted["main.js"])
++	}
++}
 diff --git a/driver/withdrawn_diagnostics.go b/driver/withdrawn_diagnostics.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..cccf3d0b7243a7a0574e6f9aa1f6fa1a0bf03a80
+index 0000000..cccf3d0
 --- /dev/null
 +++ b/driver/withdrawn_diagnostics.go
 @@ -0,0 +1,50 @@
@@ -468,7 +878,7 @@ index 0000000000000000000000000000000000000000..cccf3d0b7243a7a0574e6f9aa1f6fa1a
 +  return nil
 +}
 diff --git a/lib/compiler/internal/build/BuildExecution.js b/lib/compiler/internal/build/BuildExecution.js
-index 9386a16e3c1f98c877f1bc3454b91d416cde9a63..f5f9f54e09eddecc5c06a00c998a6b98785bb702 100644
+index 9386a16..f5f9f54 100644
 --- a/lib/compiler/internal/build/BuildExecution.js
 +++ b/lib/compiler/internal/build/BuildExecution.js
 @@ -352,7 +352,8 @@ var BuildExecution;
@@ -529,7 +939,7 @@ index 9386a16e3c1f98c877f1bc3454b91d416cde9a63..f5f9f54e09eddecc5c06a00c998a6b98
      }
      BuildExecution.runNativePluginCommand = runNativePluginCommand;
 diff --git a/lib/compiler/internal/build/CompilerDiagnostics.js b/lib/compiler/internal/build/CompilerDiagnostics.js
-index 41017580431084dd18ae9e555d4ef32082714b38..3ddaba4ddd0942baa6fdbfc47fdb398b9d05150a 100644
+index 4101758..3ddaba4 100644
 --- a/lib/compiler/internal/build/CompilerDiagnostics.js
 +++ b/lib/compiler/internal/build/CompilerDiagnostics.js
 @@ -28,6 +28,9 @@ var CompilerDiagnostics;
@@ -554,7 +964,7 @@ index 41017580431084dd18ae9e555d4ef32082714b38..3ddaba4ddd0942baa6fdbfc47fdb398b
          if (diagnostics.length === 0)
              return null;
 diff --git a/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts b/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts
-index 7e0c116b7d073a66ad643e8bd50ffe9773241c53..16b43ecf6a8d1f164442a02ac1500cae6e2fae67 100644
+index 7e0c116..16b43ec 100644
 --- a/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts
 +++ b/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts
 @@ -30,6 +30,27 @@ export declare namespace PluginFailureDiagnostics {
@@ -586,7 +996,7 @@ index 7e0c116b7d073a66ad643e8bd50ffe9773241c53..16b43ecf6a8d1f164442a02ac1500cae
       * Keep the original failure when no new diagnostic batch remains. Otherwise
       * seed its unparsed process failure before the recovered reports and retain
 diff --git a/lib/compiler/internal/build/PluginFailureDiagnostics.js b/lib/compiler/internal/build/PluginFailureDiagnostics.js
-index d2863a9ea33d267630088412cc65e98953de4f2c..b7c954703c2c955e9b117756193edb94ddc495c3 100644
+index d2863a9..b7c9547 100644
 --- a/lib/compiler/internal/build/PluginFailureDiagnostics.js
 +++ b/lib/compiler/internal/build/PluginFailureDiagnostics.js
 @@ -40,6 +40,30 @@ var PluginFailureDiagnostics;
@@ -621,7 +1031,7 @@ index d2863a9ea33d267630088412cc65e98953de4f2c..b7c954703c2c955e9b117756193edb94
       * Keep the original failure when no new diagnostic batch remains. Otherwise
       * seed its unparsed process failure before the recovered reports and retain
 diff --git a/lib/compiler/internal/build/appendBuildOutput.js b/lib/compiler/internal/build/appendBuildOutput.js
-index 96c8d4e6ed4dd92156bf28064055177277cfd2ff..435a311e174004eec0d110ba0919d1bb3e45a722 100644
+index 96c8d4e..435a311 100644
 --- a/lib/compiler/internal/build/appendBuildOutput.js
 +++ b/lib/compiler/internal/build/appendBuildOutput.js
 @@ -9,6 +9,8 @@ const normalizeBuildOutput_1 = require("./normalizeBuildOutput");
@@ -650,7 +1060,7 @@ index 96c8d4e6ed4dd92156bf28064055177277cfd2ff..435a311e174004eec0d110ba0919d1bb
          emittedSources: right.emittedSources,
          emittedSourceProofFailures: right.emittedSourceProofFailures,
 diff --git a/lib/compiler/internal/build/normalizeBuildOutput.js b/lib/compiler/internal/build/normalizeBuildOutput.js
-index 889d79686b3b8a830e69695f8370e36d109e50b6..0fc1166d503630090b48ab54809d06d886d6a6c7 100644
+index 889d796..0fc1166 100644
 --- a/lib/compiler/internal/build/normalizeBuildOutput.js
 +++ b/lib/compiler/internal/build/normalizeBuildOutput.js
 @@ -1,6 +1,7 @@
@@ -662,7 +1072,7 @@ index 889d79686b3b8a830e69695f8370e36d109e50b6..0fc1166d503630090b48ab54809d06d8
  /**
   * Normalise a raw spawn result into a `TtscBuildResult`.
 diff --git a/lib/compiler/internal/captureProcessOutput.js b/lib/compiler/internal/captureProcessOutput.js
-index 06a4734a978facf210ffe4e5ce087d00a2b11412..b84d2a1ccde1ba107beebed987a477c42f9c4179 100644
+index 06a4734..b84d2a1 100644
 --- a/lib/compiler/internal/captureProcessOutput.js
 +++ b/lib/compiler/internal/captureProcessOutput.js
 @@ -10,7 +10,9 @@ const createCanonicalTempDirectory_1 = require("../../internal/createCanonicalTe
@@ -709,7 +1119,7 @@ index 06a4734a978facf210ffe4e5ce087d00a2b11412..b84d2a1ccde1ba107beebed987a477c4
  /** Attempt closure without replacing the acquisition or process outcome. */
 diff --git a/lib/compiler/internal/sharedHost/WITHDRAWN_DIAGNOSTICS_PATH_ENV.js b/lib/compiler/internal/sharedHost/WITHDRAWN_DIAGNOSTICS_PATH_ENV.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..557e3eaf1e05ff7f9cb4d231699b4f7a91fcc345
+index 0000000..557e3ea
 --- /dev/null
 +++ b/lib/compiler/internal/sharedHost/WITHDRAWN_DIAGNOSTICS_PATH_ENV.js
 @@ -0,0 +1,12 @@
@@ -727,7 +1137,7 @@ index 0000000000000000000000000000000000000000..557e3eaf1e05ff7f9cb4d231699b4f7a
 +//# sourceMappingURL=WITHDRAWN_DIAGNOSTICS_PATH_ENV.js.map
 \ No newline at end of file
 diff --git a/lib/compiler/internal/spawnNative.js b/lib/compiler/internal/spawnNative.js
-index b347a08e9a843a5277bcd750f6acbd5d48b08d2e..cae5f80042583fbf5abd57bb54460ac5ef56f3a5 100644
+index b347a08..cae5f80 100644
 --- a/lib/compiler/internal/spawnNative.js
 +++ b/lib/compiler/internal/spawnNative.js
 @@ -5,6 +5,8 @@ const isSpawnSyncFdExhaustion_1 = require("../../internal/isSpawnSyncFdExhaustio
@@ -779,7 +1189,7 @@ index b347a08e9a843a5277bcd750f6acbd5d48b08d2e..cae5f80042583fbf5abd57bb54460ac5
      }
      finally {
 diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javascriptRuntimeCapabilities.js
-index 53dc81d7ae8b6eac246306ad8f94b01f2594689a..d6ad694d69deca3661f5b89b491a48f282b34d42 100644
+index 53dc81d..d6ad694 100644
 --- a/lib/internal/javascriptRuntimeCapabilities.js
 +++ b/lib/internal/javascriptRuntimeCapabilities.js
 @@ -43,6 +43,19 @@ const spawnSyncWithLowDescriptors_1 = require("./spawnSyncWithLowDescriptors");
@@ -803,7 +1213,7 @@ index 53dc81d7ae8b6eac246306ad8f94b01f2594689a..d6ad694d69deca3661f5b89b491a48f2
      // which would refuse the cache and run in the probe (#1740).
      const effectiveEnv = TtsxNodeOptions_1.TtsxNodeOptions.forHelpers(SidecarEnvironment_1.SidecarEnvironment.merge(process.env, env));
 diff --git a/lib/plugin/internal/source/GoSourceInputs.js b/lib/plugin/internal/source/GoSourceInputs.js
-index 6bf30f65eb6f046eb2b9d505f6838b330a444df4..abc3485a35c4e380dc6e4c07fbacf2553ff2e21a 100644
+index 6bf30f6..abc3485 100644
 --- a/lib/plugin/internal/source/GoSourceInputs.js
 +++ b/lib/plugin/internal/source/GoSourceInputs.js
 @@ -73,6 +73,16 @@ var GoSourceInputs;
@@ -824,7 +1234,7 @@ index 6bf30f65eb6f046eb2b9d505f6838b330a444df4..abc3485a35c4e380dc6e4c07fbacf255
          // (`go mod edit`, `go env`, `go version`) call goBuildEnv with no cache root
          // and inherit ambient GOCACHE rather than receiving the managed build
 diff --git a/lib/plugin/internal/source/NativeSourcePackages.d.ts b/lib/plugin/internal/source/NativeSourcePackages.d.ts
-index 8e0fe14cc74e9ed08439ad682977a72fde65a5d7..eef080d782bc703166b4512557593fc636d5754a 100644
+index 8e0fe14..eef080d 100644
 --- a/lib/plugin/internal/source/NativeSourcePackages.d.ts
 +++ b/lib/plugin/internal/source/NativeSourcePackages.d.ts
 @@ -7,12 +7,12 @@ import { SourcePluginWorkspace } from "./SourcePluginWorkspace";
@@ -877,7 +1287,7 @@ index 8e0fe14cc74e9ed08439ad682977a72fde65a5d7..eef080d782bc703166b4512557593fc6
      /**
       * Require a valid production package and agreement with requested ownership.
 diff --git a/lib/plugin/internal/source/NativeSourcePackages.js b/lib/plugin/internal/source/NativeSourcePackages.js
-index e3b72e2fe7fb0ccfc169209726db886c9bfc7689..a8a211058dd2aa9478af64a270500948c022d7ed 100644
+index e3b72e2..a8a2110 100644
 --- a/lib/plugin/internal/source/NativeSourcePackages.js
 +++ b/lib/plugin/internal/source/NativeSourcePackages.js
 @@ -18,6 +18,8 @@ const PluginContentIdentities_1 = require("./PluginContentIdentities");
@@ -1094,7 +1504,7 @@ index e3b72e2fe7fb0ccfc169209726db886c9bfc7689..a8a211058dd2aa9478af64a270500948
  //# sourceMappingURL=NativeSourcePackages.js.map
 \ No newline at end of file
 diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
-index da585c3ce22340d4a7d3c2b2793ae5c951958372..63c842daefa4c15cbc17b778dd382ac038eed69a 100644
+index da585c3..63c842d 100644
 --- a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 +++ b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 @@ -20,10 +20,10 @@ const pluginBuildEnvironment_1 = require("./pluginBuildEnvironment");
@@ -1122,7 +1532,7 @@ index da585c3ce22340d4a7d3c2b2793ae5c951958372..63c842daefa4c15cbc17b778dd382ac0
          const retire = () => {
              if (worker === created)
 diff --git a/lib/plugin/internal/source/SourcePluginWorkspace.d.ts b/lib/plugin/internal/source/SourcePluginWorkspace.d.ts
-index b4623b785d56dfd359c0a01e2f048dd624edb857..0011d99bc0699a9487b3ce50c37a3e2f49f83585 100644
+index b4623b7..0011d99 100644
 --- a/lib/plugin/internal/source/SourcePluginWorkspace.d.ts
 +++ b/lib/plugin/internal/source/SourcePluginWorkspace.d.ts
 @@ -41,6 +41,10 @@ export declare namespace SourcePluginWorkspace {
@@ -1146,7 +1556,7 @@ index b4623b785d56dfd359c0a01e2f048dd624edb857..0011d99bc0699a9487b3ce50c37a3e2f
          readonly modulePath: string;
      }
 diff --git a/lib/plugin/internal/source/SourcePluginWorkspace.js b/lib/plugin/internal/source/SourcePluginWorkspace.js
-index 0c15fff7f0690410e69308f9567977de50a42bf2..02fe6f95e34f135b33296de1241a4819bef171a7 100644
+index 0c15fff..02fe6f9 100644
 --- a/lib/plugin/internal/source/SourcePluginWorkspace.js
 +++ b/lib/plugin/internal/source/SourcePluginWorkspace.js
 @@ -72,6 +72,10 @@ var SourcePluginWorkspace;
@@ -1184,7 +1594,7 @@ index 0c15fff7f0690410e69308f9567977de50a42bf2..02fe6f95e34f135b33296de1241a4819
              OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
              useLines.push(`\t${(0, formatGoWorkPath_1.formatGoWorkPath)(dir)}`);
 diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts b/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
-index bd872710a248aa9bd2dbd0c9bc59f89d9b60970c..46184064f7ba45602b03e99db69291bbbe522675 100644
+index bd87271..4618406 100644
 --- a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
 +++ b/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
 @@ -21,7 +21,11 @@
@@ -1201,7 +1611,7 @@ index bd872710a248aa9bd2dbd0c9bc59f89d9b60970c..46184064f7ba45602b03e99db69291bb
   * A caller that keeps the population as a listing (`IPluginSourceListing`)
   * passes `visit`, which sees each directory the walk lists just before its
 diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.js b/lib/plugin/internal/source/collectPluginSourceFiles.js
-index 22ef5cb14a41ddea0ec480c45c4c8806cfc7c4af..e6aae920c3c6fc897b2953d25d38f3c3c4fa2d29 100644
+index 22ef5cb..e6aae92 100644
 --- a/lib/plugin/internal/source/collectPluginSourceFiles.js
 +++ b/lib/plugin/internal/source/collectPluginSourceFiles.js
 @@ -30,7 +30,11 @@ const GoSourceInputs_1 = require("./GoSourceInputs");
@@ -1245,7 +1655,7 @@ index 22ef5cb14a41ddea0ec480c45c4c8806cfc7c4af..e6aae920c3c6fc897b2953d25d38f3c3
  //# sourceMappingURL=collectPluginSourceFiles.js.map
 \ No newline at end of file
 diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/internal/source/inspectPluginBuildLock.js
-index 1d9fba4c59143dc68efff3dba52499121f727b66..63d7ba0a344119dad76df5fdc2477c69dccb7ba9 100644
+index 1d9fba4..63d7ba0 100644
 --- a/lib/plugin/internal/source/inspectPluginBuildLock.js
 +++ b/lib/plugin/internal/source/inspectPluginBuildLock.js
 @@ -65,9 +65,16 @@ function inspectPluginBuildLock(lockDir) {
@@ -1290,7 +1700,7 @@ index 1d9fba4c59143dc68efff3dba52499121f727b66..63d7ba0a344119dad76df5fdc2477c69
   * Whether a path lookup proves absence. Permission and sharing failures are
   * inconclusive, never evidence of a released or old abandoned generation.
 diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/internal/source/waitForPluginBinary.js
-index 191b99ea9f36da615f82f921d40c185a56737bbd..a741af5a3e5d401f1827d896774d89bf7e2bd0c5 100644
+index 191b99e..a741af5 100644
 --- a/lib/plugin/internal/source/waitForPluginBinary.js
 +++ b/lib/plugin/internal/source/waitForPluginBinary.js
 @@ -25,6 +25,12 @@ const inspectPluginBuildLock_1 = require("./inspectPluginBuildLock");
@@ -1342,19 +1752,126 @@ index 191b99ea9f36da615f82f921d40c185a56737bbd..a741af5a3e5d401f1827d896774d89bf
          if (clock - startedAt >= opts.timeoutMs) {
              throw new Error(`ttsc: timed out after ${(0, formatDuration_1.formatDuration)(clock - startedAt)} waiting for ` +
                  `${opts.lockInfo.label} "${opts.lockInfo.pluginName}" at ${opts.lockDir}; ` +
+diff --git a/utility/emit_transform_test.go b/utility/emit_transform_test.go
+new file mode 100644
+index 0000000..73ebec9
+--- /dev/null
++++ b/utility/emit_transform_test.go
+@@ -0,0 +1,98 @@
++package utility
++
++import (
++	"bytes"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	shimast "github.com/microsoft/typescript-go/shim/ast"
++	shimprinter "github.com/microsoft/typescript-go/shim/printer"
++
++	"github.com/samchon/ttsc/packages/ttsc/driver"
++)
++
++type utilityEmitTransformPlugin struct{}
++
++func init() {
++	driver.RegisterPlugin(utilityEmitTransformPlugin{})
++}
++
++func (utilityEmitTransformPlugin) EmitTransform(ctx driver.PluginContext) (driver.PluginTransform, error) {
++	if ctx.Program == nil {
++		return nil, nil
++	}
++	return func(ec *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
++		var visitor *shimast.NodeVisitor
++		visitor = ec.NewNodeVisitor(func(node *shimast.Node) *shimast.Node {
++			if node.Kind == shimast.KindStringLiteral && node.Text() == "utility-before" {
++				return ec.Factory.NewStringLiteral("utility-after", shimast.TokenFlagsNone)
++			}
++			return visitor.VisitEachChild(node)
++		})
++		return visitor.VisitSourceFile(sf)
++	}, nil
++}
++
++func TestUtilityTransformAndServeRunLinkedEmitTransforms(t *testing.T) {
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"compilerOptions":{"target":"ES2022","module":"ESNext","strict":true},"files":["entry.ts"]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "entry.ts"), []byte("export const value = \"utility-before\";\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	payload, _ := json.Marshal([]driver.PluginEntry{{Name: "utility-emit-test", Stage: "transform", Config: map[string]any{}}})
++	baseArgs := []string{"--cwd", root, "--tsconfig", "tsconfig.json", "--plugins-json", string(payload)}
++
++	t.Run("transform", func(t *testing.T) {
++		var stdout, stderr bytes.Buffer
++		status := RunTransformWithIO(baseArgs, &stdout, &stderr)
++		if status != 0 {
++			t.Fatalf("RunTransformWithIO status=%d stderr=%s", status, stderr.String())
++		}
++		var env struct {
++			TypeScript map[string]string          `json:"typescript"`
++			SourceMaps map[string]json.RawMessage `json:"sourceMaps"`
++		}
++		if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
++			t.Fatalf("decode transform output: %v\n%s", err, stdout.String())
++		}
++		if got := env.TypeScript["entry.ts"]; !strings.Contains(got, `"utility-after"`) || strings.Contains(got, `"utility-before"`) {
++			t.Fatalf("transform output did not apply linked emit transform:\n%s", got)
++		}
++		if len(env.SourceMaps["entry.ts"]) == 0 {
++			t.Fatalf("expected source map for entry.ts after linked emit transform")
++		}
++	})
++
++	t.Run("serve", func(t *testing.T) {
++		in := strings.NewReader("{\"file\":\"entry.ts\"}\n{\"update\":\"entry.ts\",\"content\":\"export const value = \\\"utility-before\\\";\\nexport const n = 2;\\n\"}\n{\"file\":\"entry.ts\"}\n")
++		var out bytes.Buffer
++		status := RunServe(in, &out, baseArgs)
++		if status != 0 {
++			t.Fatalf("RunServe status=%d out=%s", status, out.String())
++		}
++		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
++		if len(lines) != 3 {
++			t.Fatalf("expected 3 serve responses, got %d:\n%s", len(lines), out.String())
++		}
++		for _, idx := range []int{0, 2} {
++			var resp struct {
++				Found      bool   `json:"found"`
++				TypeScript string `json:"typescript"`
++			}
++			if err := json.Unmarshal([]byte(lines[idx]), &resp); err != nil {
++				t.Fatalf("decode serve line %d: %v", idx, err)
++			}
++			if !resp.Found || !strings.Contains(resp.TypeScript, `"utility-after"`) || strings.Contains(resp.TypeScript, `"utility-before"`) {
++				t.Fatalf("serve line %d missing linked emit transform:\n%s", idx, resp.TypeScript)
++			}
++		}
++	})
++}
 diff --git a/utility/host.go b/utility/host.go
-index ce42de43a7fab2d28b3a50529a88c21a988d0d0d..dcd04ca94c0900896b0e1bc04e9ed53e7da47b65 100644
+index ce42de4..2f07583 100644
 --- a/utility/host.go
 +++ b/utility/host.go
-@@ -7,6 +7,7 @@ import (
+@@ -7,8 +7,10 @@ import (
    "io"
    "os"
    "path/filepath"
 +  "sort"
    "strings"
  
++  shimast "github.com/microsoft/typescript-go/shim/ast"
    shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
-@@ -260,7 +261,10 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+   shimprinter "github.com/microsoft/typescript-go/shim/printer"
+   shimtspath "github.com/microsoft/typescript-go/shim/tspath"
+@@ -260,7 +262,10 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
      opts.quiet = false // --verbose overrides the default --quiet=true
    }
    if !opts.quiet {
@@ -1366,7 +1883,7 @@ index ce42de43a7fab2d28b3a50529a88c21a988d0d0d..dcd04ca94c0900896b0e1bc04e9ed53e
    }
    writeFile, finishPreamble := makeSourcePreambleWriteFile(prog)
    var snapshot func() map[string][]string
-@@ -310,6 +314,18 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+@@ -310,6 +315,18 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
    }
    if !opts.quiet {
      fmt.Fprintf(opts.stdout, "// ttsc utility: emitted=%d files\n", len(emittedFiles))
@@ -1385,3 +1902,85 @@ index ce42de43a7fab2d28b3a50529a88c21a988d0d0d..dcd04ca94c0900896b0e1bc04e9ed53e
      driver.WriteEnvironmentInputsSummary(opts.stdout, "// ttsc utility: ", prog)
    }
    return 0
+@@ -375,16 +392,33 @@ func RunTransformWithIO(args []string, stdout, stderr io.Writer) int {
+     if err := prog.ApplyLinkedPlugins(); err != nil {
+       fmt.Fprintln(opts.stderr, err)
+       diags = append(diags, driver.Diagnostic{Message: err.Error()})
++    } else if linkedTransforms, err := prog.LinkedEmitTransforms(); err != nil {
++      fmt.Fprintln(opts.stderr, err)
++      diags = append(diags, driver.Diagnostic{Message: err.Error()})
+     } else {
+       out.SourceMaps = map[string]json.RawMessage{}
+       for _, file := range prog.SourceFiles() {
++        var ec *shimprinter.EmitContext
++        target := file
++        if len(linkedTransforms) != 0 {
++          ec = shimprinter.NewEmitContext()
++          for _, transform := range linkedTransforms {
++            if transform == nil {
++              continue
++            }
++            if next := transform(ec, target); next != nil {
++              target = next
++            }
++          }
++          shimast.SetParentInChildrenUnset(target.AsNode())
++        }
+         // The map carries the source text it was generated from, so a
+         // consumer can tell whether it describes the text it was handed.
+         text, sourceMap := shimprinter.EmitSourceFileWithSourceMap(
+           shimprinter.PrinterOptions{InlineSources: true},
+           shimprinter.PrintHandlers{},
+-          nil,
+-          file,
++          ec,
++          target,
+         )
+         key := apiOutputKey(opts.cwd, string(file.FileName()))
+         out.TypeScript[key] = text
+diff --git a/utility/serve.go b/utility/serve.go
+index ae4bd0e..499c093 100644
+--- a/utility/serve.go
++++ b/utility/serve.go
+@@ -8,6 +8,7 @@ import (
+   "os"
+   "strings"
+ 
++  shimast "github.com/microsoft/typescript-go/shim/ast"
+   shimprinter "github.com/microsoft/typescript-go/shim/printer"
+   shimtspath "github.com/microsoft/typescript-go/shim/tspath"
+ 
+@@ -180,10 +181,32 @@ func buildServeCache(opts hostOptions) (map[string]string, bool) {
+     fmt.Fprintln(os.Stderr, err)
+     return nil, false
+   }
++  linkedTransforms, err := prog.LinkedEmitTransforms()
++  if err != nil {
++    fmt.Fprintln(os.Stderr, err)
++    return nil, false
++  }
+   printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, nil)
+   cache := map[string]string{}
+   for _, file := range prog.SourceFiles() {
+-    cache[apiOutputKey(opts.cwd, string(file.FileName()))] = shimprinter.EmitSourceFile(printer, file)
++    key := apiOutputKey(opts.cwd, string(file.FileName()))
++    if len(linkedTransforms) == 0 {
++      cache[key] = shimprinter.EmitSourceFile(printer, file)
++      continue
++    }
++    ec := shimprinter.NewEmitContext()
++    target := file
++    for _, transform := range linkedTransforms {
++      if transform == nil {
++        continue
++      }
++      if next := transform(ec, target); next != nil {
++        target = next
++      }
++    }
++    shimast.SetParentInChildrenUnset(target.AsNode())
++    filePrinter := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, ec)
++    cache[key] = shimprinter.EmitSourceFile(filePrinter, target)
+   }
+   if opts.observationsIncomplete != nil {
+     *opts.observationsIncomplete = prog.PluginObservationsIncomplete()

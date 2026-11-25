@@ -445,9 +445,39 @@ cold selection, to answer from the manifests and two package directories. When t
 module, the patch lists it where it lies, under a generated `go.work` (`GOWORK`) and a Go `-overlay` that presents each
 contributor's files at `contrib/<name>`; the answer is recorded only when the module and contributors still hold their
 keyed digests after Go ran. A proposal, a contributor holding a nested `go.mod`, or a host entry under a link or a
-pruned directory is still observed in a copy. The packaged managed asset is the source, so clean managed installs
-receive the same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that
-exact compiler version; the repository's lockfile continues to own its compiler pin.
+pruned directory is still observed in a copy.
+
+A resident `driver.Session` whose `Session.Apply` installs a new program generation looks up the changed file directly
+on `TSProgram` (`TSProgram.GetSourceFile`) and resets `pluginsApplied`, `pluginsApplyErr` and the per-generation plugin
+ledgers (`declarations`, `inputs`, `outputs` via `linkedPluginState.resetGeneration` in `driver/session.go` and
+`driver/plugins.go`, [samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)): stock ttsc left the generation-1
+latch and ledgers set across `Session.Apply`, so reusing one session across edits skipped linked `ProgramPlugin` hooks
+on every later generation.
+
+`PluginContext.Program` exposes the active `*Program` to every generation-bound linked hook (`ProgramPlugin`,
+`EmitTransformPlugin`, `DiagnosticPlugin`; `nil` for pre-load `SourcePreamblePlugin`), and
+`(*Program).LinkedEmitTransforms()` exports the ordered per-file `PluginTransform` list collected from registered
+`EmitTransformPlugin`s (`driver/plugins.go`, `driver/program.go`, `driver/emit_plugin.go`,
+[samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)): a host that transforms and prints TypeScript outside
+`EmitWithPluginTransformers` can run linked emit transforms per file without mutating the Program's parsed ASTs.
+
+ttsc's utility `transform` (`utility/host.go` `RunTransformWithIO`) and `serve` (`utility/serve.go` `buildServeCache`)
+lanes run `(*Program).LinkedEmitTransforms()` per file in a fresh `shimprinter.EmitContext`, restoring unset parent
+links (`shimast.SetParentInChildrenUnset`) before printing TypeScript and source maps
+([samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)): stock utility lanes ran only `ProgramPlugin`s and
+skipped `EmitTransformPlugin`s, forcing per-file transforms to mutate shared program trees. When no
+`EmitTransformPlugin` is registered, both lanes take the unchanged path.
+
+`EmitWithPluginTransformers` and `pluginEmitDiagnostics` (`driver/emit_plugin.go`, `driver/emit_plugin_output.go`)
+filter diagnostics, drop the checker refusals a linked `DiagnosticPlugin` withdraws via `LoweredDiagnostics`, and record
+those withdrawals (`recordWithdrawnDiagnostics`) at the pre-emit and JavaScript-emit gates: when every pre-emit error is
+withdrawn under `noEmitOnError`, declaration emit (`EmitOnlyDts`) temporarily clears `NoEmitOnError` around
+`emitProgram` (restoring it on return) so both JavaScript and `.d.ts` outputs emit while any unwithdrawn error still
+blocks emit ([samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)).
+
+The packaged managed asset is the source, so clean managed installs receive the same repairs without a compiler fork or
+edits to the dependency cache. The registration applies only to that exact compiler version; the repository's lockfile
+continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
