@@ -1893,10 +1893,18 @@ mod tests {
             WaitResolution::Withdrawn { .. } => panic!("install was withdrawn instead of fenced"),
         }
 
+        let _ = cli_a_w.shutdown().await;
+        let _ = cli_b_w.shutdown().await;
+        drop(lines_a);
+        drop(lines_b);
         drop(cli_a_w);
         drop(cli_b_w);
-        let _ = task_a.await;
-        let _ = task_b.await;
+        let _ = tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, task_a)
+            .await
+            .expect("task_a exits on client close");
+        let _ = tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, task_b)
+            .await
+            .expect("task_b exits on client close");
     }
 
     /// A fenced turn refuses new binds (`fenced_bind_refused`, 05_gateway.md "Land turns") until
@@ -1921,12 +1929,20 @@ mod tests {
         let held = read_json_line(&mut lines, "held").await;
         assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
 
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn child to bind");
+        let child_pid = child.id().expect("child pid");
+
         cli_w
             .write_all(b"{\"step\":\"fenced\"}\n")
             .await
             .expect("send fenced");
         cli_w
-            .write_all(format!("{{\"step\":\"bind\",\"pid\":{}}}\n", std::process::id()).as_bytes())
+            .write_all(format!("{{\"step\":\"bind\",\"pid\":{child_pid}}}\n").as_bytes())
             .await
             .expect("send bind while fenced");
 
@@ -1939,12 +1955,28 @@ mod tests {
         assert!(
             answer["error"]
                 .as_str()
-                .is_some_and(|msg| msg.contains("fenced")),
-            "bind refusal must name fenced state, not unknown step: {answer}"
+                .is_some_and(|msg| msg.contains("fenced")
+                    && !msg.contains("unknown variant")
+                    && !msg.contains("a land turn step is a bind or an end")),
+            "bind refusal must name fenced state, not reject step fenced as unknown: {answer}"
+        );
+        let snap = turns.snapshot(u64::MAX).await.expect("snapshot");
+        assert!(
+            snap.queues[0].tickets[0].fenced,
+            "ticket must be marked fenced: {snap:?}"
+        );
+        assert!(
+            snap.queues[0].tickets[0].bound.is_empty(),
+            "refused bind must not bind the child pid: {snap:?}"
         );
 
+        let _ = cli_w.shutdown().await;
+        drop(lines);
         drop(cli_w);
-        let _ = task.await;
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, task)
+            .await
+            .expect("hold task exits on client close");
     }
 
     /// When an install lifts its fence without restarting, held fenced turns receive
@@ -2010,7 +2042,11 @@ mod tests {
             "ticket fenced mark must clear after unfence: {snap:?}"
         );
 
+        let _ = cli_w.shutdown().await;
+        drop(lines);
         drop(cli_w);
-        let _ = task.await;
+        let _ = tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, task)
+            .await
+            .expect("hold task exits on client close");
     }
 }
