@@ -5114,4 +5114,94 @@ mod tests {
         };
         assert!(oversized.validate().is_err());
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_accept_does_not_lose_connection_arriving_before_would_block() {
+        struct ArrivingMidAccept {
+            inner: std::net::TcpListener,
+            addr: std::net::SocketAddr,
+            injected: std::sync::atomic::AtomicBool,
+            client: Arc<std::sync::Mutex<Option<std::net::TcpStream>>>,
+        }
+
+        impl std::os::fd::AsFd for ArrivingMidAccept {
+            fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+                self.inner.as_fd()
+            }
+        }
+
+        impl std::os::fd::AsRawFd for ArrivingMidAccept {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                self.inner.as_raw_fd()
+            }
+        }
+
+        impl StdAccept for ArrivingMidAccept {
+            type StdStream = std::net::TcpStream;
+            type AsyncStream = tokio::net::TcpStream;
+            type Addr = std::net::SocketAddr;
+
+            fn accept_std(&self) -> std::io::Result<(Self::StdStream, Self::Addr)> {
+                if !self
+                    .injected
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    let client = std::net::TcpStream::connect_timeout(
+                        &self.addr,
+                        cowshed_os::test_backstop::NO_PROGRESS,
+                    )?;
+                    *self.client.lock().expect("client slot") = Some(client);
+                    // Hold the blocking accept long enough for the current_thread runtime to park
+                    // and let its I/O driver observe the new connection and advance the listener's
+                    // readiness tick before WouldBlock is returned.
+                    std::thread::sleep(Duration::from_millis(200));
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                self.inner.accept()
+            }
+
+            fn set_nonblocking(stream: &Self::StdStream) -> std::io::Result<()> {
+                stream.set_nonblocking(true)
+            }
+
+            fn into_async(stream: Self::StdStream) -> std::io::Result<Self::AsyncStream> {
+                tokio::net::TcpStream::from_std(stream)
+            }
+        }
+
+        let client_slot = Arc::new(std::sync::Mutex::new(None));
+        let client_for_listener = Arc::clone(&client_slot);
+        let listener = Fenced::create(|| {
+            let inner = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+            inner.set_nonblocking(true)?;
+            let addr = inner.local_addr()?;
+            Ok(ArrivingMidAccept {
+                inner,
+                addr,
+                injected: std::sync::atomic::AtomicBool::new(false),
+                client: client_for_listener,
+            })
+        })
+        .expect("bind test listener");
+
+        let mut accept = AsyncAccept::new(listener).expect("register test listener");
+        let (stream, peer) = tokio::time::timeout(
+            cowshed_os::test_backstop::NO_PROGRESS,
+            accept.accept(),
+        )
+        .await
+        .expect(
+            "accept must not lose the readiness wakeup for a connection arriving during WouldBlock",
+        )
+        .expect("accept the arriving connection");
+
+        let client = client_slot
+            .lock()
+            .expect("client slot")
+            .take()
+            .expect("first accept_std connected a client");
+        let client_addr = client.local_addr().expect("client local addr");
+        assert_eq!(peer, client_addr);
+        assert_eq!(stream.peer_addr().expect("accepted peer addr"), client_addr);
+    }
 }
