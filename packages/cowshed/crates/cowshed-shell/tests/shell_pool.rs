@@ -1685,7 +1685,15 @@ async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one() {
     let mut workspace = Workspace::new("shell-pool-revoke", 41_312);
-    workspace.envrc("");
+    // `.envrc-local` is sourced during the first evaluation and again by every adopting host
+    // (11_shell.md, "Inherited shells"), so `$TMPDIR/tails` observes the prewarmed spare without
+    // requiring it to re-evaluate `.envrc`.
+    std::fs::write(
+        workspace.mount().join(".envrc-local"),
+        "printf 'tail\\n' >> \"$TMPDIR/tails\"\n",
+    )
+    .expect(".envrc-local");
+    workspace.envrc("source_env_if_exists .envrc-local\n");
     let granted = workspace
         .root
         .parent()
@@ -1712,16 +1720,25 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
         )
         .await
         .expect("admit the running job");
-    // The spare built ahead of demand under revision 1 exists before the revoke (it adopts the
-    // export the first command's evaluation left, so its activation is what shows it).
-    let spare = tokio::time::timeout(Duration::from_secs(60), async {
-        while workspace.activations() < 2 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
-    assert!(spare.is_ok(), "a spare activates under revision 1");
-    let before = workspace.activations();
+    // The spare built ahead of demand under revision 1 adopts the export the first command's
+    // evaluation left (without re-evaluating `.envrc`), sourcing `.envrc-local` as it does.
+    let tails = workspace.sandbox.exec_temp_dir.join("tails");
+    while std::fs::read_to_string(&tails)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+        < 2
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "the revision 1 spare adopts the checkout's export without re-evaluating .envrc"
+    );
+    let before = handle
+        .shell_pool()
+        .await
+        .expect("pool counts before revoke");
 
     let mut revoked = workspace.sandbox.clone();
     revoked.grants.write.clear();
@@ -1737,9 +1754,28 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
         "the first command after the revoke is refused the revoked path"
     );
     assert!(!granted.join("after").exists());
-    assert!(
-        workspace.activations() > before,
-        "no host built under revision 1, the spare included, serves revision 2"
+    let after = advanced
+        .shell_pool()
+        .await
+        .expect("pool counts after revoke");
+    assert_eq!(
+        after.pools,
+        before.pools + 1,
+        "revision 2 starts a fresh pool: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after.activated,
+        before.activated + 1,
+        "no host built under revision 1, the spare included, serves revision 2: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after.spare, before.spare,
+        "revision 1's spare never serves revision 2: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "revision 2 adopts the checkout's export without re-evaluating .envrc"
     );
 
     std::fs::write(&gate, b"go").expect("release the running job");
