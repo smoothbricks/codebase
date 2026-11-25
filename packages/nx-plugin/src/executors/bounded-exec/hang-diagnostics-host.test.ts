@@ -12,8 +12,9 @@ describe('privileged hang probe host proofs', () => {
   it('ends a privileged probe through sudo, so its root lsof does not outlive sudo', async () => {
     // The privileged probe exists only on Darwin, where it runs `sudo -n lsof`.
     if (process.platform !== 'darwin') return;
-    // `-r 30` lists once, then sleeps holding its pipe: alive and silent when stopped, as a slow scan is.
-    const command = `lsof -r 30 -nP -p ${process.pid}`;
+    // `-r 30` lists once, then sleeps holding its pipe: alive and silent when stopped, as a slow scan is. `-b -O` as the
+    // probe runs it (hang-diagnostics.ts): no helper forks, so readiness is the scan alone.
+    const command = `lsof -b -O -r 30 -nP -p ${process.pid}`;
     const probe = spawn('sudo', ['-n', ...command.split(' ')], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     try {
       const exited = once(probe, 'exit');

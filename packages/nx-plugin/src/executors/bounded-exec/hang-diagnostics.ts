@@ -35,16 +35,18 @@ const FS_USAGE_SECONDS = 5;
  */
 const READING_RESERVE_MS = 1_000;
 /**
- * lsof's mount-table fallback (darwin libproc dmnt.c, readmnt()): a mount it cannot stat(), such as one detaching under a
- * concurrent shed, is kept with its mount-table device. Descriptors come per process from libproc, so this warning omits
- * none of the selected processes' rows.
+ * lsof's mount-table fallback (darwin libproc dmnt.c, readmnt()): a mount it does not stat() is kept with its
+ * mount-table device. Descriptors come per process from libproc, so this warning omits none of the selected processes'
+ * rows. Under `-b` it is said for every mount, each after the stat() and readlink() it avoided.
  */
 const LSOF_MOUNT_FALLBACK =
   /^lsof: WARNING: can't stat\(\) \S+ file system .*\n {6}Output information may be incomplete\.\n {6}assuming "dev=[0-9a-f]+" from mount table\n/gm;
+/** What lsof says of each kernel call `-b` makes it avoid: by design, and no row is lost to it. */
+const LSOF_AVOIDED = /^lsof: avoiding (?:readlink|stat)\(.*\): -b was specified\.\n/gm;
 
-/** The lsof stderr that makes its census incomplete: everything except its mount-table fallback. */
+/** The lsof stderr that makes its census incomplete: everything except its mount-table fallback and `-b`'s notes. */
 function lsofFaults(stderr: string): string {
-  return stderr.replace(LSOF_MOUNT_FALLBACK, '').trim();
+  return stderr.replace(LSOF_MOUNT_FALLBACK, '').replace(LSOF_AVOIDED, '').trim();
 }
 
 /** A `sample` report up to its binary-image list: its header and call graph name the stacks; the load map is bulk. */
@@ -196,7 +198,14 @@ export function captureHangDiagnostics(
       finish('incomplete');
       return;
     }
-    const probe = async (name: string, file: string, args: readonly string[], limitMs: number) => {
+    /** Runs one probe and records it; `faults` picks what of its stderr the snapshot shows (all of it by default). */
+    const probe = async (
+      name: string,
+      file: string,
+      args: readonly string[],
+      limitMs: number,
+      faults: (stderr: string) => string = (stderr) => stderr.trim(),
+    ) => {
       active.add(name);
       lines.push(`${name}: ${file} ${args.join(' ')}`);
       const result = await source.probe(
@@ -210,7 +219,8 @@ export function captureHangDiagnostics(
         lines.push(
           `${name}: ${result.status}${result.status === 'exited' ? ` code=${result.code}` : ` ${result.detail}`}`,
         );
-        if (result.stderr.trim() !== '') lines.push(`${name} stderr:\n${result.stderr.trimEnd()}`);
+        const shown = faults(result.stderr);
+        if (shown !== '') lines.push(`${name} stderr:\n${shown}`);
       }
       return result;
     };
@@ -310,9 +320,14 @@ export function captureHangDiagnostics(
       let observed = before.length > 0;
       if (source.platform === 'darwin') {
         const openFiles = async (): Promise<void> => {
-          const args = ['-nP', '-p', before.map((entry) => entry.pid).join(',')];
+          // `-b` makes lsof avoid the kernel calls that block on a hung mount (stat, lstat, readlink): each mount's device
+          // comes from the mount table and each descriptor's path from the kernel's vnode record, so a process holding a
+          // file on a hung mount is still listed with its path. lsof then needs no helper processes to step around such a
+          // mount, and `-O` stops it forking them: under load those forks cost 0.8-2.5 s, past this probe's 1.5 s
+          // deadline, where the same census with `-O` took 0.08-0.22 s (load 71).
+          const args = ['-b', '-O', '-nP', '-p', before.map((entry) => entry.pid).join(',')];
           // Bare `sudo`/`lsof` through PATH, like `ps` above: NixOS provides neither /usr/bin/sudo nor /usr/sbin/lsof.
-          let resources = await probe('lsof privileged', 'sudo', ['-n', 'lsof', ...args], 1_500);
+          let resources = await probe('lsof privileged', 'sudo', ['-n', 'lsof', ...args], 1_500, lsofFaults);
           if (finished) return;
           const answered = (result: HangProbeResult): boolean =>
             result.status === 'exited' &&
@@ -324,16 +339,18 @@ export function captureHangDiagnostics(
             lines.push(
               'Privileged resource census unavailable; fallback is ordinary-user visibility only, not proof of no holders.',
             );
-            resources = await probe('lsof user-scoped fallback', 'lsof', args, 1_000);
+            resources = await probe('lsof user-scoped fallback', 'lsof', args, 1_000, lsofFaults);
             if (finished) return;
           }
           if (resources.stdout.trim() !== '')
             lines.push(`lsof open files/sockets (not contested-lock proof):\n${resources.stdout.trimEnd()}`);
           if (!answered(resources) || lsofFaults(resources.stderr) !== '') incomplete = true;
-          else if (resources.stderr.trim() !== '')
+          else if (resources.stderr.trim() !== '') {
+            const mounts = resources.stderr.match(LSOF_MOUNT_FALLBACK)?.length ?? 0;
             lines.push(
-              'lsof warned only that it could not stat() the named mounts and kept their mount-table devices; that omits no descriptor of the selected processes.',
+              `lsof took ${mounts} mounts' devices from the mount table instead of stat() (-b), which omits no descriptor of the selected processes.`,
             );
+          }
           observed = resources.stdout.trim() !== '';
           if (!observed && answered(resources))
             lines.push('lsof reported no open-file matches within its stated visibility.');

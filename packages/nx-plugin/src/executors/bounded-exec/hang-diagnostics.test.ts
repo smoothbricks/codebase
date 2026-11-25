@@ -243,7 +243,7 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('not proof of a contested lock');
     expect(capture.text).toContain('pid=101 pgid=101');
     expect(calls.map((call) => call.file)).toEqual(['sudo']);
-    expect(calls[0]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
+    expect(calls[0]?.args).toEqual(['-n', 'lsof', '-b', '-O', '-nP', '-p', '101,202,303,404']);
     expect(capture.text).not.toContain('Lock wait');
     expect(capture.lockWaits).toEqual([]);
     expect(capture.offsetFromExpiryMs).toBeGreaterThan(0);
@@ -328,16 +328,25 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('read failed');
   });
 
-  it("keeps the verdict when lsof's only stderr is its fallback for a mount it could not stat", async () => {
-    // Observed verbatim while a concurrent image detached: lsof exited 0 and listed every selected descriptor.
+  it("keeps the verdict when lsof's only stderr is -b's notes and its mount-table fallback, and shows neither", async () => {
+    // Observed verbatim: lsof -b exited 0 and listed every selected descriptor (the first fallback while a concurrent
+    // image detached, the avoided calls under -b).
     const fallback =
+      'lsof: avoiding readlink(/private/tmp/hang-capture-repro/dmg.Gqndhm): -b was specified.\n' +
+      'lsof: avoiding stat(/private/tmp/hang-capture-repro/dmg.Gqndhm): -b was specified.\n' +
       "lsof: WARNING: can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm\n" +
       '      Output information may be incomplete.\n' +
-      '      assuming "dev=100037e" from mount table\n';
+      '      assuming "dev=100037e" from mount table\n' +
+      'lsof: avoiding readlink(/dev): -b was specified.\n' +
+      'lsof: avoiding stat(/dev): -b was specified.\n' +
+      "lsof: WARNING: can't stat() devfs file system /dev\n" +
+      '      Output information may be incomplete.\n' +
+      '      assuming "dev=46b2b6bd" from mount table\n';
     const warned = scriptedHost([[root]], [exited(fileObservation, 0, fallback), exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), warned.host);
     expect(capture.outcome, capture.text).toBe('holders');
-    expect(capture.text).toContain("can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm");
+    expect(capture.text).not.toContain('lsof privileged stderr');
+    expect(capture.text).toContain("lsof took 2 mounts' devices from the mount table instead of stat() (-b)");
     expect(capture.text).toContain('omits no descriptor of the selected processes');
     expect(warned.calls.map((call) => call.file)).toEqual(['sudo']);
     const empty = scriptedHost([[root]], [exited('', 1, fallback)]);
@@ -347,6 +356,7 @@ describe('pre-expiry hang diagnostics', () => {
       const other = await captureHangDiagnostics(request(), host);
       expect(other.outcome, other.text).toBe('incomplete');
       expect(other.text).toContain('lsof: WARNING: other');
+      expect(other.text).not.toContain('-b was specified');
     }
   });
 
@@ -639,7 +649,7 @@ describe('pre-expiry hang diagnostics', () => {
     // Every stack sample has started while none has answered, beside the open-file census; the closing reading waits.
     await started;
     expect(samples.map((sample) => sample.pid)).toEqual([ROOT, 303, 404]);
-    expect(calls[0]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
+    expect(calls[0]?.args).toEqual(['-n', 'lsof', '-b', '-O', '-nP', '-p', '101,202,303,404']);
     for (const answer of answers) answer(exited(SAMPLE_REPORT));
     const capture = await capturing;
     expect(capture.outcome, capture.text).toBe('holders');
