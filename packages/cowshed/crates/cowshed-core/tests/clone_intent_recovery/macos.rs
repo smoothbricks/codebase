@@ -4557,3 +4557,316 @@ fn census() -> cowshed_core::census::CensusScope {
         std::sync::Arc::from(std::path::Path::new("/var/empty")),
     )
 }
+
+/// A process group whose recorded leader exited and was reaped while a background descendant
+/// keeps the group alive reading `release`: `job_groups::take_lost` retains it as unresolved
+/// until `release` is dropped and the descendant exits.
+struct LeaderlessGroup {
+    pgid: i32,
+    release: Option<std::process::ChildStdin>,
+    output: Option<BufReader<std::process::ChildStdout>>,
+}
+
+impl LeaderlessGroup {
+    fn start(ledger: &Path, job_id: u64) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        if let Some(parent) = ledger.parent() {
+            fs::create_dir_all(parent).expect("ledger parent directory");
+        }
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 3<&0; (printf 'READY\\n'; cat <&3; printf 'RELEASED\\n') & exit 0",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn leaderless group");
+        let birth =
+            cowshed_core::runtime::job_groups::GroupLeader::observe(child.id()).expect("observe");
+        cowshed_core::runtime::job_groups::Recorder::new(ledger.to_path_buf())
+            .record(
+                [cowshed_core::runtime::job_groups::JobGroupClaim::group(
+                    job_id, birth,
+                )]
+                .into_iter(),
+                &[],
+            )
+            .expect("write unresolved ledger");
+        let release = child.stdin.take().expect("group stdin");
+        let mut output = BufReader::new(child.stdout.take().expect("group stdout"));
+        let mut ready = String::new();
+        output.read_line(&mut ready).expect("read readiness");
+        assert_eq!(ready, "READY\n");
+        assert!(child.wait_bounded().expect("reap leader").success());
+        Self {
+            pgid: birth.pgid(),
+            release: Some(release),
+            output: Some(output),
+        }
+    }
+
+    fn release_and_wait(mut self, ledger: &Path) {
+        drop(self.release.take());
+        if let Some(mut output) = self.output.take() {
+            let mut tail = String::new();
+            output.read_to_string(&mut tail).expect("read release");
+            assert_eq!(tail, "RELEASED\n");
+        }
+        while !cowshed_core::runtime::job_groups::unresolved(ledger)
+            .expect("inspect ledger")
+            .is_empty()
+        {
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl Drop for LeaderlessGroup {
+    fn drop(&mut self) {
+        drop(self.release.take());
+    }
+}
+
+/// Land's fold path (`RetireWhen::IfUnowned`) retires a folded workspace's empty group ledger once
+/// nothing unresolved remains, and refuses the fold while keeping the ledger intact when an
+/// unresolved group is still held.
+#[tokio::test]
+async fn land_fold_retires_empty_ledger_and_refuses_while_unresolved_group_remains() {
+    let fixture = Fixture::new("fold-ledger");
+    let runtime = fixture.adopt().await;
+    let lane = fixture
+        .mint(&runtime, "lane", ForkOptions::default())
+        .await
+        .expect("lane");
+
+    let mut peer_mounts = Vec::new();
+    for peer in ["clean", "unresolved"] {
+        let view = fixture
+            .fork(&runtime, "lane", peer)
+            .await
+            .expect("fork peer");
+        let mount = PathBuf::from(view["info"]["mount"].as_str().expect("peer mount"));
+        fs::write(mount.join(peer), format!("{peer}'s work\n")).expect("peer work");
+        git(&mount, &["add", peer]);
+        git(&mount, &["commit", "-q", "-m", &format!("{peer}'s work")]);
+        peer_mounts.push(mount);
+    }
+    let train_view = fixture
+        .fork(&runtime, "lane", "train")
+        .await
+        .expect("fork train");
+    let train = PathBuf::from(train_view["info"]["mount"].as_str().expect("train mount"));
+    for mount in &peer_mounts {
+        git(
+            &train,
+            &["fetch", "-q", mount.to_str().expect("mount utf8"), "HEAD"],
+        );
+        git(&train, &["cherry-pick", "FETCH_HEAD"]);
+    }
+    runtime
+        .shutdown()
+        .await
+        .expect("stop peer supervisors before fold");
+
+    let ledger_of = |ws: &str| {
+        cowshed_core::runtime::job_groups::ledger_path(&supervisor_socket::socket_path(
+            fixture.storage.store(),
+            &fixture.repo,
+            &name(ws),
+        ))
+    };
+    let clean_ledger = ledger_of("clean");
+    let unresolved_ledger = ledger_of("unresolved");
+    fs::create_dir_all(fixture.storage.store().join("run")).expect("run directory");
+    cowshed_core::runtime::job_groups::Recorder::new(clean_ledger.clone())
+        .record(std::iter::empty(), &[])
+        .expect("empty ledger");
+    let held = LeaderlessGroup::start(&unresolved_ledger, 9);
+    let taken =
+        cowshed_core::runtime::job_groups::take_lost(&unresolved_ledger, std::time::Duration::ZERO)
+            .expect("take lost into unresolved");
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].pgid(), held.pgid);
+
+    let runtime = fixture
+        .open_naming("train")
+        .await
+        .expect("open landing runtime");
+    let landed = fixture
+        .land_into(&runtime, "train", &lane, true)
+        .await
+        .expect("land train into lane");
+
+    let outcome = |ws: &str| {
+        landed["folded"]
+            .as_array()
+            .unwrap_or_else(|| panic!("fold report missing: {landed}"))
+            .iter()
+            .find(|fold| fold["workspace"] == ws)
+            .map(|fold| fold["outcome"].clone())
+    };
+    assert_eq!(
+        outcome("clean"),
+        Some(json!({ "kind": "retired" })),
+        "clean peer is folded: {landed}"
+    );
+    assert!(
+        !clean_ledger.exists(),
+        "folding a peer retires its empty group ledger"
+    );
+    let kept = outcome("unresolved").expect("unresolved peer is reported");
+    assert_eq!(kept["kind"], "kept", "{landed}");
+    assert!(
+        unresolved_ledger.exists(),
+        "unresolved group ledger stays intact on refusal"
+    );
+    assert_eq!(
+        cowshed_core::runtime::job_groups::unresolved(&unresolved_ledger)
+            .expect("read unresolved")
+            .len(),
+        1
+    );
+
+    held.release_and_wait(&unresolved_ledger);
+    runtime.shutdown().await.expect("stop landing runtime");
+}
+
+/// `retire_pending_workspace` reconciles the workspace's group ledger: an unresolved group refuses
+/// retirement and keeps its evidence, and once nothing unresolved remains the ledger is retired.
+#[tokio::test]
+async fn retire_pending_workspace_retires_empty_ledger_and_refuses_while_unresolved() {
+    let fixture = Fixture::new("pending-ledger");
+    let runtime = fixture.adopt().await;
+    fixture.plant_workspace_branch("wedged");
+    fixture
+        .mint(&runtime, "wedged", worktree())
+        .await
+        .expect_err("stale branch leaves wedged pending");
+    runtime.shutdown().await.expect("stop creating runtime");
+
+    let ledger = cowshed_core::runtime::job_groups::ledger_path(&supervisor_socket::socket_path(
+        fixture.storage.store(),
+        &fixture.repo,
+        &name("wedged"),
+    ));
+    let held = LeaderlessGroup::start(&ledger, 11);
+    let taken = cowshed_core::runtime::job_groups::take_lost(&ledger, std::time::Duration::ZERO)
+        .expect("take lost into unresolved");
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].pgid(), held.pgid);
+
+    let rm = fixture
+        .open_removing("wedged")
+        .await
+        .expect("open removing runtime");
+    let refused = fixture
+        .remove(&rm, "wedged")
+        .await
+        .expect_err("unresolved group must refuse pending clone retirement");
+    assert_eq!(refused.code, cowshed_core::ErrorCode::Conflict);
+    assert!(ledger.exists(), "unresolved ledger stays on disk");
+    assert_eq!(
+        cowshed_core::runtime::job_groups::unresolved(&ledger)
+            .expect("read unresolved")
+            .len(),
+        1
+    );
+
+    held.release_and_wait(&ledger);
+    fixture
+        .remove(&rm, "wedged")
+        .await
+        .expect("pending clone retires once unresolved group exits");
+    assert!(
+        !ledger.exists(),
+        "retire_pending_workspace retires the ledger once nothing unresolved remains"
+    );
+    rm.shutdown().await.expect("stop removing runtime");
+}
+
+/// `gc` of a `RetiredWorkspace` retires that workspace's empty group ledger when no authoritative
+/// or pending workspace reuses the name, and leaves the ledger alone when a live workspace does.
+#[tokio::test]
+async fn gc_retires_retired_workspace_ledger_unless_name_is_reused() {
+    let fixture = Fixture::new("gc-retired-ledger");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "reused", ForkOptions::default())
+        .await
+        .expect("mint reused");
+    fixture
+        .mint(&runtime, "old", ForkOptions::default())
+        .await
+        .expect("mint old");
+
+    let layout = fixture.layout();
+    let old_meta = DetachedWorkspaceMetadata::read_for_image(
+        layout.session_image(&name("old")).expect("old").image(),
+    )
+    .expect("old metadata");
+    let mut reused_retired_meta = DetachedWorkspaceMetadata::read_for_image(
+        layout
+            .session_image(&name("reused"))
+            .expect("reused")
+            .image(),
+    )
+    .expect("reused metadata");
+    reused_retired_meta.workspace_incarnation =
+        WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c99").expect("other incarnation");
+
+    fixture
+        .remove(&runtime, "old")
+        .await
+        .expect("remove old cleanly");
+    runtime.shutdown().await.expect("stop runtime");
+
+    let trash = layout.project().sessions.join(".trash");
+    fs::create_dir_all(&trash).expect("trash directory");
+    for metadata in [&old_meta, &reused_retired_meta] {
+        let retired = trash.join(format!(
+            "{}-{}.dmg",
+            metadata.workspace.as_str(),
+            metadata.workspace_incarnation.as_str()
+        ));
+        fs::create_dir(&retired).expect("retired payload directory");
+        metadata.write_for_image(&retired).expect("retired sidecar");
+    }
+
+    let ledger_of = |ws: &str| {
+        cowshed_core::runtime::job_groups::ledger_path(&supervisor_socket::socket_path(
+            fixture.storage.store(),
+            &fixture.repo,
+            &name(ws),
+        ))
+    };
+    let old_ledger = ledger_of("old");
+    let reused_ledger = ledger_of("reused");
+    fs::create_dir_all(fixture.storage.store().join("run")).expect("run directory");
+    for ledger in [&old_ledger, &reused_ledger] {
+        cowshed_core::runtime::job_groups::Recorder::new(ledger.clone())
+            .record(std::iter::empty(), &[])
+            .expect("write empty ledger");
+    }
+
+    let gc = fixture.gc().await;
+    fixture
+        .call(
+            &gc,
+            "coordinator.gc",
+            json!({ "repoId": fixture.repo, "options": { "dryRun": false } }),
+        )
+        .await
+        .expect("gc");
+    gc.shutdown().await.expect("stop gc");
+
+    assert!(
+        !old_ledger.exists(),
+        "gc retires the ledger of a retired workspace whose name is no longer live"
+    );
+    assert!(
+        reused_ledger.exists(),
+        "gc leaves the ledger untouched when a live workspace reuses that name"
+    );
+}

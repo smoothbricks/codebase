@@ -582,4 +582,163 @@ mod tests {
             |entry| matches!(&entry.source, DiskImageSource::File(path) if path == &image || path.starts_with(&report.archive))
         ));
     }
+
+    /// `forget` reconciles group ledgers of workspaces recorded only by retired or staged
+    /// sidecars in the project tree (e.g. `sessions/.trash` and `.staging`): an unresolved group
+    /// refuses the forget while retaining its ledger, and once released both ledgers are retired.
+    #[tokio::test]
+    async fn forget_reconciles_ledgers_of_retired_and_staged_workspace_sidecars() {
+        use cowshed_os::fork_lock::Spawn as _;
+        use cowshed_os::test_backstop::ChildBackstop as _;
+        use std::io::{BufRead as _, Read as _};
+        use std::os::unix::process::CommandExt as _;
+
+        struct HeldGroup {
+            pgid: i32,
+            release: Option<std::process::ChildStdin>,
+            output: Option<std::io::BufReader<std::process::ChildStdout>>,
+        }
+        impl Drop for HeldGroup {
+            fn drop(&mut self) {
+                drop(self.release.take());
+            }
+        }
+
+        let root = crate::temp_root::TempRoot::new("pr");
+        let repo = RepoId::parse("acme/forget-ledgers").unwrap();
+        let (storage, project) = recorded(
+            &root,
+            TestNamespace::mint().expect("a test namespace"),
+            &repo,
+        );
+
+        let write_sidecar = |image: &Path, ws: &str, inc: &str, state| {
+            fs::create_dir_all(image.parent().unwrap()).unwrap();
+            fs::write(image, b"partial image evidence").unwrap();
+            crate::metadata::DetachedWorkspaceMetadata {
+                version: crate::metadata::SIDECAR_VERSION,
+                repo_id: repo.clone(),
+                workspace: WorkspaceName::session(ws).unwrap(),
+                workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(inc).unwrap(),
+                platform: crate::metadata::Platform::Macos,
+                publication_state: state,
+                updated_at: "2026-07-14T00:00:00Z".to_owned(),
+                grants: crate::metadata::GrantSet::default(),
+                info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                    project_root: PathBuf::from("/project"),
+                    role: crate::metadata::WorkspaceRole::Workspace,
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                    branch: None,
+                    created_at: "2026-07-14T00:00:00Z".to_owned(),
+                    forked_from: None,
+                    captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                    stale: false,
+                    git_worktree: false,
+                },
+            }
+            .write_for_image(image)
+            .unwrap();
+        };
+
+        write_sidecar(
+            &project.join("sessions/.trash/retired-0198f2c0b7e34dc795f17b238b331c80.dmg"),
+            "retired",
+            "0198f2c0b7e34dc795f17b238b331c80",
+            crate::metadata::PublicationState::Active,
+        );
+        write_sidecar(
+            &project.join(".staging/staged-0198f2c0b7e34dc795f17b238b331c81.dmg"),
+            "staged",
+            "0198f2c0b7e34dc795f17b238b331c81",
+            crate::metadata::PublicationState::PendingFence,
+        );
+
+        let ledger_of = |ws: &str| {
+            crate::runtime::job_groups::ledger_path(&supervisor_socket::socket_path(
+                storage.store(),
+                &repo,
+                &WorkspaceName::session(ws).unwrap(),
+            ))
+        };
+        let retired_ledger = ledger_of("retired");
+        let staged_ledger = ledger_of("staged");
+        fs::create_dir_all(storage.store().join("run")).unwrap();
+        crate::runtime::job_groups::Recorder::new(retired_ledger.clone())
+            .record(std::iter::empty(), &[])
+            .unwrap();
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 3<&0; (printf 'READY\\n'; cat <&3; printf 'RELEASED\\n') & exit 0",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .unwrap();
+        let birth = crate::runtime::job_groups::GroupLeader::observe(child.id()).unwrap();
+        crate::runtime::job_groups::Recorder::new(staged_ledger.clone())
+            .record(
+                [crate::runtime::job_groups::JobGroupClaim::group(17, birth)].into_iter(),
+                &[],
+            )
+            .unwrap();
+        let release = child.stdin.take().unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready, "READY\n");
+        assert!(child.wait_bounded().unwrap().success());
+        let mut held = HeldGroup {
+            pgid: birth.pgid(),
+            release: Some(release),
+            output: Some(output),
+        };
+        let taken = crate::runtime::job_groups::take_lost(&staged_ledger, Duration::ZERO).unwrap();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].pgid(), held.pgid);
+
+        let refused = forget_project(storage.clone(), repo.clone())
+            .await
+            .expect_err("unresolved group for staged workspace sidecar must refuse forget");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert!(project.exists());
+        assert!(staged_ledger.exists());
+        assert_eq!(
+            crate::runtime::job_groups::unresolved(&staged_ledger)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        drop(held.release.take());
+        let mut tail = String::new();
+        held.output
+            .take()
+            .unwrap()
+            .read_to_string(&mut tail)
+            .unwrap();
+        assert_eq!(tail, "RELEASED\n");
+        while !crate::runtime::job_groups::unresolved(&staged_ledger)
+            .unwrap()
+            .is_empty()
+        {
+            std::thread::yield_now();
+        }
+
+        let report = forget_project(storage.clone(), repo.clone())
+            .await
+            .expect("forget succeeds once unresolved group exits");
+        assert!(!project.exists());
+        assert_eq!(report.repo_id, repo);
+        assert!(
+            !retired_ledger.exists(),
+            "forget retires empty ledger of retired trash sidecar"
+        );
+        assert!(
+            !staged_ledger.exists(),
+            "forget retires released ledger of staged sidecar"
+        );
+    }
 }
