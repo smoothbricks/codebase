@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/bend-emit",
-  "version": "0.0.5-next.0",
+  "version": "0.0.5",
   "type": "module",
   "sideEffects": false,
   "engines": {
