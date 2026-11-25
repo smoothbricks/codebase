@@ -113,3 +113,32 @@ export function fewestThreadsWithin(recordedWallsMs: readonly number[], want: nu
   }
   return bestThreads;
 }
+
+/**
+ * The reservation minimum a whole-suite leaf names over `recordedWallsMs`: the larger of its liveness minimum
+ * (`suiteMinimum(walls, want, idleMs)` when `idleMs` is stated, else `1`) and its wall floor
+ * (`fewestThreadsWithin(walls, want, suiteWall(walls, want) + agingMs)` when `agingMs` is stated, else `1`).
+ * One (no minimum) when `recordedWallsMs` is empty or `want <= 1`. Refuses a non-finite or negative `idleMs` or
+ * `agingMs`.
+ */
+export function wholeSuiteMinimum(
+  recordedWallsMs: readonly number[],
+  want: number,
+  idleMs: number | undefined,
+  agingMs?: number | null,
+): number {
+  if (idleMs !== undefined && (!Number.isFinite(idleMs) || idleMs < 0)) {
+    throw new RangeError(`idleMs must be a finite non-negative number, got ${String(idleMs)}`);
+  }
+  if (agingMs !== undefined && agingMs !== null && (!Number.isFinite(agingMs) || agingMs < 0)) {
+    throw new RangeError(`agingMs must be a finite non-negative number, got ${String(agingMs)}`);
+  }
+  if (recordedWallsMs.length === 0 || !Number.isFinite(want) || want <= 1) return 1;
+  const cappedWant = Math.min(Math.floor(want), recordedWallsMs.length);
+  const liveness = idleMs === undefined ? 1 : suiteMinimum(recordedWallsMs, cappedWant, idleMs);
+  const floor =
+    agingMs === undefined || agingMs === null
+      ? 1
+      : fewestThreadsWithin(recordedWallsMs, cappedWant, suiteWall(recordedWallsMs, cappedWant) + agingMs);
+  return Math.max(liveness, floor);
+}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
-import { fewestThreadsWithin, suiteMinimum, suiteWall } from './suite-minimum.js';
+import { fewestThreadsWithin, suiteMinimum, suiteWall, wholeSuiteMinimum } from './suite-minimum.js';
 
 const IDLE_MS = 180_000;
 const SEED = 20261124;
@@ -131,6 +131,53 @@ describe('the fewest threads to finish a suite within a target wall', () => {
       ),
       { seed: SEED, numRuns: 200 },
     );
+  });
+});
+
+describe('wholeSuiteMinimum floor composition', () => {
+  it('returns 1 for empty walls or want <= 1, with or without bounds', () => {
+    expect(wholeSuiteMinimum([], 18, IDLE_MS)).toBe(1);
+    expect(wholeSuiteMinimum([], 18, IDLE_MS, 30_000)).toBe(1);
+    expect(wholeSuiteMinimum([], 18, undefined, 30_000)).toBe(1);
+    expect(wholeSuiteMinimum(seconds(200, 200, 200), 1, IDLE_MS, 30_000)).toBe(1);
+    expect(wholeSuiteMinimum(seconds(200, 200, 200), 0, IDLE_MS, 30_000)).toBe(1);
+    expect(wholeSuiteMinimum(seconds(200, 200, 200), -2, IDLE_MS, 30_000)).toBe(1);
+  });
+
+  it('omits liveness when idleMs is undefined and omits the wall floor when agingMs is omitted or null', () => {
+    const minigrafWalls = new Array<number>(955).fill(1_079_000 / 955);
+    expect(wholeSuiteMinimum(minigrafWalls, 18, undefined, undefined)).toBe(1);
+    expect(wholeSuiteMinimum(minigrafWalls, 18, undefined, null)).toBe(1);
+    expect(wholeSuiteMinimum(minigrafWalls, 18, undefined, 30_000)).toBe(12);
+    expect(wholeSuiteMinimum(minigrafWalls, 18, IDLE_MS)).toBe(1);
+    expect(wholeSuiteMinimum(minigrafWalls, 18, IDLE_MS, null)).toBe(1);
+    expect(wholeSuiteMinimum(minigrafWalls, 18, IDLE_MS, 30_000)).toBe(12);
+    // Without idleMs, a long test that would raise liveness still contributes only 1 to the liveness side.
+    expect(wholeSuiteMinimum(seconds(200, 50, 50), 18, undefined, 100_000)).toBe(1);
+  });
+
+  it('takes the larger of liveness and wall floor and stays capped by min(want, walls.length)', () => {
+    // Liveness dominates: one 200 s test beside two 50 s tests needs 2 threads for 180 s idle, while 1 thread is
+    // within 100 s of the 2-thread wall (300 s vs 200 s).
+    expect(wholeSuiteMinimum(seconds(200, 50, 50), 18, IDLE_MS, 100_000)).toBe(2);
+    // Wall floor dominates: 6,000 tests of 300 ms satisfy 180 s idle on 1 thread, while aging 30 s over 18 threads
+    // (100.2 s + 30 s = 130.2 s) requires 14 threads.
+    const manyShort = new Array<number>(6_000).fill(300);
+    expect(wholeSuiteMinimum(manyShort, 18, IDLE_MS)).toBe(1);
+    expect(wholeSuiteMinimum(manyShort, 18, IDLE_MS, 30_000)).toBe(14);
+    // Never exceeds want or walls.length.
+    expect(wholeSuiteMinimum(seconds(900, 900), 18, IDLE_MS, 0)).toBe(2);
+    expect(wholeSuiteMinimum(seconds(900, 900, 900, 900), 2, IDLE_MS, 0)).toBe(2);
+  });
+
+  it('refuses invalid idleMs or agingMs rather than silently dropping them', () => {
+    const walls = seconds(60, 60, 60);
+    for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(() => wholeSuiteMinimum(walls, 18, IDLE_MS, bad)).toThrow(RangeError);
+      expect(() => wholeSuiteMinimum([], 18, IDLE_MS, bad)).toThrow(RangeError);
+      expect(() => wholeSuiteMinimum(walls, 18, bad, 30_000)).toThrow(RangeError);
+      expect(() => wholeSuiteMinimum([], 18, bad, 30_000)).toThrow(RangeError);
+    }
   });
 });
 //#endregion smoo/cowshed!n/a-minimum-for-a-whole-suite

@@ -33,6 +33,7 @@
     "src/cross-check-policy.test.ts": 3637,
     "src/nx-task-artifacts.test.ts": 3581,
     "src/testing.test.ts": 3360,
+    "src/bin/smoo-nx-suite-minimum.test.ts": 3260,
     "src/bun-patch-keys.test.ts": 3182,
     "src/executors/bounded-exec/cpu-pool.test.ts": 3156,
     "src/cargo-closure-key.test.ts": 2557,

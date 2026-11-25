@@ -99,7 +99,7 @@ import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner, sizeRunnerToGrant } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import { type BoundedExecOptions, boundedCommand, type ShellBoundedExecOptions } from './schema.js';
-import { fewestThreadsWithin, readLastWalls, suiteMinimum, suiteWall } from './suite-minimum.js';
+import { readLastWalls, wholeSuiteMinimum } from './suite-minimum.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
   type BoundedExecRecord,
@@ -1579,11 +1579,7 @@ async function runCommand(
         // no-progress bound) and, when the run's endpoint states the pool's aging bound, its wall floor (keeping its
         // LPT wall within one aging bound of its full-ask wall; specs/cowshed/05_gateway.md, "A minimum for a whole
         // suite").
-        const walls = [...lastWalls.values()];
-        const liveness = idleTimeoutMs === undefined ? 1 : suiteMinimum(walls, cpus, idleTimeoutMs);
-        const agingMs = runAgingMs(process.env);
-        const floor = agingMs === null ? 1 : fewestThreadsWithin(walls, cpus, suiteWall(walls, cpus) + agingMs);
-        const min = Math.max(liveness, floor);
+        const min = wholeSuiteMinimum([...lastWalls.values()], cpus, idleTimeoutMs, runAgingMs(process.env));
         const named = min > 1 ? ` min=${min}` : '';
         tell(`cowshed: mbx reserve wait start cpus=${cpus}${named} priority=${reservedLeaf.priority}\n`);
         const held = reserveCores(endpoint, cpus, reservedLeaf.priority, min, undefined, reservedLeaf.jobStartedMs);
