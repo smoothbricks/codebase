@@ -1342,8 +1342,6 @@ fn unavailable(job_id: TreeOwner) -> CowshedError {
     ))
 }
 
-/// A retirement step the kernel refused. Nothing is presumed ended: every registration, the
-/// fold and the signal record stay for an explicit retry.
 /// The refusal of lives that still ran `within` after SIGKILL, every exit queued for them
 /// already folded. Each survivor is named with what the kernel shows of it now (its run state,
 /// its nice and the CPU it has used), so the refusal itself says whether the life was never
@@ -1385,8 +1383,48 @@ fn survivor_state(pid: u32) -> String {
         Ok(None) => "cpu unread (no such process)".to_owned(),
         Err(error) => format!("cpu unread ({error})"),
     };
+    if state == procinfo::RunState::Uninterruptible {
+        return format!("pid {pid} {state}, {nice}, {cpu}, {}", held_open(pid));
+    }
     format!("pid {pid} {state}, {nice}, {cpu}")
 }
+
+/// What a process holds open: each descriptor that names a path, and how many name none (pipes,
+/// sockets). For a life in an uninterruptible kernel wait, these point at the file system or the
+/// peer the call waits on.
+fn held_open(pid: libc::pid_t) -> String {
+    let paths = match procinfo::open_paths(pid) {
+        Ok(Ok(paths)) => paths,
+        Ok(Err(unread)) => return format!("open descriptors unread ({unread:?})"),
+        Err(error) => return format!("open descriptors unread ({error})"),
+    };
+    // Darwin names pipes and sockets by address and files by inode; Linux names every
+    // descriptor by inode. Both together list every descriptor either platform names.
+    let kinds = procinfo::NameKinds {
+        devices: true,
+        inodes: true,
+    };
+    let pathless = match procinfo::descriptor_names(pid, kinds) {
+        Ok(Ok(names)) => names
+            .iter()
+            .filter(|(fd, _)| !paths.iter().any(|open| open.fd == *fd))
+            .count()
+            .to_string(),
+        Ok(Err(unread)) => format!("unread ({unread:?})"),
+        Err(error) => format!("unread ({error})"),
+    };
+    let named: Vec<String> = paths
+        .iter()
+        .map(|open| format!("fd {} {}", open.fd, open.path.display()))
+        .collect();
+    format!(
+        "holding [{}], descriptors naming no path: {pathless}",
+        named.join(", ")
+    )
+}
+
+/// A retirement step the kernel refused. Nothing is presumed ended: every registration, the
+/// fold and the signal record stay for an explicit retry.
 fn refused(job_id: TreeOwner, error: ObserveError) -> CowshedError {
     CowshedError::environment_missing(
         format!("{}'s processes cannot be retired: {error}", job_id),
@@ -1410,7 +1448,8 @@ mod tests {
         let mut command = std::process::Command::new("cat");
         command
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null());
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         let mut child = command.spawn_locked().unwrap();
         let pid = child.id();
         // SAFETY: a stop sent to this test's own child.
@@ -1436,6 +1475,11 @@ mod tests {
             "{message}"
         );
         assert!(refusal.survivors_were_killed(), "{message}");
+        // What an uninterruptible survivor's refusal adds: the child's /dev/null stdout and
+        // stderr, and its stdin pipe.
+        let held = held_open(libc::pid_t::try_from(pid).unwrap());
+        assert!(held.contains("fd 1 /dev/null, fd 2 /dev/null"), "{held}");
+        assert!(held.contains("descriptors naming no path: 1"), "{held}");
         child.kill().unwrap();
         assert!(!child.wait_bounded().unwrap().success());
     }
