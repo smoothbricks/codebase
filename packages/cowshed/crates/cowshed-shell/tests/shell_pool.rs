@@ -2789,15 +2789,14 @@ async fn host_controller_a_priority_refusal_on_a_lowered_warm_host_names_the_hos
     );
 }
 
-/// Cold-spawning a warm shell host must never block the supervisor's `current_thread` runtime:
-/// while another thread holds the fork lock exclusive, a sibling ticker task on the same runtime
-/// keeps ticking (specs/cowshed/05_gateway.md "Deadlines", 11_shell.md "Supervisor").
+/// Cold-spawning a warm shell host must never silence the supervisor's `current_thread` runtime:
+/// while another thread holds the fork lock exclusive across two heartbeat intervals during the
+/// cold host spawn, a client `wait` call over the supervisor's Unix socket still receives
+/// `Response::Progress` heartbeats (specs/cowshed/05_gateway.md "Deadlines", 11_shell.md
+/// "Supervisor").
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_cold_shell_host_spawn_does_not_block_runtime_thread() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     let workspace = Workspace::new("shell-spawn-off-runtime", 41_680);
     workspace.envrc("export FROM_ENVRC=root\n");
     std::fs::create_dir(workspace.mount().join("nested")).expect("nested shell directory");
@@ -2816,60 +2815,116 @@ async fn host_controller_cold_shell_host_spawn_does_not_block_runtime_thread() {
             .stdout,
         "root"
     );
+    let (server, socket) = FixtureServer::start(handle.clone()).await;
 
-    // Park a thread holding the fork lock exclusive so any spawn (or fenced pipe creation) on
-    // the supervisor's current_thread runtime blocks until the hold ends.
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let holder = std::thread::spawn(move || {
-        let _hold = cowshed_os::fork_lock::hold_exclusive();
-        held_tx.send(()).expect("signal fork lock held");
-        // Release as soon as the runtime proves liveness, or after 3 s if the runtime is wedged
-        // behind the lock so a red run fails cleanly rather than hanging.
-        let _ = release_rx.recv_timeout(Duration::from_secs(3));
-    });
-    held_rx.recv().expect("fork lock acquired");
-
-    let ticks_while_held = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&ticks_while_held);
-    let ticker = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
-        // The first tick completes immediately; count subsequent ticks while the lock is held.
-        interval.tick().await;
-        while cowshed_os::fork_lock::held_exclusive() {
-            interval.tick().await;
-            if cowshed_os::fork_lock::held_exclusive() {
-                let count = observed.fetch_add(1, Ordering::Relaxed) + 1;
-                if count >= 30 {
-                    let _ = release_tx.send(());
-                    break;
-                }
-            }
-        }
-    });
-
+    // Admit the nested job first so ArtifactStoreSink::admit (which drops a Fenced<File> on the
+    // blocking pool) completes before the fork lock is held. On this current_thread runtime,
+    // handle.exec returns before the actor's next turn starts spawn_admitted -> spawn_host.
     let mut nested = sh("printf %s \"$FROM_ENVRC\"");
     nested.cwd = Some(cowshed_core::api::dto::WorkspacePath::new("nested").expect("nested cwd"));
     let job = handle
         .exec(None, None, nested, AdmissionSource::Worker)
         .await
         .expect("admit pooled job");
-    assert_eq!(ran(&handle, job).await.ok().stdout, "nested");
+
+    // Hold the fork lock exclusive across two 5 s heartbeat intervals (12 s ceiling) before
+    // yielding back to the runtime so spawn_admitted -> spawn_host runs under the hold.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _hold = cowshed_os::fork_lock::hold_exclusive();
+        held_tx.send(()).expect("signal fork lock held");
+        let _ = release_rx.recv_timeout(Duration::from_secs(12));
+    });
+    held_rx.recv().expect("fork lock acquired");
+
+    // Independent client thread speaking the supervisor socket protocol so a wedged supervisor
+    // runtime cannot mask the client's observation of missing heartbeats.
+    let (client_tx, client_rx) = tokio::sync::oneshot::channel();
+    let client_socket = socket.clone();
+    let client = std::thread::spawn(move || {
+        use cowshed_os::test_backstop::UnixStreamBackstop as _;
+        use std::io::{Read as _, Write as _};
+
+        let mut stream =
+            std::os::unix::net::UnixStream::connect_bounded(&client_socket).expect("connect wait");
+        let auth = authority(1);
+        let wait_request = serde_json::json!({
+            "call": {
+                "authority": {
+                    "repoId": auth.repo_id,
+                    "workspace": auth.workspace,
+                    "workspaceIncarnation": auth.workspace_incarnation,
+                    "grantRevision": auth.grant_revision,
+                    "lifecycleRevision": auth.lifecycle_revision,
+                },
+                "call": {
+                    "call": "wait",
+                    "jobId": job,
+                },
+                "bytes": 0,
+            }
+        });
+        let payload = serde_json::to_vec(&wait_request).expect("encode wait request");
+        let length = u32::try_from(payload.len())
+            .expect("wait request fits u32")
+            .to_be_bytes();
+        stream.write_all(&length).expect("write wait frame length");
+        stream.write_all(&payload).expect("write wait frame");
+
+        let mut progress_during_hold = 0_usize;
+        let answer = loop {
+            let mut header = [0_u8; 4];
+            stream
+                .read_exact(&mut header)
+                .expect("read supervisor response length");
+            let frame_len = usize::try_from(u32::from_be_bytes(header)).expect("frame len");
+            let mut body = vec![0_u8; frame_len];
+            stream
+                .read_exact(&mut body)
+                .expect("read supervisor response body");
+            let frame: serde_json::Value =
+                serde_json::from_slice(&body).expect("decode supervisor response frame");
+            if frame.get("progress").is_some() {
+                if cowshed_os::fork_lock::held_exclusive() {
+                    progress_during_hold += 1;
+                    if progress_during_hold >= 2 {
+                        let _ = release_tx.send(());
+                    }
+                }
+                continue;
+            }
+            break frame;
+        };
+        let _ = client_tx.send((progress_during_hold, answer));
+    });
+
+    let (progress_during_hold, answer) = client_rx.await.expect("wait client finished");
+    client.join().expect("wait client thread");
+    holder.join().expect("fork lock holder thread");
+
+    let info: JobInfo = serde_json::from_value(
+        answer
+            .get("ok")
+            .and_then(|ok| ok.get("value"))
+            .cloned()
+            .unwrap_or_else(|| panic!("expected ok wait response, got {answer}")),
+    )
+    .expect("decode JobInfo from wait answer");
+    assert_eq!(info.exit, Some(ExitStatus::Exited { code: 0 }), "{info:?}");
+    let stdout = read_stream(&handle, &info, StreamKind::Stdout).await;
+    assert_eq!(String::from_utf8_lossy(&stdout), "nested");
     assert_eq!(
         workspace.activations(),
         2,
         "nested shell performed a cold host spawn and activation"
     );
-
-    ticker.await.expect("ticker task");
-    holder.join().expect("fork lock holder thread");
-
-    let ticks = ticks_while_held.load(Ordering::Relaxed);
     assert!(
-        ticks >= 20,
-        "supervisor current_thread runtime ticked only {ticks} times while fork lock was held \
-         exclusive during cold shell-host spawn (expected at least 20)"
+        progress_during_hold >= 2,
+        "wait client received only {progress_during_hold} Response::Progress heartbeats while \
+         fork lock was held exclusive during cold shell-host spawn (expected at least 2)"
     );
+    drop(server);
 }
 
 /// This test process's census, as a fixture store's census reaches it, over a store that holds no
