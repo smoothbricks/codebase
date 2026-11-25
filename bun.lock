@@ -51,7 +51,7 @@
     },
     "packages/bend-emit": {
       "name": "@smoothbricks/bend-emit",
-      "version": "0.0.5",
+      "version": "0.0.6-next.0",
       "bin": {
         "bend-emit": "./bin/bend-emit.ts",
       },
