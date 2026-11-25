@@ -85,6 +85,18 @@ opt-level = 3
 # code is the hot loop, and nothing depends on it.
 [profile.dev.package.cowshed-admission-sim]
 opt-level = 3
+
+# cowshed's tests run its gateway, supervisors and project runtime in process, the same code the
+# installed release binary runs: at opt-level 0 its async poll frames keep every await's temporaries
+# in separate stack slots, and adopting a checkout (open, recover, replay an intent, ensure its
+# supervisor, render its sandbox) used 2,069,584 bytes of a test thread's stack (measured
+# 2026-11-25). Optimizing the crates whose code that chain is shrinks those frames and the tests'
+# CPU; nothing outside cowshed depends on them.
+[profile.dev.package.cowshed-core]
+opt-level = 1
+
+[profile.dev.package.cowshed-cli]
+opt-level = 1
 # Same debug level as package."*": a crate that both build scripts or proc
 # macros and ordinary code use is one unit only while both see the same level;
 # otherwise Cargo compiles it, and everything above it, twice.
