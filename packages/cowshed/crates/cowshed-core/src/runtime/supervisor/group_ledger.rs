@@ -4,23 +4,29 @@
 //! (specs/cowshed/05_gateway.md §Deadlines).
 //!
 //! One cut may be in flight while one newer cut waits; a newer cut replaces the waiting one.
-//! Nothing is queued, timed or retried: a failed write stays the writer's answer until a later cut
-//! succeeds, and a failed final write is the final result. The recorder and the inherited
-//! unresolved groups live only on this thread. The writer's clone of the socket's publication
-//! lease is dropped after its last write and before its final answer, so none of its writes can
-//! land once a successor holds the lease.
+//! Ordinary publication is bounded to at most once per [`MIN_PUBLISH_INTERVAL`], and cuts whose
+//! serialized bytes match the last published bytes skip temp+rename. Final retirement and runtime
+//! teardown bypass the rate bound and flush at once. Nothing is queued or retried: a failed write
+//! stays the writer's answer until a later cut succeeds, and a failed final write is the final
+//! result. The recorder and the inherited unresolved groups live only on this thread. The writer's
+//! clone of the socket's publication lease is dropped after its last write and before its final
+//! answer, so none of its writes can land once a successor holds the lease.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::dto::JobId;
 use crate::runtime::job_groups::{JobGroupClaim, Recorder, UnresolvedGroup};
 use crate::runtime::supervisor_socket::PublicationLease;
 
 use super::JobStateRecord;
+
+/// Minimum interval between ordinary ledger publications on disk (11_shell.md §Supervisor
+/// recovery). Final retirement and runtime teardown bypass this bound and flush at once.
+const MIN_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One immutable cut of the actor's current claims. Each claim's member lives are the `Arc` the
 /// job's observation published, shared as handed and never reloaded here.
@@ -34,8 +40,9 @@ struct Custody {
     done: std::sync::mpsc::SyncSender<io::Result<()>>,
 }
 
-/// The writer's admission and ordering, decided without I/O or a clock. `C` is a cut, `F` the
-/// final flush's reply and `T` teardown custody, so the tables below drive it with plain values.
+/// The writer's admission, ordering, and publication-rate policy, decided without I/O and with an
+/// injected monotonic clock (`Instant`). `C` is a cut, `F` the final flush's reply and `T`
+/// teardown custody, so the tables below drive it with plain values.
 struct Slot<C, F, T> {
     /// The newest cut the writer has not taken; a newer one replaces it.
     latest: Option<C>,
@@ -43,6 +50,11 @@ struct Slot<C, F, T> {
     in_flight: bool,
     /// Why the newest finished write failed, until a later write succeeds. Never retried.
     failure: Option<io::Error>,
+    /// Minimum spacing between published ordinary cuts.
+    min_interval: Duration,
+    /// When the last ordinary cut was actually written to disk (byte-identical skips do not
+    /// advance this).
+    last_published: Option<Instant>,
     phase: Phase<F, T>,
 }
 
@@ -76,6 +88,14 @@ enum Work<C, F, T> {
     },
 }
 
+/// Decision of [`Slot::next`]: run work now, wait for an event, or wait until the rate window's
+/// deadline (while still waking immediately on a new cut, finish, or teardown).
+enum Next<C, F, T> {
+    Work(Work<C, F, T>),
+    Wait,
+    WaitUntil(Instant),
+}
+
 /// How teardown custody was received.
 enum Handoff<C, T> {
     /// Retired after the in-flight write; the obsolete waiting cut is returned to be dropped.
@@ -87,11 +107,18 @@ enum Handoff<C, T> {
 }
 
 impl<C, F, T> Slot<C, F, T> {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_interval(Duration::ZERO)
+    }
+
+    fn with_interval(min_interval: Duration) -> Self {
         Self {
             latest: None,
             in_flight: false,
             failure: None,
+            min_interval,
+            last_published: None,
             phase: Phase::Open,
         }
     }
@@ -143,35 +170,70 @@ impl<C, F, T> Slot<C, F, T> {
         }
     }
 
-    /// The writer's next work once its in-flight write is done; `None` waits for an event.
-    fn next(&mut self) -> Option<Work<C, F, T>> {
+    /// The writer's next work at `now` once its in-flight write is done. Ordinary cuts in
+    /// `Phase::Open` wait until `last_published + min_interval` (leaving `latest` in place so
+    /// newer cuts coalesce into it); `Finishing` and `TearingDown` bypass the bound and flush at
+    /// once.
+    fn next(&mut self, now: Instant) -> Next<C, F, T> {
         if self.in_flight {
-            return None;
+            return Next::Wait;
         }
-        if matches!(self.phase, Phase::Open | Phase::Finishing(_))
-            && let Some(cut) = self.latest.take()
-        {
-            self.in_flight = true;
-            return Some(Work::Write(cut));
+        match &self.phase {
+            Phase::Open => {
+                if self.latest.is_some() {
+                    if !self.min_interval.is_zero()
+                        && let Some(last) = self.last_published
+                        && let Some(deadline) = last.checked_add(self.min_interval)
+                        && now < deadline
+                    {
+                        return Next::WaitUntil(deadline);
+                    }
+                    if let Some(cut) = self.latest.take() {
+                        self.in_flight = true;
+                        return Next::Work(Work::Write(cut));
+                    }
+                }
+                return Next::Wait;
+            }
+            Phase::Finishing(_) => {
+                if let Some(cut) = self.latest.take() {
+                    self.in_flight = true;
+                    return Next::Work(Work::Write(cut));
+                }
+            }
+            Phase::TearingDown { .. } | Phase::Retiring | Phase::Closed { .. } | Phase::Dead => {}
         }
         match std::mem::replace(&mut self.phase, Phase::Retiring) {
-            Phase::TearingDown { custody, finish } => Some(Work::Retire { custody, finish }),
+            Phase::TearingDown { custody, finish } => Next::Work(Work::Retire { custody, finish }),
             Phase::Finishing(reply) => {
                 let result = self.failure.take().map_or(Ok(()), Err);
                 self.phase = Phase::Closed { ok: result.is_ok() };
-                Some(Work::Finish { reply, result })
+                Next::Work(Work::Finish { reply, result })
             }
             phase => {
                 self.phase = phase;
-                None
+                Next::Wait
             }
         }
     }
 
-    /// The in-flight write ended. A failure is kept, not retried.
-    fn written(&mut self, result: io::Result<()>) {
+    /// The in-flight write ended at `now`. `Ok(true)` means bytes were published to disk and
+    /// starts the next rate-limit window; `Ok(false)` means a byte-identical cut was skipped and
+    /// does not consume the window. A failure is kept, not retried.
+    fn written(&mut self, result: io::Result<bool>, now: Instant) {
         self.in_flight = false;
-        self.failure = result.err();
+        match result {
+            Ok(true) => {
+                self.failure = None;
+                self.last_published = Some(now);
+            }
+            Ok(false) => {
+                self.failure = None;
+            }
+            Err(error) => {
+                self.failure = Some(error);
+            }
+        }
     }
 
     /// The writer thread ended. Returns the custody it never took; a closed writer stays closed.
@@ -248,7 +310,7 @@ impl GroupLedgerWriter {
         let path = recorder.path().to_path_buf();
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                slot: Slot::new(),
+                slot: Slot::with_interval(MIN_PUBLISH_INTERVAL),
                 spare: Vec::new(),
             }),
             wake: Condvar::new(),
@@ -393,24 +455,38 @@ impl Drop for Ended<'_> {
 
 fn write_ledger(
     shared: &Shared,
-    recorder: Recorder,
+    mut recorder: Recorder,
     mut inherited: Vec<UnresolvedGroup>,
     lease: Option<PublicationLease>,
 ) {
     let _ended = Ended(shared);
     let mut state = shared.lock();
     loop {
-        let Some(work) = state.slot.next() else {
-            state = shared.wake.wait(state).expect("group ledger slot poisoned");
-            continue;
+        let work = match state.slot.next(Instant::now()) {
+            Next::Work(work) => work,
+            Next::Wait => {
+                state = shared.wake.wait(state).expect("group ledger slot poisoned");
+                continue;
+            }
+            Next::WaitUntil(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    (state, _) = shared
+                        .wake
+                        .wait_timeout(state, remaining)
+                        .expect("group ledger slot poisoned");
+                }
+                continue;
+            }
         };
         drop(state);
         match work {
             Work::Write(mut cut) => {
-                let result = record(&recorder, cut.iter().cloned(), &mut inherited);
+                let result = record(&mut recorder, cut.iter().cloned(), &mut inherited);
+                let finished_at = Instant::now();
                 cut.clear();
                 state = shared.lock();
-                state.slot.written(result);
+                state.slot.written(result, finished_at);
                 state.recycle(cut);
             }
             Work::Finish { reply, result } => {
@@ -425,8 +501,13 @@ fn write_ledger(
             } => {
                 // The jobs are published before their retirement; a failure is logged and the
                 // handoff write after retirement decides the result.
-                let _ = record(&recorder, super::job_group_claims(&jobs), &mut inherited);
-                let result = super::retire_dropped_jobs(jobs, Some(&recorder), inherited, grace);
+                let _ = record(
+                    &mut recorder,
+                    super::job_group_claims(&jobs),
+                    &mut inherited,
+                );
+                let result =
+                    super::retire_dropped_jobs(jobs, Some(&mut recorder), inherited, grace);
                 drop(lease);
                 if let Some(reply) = finish {
                     let _ = reply.send(Err(io::Error::other(
@@ -440,12 +521,13 @@ fn write_ledger(
     }
 }
 
-/// One ledger rewrite. A success carries the inherited groups still held into the next one.
+/// One ledger rewrite. A success carries the inherited groups still held into the next one and
+/// reports whether bytes were written (`true`) or skipped as byte-identical (`false`).
 fn record(
-    recorder: &Recorder,
+    recorder: &mut Recorder,
     claims: impl Iterator<Item = JobGroupClaim> + Clone,
     inherited: &mut Vec<UnresolvedGroup>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     match recorder.record(claims, inherited) {
         Ok(recorded) => {
             for error in &recorded.uninspected {
@@ -456,7 +538,7 @@ fn record(
                 );
             }
             *inherited = recorded.carried;
-            Ok(())
+            Ok(recorded.published)
         }
         Err(error) => {
             // The jobs run either way; what is lost is only the means to end them should this
@@ -507,7 +589,7 @@ mod tests {
         ClosedOk(bool),
     }
 
-    fn apply(slot: &mut Table, step: Step) -> Seen {
+    fn apply(slot: &mut Table, step: Step, now: Instant) -> Seen {
         match step {
             Step::Publish(cut) => match slot.publish(cut) {
                 Ok(replaced) => Seen::Published(replaced),
@@ -522,16 +604,19 @@ mod tests {
                 Handoff::Settled(custody) => Seen::Settled(custody),
                 Handoff::Refused(custody) => Seen::Refused(custody),
             },
-            Step::Next => match slot.next() {
-                None => Seen::Idle,
-                Some(Work::Write(cut)) => Seen::Write(cut),
-                Some(Work::Finish { reply, result }) => {
+            Step::Next => match slot.next(now) {
+                Next::Wait | Next::WaitUntil(_) => Seen::Idle,
+                Next::Work(Work::Write(cut)) => Seen::Write(cut),
+                Next::Work(Work::Finish { reply, result }) => {
                     Seen::Finish(reply, result.map_err(|error| error.to_string()))
                 }
-                Some(Work::Retire { custody, finish }) => Seen::Retire(custody, finish),
+                Next::Work(Work::Retire { custody, finish }) => Seen::Retire(custody, finish),
             },
             Step::Written(failure) => {
-                slot.written(failure.map_or(Ok(()), |failure| Err(io::Error::other(failure))));
+                slot.written(
+                    failure.map_or(Ok(true), |failure| Err(io::Error::other(failure))),
+                    now,
+                );
                 Seen::Written
             }
             Step::Dead => Seen::Dead(slot.dead()),
@@ -541,8 +626,9 @@ mod tests {
 
     fn run(table: &[(Step, Seen)]) {
         let mut slot = Table::new();
+        let now = Instant::now();
         for (index, (step, expected)) in table.iter().enumerate() {
-            assert_eq!(&apply(&mut slot, *step), expected, "step {index}");
+            assert_eq!(&apply(&mut slot, *step, now), expected, "step {index}");
         }
     }
 

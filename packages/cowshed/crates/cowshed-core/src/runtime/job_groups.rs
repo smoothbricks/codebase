@@ -288,16 +288,20 @@ pub struct Recorded {
     pub carried: Vec<UnresolvedGroup>,
     /// Why some inherited groups could not be inspected. They are carried unchanged.
     pub uninspected: Vec<io::Error>,
+    /// Whether this call wrote and renamed the ledger file (`false` when the serialized bytes
+    /// equalled the last published bytes and the rewrite was skipped).
+    pub published: bool,
 }
 
 /// The two paths of the supervisor's atomic group publication, prepared once when it starts,
 /// and the boot session its observed lives are fenced by, read once when the first is
-/// published. No group state is retained here: every publication borrows the actor's current
-/// claims.
+/// published. Keeps the bytes of the last successful publication so a byte-identical cut skips
+/// temp+rename without reading disk or hashing; no group state is retained here.
 pub struct Recorder {
     path: PathBuf,
     temporary: PathBuf,
     boot_session: OnceLock<String>,
+    last_written: Option<Vec<u8>>,
 }
 
 impl Recorder {
@@ -307,6 +311,7 @@ impl Recorder {
             path,
             temporary,
             boot_session: OnceLock::new(),
+            last_written: None,
         }
     }
 
@@ -315,8 +320,9 @@ impl Recorder {
     }
 
     /// Replace the ledger with the current claims and inherited unresolved groups not seen
-    /// released. An inspection failure keeps its group and is reported to the supervisor.
-    pub fn record<I>(&self, groups: I, inherited: &[UnresolvedGroup]) -> io::Result<Recorded>
+    /// released, skipping temp+rename when the serialized JSON bytes equal the last published
+    /// bytes. An inspection failure keeps its group and is reported to the supervisor.
+    pub fn record<I>(&mut self, groups: I, inherited: &[UnresolvedGroup]) -> io::Result<Recorded>
     where
         I: Iterator<Item = JobGroupClaim> + Clone,
     {
@@ -341,10 +347,20 @@ impl Recorder {
             ended: false,
             unresolved: &carried,
         };
-        publish(&self.path, &self.temporary, &ledger)?;
+        let bytes = serde_json::to_vec(&ledger).map_err(io::Error::other)?;
+        if self.last_written.as_deref() == Some(bytes.as_slice()) {
+            return Ok(Recorded {
+                carried,
+                uninspected,
+                published: false,
+            });
+        }
+        publish_bytes(&self.path, &self.temporary, &bytes)?;
+        self.last_written = Some(bytes);
         Ok(Recorded {
             carried,
             uninspected,
+            published: true,
         })
     }
 }
@@ -437,6 +453,10 @@ fn replace(path: &Path, ledger: &Ledger) -> io::Result<()> {
 
 fn publish(path: &Path, temporary: &Path, ledger: &impl Serialize) -> io::Result<()> {
     let bytes = serde_json::to_vec(ledger).map_err(io::Error::other)?;
+    publish_bytes(path, temporary, &bytes)
+}
+
+fn publish_bytes(path: &Path, temporary: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::write(temporary, bytes)?;
     std::fs::rename(temporary, path)
 }
@@ -1848,27 +1868,37 @@ os._exit(0)
         use std::os::unix::fs::MetadataExt as _;
 
         let (_scratch, ledger) = scratch();
-        let recorder = super::Recorder::new(ledger.clone());
+        let mut recorder = super::Recorder::new(ledger.clone());
         let first = GroupLeader::from_parts(42, 1, 100).unwrap();
         let second = GroupLeader::from_parts(43, 2, 200).unwrap();
 
-        recorder
-            .record([super::JobGroupClaim::group(1, first)].into_iter(), &[])
-            .unwrap();
+        assert!(
+            recorder
+                .record([super::JobGroupClaim::group(1, first)].into_iter(), &[])
+                .unwrap()
+                .published
+        );
         let first_inode = std::fs::symlink_metadata(&ledger).unwrap().ino();
 
-        recorder
-            .record([super::JobGroupClaim::group(1, first)].into_iter(), &[])
-            .unwrap();
+        assert!(
+            !recorder
+                .record([super::JobGroupClaim::group(1, first)].into_iter(), &[])
+                .unwrap()
+                .published,
+            "a byte-identical cut reports published=false"
+        );
         assert_eq!(
             std::fs::symlink_metadata(&ledger).unwrap().ino(),
             first_inode,
             "a byte-identical cut skips temp+rename and keeps the existing inode"
         );
 
-        recorder
-            .record([super::JobGroupClaim::group(2, second)].into_iter(), &[])
-            .unwrap();
+        assert!(
+            recorder
+                .record([super::JobGroupClaim::group(2, second)].into_iter(), &[])
+                .unwrap()
+                .published
+        );
         let second_inode = std::fs::symlink_metadata(&ledger).unwrap().ino();
         assert_ne!(
             second_inode, first_inode,

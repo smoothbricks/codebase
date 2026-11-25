@@ -1461,14 +1461,20 @@ admitted but never sealed. Two things put that right:
   The actor freezes current job-group headers and shares each claim's observed member lives from the job's published
   process observation, never copying the identity slice or reloading it on the writer. This transport cut is not another
   authority or group inventory. One write may be in flight; subsequent changes replace the one latest pending cut, so
-  notifications during a stalled write coalesce into one successor publication. Cleared header buffers are reused. The
-  writer owns the recorder, prepared paths, once-read boot session and inspected inherited entries, and preserves the
-  existing JSON field order. It holds the served socket's existing fenced lease until its last write ends. Final
-  retirement closes admission, flushes the newest cut and drops that lease before acknowledging success; the actor
-  continues answering heartbeat round trips while the flush waits. A failed final publication is an error, not
-  retirement success. Ordinary writes allocate their JSON output buffer; inherited recovery owns carried entries and
-  inspection errors. This does not add an active-job frontier or change which unsealed and failed-wait groups remain
-  recorded.
+  notifications during a stalled write coalesce into one successor publication. Each temp-plus-rename rewrite allocates
+  a new inode and therefore costs a vnode (01a_apfs.md §The vnode table; measured 139 renames in 2 s for one
+  supervisor). The writer therefore skips any cut whose serialized bytes equal the last bytes it published (comparing
+  against the bytes it keeps, with no extra read or digest), and bounds ordinary publication to at most once a second:
+  the writer waits on its next cut or the interval's end, coalescing intermediate cuts into the one pending cut, because
+  the ledger serves only recovery after a lost supervisor and recovery re-proves membership from kernel identities
+  (above), so a ledger up to 1 s old still recovers correctly. Cleared header buffers are reused. The writer owns the
+  recorder, prepared paths, once-read boot session and inspected inherited entries, and preserves the existing JSON
+  field order. It holds the served socket's existing fenced lease until its last write ends. Final retirement and
+  runtime teardown bypass the interval bound: final retirement closes admission, flushes the newest cut at once and
+  drops that lease before acknowledging success; the actor continues answering heartbeat round trips while the flush
+  waits. A failed final publication is an error, not retirement success. Ordinary writes allocate their JSON output
+  buffer; inherited recovery owns carried entries and inspection errors. This does not add an active-job frontier or
+  change which unsealed and failed-wait groups remain recorded.
 
   Runtime teardown uses the same native retirement, not a legacy group signal followed by unconditional claim release.
   The actor transfers all parent handles and resource claims to that same writer for retirement and joins for a bounded

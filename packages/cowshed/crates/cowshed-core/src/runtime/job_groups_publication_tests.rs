@@ -161,7 +161,7 @@ fn ordinary_publication_allocates_only_its_json_output_buffer() {
     );
     let scratch = Scratch::new();
     let path = scratch.0.join("groups");
-    let recorder = Recorder::new(path.clone());
+    let mut recorder = Recorder::new(path.clone());
     let leader = GroupLeader::from_parts(42, 1, 1).unwrap();
     for (retained, active) in [(16, 0), (16, 1), (17, 1), (1_024, 1), (1_024, 1_024)] {
         let jobs: BTreeMap<_, _> = (1..=retained)

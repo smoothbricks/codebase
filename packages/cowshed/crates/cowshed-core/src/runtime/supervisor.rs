@@ -5487,7 +5487,7 @@ fn job_group_claims(
 /// exit proof or a successful durable handoff of its refreshed observed membership.
 fn retire_dropped_jobs(
     mut jobs: BTreeMap<JobId, JobStateRecord>,
-    ledger: Option<&super::job_groups::Recorder>,
+    ledger: Option<&mut super::job_groups::Recorder>,
     inherited: Vec<super::job_groups::UnresolvedGroup>,
     grace: Duration,
 ) -> std::io::Result<()> {
