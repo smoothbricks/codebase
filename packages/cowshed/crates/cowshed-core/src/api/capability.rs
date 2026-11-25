@@ -2418,6 +2418,12 @@ impl Coordinator {
         &self.project
     }
 
+    /// End the coordinator connection: the controller reads end of stream and ends the session;
+    /// every call still pending, and every call after this on handles derived from it, refuses.
+    pub async fn close(&self) -> Result<()> {
+        self.runtime.close().await
+    }
+
     /// The daemon's refusal of this controller's build, once any call on this connection has met
     /// it. From then on the daemon refuses every call of this controller that needs a workspace
     /// supervisor, while a supervisor of the controller's own build still serving — one draining

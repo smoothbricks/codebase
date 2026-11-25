@@ -1693,6 +1693,105 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
     .await;
 }
 
+/// A follow opened while a background job is queued behind memory pressure must end once the
+/// job is terminal (07_api.md "job.logs").
+#[tokio::test]
+async fn a_follow_opened_while_queued_behind_memory_pressure_ends_at_terminal() {
+    use cowshed_core::host_pressure::{Reading, Source};
+    use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
+
+    let (pressure, reports) = tokio::sync::watch::channel(Reading::Known(MemoryPressure::Darwin {
+        level: DarwinPressureLevel::Warning,
+    }));
+    let root = workspace_root(&temp_parent::scratch_parent(), "follow-queued");
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            memory_pressure: Source::Driven(reports),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let held = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+
+    let first = h
+        .handle
+        .log_read(held, StreamKind::Stderr, 0, true)
+        .await
+        .unwrap();
+    let first_text = String::from_utf8_lossy(&first.bytes);
+    assert!(
+        first_text.contains("cowshed: jobserver wait start queue=memory pressure=level=warning\n"),
+        "{first_text:?}"
+    );
+    assert!(!first.eof);
+
+    // Start the second follow read while the job is still queued and prove it has reached the
+    // supervisor actor before releasing pressure (one round-trip `info` ordered behind it).
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let follow_handle = h.handle.clone();
+    let follower = tokio::spawn(async move {
+        let mut offset = first.next_offset;
+        let mut rest = Vec::new();
+        let mut second =
+            std::pin::pin!(follow_handle.log_read(held, StreamKind::Stderr, offset, true));
+        let mut first_chunk = None;
+        tokio::select! {
+            biased;
+            chunk = &mut second => first_chunk = Some(chunk.unwrap()),
+            () = tokio::task::yield_now() => {}
+        }
+        let _ = parked_tx.send(());
+        let mut chunk = match first_chunk {
+            Some(chunk) => chunk,
+            None => second.await.unwrap(),
+        };
+        loop {
+            rest.extend_from_slice(&chunk.bytes);
+            offset = chunk.next_offset;
+            if chunk.eof {
+                return rest;
+            }
+            chunk = follow_handle
+                .log_read(held, StreamKind::Stderr, offset, true)
+                .await
+                .unwrap();
+        }
+    });
+    parked_rx.await.unwrap();
+    assert_eq!(h.handle.info(held).await.unwrap().state, JobState::Queued);
+
+    pressure.send_replace(Reading::Known(MemoryPressure::Darwin {
+        level: DarwinPressureLevel::Normal,
+    }));
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(spawned.request.job_id, held);
+    complete(&spawned, b"ran\n", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(h.handle.wait(held).await.unwrap().state, JobState::Exited);
+
+    let rest = tokio::time::timeout(Duration::from_secs(5), follower)
+        .await
+        .expect("follow opened while queued must end once the job is terminal")
+        .unwrap();
+    let rest_text = String::from_utf8_lossy(&rest);
+    assert!(
+        rest_text.contains("cowshed: jobserver wait done elapsed=")
+            && rest_text.contains("status=ok\n"),
+        "{rest_text:?}"
+    );
+}
+
 async fn verify_pressure_hold(
     held_pressure: cowshed_gateway_types::host_status::MemoryPressure,
     released_pressure: cowshed_gateway_types::host_status::MemoryPressure,

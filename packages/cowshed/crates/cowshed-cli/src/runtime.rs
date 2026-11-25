@@ -721,7 +721,13 @@ impl ActorBridge {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
-        drop(self.coordinator.take());
+        // Close the controller actor explicitly rather than relying on dropping `self.coordinator`
+        // to be the last `Arc<dyn ControllerRuntime>`: callers of `ActorBridge::coordinator()` may
+        // still hold derived handles (`Project`, `WorkspaceHandle`, `JobHandle`) across shutdown.
+        let close_error = match self.coordinator.take() {
+            Some(coordinator) => coordinator.close().await.err(),
+            None => None,
+        };
         let connection_error = match self.connection.take() {
             Some(connection) => join_connection(connection).await.err(),
             None => None,
@@ -730,7 +736,10 @@ impl ActorBridge {
             Some(runtime) => runtime.shutdown().await.err(),
             None => None,
         };
-        combine_teardown(connection_error, runtime_error)
+        combine_teardown(
+            combine_teardown(close_error, connection_error).err(),
+            runtime_error,
+        )
     }
 }
 
@@ -7955,6 +7964,95 @@ mod tests {
                 && warning.contains(&branched.branches[0].branch),
             "{warning}"
         );
+    }
+
+    /// `ActorBridge::coordinator` lends `&Coordinator` so callers can derive handles (`Project`,
+    /// `WorkspaceHandle`, `JobHandle`) that hold clones of the shared `ActorRuntime`. Shutting
+    /// down the bridge must close its controller connection even while such a handle is still in
+    /// scope, rather than waiting forever for the last sender to drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actor_bridge_shutdown_closes_connection_while_derived_handle_lives() {
+        use cowshed_core::api::operations::{self, ProjectOpened, encode_result};
+        use cowshed_core::api::server::{
+            ConnectionAuthority, LocalWaitCauses, RouterHandle, RouterResponse,
+            serve_controller_connection_in_process,
+        };
+        use cowshed_core::repository::{BoundIdentity, RepositoryBinding};
+        use std::num::NonZeroUsize;
+        use std::os::fd::OwnedFd;
+        use std::time::Duration;
+
+        let repo_id = RepoId::parse("fixture/shutdown").expect("repo id");
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let (router, mut commands) = RouterHandle::channel(NonZeroUsize::MIN);
+        let local_waits = LocalWaitCauses::default();
+        let connection = tokio::spawn(serve_controller_connection_in_process(
+            OwnedFd::from(server),
+            ConnectionAuthority::Coordinator {
+                repo_id: repo_id.clone(),
+            },
+            router,
+            local_waits.clone(),
+        ));
+        let (cowshed, token) =
+            cowshed_core::Cowshed::connect_in_process(OwnedFd::from(client), local_waits)
+                .await
+                .expect("connect in-process");
+
+        let binding = Arc::new(
+            RepositoryBinding::new(vec![BoundIdentity {
+                repo_id: repo_id.clone(),
+                remote_name: None,
+                remote_url: None,
+                primary: true,
+            }])
+            .expect("binding"),
+        );
+        let open_reply = ProjectOpened {
+            repo_id: repo_id.clone(),
+            binding,
+            git_root: Arc::from(Path::new("/tmp/fixture-project")),
+            store_root: Arc::from(Path::new("/tmp/fixture-store")),
+            substrate: Some(cowshed_core::api::StoreSubstrate::Directory),
+        };
+        let serve_open = tokio::spawn(async move {
+            let command = commands.recv().await.expect("project.open command");
+            let (_, reply) = command.into_parts();
+            let result = encode_result::<operations::ProjectOpen>(&open_reply).expect("encode");
+            let _ = reply.send(Ok(RouterResponse::json(result)));
+        });
+        let project = cowshed
+            .open("/tmp/fixture-project")
+            .await
+            .expect("open project");
+        serve_open.await.expect("serve open");
+        let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+        drop(cowshed);
+
+        // Keep a handle derived from the connection alive across `bridge.shutdown()`, matching
+        // any caller that holds a `WorkspaceHandle` or `JobHandle` from `bridge.coordinator()`.
+        let derived = project;
+        let bridge = ActorBridge {
+            coordinator: Some(coordinator),
+            connection: Some(connection),
+            runtime: None,
+            backend: GatewayStoreBackend::Directory,
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), bridge.shutdown())
+            .await
+            .expect("ActorBridge::shutdown must close its connection while derived handles live")
+            .expect("clean ActorBridge shutdown");
+
+        // Any subsequent call on the stale derived handle must fail immediately rather than hang.
+        let Err(error) = tokio::time::timeout(Duration::from_secs(2), derived.list(None))
+            .await
+            .expect("stale handle after shutdown must not hang")
+        else {
+            panic!("stale handle after shutdown must fail");
+        };
+        assert_eq!(error.code, ErrorCode::EnvironmentMissing, "{error:?}");
     }
 }
 
