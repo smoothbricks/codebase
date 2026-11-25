@@ -3324,15 +3324,30 @@ impl<L: StdAccept> AsyncAccept<L> {
 
     pub(crate) async fn accept(&mut self) -> std::io::Result<(L::AsyncStream, L::Addr)> {
         loop {
-            if self.pending.is_none() {
-                let _ready = self.listener.readable().await?;
+            // Hold the readiness guard that motivated spawning `pending` across the blocking
+            // accept (disjoint borrows of `self.listener` and `self.pending`). On WouldBlock,
+            // clearing that guard only clears its pre-accept tick and preserves any newer
+            // connection event the I/O driver recorded while the blocking accept ran.
+            //
+            // Cancellation safety: if `tokio::select!` cancels `accept` while `pending` is Some,
+            // the prior call dropped its guard without clearing readiness. A re-entered `accept`
+            // resumes that same `pending` task without taking a post-spawn guard (which could
+            // carry a newer tick than `pending`'s syscall); if the resumed task returns
+            // WouldBlock, readiness is left untouched so the next iteration gets `readable()` at
+            // once with a fresh pre-accept guard and either accepts a waiting connection or clears
+            // that guard on a genuine WouldBlock.
+            let ready = if self.pending.is_none() {
+                let guard = self.listener.readable().await?;
                 let shared = Arc::clone(&self.listener.get_ref().0);
                 self.pending = Some(tokio::task::spawn_blocking(move || {
                     let (stream, addr) = fork_lock::create(|| shared.accept_std())?;
                     L::set_nonblocking(&stream)?;
                     Ok(Accepted { stream, addr })
                 }));
-            }
+                Some(guard)
+            } else {
+                None
+            };
             let outcome = self
                 .pending
                 .as_mut()
@@ -3343,7 +3358,9 @@ impl<L: StdAccept> AsyncAccept<L> {
             match outcome {
                 Ok(Accepted { stream, addr }) => return Ok((L::into_async(stream)?, addr)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.listener.readable().await?.clear_ready();
+                    if let Some(mut guard) = ready {
+                        guard.clear_ready();
+                    }
                 }
                 Err(error) => return Err(error),
             }
