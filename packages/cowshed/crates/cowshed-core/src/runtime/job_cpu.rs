@@ -227,8 +227,13 @@ pub(crate) struct FifoDrainer {
 impl FifoDrainer {
     /// Start draining `file` (a non-blocking duplicated read-write descriptor from
     /// [`Jobserver::dup_nonblocking_fd`]), sending each withdrawn byte count through `tx`.
+    ///
+    /// Watches `span` directly so when the gate span goes off (or is already off at start), the
+    /// drainer stops draining and writes every held byte back without waiting for an actor turn.
+    /// [`Self::restore`] joins the task to collect the restored byte count for span recording.
     pub(crate) fn start<T: Send + 'static>(
         file: File,
+        mut span: tokio::sync::watch::Receiver<bool>,
         tx: tokio::sync::mpsc::Sender<T>,
         map: impl Fn(usize) -> T + Send + 'static,
     ) -> io::Result<Self> {
@@ -237,26 +242,52 @@ impl FifoDrainer {
         let task = tokio::spawn(async move {
             let mut held = Vec::<u8>::new();
             let mut buf = [0_u8; 256];
-            let initial = drain_file(async_fd.get_ref(), &mut buf, &mut held);
-            if initial > 0 {
-                let _ = tx.send(map(initial)).await;
+            if !*span.borrow() {
+                return 0;
             }
-            let restore = loop {
+            let initial = drain_file(async_fd.get_ref(), &mut buf, &mut held);
+            let mut restore_override = None;
+            if initial > 0 {
                 tokio::select! {
                     biased;
-                    stop = &mut stop_rx => break stop.unwrap_or(false),
-                    ready = async_fd.readable() => {
-                        let Ok(mut guard) = ready else {
-                            break false;
-                        };
-                        let count = drain_file(async_fd.get_ref(), &mut buf, &mut held);
-                        if count > 0 {
-                            let _ = tx.send(map(count)).await;
-                        } else {
-                            guard.clear_ready();
+                    stop = &mut stop_rx => {
+                        restore_override = Some(stop.unwrap_or(false));
+                    }
+                    () = wait_span_off(&mut span) => {
+                        restore_override = Some(true);
+                    }
+                    _ = tx.send(map(initial)) => {}
+                }
+            }
+            let restore = match restore_override {
+                Some(restore) => restore,
+                None => loop {
+                    tokio::select! {
+                        biased;
+                        stop = &mut stop_rx => break stop.unwrap_or(false),
+                        () = wait_span_off(&mut span) => break true,
+                        ready = async_fd.readable() => {
+                            let Ok(mut guard) = ready else {
+                                break false;
+                            };
+                            let count = drain_file(async_fd.get_ref(), &mut buf, &mut held);
+                            if count > 0 {
+                                drop(guard);
+                                let interrupted = tokio::select! {
+                                    biased;
+                                    stop = &mut stop_rx => Some(stop.unwrap_or(false)),
+                                    () = wait_span_off(&mut span) => Some(true),
+                                    _ = tx.send(map(count)) => None,
+                                };
+                                if let Some(restore) = interrupted {
+                                    break restore;
+                                }
+                            } else {
+                                guard.clear_ready();
+                            }
                         }
                     }
-                }
+                },
             };
             if restore && !held.is_empty() {
                 let mut written = 0;
@@ -302,6 +333,13 @@ impl Drop for FifoDrainer {
             let _ = stop.send(false);
         }
     }
+}
+
+/// Resolve once the gate span is off, or its publisher is gone, which is the same: a supervisor
+/// that no longer hears the gate state takes it to be off (05_gateway.md "A land's gate takes
+/// tokens back").
+pub(crate) async fn wait_span_off(span: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = span.wait_for(|&active| !active).await;
 }
 
 fn drain_file(mut file: &File, buf: &mut [u8], held: &mut Vec<u8>) -> usize {

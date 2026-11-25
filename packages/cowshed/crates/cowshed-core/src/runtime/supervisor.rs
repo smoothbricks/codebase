@@ -6812,7 +6812,7 @@ impl SupervisorActor {
                 if let Some(bg) = &job.darwinbg
                     && bg.active
                 {
-                    lives.extend(bg.applied.iter().copied());
+                    lives.extend(bg.snapshot_applied());
                 }
             }
             lives
@@ -9103,13 +9103,16 @@ impl SupervisorActor {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        if job.terminal() || !self.gate_active {
+        if job.terminal() || !self.gate_active || !self.gate_watch.span_active() {
             return;
         }
         if let Some(Ok(Some(fd))) = dup_result {
-            match super::job_cpu::FifoDrainer::start(fd, self.events.clone(), move |count| {
-                ProcessEvent::TokensWithdrawn { job_id, count }
-            }) {
+            match super::job_cpu::FifoDrainer::start(
+                fd,
+                self.gate_watch.span(),
+                self.events.clone(),
+                move |count| ProcessEvent::TokensWithdrawn { job_id, count },
+            ) {
                 Ok(drainer) => job.token_drainer = Some(drainer),
                 Err(error) => {
                     cowshed_os::eprintln!(
@@ -9169,9 +9172,10 @@ impl SupervisorActor {
 
     #[cfg(target_os = "macos")]
     async fn handle_darwinbg_window(&mut self, job_id: JobId) {
-        if !self.gate_active {
+        if !self.gate_active || !self.gate_watch.span_active() {
             return;
         }
+        let span = self.gate_watch.span();
         let (cpu_millicores, held, lives) = {
             let Some(job) = self.jobs.get_mut(&job_id) else {
                 return;
@@ -9206,40 +9210,52 @@ impl SupervisorActor {
             if !gate_priority::exceeds_token_budget(cpu_millicores, held) {
                 return;
             }
-            bg.stop_window_task();
-            bg.active = true;
             let mut lives: Vec<super::process_tree::ProcessIdentity> = job
                 .monitor
                 .as_ref()
                 .map(|monitor| monitor.running_lives().to_vec())
                 .unwrap_or_default();
-            for &life in &lives {
-                bg.applied.insert(life);
+            if lives.is_empty() {
+                return;
             }
             lives.sort_unstable_by_key(|life| (life.pid, life.birth.0));
             lives.dedup();
+            bg.stop_window_task();
+            bg.active = true;
+            bg.record_applied(&lives);
+            bg.arm_clear_task(job.monitor.clone(), span);
             (cpu_millicores, held, lives)
         };
-        if lives.is_empty() {
-            return;
-        }
         // Persist every life to `.groups` BEFORE calling `setpriority(PRIO_DARWIN_BG)`.
         self.flush_groups_darwinbg().await;
+        // Re-check the live span watch before applying: if span-off happened during the flush,
+        // do not apply `PRIO_DARWIN_BG` and remove the unpublished entry from `.groups`.
+        if !self.gate_watch.span_active() {
+            if let Some(job) = self.jobs.get_mut(&job_id) {
+                job.darwinbg = None;
+            }
+            self.flush_groups_darwinbg().await;
+            return;
+        }
+        let applied_lives = lives.clone();
         let outcomes = off_actor::run(move || gate_priority::apply_darwinbg_to_lives(lives)).await;
+        // If span-off happened while `apply_darwinbg_to_lives` was executing on the blocking pool
+        // (potentially racing ahead of the out-of-turn clear task), clear those lives immediately
+        // so no process is left backgrounded past span-off.
+        if !self.gate_watch.span_active() {
+            let clear_outcomes =
+                off_actor::run(move || gate_priority::clear_darwinbg_from_lives(applied_lives))
+                    .await;
+            self.record_darwinbg_unconfirmed(job_id, &clear_outcomes);
+            return;
+        }
+        self.record_darwinbg_unconfirmed(job_id, &outcomes);
         let Some(job) = self.jobs.get(&job_id) else {
             return;
         };
         if let Some(job_spans) = &self.job_spans
             && job.caller.is_none()
         {
-            for (pid, outcome) in outcomes {
-                if outcome == super::placement::DarwinBgOutcome::Unconfirmed {
-                    job_spans.record_gate_priority(
-                        &job.info,
-                        super::job_spans::GatePriorityRow::DarwinBgUnconfirmed { pid },
-                    );
-                }
-            }
             job_spans.record_gate_priority(
                 &job.info,
                 super::job_spans::GatePriorityRow::DarwinBgSet {
@@ -9252,7 +9268,7 @@ impl SupervisorActor {
 
     #[cfg(target_os = "macos")]
     async fn extend_darwinbg_for_new_lives(&mut self) {
-        if !self.gate_active {
+        if !self.gate_active || !self.gate_watch.span_active() {
             return;
         }
         let mut additions: Vec<(JobId, Vec<super::process_tree::ProcessIdentity>)> = Vec::new();
@@ -9271,7 +9287,7 @@ impl SupervisorActor {
             };
             let mut new_lives = Vec::new();
             for &life in monitor.running_lives().iter() {
-                if bg.applied.insert(life) {
+                if bg.insert_if_new(life) {
                     new_lives.push(life);
                 }
             }
@@ -9283,21 +9299,49 @@ impl SupervisorActor {
             return;
         }
         self.flush_groups_darwinbg().await;
+        if !self.gate_watch.span_active() {
+            return;
+        }
         for (job_id, new_lives) in additions {
+            if !self.gate_watch.span_active() {
+                break;
+            }
+            let applied = new_lives.clone();
             let outcomes =
                 off_actor::run(move || gate_priority::apply_darwinbg_to_lives(new_lives)).await;
-            if let Some(job) = self.jobs.get(&job_id)
-                && let Some(job_spans) = &self.job_spans
-                && job.caller.is_none()
-            {
-                for (pid, outcome) in outcomes {
-                    if outcome == super::placement::DarwinBgOutcome::Unconfirmed {
-                        job_spans.record_gate_priority(
-                            &job.info,
-                            super::job_spans::GatePriorityRow::DarwinBgUnconfirmed { pid },
-                        );
-                    }
-                }
+            if !self.gate_watch.span_active() {
+                let clear_outcomes =
+                    off_actor::run(move || gate_priority::clear_darwinbg_from_lives(applied)).await;
+                self.record_darwinbg_unconfirmed(job_id, &clear_outcomes);
+                break;
+            }
+            self.record_darwinbg_unconfirmed(job_id, &outcomes);
+        }
+    }
+
+    /// Record a `job.darwinbg.unconfirmed` row for each life whose `PRIO_DARWIN_BG` readback did
+    /// not confirm the set or clear (05_gateway.md "A land's gate takes tokens back").
+    #[cfg(target_os = "macos")]
+    fn record_darwinbg_unconfirmed(
+        &self,
+        job_id: JobId,
+        outcomes: &[(u32, super::placement::DarwinBgOutcome)],
+    ) {
+        let Some(job) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let Some(job_spans) = &self.job_spans else {
+            return;
+        };
+        if job.caller.is_some() {
+            return;
+        }
+        for &(pid, outcome) in outcomes {
+            if outcome == super::placement::DarwinBgOutcome::Unconfirmed {
+                job_spans.record_gate_priority(
+                    &job.info,
+                    super::job_spans::GatePriorityRow::DarwinBgUnconfirmed { pid },
+                );
             }
         }
     }
@@ -9328,39 +9372,26 @@ impl SupervisorActor {
         }
         #[cfg(target_os = "macos")]
         {
-            let clear_lives = self.jobs.get_mut(&job_id).and_then(|job| {
+            let active_bg = self.jobs.get_mut(&job_id).and_then(|job| {
                 let mut bg = job.darwinbg.take()?;
                 bg.stop_window_task();
                 if !bg.active {
                     return None;
                 }
-                let mut lives = std::mem::take(&mut bg.applied);
-                if let Some(monitor) = &job.monitor {
-                    for &life in monitor.running_lives().iter() {
-                        lives.insert(life);
-                    }
-                }
-                Some(lives.into_iter().collect::<Vec<_>>())
+                Some((bg, job.monitor.clone()))
             });
-            if let Some(lives) = clear_lives {
-                // Clear PRIO_DARWIN_BG on every live process FIRST, then remove from `.groups`.
-                let outcomes =
-                    off_actor::run(move || gate_priority::clear_darwinbg_from_lives(lives)).await;
+            if let Some((bg, monitor)) = active_bg {
+                // Join the out-of-turn clear task (or run it now on job exit), clearing any
+                // residual lives FIRST, then record span rows and remove from `.groups`.
+                let outcomes = bg.finish_clear(monitor.as_ref()).await;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.darwinbg_cleared = job.darwinbg_cleared.saturating_add(1);
                 }
+                self.record_darwinbg_unconfirmed(job_id, &outcomes);
                 if let Some(job) = self.jobs.get(&job_id)
                     && let Some(job_spans) = &self.job_spans
                     && job.caller.is_none()
                 {
-                    for (pid, outcome) in outcomes {
-                        if outcome == super::placement::DarwinBgOutcome::Unconfirmed {
-                            job_spans.record_gate_priority(
-                                &job.info,
-                                super::job_spans::GatePriorityRow::DarwinBgUnconfirmed { pid },
-                            );
-                        }
-                    }
                     job_spans.record_gate_priority(
                         &job.info,
                         super::job_spans::GatePriorityRow::DarwinBgCleared,

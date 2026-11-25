@@ -10,16 +10,24 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
+use std::sync::Mutex;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 use cowshed_os::deadline;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::sync::{Notify, mpsc};
+#[cfg(target_os = "macos")]
+use tokio::sync::oneshot;
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::api::dto::{ExecClass, JobId};
 #[cfg(target_os = "macos")]
 use crate::api::resources::CpuMicros;
 use crate::gate_watch::{GateWatchEvent, GateWatchOpen, GateWatchState};
+#[cfg(target_os = "macos")]
+use crate::runtime::job_cpu::wait_span_off;
+#[cfg(target_os = "macos")]
+use crate::runtime::process_monitor::ProcessMonitor;
 #[cfg(target_os = "macos")]
 use crate::runtime::process_tree::ProcessIdentity;
 
@@ -86,18 +94,29 @@ pub(super) const fn exceeds_token_budget(cpu_millicores: u32, held_tokens: u32) 
         > (held_tokens as u64).saturating_mul(DARWIN_BG_THRESHOLD_MILLICORES_PER_TOKEN)
 }
 
+/// Result of one per-job out-of-turn `PRIO_DARWIN_BG` clear task: the exact lives already cleared
+/// and each life's `PROC_PIDTHREADINFO` readback outcome.
+#[cfg(target_os = "macos")]
+type DarwinBgClearResult = (
+    HashSet<ProcessIdentity>,
+    Vec<(u32, crate::runtime::placement::DarwinBgOutcome)>,
+);
+
 /// Per-job macOS `PRIO_DARWIN_BG` measurement and active state while a land's gate runs.
 #[cfg(target_os = "macos")]
 pub(super) struct JobDarwinBg {
     window_task: Option<tokio::task::JoinHandle<()>>,
     pub(super) window_start: Option<(Instant, CpuMicros)>,
     pub(super) active: bool,
-    pub(super) applied: HashSet<ProcessIdentity>,
+    applied: Arc<Mutex<HashSet<ProcessIdentity>>>,
+    clear_stop: Option<oneshot::Sender<bool>>,
+    clear_task: Option<tokio::task::JoinHandle<DarwinBgClearResult>>,
 }
 
 #[cfg(target_os = "macos")]
 impl JobDarwinBg {
     /// Start the one-shot 1 s grace timer followed by 3 s measurement windows for `job_id`.
+    /// No clear task is spawned until `PRIO_DARWIN_BG` is actually applied (`arm_clear_task`).
     pub(super) fn start(job_id: JobId, events: mpsc::Sender<ProcessEvent>) -> Self {
         let task = tokio::spawn(async move {
             tokio::time::sleep(DARWIN_BG_GRACE).await;
@@ -123,7 +142,9 @@ impl JobDarwinBg {
             window_task: Some(task),
             window_start: None,
             active: false,
-            applied: HashSet::new(),
+            applied: Arc::new(Mutex::new(HashSet::new())),
+            clear_stop: None,
+            clear_task: None,
         }
     }
 
@@ -132,12 +153,114 @@ impl JobDarwinBg {
             task.abort();
         }
     }
+
+    pub(super) fn record_applied(&self, lives: &[ProcessIdentity]) {
+        let mut guard = self.applied.lock().expect("darwinbg applied lock poisoned");
+        for &life in lives {
+            guard.insert(life);
+        }
+    }
+
+    pub(super) fn insert_if_new(&self, life: ProcessIdentity) -> bool {
+        self.applied
+            .lock()
+            .expect("darwinbg applied lock poisoned")
+            .insert(life)
+    }
+
+    pub(super) fn snapshot_applied(&self) -> Vec<ProcessIdentity> {
+        self.applied
+            .lock()
+            .expect("darwinbg applied lock poisoned")
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Spawn the per-job out-of-turn clear task once `PRIO_DARWIN_BG` is first applied to this
+    /// job. When the gate span watch turns off (without waiting for an actor turn), or when the
+    /// actor signals `finish_clear`, the task clears every applied life plus `monitor`'s
+    /// `running_lives()` on the blocking pool via [`super::off_actor::run`].
+    pub(super) fn arm_clear_task(
+        &mut self,
+        monitor: Option<ProcessMonitor>,
+        mut span: watch::Receiver<bool>,
+    ) {
+        if self.clear_task.is_some() {
+            return;
+        }
+        let applied = Arc::clone(&self.applied);
+        let (stop_tx, mut stop_rx) = oneshot::channel::<bool>();
+        let task = tokio::spawn(async move {
+            let should_clear = tokio::select! {
+                biased;
+                stop = &mut stop_rx => stop.unwrap_or(false),
+                () = wait_span_off(&mut span) => true,
+            };
+            if !should_clear {
+                return (HashSet::new(), Vec::new());
+            }
+            let mut lives: HashSet<ProcessIdentity> = {
+                applied
+                    .lock()
+                    .expect("darwinbg applied lock poisoned")
+                    .clone()
+            };
+            if let Some(monitor) = &monitor {
+                for &life in monitor.running_lives().iter() {
+                    lives.insert(life);
+                }
+            }
+            if lives.is_empty() {
+                return (HashSet::new(), Vec::new());
+            }
+            let to_clear: Vec<_> = lives.iter().copied().collect();
+            let outcomes = super::off_actor::run(move || clear_darwinbg_from_lives(to_clear)).await;
+            (lives, outcomes)
+        });
+        self.clear_stop = Some(stop_tx);
+        self.clear_task = Some(task);
+    }
+
+    /// Complete clearing for this job inside `end_job_withdrawal`: joins the out-of-turn clear
+    /// task (triggering it now if still waiting, e.g. on job exit), clears any residual life added
+    /// after that task snapshotted, and returns all readback outcomes for actor span recording.
+    pub(super) async fn finish_clear(
+        mut self,
+        monitor: Option<&ProcessMonitor>,
+    ) -> Vec<(u32, crate::runtime::placement::DarwinBgOutcome)> {
+        self.stop_window_task();
+        if let Some(stop) = self.clear_stop.take() {
+            let _ = stop.send(true);
+        }
+        let (already_cleared, mut outcomes) = match self.clear_task.take() {
+            Some(task) => task.await.unwrap_or_default(),
+            None => (HashSet::new(), Vec::new()),
+        };
+        let mut remaining: HashSet<ProcessIdentity> =
+            std::mem::take(&mut *self.applied.lock().expect("darwinbg applied lock poisoned"));
+        if let Some(monitor) = monitor {
+            for &life in monitor.running_lives().iter() {
+                remaining.insert(life);
+            }
+        }
+        remaining.retain(|life| !already_cleared.contains(life));
+        if !remaining.is_empty() {
+            let to_clear: Vec<_> = remaining.into_iter().collect();
+            let extra = super::off_actor::run(move || clear_darwinbg_from_lives(to_clear)).await;
+            outcomes.extend(extra);
+        }
+        outcomes
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for JobDarwinBg {
     fn drop(&mut self) {
         self.stop_window_task();
+        if let Some(stop) = self.clear_stop.take() {
+            let _ = stop.send(false);
+        }
     }
 }
 
@@ -199,10 +322,12 @@ pub(super) fn clear_darwinbg_from_lives(
 
 /// One persistent `gate-watch` client task per supervisor, opening its bidirectional connection to
 /// `<store>/gateway.sock` when the gateway says `hello` (`Request::Hello` on the supervisor
-/// socket), forwarding `GateWatchState` and silence-bound resets as
-/// [`ProcessEvent::GateWatchState`], and waiting for the next `hello` whenever the watch ends.
+/// socket), publishing the live gate span on a `watch::Sender<bool>` so drainers and darwinbg
+/// clearers react to span-off without waiting for an actor turn, forwarding `GateWatchState` for
+/// actor bookkeeping, and waiting for the next `hello` whenever the watch ends.
 pub(super) struct GateWatchClient {
     commands: mpsc::UnboundedSender<GateWatchEvent>,
+    span: watch::Receiver<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -214,8 +339,30 @@ impl GateWatchClient {
         events: mpsc::Sender<ProcessEvent>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_watch_loop(gateway_socket, ledger, rx, hello, events));
-        Self { commands: tx, task }
+        let (span_tx, span_rx) = watch::channel(false);
+        let task = tokio::spawn(run_watch_loop(
+            gateway_socket,
+            ledger,
+            rx,
+            hello,
+            span_tx,
+            events,
+        ));
+        Self {
+            commands: tx,
+            span: span_rx,
+            task,
+        }
+    }
+
+    /// Subscribe to the live gate span state published directly by `run_watch_loop`.
+    pub(super) fn span(&self) -> watch::Receiver<bool> {
+        self.span.clone()
+    }
+
+    /// Current live gate span state as last published by `run_watch_loop`.
+    pub(super) fn span_active(&self) -> bool {
+        *self.span.borrow()
     }
 
     pub(super) fn gate_start(&self, job_id: JobId) {
@@ -234,6 +381,26 @@ impl GateWatchClient {
 impl Drop for GateWatchClient {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// Ensures the published span watch always flips to `false` on any exit of `run_watch_loop`
+/// (closed command channel, closed event channel, or task abort).
+struct SpanGuard(watch::Sender<bool>);
+
+impl SpanGuard {
+    fn set(&self, active: bool) {
+        self.0.send_if_modified(|current| {
+            let changed = *current != active;
+            *current = active;
+            changed
+        });
+    }
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        self.set(false);
     }
 }
 
@@ -258,7 +425,14 @@ fn record_local_gate(active_local_gates: &mut BTreeSet<u64>, event: &GateWatchEv
     }
 }
 
-async fn clear_active(last_active: &mut bool, events: &mpsc::Sender<ProcessEvent>) -> bool {
+async fn clear_active(
+    last_active: &mut bool,
+    span: &SpanGuard,
+    events: &mpsc::Sender<ProcessEvent>,
+) -> bool {
+    // Publish span-off first so drainers and macOS darwinbg clear tasks reset without waiting for
+    // the actor's `GateWatchState` turn (or an `events` channel that may be full behind a stall).
+    span.set(false);
     if !*last_active {
         return true;
     }
@@ -277,8 +451,10 @@ async fn run_watch_loop(
     ledger: Option<PathBuf>,
     mut commands: mpsc::UnboundedReceiver<GateWatchEvent>,
     hello: Arc<Notify>,
+    span_tx: watch::Sender<bool>,
     events: mpsc::Sender<ProcessEvent>,
 ) {
+    let span = SpanGuard(span_tx);
     let mut active_local_gates = BTreeSet::<u64>::new();
     let mut last_active = false;
     let peer = deadline::Peer::unix("gateway", &gateway_socket);
@@ -304,7 +480,7 @@ async fn run_watch_loop(
         let connect_deadline = deadline::start("gate-watch", deadline::HANDSHAKE);
         let Ok(stream) = deadline::connect_unix(&connect_deadline, &peer, &gateway_socket).await
         else {
-            if !clear_active(&mut last_active, &events).await {
+            if !clear_active(&mut last_active, &span, &events).await {
                 return;
             }
             continue;
@@ -312,7 +488,7 @@ async fn run_watch_loop(
         let (reader, mut writer) = stream.into_split();
         let open = GateWatchOpen::new(ledger.clone());
         if write_json_line(&mut writer, &open).await.is_err() {
-            if !clear_active(&mut last_active, &events).await {
+            if !clear_active(&mut last_active, &span, &events).await {
                 return;
             }
             continue;
@@ -328,7 +504,7 @@ async fn run_watch_loop(
             }
         }
         if !replayed {
-            if !clear_active(&mut last_active, &events).await {
+            if !clear_active(&mut last_active, &span, &events).await {
                 return;
             }
             continue;
@@ -358,6 +534,7 @@ async fn run_watch_loop(
                                     silence.as_mut().reset(
                                         tokio::time::Instant::now() + deadline::HEARTBEAT_SILENCE,
                                     );
+                                    span.set(state.active);
                                     last_active = state.active;
                                     if events
                                         .send(ProcessEvent::GateWatchState {
@@ -382,7 +559,7 @@ async fn run_watch_loop(
                 }
             }
         }
-        if !clear_active(&mut last_active, &events).await {
+        if !clear_active(&mut last_active, &span, &events).await {
             return;
         }
     }
