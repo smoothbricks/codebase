@@ -1151,14 +1151,18 @@ impl<P: ProcessReads> Writer<P> {
         if survivors.is_empty() {
             return Ok(self.retired(scope));
         }
-        Err(CowshedError::survived_sigkill(
-            format!(
-                "{}'s processes {:?} still run {:?} after SIGKILL",
-                self.job_id,
-                survivors.iter().map(|life| life.pid).collect::<Vec<_>>(),
-                grace.max(KILL_JOIN)
-            ),
-            "they stay owned and watched; retry the retirement",
+        // Fold every exit the kernel queued after the join's last wait, so a life whose exit is
+        // already queued is joined, never reported as surviving.
+        let drained = self.observer.drain_custody();
+        self.observed(drained)?;
+        let survivors = self.owned(scope)?;
+        if survivors.is_empty() {
+            return Ok(self.retired(scope));
+        }
+        Err(survived_sigkill_refusal(
+            self.job_id,
+            &survivors.iter().map(|life| life.pid).collect::<Vec<_>>(),
+            grace.max(KILL_JOIN),
         ))
     }
 
@@ -1340,6 +1344,49 @@ fn unavailable(job_id: TreeOwner) -> CowshedError {
 
 /// A retirement step the kernel refused. Nothing is presumed ended: every registration, the
 /// fold and the signal record stay for an explicit retry.
+/// The refusal of lives that still ran `within` after SIGKILL, every exit queued for them
+/// already folded. Each survivor is named with what the kernel shows of it now (its run state,
+/// its nice and the CPU it has used), so the refusal itself says whether the life was never
+/// scheduled to die (a runnable life at a low priority that used no CPU since), stuck in the
+/// kernel (an uninterruptible wait, which no signal ends) or exited unreaped.
+fn survived_sigkill_refusal(
+    job_id: TreeOwner,
+    survivors: &[u32],
+    within: Duration,
+) -> CowshedError {
+    let named: Vec<String> = survivors.iter().map(|&pid| survivor_state(pid)).collect();
+    CowshedError::survived_sigkill(
+        format!(
+            "{}'s processes still run {within:?} after SIGKILL, every exit queued for them folded: {}",
+            job_id,
+            named.join("; ")
+        ),
+        "they stay owned and watched; retry the retirement",
+    )
+}
+
+/// One survivor as the kernel shows it now: pid, run state, nice and CPU time used.
+fn survivor_state(pid: u32) -> String {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return format!("pid {pid} (not a pid)");
+    };
+    let state = procinfo::run_state(pid);
+    crate::runtime::shell_host::clear_errno();
+    // SAFETY: a plain read of another process's priority.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+    let nice_read = io::Error::last_os_error();
+    let nice = if nice == -1 && nice_read.raw_os_error().is_some_and(|code| code != 0) {
+        format!("nice unread ({nice_read})")
+    } else {
+        format!("nice {nice}")
+    };
+    let cpu = match procinfo::cpu_time(pid) {
+        Ok(Some(cpu)) => format!("cpu {cpu:?}"),
+        Ok(None) => "cpu unread (no such process)".to_owned(),
+        Err(error) => format!("cpu unread ({error})"),
+    };
+    format!("pid {pid} {state}, {nice}, {cpu}")
+}
 fn refused(job_id: TreeOwner, error: ObserveError) -> CowshedError {
     CowshedError::environment_missing(
         format!("{}'s processes cannot be retired: {error}", job_id),
@@ -1353,6 +1400,45 @@ mod tests {
     use crate::api::dto::{CommandArg, JobId, UtcTimestamp};
     use crate::api::process::JobProcessSample;
     use cowshed_os::test_backstop::ChildBackstop as _;
+
+    /// A SIGKILL refusal names each survivor's kernel state: here a SIGSTOPped life, so the
+    /// refusal reads it as stopped with its nice and CPU time, and carries the SurvivedSigkill
+    /// cause.
+    #[test]
+    fn a_survived_sigkill_refusal_names_a_stopped_survivors_kernel_state() {
+        use cowshed_os::fork_lock::Spawn as _;
+        let mut command = std::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+        let mut child = command.spawn_locked().unwrap();
+        let pid = child.id();
+        // SAFETY: a stop sent to this test's own child.
+        assert_eq!(
+            unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap(), libc::SIGSTOP) },
+            0
+        );
+        // The kernel reports the stop to its parent: wait for that event, not a polled state.
+        let (waited, status) = cowshed_os::test_backstop::waitpid(
+            libc::pid_t::try_from(pid).unwrap(),
+            libc::WUNTRACED,
+        )
+        .expect("wait for the child's stop");
+        assert_eq!(waited, libc::pid_t::try_from(pid).unwrap());
+        assert!(libc::WIFSTOPPED(status));
+        let refusal = survived_sigkill_refusal(TreeOwner::Spare, &[pid], KILL_JOIN);
+        let message = refusal.to_string();
+        assert!(message.contains(&format!("pid {pid} stopped")), "{message}");
+        assert!(message.contains(", nice "), "{message}");
+        assert!(message.contains(", cpu "), "{message}");
+        assert!(
+            message.contains("every exit queued for them folded"),
+            "{message}"
+        );
+        assert!(refusal.survivors_were_killed(), "{message}");
+        child.kill().unwrap();
+        assert!(!child.wait_bounded().unwrap().success());
+    }
 
     #[test]
     fn a_spare_activation_root_is_watched_and_retired_without_a_job() {
