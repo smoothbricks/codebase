@@ -1351,14 +1351,18 @@ fn doc_commit_expiry_at_commit_bind_names_bound_and_puts_back_staged_edit() {
 fn doc_commit_put_back_after_loss_skips_path_rewritten_by_another_holder() {
     let repo = Repo::new("paths = [\"*.md\"]\n");
     let started_fifo = repo.root.join("re2-started.fifo");
-    let signalled_fifo = repo.root.join("re2-signalled.fifo");
-    let resume_fifo = repo.root.join("re2-resume.fifo");
     let hold_fifo = repo.root.join("re2-hold.fifo");
     make_fifo(&started_fifo);
-    make_fifo(&signalled_fifo);
-    make_fifo(&resume_fifo);
     make_fifo(&hold_fifo);
+    let main = repo.main();
 
+    // The check stands for a running check. Its SIGTERM trap is the "other holder": after the
+    // loss and before the check ends (so before put-back, which waits for the signalled commands
+    // to end), it rewrites docs/a.md, stages docs/c.md (same bytes, new index entry) and moves
+    // docs/b.md's mtime without changing its bytes. Doing this inside the trap orders it by the
+    // signal itself: no test step runs between the signal and the reap bound, which an earlier
+    // version raced under gate load (sb-batch-4 gate 2: the reap ended the check first and the
+    // test then blocked opening a fifo no one would read).
     let check_script = repo.file(
         "re2-check.sh",
         &format!(
@@ -1366,19 +1370,19 @@ fn doc_commit_put_back_after_loss_skips_path_rewritten_by_another_holder() {
              bg=\"\"\n\
              on_term() {{\n\
                  if [ -n \"$bg\" ]; then kill \"$bg\" 2>/dev/null || true; fi\n\
-                 printf 'signalled\\n' > '{}'\n\
-                 read _go < '{}'\n\
+                 printf 'written by next holder\\n' > '{main}/docs/a.md'\n\
+                 git -C '{main}' add docs/c.md\n\
+                 touch -t 202311141313.20 '{main}/docs/b.md'\n\
                  exit 143\n\
              }}\n\
              trap on_term TERM\n\
-             cat < '{}' >/dev/null &\n\
+             cat < '{hold}' >/dev/null &\n\
              bg=$!\n\
-             printf 'started\\n' > '{}'\n\
+             printf 'started\\n' > '{started}'\n\
              wait \"$bg\"\n",
-            signalled_fifo.display(),
-            resume_fifo.display(),
-            hold_fifo.display(),
-            started_fifo.display(),
+            main = main.display(),
+            hold = hold_fifo.display(),
+            started = started_fifo.display(),
         ),
     );
     fs::set_permissions(&check_script, fs::Permissions::from_mode(0o755))
@@ -1449,36 +1453,9 @@ new file mode 100644
         "started"
     );
 
-    // 2. Gateway cuts the turn; doc-commit sends SIGTERM to check, which pauses in its trap
-    //    before exiting (so put-back has not started yet).
+    // 2. The gateway cuts the turn. doc-commit sends SIGTERM to the check, whose trap plays the
+    //    other holder and then exits; doc-commit reaps it and runs the guarded put-back.
     stand_in.cut_now();
-    assert_eq!(
-        fs::read_to_string(&signalled_fifo)
-            .expect("read signalled")
-            .trim(),
-        "signalled"
-    );
-
-    // 3. After the loss and before put-back, another holder rewrites `docs/a.md` on disk and
-    //    stages `docs/c.md` in the index (same bytes, different index entry), while `docs/b.md`
-    //    only has its mtime changed (identical bytes and index) and `README.md` is untouched.
-    fs::write(repo.main().join("docs/a.md"), "written by next holder\n")
-        .expect("rewrite docs/a.md as another holder");
-    git(&repo.main(), &["add", "docs/c.md"]);
-    let b_path = repo.main().join("docs/b.md");
-    let b_file = fs::OpenOptions::new()
-        .write(true)
-        .open(&b_path)
-        .expect("open docs/b.md to bump mtime");
-    b_file
-        .set_modified(
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-        )
-        .expect("change docs/b.md mtime without changing its bytes");
-    drop(b_file);
-
-    // 4. Release check so doc-commit reaps it and runs guarded put-back.
-    fs::write(&resume_fifo, "go\n").expect("release trapping check");
 
     let output = child
         .wait_with_output_bounded()
