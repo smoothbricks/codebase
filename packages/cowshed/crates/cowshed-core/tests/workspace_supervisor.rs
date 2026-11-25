@@ -13768,4 +13768,160 @@ for pid in children:
             .await
             .unwrap();
     }
+
+    /// Red (c): a supervisor killed while holding `PRIO_DARWIN_BG` on a recorded job's life.
+    /// Recovery must clear `PRIO_DARWIN_BG` on every recorded life BEFORE ending any group
+    /// (sending `SIGTERM`). Proven without a race by trapping `SIGTERM` in the burner: its
+    /// handler reads its own threads' `pth_maxpriority` through `PROC_PIDTHREADINFO` and writes
+    /// the values to a file before exiting. Today's code sends `SIGTERM` with `PRIO_DARWIN_BG`
+    /// still set so the handler records `4`; fixed, it records `63`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn supervisor_recovery_clears_darwinbg_before_sending_sigterm() {
+        use cowshed_core::runtime::job_groups::GroupLeader;
+        use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        let root = TempRoot::new_in(&temp_parent::canonical_parent(), "gate-recovery-c");
+        let result_path = root.join("sigterm-maxprio.txt");
+        let ledger = root.join("supervisor.groups");
+
+        let script = r#"
+import ctypes, os, signal, struct, sys
+
+result_path = sys.argv[1]
+threadinfo_size = int(sys.argv[2])
+maxprio_offset = int(sys.argv[3])
+PROC_PIDLISTTHREADS = int(sys.argv[4])
+PROC_PIDTHREADINFO = int(sys.argv[5])
+
+libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+libc.proc_pidinfo.argtypes = [
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_uint64,
+    ctypes.c_void_p,
+    ctypes.c_int,
+]
+libc.proc_pidinfo.restype = ctypes.c_int
+
+def read_max_priorities():
+    pid = os.getpid()
+    tids = (ctypes.c_uint64 * 64)()
+    nbytes = libc.proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, tids, ctypes.sizeof(tids))
+    assert nbytes > 0, f'PROC_PIDLISTTHREADS failed: {nbytes}'
+    count = nbytes // 8
+    buf = ctypes.create_string_buffer(threadinfo_size)
+    out = []
+    for i in range(count):
+        got = libc.proc_pidinfo(pid, PROC_PIDTHREADINFO, tids[i], buf, threadinfo_size)
+        if got == threadinfo_size:
+            (prio,) = struct.unpack_from('i', buf, maxprio_offset)
+            out.append(prio)
+    return out
+
+def on_term(_signum, _frame):
+    prios = read_max_priorities()
+    with open(result_path, 'w', encoding='utf-8') as f:
+        f.write(','.join(str(p) for p in prios) + '\n')
+        f.flush()
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+initial = read_max_priorities()
+sys.stdout.write('ready ' + ','.join(str(p) for p in initial) + '\n')
+sys.stdout.flush()
+os.read(0, 1)
+"#;
+        let threadinfo_size = std::mem::size_of::<libc::proc_threadinfo>();
+        let maxprio_offset = std::mem::offset_of!(libc::proc_threadinfo, pth_maxpriority);
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"exec python3 -c "$1" "$2" "$3" "$4" "$5" "$6""#,
+                "darwinbg-recovery-burner",
+                script,
+                result_path.to_str().unwrap(),
+                &threadinfo_size.to_string(),
+                &maxprio_offset.to_string(),
+                "6",
+                &libc::PROC_PIDTHREADINFO.to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn recovery burner");
+        let pid = child.id();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .expect("read burner ready line");
+        assert_eq!(
+            ready.trim(),
+            "ready 63",
+            "burner self-check reads 63 before PRIO_DARWIN_BG"
+        );
+
+        let leader = GroupLeader::observe(pid).expect("observe burner group leader");
+        let record = Darwin
+            .record(pid)
+            .expect("read burner record")
+            .expect("burner is running");
+        let boot_session = cowshed_apfs::attach_budget::boot()
+            .expect("read boot session")
+            .session;
+
+        // SAFETY: `pid` is our live child in its own process group.
+        let set =
+            unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) };
+        assert_eq!(
+            set,
+            0,
+            "set PRIO_DARWIN_BG on burner: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_tree_max_priority(&[pid], 4, "burner has PRIO_DARWIN_BG before recovery");
+
+        // Record the dead supervisor's ledger naming this live job and life.
+        let payload = serde_json::json!({
+            "supervisor": 1,
+            "groups": [{
+                "jobId": 1,
+                "pgid": leader.pgid(),
+                "leaderStart": leader.start(),
+                "members": {
+                    "bootSession": boot_session,
+                    "lives": [{
+                        "pid": pid,
+                        "birth": record.unique_id,
+                    }]
+                }
+            }]
+        });
+        std::fs::write(&ledger, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let _recovered =
+            cowshed_core::runtime::job_groups::take_lost(&ledger, Duration::from_secs(2))
+                .expect("recovery take_lost");
+        let status = child.wait_bounded().expect("reap burner");
+        assert!(
+            status.success(),
+            "burner exited cleanly on SIGTERM: {status:?}"
+        );
+
+        let observed: Vec<i32> = std::fs::read_to_string(&result_path)
+            .expect("burner SIGTERM handler wrote max priorities")
+            .trim()
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert!(
+            !observed.is_empty() && observed.iter().all(|&p| p == 63),
+            "SIGTERM handler must observe pth_maxpriority == 63 (darwinbg cleared before TERM), got {observed:?}"
+        );
+    }
 }
