@@ -373,6 +373,8 @@ impl Gateway {
                         first_launch: config.first_launch.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
                         land_turns,
+                        gate_watch: crate::gate_watch::GateWatch::new(),
+                        run_root: path.parent().map(|store| store.join("run")),
                         task_server: crate::task_server::TaskServer::start(config.task_server),
                         cleanup: Arc::clone(&cleanup),
                     },

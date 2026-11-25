@@ -697,6 +697,11 @@ enum Incoming {
         ticket: u64,
         token: String,
     },
+    /// A served supervisor's bidirectional watch on active land's gates (05_gateway.md "A land's
+    /// gate takes tokens back").
+    GateWatch {
+        ledger: Option<PathBuf>,
+    },
     /// An install's read of the land turns with the fence, held for as long as its connection is
     /// open (05_gateway.md "The read fences the turns").
     FencedLandTurns {
@@ -1076,6 +1081,9 @@ pub(crate) struct ControlServices {
     pub startup: Option<Arc<dyn StartupProbe>>,
     pub disk_leases: DiskLeases,
     pub land_turns: crate::land_turn::LandTurns,
+    pub gate_watch: crate::gate_watch::GateWatch,
+    /// `<store>/run/` directory containing supervisor `.groups` ledgers validated by `gate-watch`.
+    pub run_root: Option<PathBuf>,
     pub task_server: crate::task_server::TaskServer,
     pub ram_disks: Option<Arc<dyn RamDisks>>,
     pub ram_leases: crate::ram_lease::Records,
@@ -1109,6 +1117,8 @@ impl fmt::Debug for ControlServices {
             .field("startup", &self.startup)
             .field("disk_leases", &self.disk_leases)
             .field("land_turns", &self.land_turns)
+            .field("gate_watch", &self.gate_watch)
+            .field("run_root", &self.run_root)
             .field("task_server", &self.task_server)
             .field("ram_disks", &self.ram_disks)
             .field("ram_leases", &self.ram_leases)
@@ -1324,6 +1334,46 @@ async fn serve<R, W>(
                 ticket,
                 token,
                 services.land_turns.clone(),
+            )
+            .await;
+        }
+        Ok(Incoming::GateWatch { ledger }) => {
+            let mut writer = writer;
+            if peer_socket.is_none() {
+                let refused = failure(
+                    ControlFailureCode::InvalidRequest,
+                    "gate-watch is available only on the host Unix control socket".to_owned(),
+                );
+                let _ = write_response(&mut writer, &refused).await;
+                return;
+            }
+            let validated_ledger = match (ledger, services.run_root.as_deref()) {
+                (None, _) => None,
+                (Some(ledger), Some(run_root)) => {
+                    match crate::gate_watch::validate_ledger_path(&ledger, run_root) {
+                        Ok(valid) => Some(valid),
+                        Err(error) => {
+                            let refused = failure(ControlFailureCode::InvalidRequest, error);
+                            let _ = write_response(&mut writer, &refused).await;
+                            return;
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    let refused = failure(
+                        ControlFailureCode::InvalidRequest,
+                        "gateway has no run directory to validate gate-watch ledger".to_owned(),
+                    );
+                    let _ = write_response(&mut writer, &refused).await;
+                    return;
+                }
+            };
+            crate::gate_watch::serve(
+                reader,
+                writer,
+                validated_ledger,
+                services.gate_watch.clone(),
+                services.handle.clone(),
             )
             .await;
         }
@@ -1571,6 +1621,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             &["op", "repo", "workspace", "command", "class", "resumable"]
         }
         cowshed_core::land_turn::LAND_TURN_RESUME_OP => &["op", "ticket", "token"],
+        cowshed_core::gate_watch::GATE_WATCH_OP => &["op", "ledger"],
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
@@ -1678,6 +1729,13 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         }
         let LandTurnResumeIn { ticket, token } = serde_json::from_value(value).map_err(encoding)?;
         return Ok(Incoming::LandTurnResume { ticket, token });
+    }
+    if op == cowshed_core::gate_watch::GATE_WATCH_OP {
+        let open: cowshed_core::gate_watch::GateWatchOpen =
+            serde_json::from_value(value).map_err(encoding)?;
+        return Ok(Incoming::GateWatch {
+            ledger: open.ledger,
+        });
     }
     if op == RAM_LEASE_OP {
         #[derive(Deserialize)]

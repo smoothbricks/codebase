@@ -12,6 +12,7 @@ mod cleanup;
 mod config;
 mod control;
 mod disk_lease;
+mod gate_watch;
 mod interfaces;
 mod land_turn;
 #[cfg(target_os = "macos")]
