@@ -88,6 +88,19 @@ impl Pool {
         command
     }
 
+    /// Read every interactive job's first admitted ask from mbx's published scheduler inspection
+    /// (`mbx stats --scheduler --json --activity`).
+    ///
+    /// Called once per heartbeat by the supervisor, only while a land's gate span is on, never
+    /// per job (05_gateway.md "A land's gate takes tokens back"). An mbx that does not publish
+    /// `scheduler.first_admitted` returns an empty list, leaving every interactive job inside
+    /// its first band so none of them is withdrawn from.
+    pub(crate) async fn first_admitted(&self) -> Result<Vec<FirstAdmitted>, String> {
+        read_report(self)
+            .await
+            .map(|report| report.scheduler.first_admitted)
+    }
+
     /// Start `job`'s hold of at most `cpus` at `priority` under the class `name`
     /// ([`reservation_name`]): `mbx reserve` in a process group of its own, its held command's
     /// stdin a pipe whose write end the returned hold alone keeps and its stdout the grant. The
@@ -482,12 +495,12 @@ async fn last_line(stderr: Option<tokio::sync::watch::Receiver<Vec<u8>>>, tail: 
         .unwrap_or_default()
 }
 
-/// The job's stderr line naming its hold's place in the pool's queue, read once from mbx's
-/// activity report; a report that cannot be read is said instead.
-async fn queue_note(pool: &Pool, group: libc::pid_t) -> String {
+/// Read mbx's scheduler activity report (`mbx stats --scheduler --json --activity`) once on the
+/// blocking pool under the control bound.
+async fn read_report(pool: &Pool) -> Result<Report, String> {
     let mut command = pool.command();
     command.args(["stats", "--scheduler", "--json", "--activity"]);
-    let read = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let output = deadline::output_within(
             "mbx activity report",
             &mut command,
@@ -505,8 +518,13 @@ async fn queue_note(pool: &Pool, group: libc::pid_t) -> String {
     })
     .await
     .map_err(|error| error.to_string())
-    .and_then(|read| read);
-    match read {
+    .and_then(|read| read)
+}
+
+/// The job's stderr line naming its hold's place in the pool's queue, read once from mbx's
+/// activity report; a report that cannot be read is said instead.
+async fn queue_note(pool: &Pool, group: libc::pid_t) -> String {
+    match read_report(pool).await {
         Ok(report) => queue_line(&report.scheduler.activity, |pid| {
             // SAFETY: getpgid only reads the process table.
             libc::pid_t::try_from(pid).is_ok_and(|pid| unsafe { libc::getpgid(pid) } == group)
@@ -518,7 +536,39 @@ async fn queue_note(pool: &Pool, group: libc::pid_t) -> String {
     }
 }
 
-/// mbx's version-2 activity report (14_nix.md, "mbx"): its leases and waiters.
+/// One interactive job's first admitted ask in mbx's scheduler pool
+/// (`mbx stats --scheduler --json --activity`, `scheduler.first_admitted`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct FirstAdmitted {
+    pub job_id: String,
+    pub job_started_ms: u64,
+    pub first_admitted_ms: u64,
+}
+
+/// Whether an interactive job identified by `(job_id, job_started_ms)` has left its first
+/// (`interactive`) band at `now_unix_ms` by mbx's own first-admission clock (05_gateway.md
+/// "Classes", "A land's gate takes tokens back"): 120 s ([`super::placement::INTERACTIVE_TO_GATE`])
+/// from `first_admitted_ms`.
+///
+/// A job absent from `first_admitted` — because mbx has not admitted an ask for it yet, or
+/// because the installed mbx does not publish `scheduler.first_admitted` — stays inside its
+/// first band (`false`) and is never withdrawn from.
+pub(crate) fn interactive_past_first_band(
+    first_admitted: &[FirstAdmitted],
+    job_id: &str,
+    job_started_ms: u64,
+    now_unix_ms: u64,
+) -> bool {
+    let band_ms = u64::try_from(super::placement::INTERACTIVE_TO_GATE.as_millis())
+        .expect("interactive band duration fits u64 milliseconds");
+    first_admitted
+        .iter()
+        .find(|entry| entry.job_id == job_id && entry.job_started_ms == job_started_ms)
+        .is_some_and(|entry| now_unix_ms.saturating_sub(entry.first_admitted_ms) >= band_ms)
+}
+
+/// mbx's version-2 activity report (14_nix.md, "mbx"): its leases, waiters, and interactive
+/// first-admission records.
 #[derive(Debug, Deserialize)]
 struct Report {
     scheduler: Activity,
@@ -526,7 +576,13 @@ struct Report {
 
 #[derive(Debug, Deserialize)]
 struct Activity {
+    #[serde(default)]
     activity: Vec<Row>,
+    /// Interactive jobs' first admitted asks in mbx's pool (05_gateway.md "A land's gate takes
+    /// tokens back"). An mbx that does not publish this field decodes as empty, leaving every
+    /// interactive job inside its first band so none of them is withdrawn from.
+    #[serde(default)]
+    first_admitted: Vec<FirstAdmitted>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -592,6 +648,68 @@ mod tests {
             queue_line(&report.scheduler.activity, |pid| pid == 43),
             None
         );
+        assert!(
+            report.scheduler.first_admitted.is_empty(),
+            "an mbx report without first_admitted leaves every interactive job in its first band"
+        );
+    }
+
+    /// `scheduler.first_admitted` decodes each interactive job's first admission, and leaves
+    /// every job inside its first band until 120 s past `first_admitted_ms` (05_gateway.md
+    /// "A land's gate takes tokens back").
+    #[test]
+    fn first_admitted_decodes_and_judges_the_interactive_band() {
+        let report: Report = serde_json::from_str(
+            r#"{"version":2,"scheduler":{"activity":[],"first_admitted":[
+                {"job_id":"job-inc-1","job_started_ms":1000,"first_admitted_ms":5000}
+            ]}}"#,
+        )
+        .expect("report with first_admitted");
+        assert_eq!(
+            report.scheduler.first_admitted,
+            vec![FirstAdmitted {
+                job_id: "job-inc-1".to_owned(),
+                job_started_ms: 1000,
+                first_admitted_ms: 5000,
+            }]
+        );
+        let admitted = &report.scheduler.first_admitted;
+        assert!(!interactive_past_first_band(
+            admitted,
+            "job-inc-1",
+            1000,
+            5000 + 119_999
+        ));
+        assert!(interactive_past_first_band(
+            admitted,
+            "job-inc-1",
+            1000,
+            5000 + 120_000
+        ));
+        assert!(!interactive_past_first_band(
+            admitted,
+            "job-inc-1",
+            999,
+            5000 + 300_000
+        ));
+        assert!(!interactive_past_first_band(
+            admitted,
+            "job-inc-2",
+            1000,
+            5000 + 300_000
+        ));
+        assert!(!interactive_past_first_band(
+            admitted,
+            "job-inc-1",
+            1000,
+            4000
+        ));
+        assert!(!interactive_past_first_band(
+            &[],
+            "job-inc-1",
+            1000,
+            5000 + 300_000
+        ));
     }
 
     /// mbx grants as many of the asked cores as are free, at least one: the held command's line
