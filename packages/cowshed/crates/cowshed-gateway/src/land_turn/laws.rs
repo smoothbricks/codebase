@@ -95,6 +95,7 @@ impl Pair {
                                 ),
                                 entry.held,
                                 entry.bounded,
+                                entry.ticket.fenced,
                             )
                         })
                         .collect()
@@ -187,6 +188,12 @@ impl Pair {
                         .left(*number, outcome.map(str::to_owned), self.now_unix_ms);
                 self.waiting
                     .retain(|install| !settled.fenced.contains(install));
+                None
+            }
+            Op::TFenced(_) | Op::TResume(_) => {
+                // `Turns` has no fence/resume op yet: leave `self.turns` unchanged so any model
+                // state change (marking `fenced`, waking waiting installs, or clearing `fenced`)
+                // is recorded below as a parity mismatch rather than a setup panic.
                 None
             }
         };
@@ -314,7 +321,7 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
          nothing"
     );
     assert_eq!(shown(&pair.code_queue()), shown(&pair.model_queue()));
-    let E::E(holder, _, _, _, held, _) = items(&pair.code_queue())[0].clone();
+    let E::E(holder, _, _, _, held, _, _) = items(&pair.code_queue())[0].clone();
     assert_eq!((holder, held), (2, true), "the next land holds the turn");
 }
 
@@ -347,7 +354,7 @@ fn the_recorded_deferred_install_waits_in_order_through_the_model_and_turns() {
     assert_eq!(
         items(&pair.code_queue())
             .into_iter()
-            .map(|E::E(number, _, _, _, held, _)| (number, held))
+            .map(|E::E(number, _, _, _, held, _, _)| (number, held))
             .collect::<Vec<_>>(),
         [(2, true), (3, false)],
         "the parked lands are numbered in arrival order once the install's fence lifts"
@@ -376,7 +383,7 @@ fn the_recorded_ref_turn_under_a_waiting_install_replays_through_the_model_and_t
         (
             items(&pair.code_queue())
                 .into_iter()
-                .map(|E::E(number, asker, _, _, held, _)| (number, asker, held))
+                .map(|E::E(number, asker, _, _, held, _, _)| (number, asker, held))
                 .collect::<Vec<_>>(),
             pair.turns.waiting.len(),
             pair.turns.parked.len()
@@ -395,7 +402,7 @@ fn the_recorded_ref_turn_under_a_waiting_install_replays_through_the_model_and_t
     assert_eq!(
         items(&pair.code_queue())
             .into_iter()
-            .map(|E::E(number, asker, _, _, held, _)| (number, asker, held))
+            .map(|E::E(number, asker, _, _, held, _, _)| (number, asker, held))
             .collect::<Vec<_>>(),
         [(3, 42, true)],
         "the land parked behind the install holds the turn once its fence lifts"
@@ -431,7 +438,7 @@ fn recorded_turns_replay_through_the_model_and_turns() {
                 let held = |queue: Rc<List<E>>| {
                     items(&queue)
                         .first()
-                        .is_some_and(|E::E(first, _, _, _, held, _)| *first == number && *held)
+                        .is_some_and(|E::E(first, _, _, _, held, _, _)| *first == number && *held)
                 };
                 assert!(
                     held(pair.model_queue()) && held(pair.code_queue()),
@@ -480,9 +487,42 @@ fn a_bounded_ask_enters_behind_a_land_while_an_install_waits_and_parks_once_the_
     assert_eq!(
         items(&pair.code_queue())
             .into_iter()
-            .map(|E::E(number, asker, _, _, held, bounded)| (number, asker, held, bounded))
+            .map(|E::E(number, asker, _, _, held, bounded, _)| (number, asker, held, bounded))
             .collect::<Vec<_>>(),
         [(3, 3, true, true)],
         "the parked bounded ask holds the turn as bounded once the install's fence lifts"
+    );
+}
+
+/// Option A law-driver check (05_gateway.md "The read fences the turns",
+/// `a_held_turn_fences_a_waiting_install_without_ending`, `fenced_bind_refused`,
+/// `unfence_clears_fenced`): a held land turn acknowledges `TFenced`, fencing the waiting install
+/// at once without emptying the queue; binds are refused while fenced; lifting the fence without a
+/// restart unfences the ticket in place and admits parked asks behind it.
+#[test]
+fn a_held_turn_fences_a_waiting_install_without_ending_replays_through_the_model_and_turns() {
+    let mut pair = Pair::new("acme");
+    for op in [
+        Op::TAsk(1, false),
+        Op::TWait,
+        Op::TAsk(2, false),
+        Op::TFenced(1),
+        Op::TBind(1, 9),
+        Op::TAsk(3, false),
+        Op::TUnfence,
+    ] {
+        pair.input(&op, None).unwrap();
+    }
+    assert_eq!(
+        items(&pair.code_queue())
+            .into_iter()
+            .map(|E::E(number, asker, _, _, held, _, fenced)| (number, asker, held, fenced))
+            .collect::<Vec<_>>(),
+        [
+            (1, 1, true, false),
+            (2, 2, false, false),
+            (3, 3, false, false)
+        ],
+        "lifting the fence unfences the held ticket in place and admits parked asks behind it"
     );
 }

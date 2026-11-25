@@ -255,6 +255,7 @@ impl Turns {
                 asked_unix_ms,
                 command,
                 bound: Vec::new(),
+                fenced: false,
             },
             asker: true,
             held: false,
@@ -1569,6 +1570,7 @@ mod tests {
                     asked_unix_ms: 0,
                     command: "land a".to_owned(),
                     bound: Vec::new(),
+                    fenced: false,
                 },
                 outcome: "exited 0".to_owned(),
                 bounded: false,
@@ -1769,4 +1771,246 @@ mod tests {
         );
     }
     //#endregion smoo/cowshed!n/read-fences-turns
+
+    /// A ticket whose asker has already ended or exited (held only by a bound command) has no live
+    /// asker to acknowledge a fence and is already fenced (`ticket_fenced` in `land_turn.bend`),
+    /// so a waiting install or fenced read fences at once without waiting for that bound command
+    /// to exit (05_gateway.md "The read fences the turns").
+    #[test]
+    fn a_ticket_held_only_by_a_bound_command_is_already_fenced_for_a_waiting_install() {
+        let mut turns = Turns::default();
+        let (first, _) = asked(&mut turns, ask("repo", "a"), 10, 0);
+        turns.bind(first, 11).unwrap();
+        assert_eq!(
+            turns
+                .left(first, Some("command runs on".to_owned()), 2)
+                .ended,
+            None
+        );
+        assert!(
+            turns.wait_fence(INSTALL, None, 3),
+            "a ticket with no live asker is already fenced: the waiting install must fence at once"
+        );
+        assert!(
+            turns.fence(),
+            "a fenced read must also fence when every live ticket has no live asker"
+        );
+        assert_eq!(
+            holders(&turns, "repo"),
+            [first],
+            "the bound command still holds its ticket in the queue"
+        );
+    }
+
+    async fn read_json_line(
+        lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        what: &str,
+    ) -> serde_json::Value {
+        let line = tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, lines.next_line())
+            .await
+            .unwrap_or_else(|_| panic!("{what} timed out at the no-progress backstop"))
+            .unwrap_or_else(|error| panic!("reading {what}: {error}"))
+            .unwrap_or_else(|| panic!("{what}: connection closed before answering"));
+        serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("{what}: bad JSON {line:?}: {error}"))
+    }
+
+    /// Waiting install fences once every held and queued resumable turn acknowledges
+    /// `{"step":"fenced"}`, without emptying the queue (`install_fenced_when_all_turns_fence`,
+    /// 05_gateway.md "The read fences the turns").
+    #[tokio::test]
+    async fn a_waiting_install_fences_once_every_held_and_queued_turn_acknowledges_without_emptying_the_queue()
+     {
+        let turns = LandTurns::start();
+        let (_peer_a, sock_a) = std::os::unix::net::UnixStream::pair().expect("socket pair a");
+        let asker_a = Process::of_socket_peer(&sock_a).expect("peer a");
+        let (client_a, server_a) = tokio::io::duplex(4096);
+        let (srv_a_r, srv_a_w) = tokio::io::split(server_a);
+        let (cli_a_r, mut cli_a_w) = tokio::io::split(client_a);
+        let mut lines_a = BufReader::new(cli_a_r).lines();
+        let task_a = tokio::spawn(hold(
+            srv_a_r,
+            srv_a_w,
+            Some(asker_a),
+            ask("repo", "a"),
+            turns.clone(),
+        ));
+        let held_a = read_json_line(&mut lines_a, "ticket a held").await;
+        assert_eq!(held_a["turn"], serde_json::json!("held"), "{held_a}");
+
+        let (_peer_b, sock_b) = std::os::unix::net::UnixStream::pair().expect("socket pair b");
+        let asker_b = Process::of_socket_peer(&sock_b).expect("peer b");
+        let (client_b, server_b) = tokio::io::duplex(4096);
+        let (srv_b_r, srv_b_w) = tokio::io::split(server_b);
+        let (cli_b_r, mut cli_b_w) = tokio::io::split(client_b);
+        let mut lines_b = BufReader::new(cli_b_r).lines();
+        let task_b = tokio::spawn(hold(
+            srv_b_r,
+            srv_b_w,
+            Some(asker_b),
+            ask("repo", "b"),
+            turns.clone(),
+        ));
+        let queued_b = read_json_line(&mut lines_b, "ticket b queued").await;
+        assert_eq!(queued_b["turn"], serde_json::json!("queued"), "{queued_b}");
+
+        let (_initial, fenced_now, waiting) = turns
+            .wait(u64::MAX, Some(std::process::id()))
+            .await
+            .expect("wait_fence");
+        assert!(!fenced_now, "two unfenced tickets are live");
+
+        // Both held and queued askers acknowledge `{"step":"fenced"}`.
+        cli_a_w
+            .write_all(b"{\"step\":\"fenced\"}\n")
+            .await
+            .expect("send fenced ack for a");
+        cli_b_w
+            .write_all(b"{\"step\":\"fenced\"}\n")
+            .await
+            .expect("send fenced ack for b");
+
+        let resolved = tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, waiting.wait())
+            .await
+            .expect("waiting install must be fenced once both tickets acknowledge")
+            .expect("wait resolution");
+        match resolved {
+            WaitResolution::Fenced(queues, _fence) => {
+                let tickets = &queues
+                    .iter()
+                    .find(|q| q.repo.as_str() == "repo")
+                    .expect("repo queue must stay populated")
+                    .tickets;
+                assert_eq!(
+                    tickets
+                        .iter()
+                        .map(|t| (t.workspace.as_str(), t.fenced))
+                        .collect::<Vec<_>>(),
+                    [("a", true), ("b", true)],
+                    "both tickets must remain in the queue marked fenced"
+                );
+            }
+            WaitResolution::Withdrawn { .. } => panic!("install was withdrawn instead of fenced"),
+        }
+
+        drop(cli_a_w);
+        drop(cli_b_w);
+        let _ = task_a.await;
+        let _ = task_b.await;
+    }
+
+    /// A fenced turn refuses new binds (`fenced_bind_refused`, 05_gateway.md "Land turns") until
+    /// it resumes or unfences.
+    #[tokio::test]
+    async fn a_fenced_turn_refuses_new_binds_until_resumed_or_unfenced() {
+        let turns = LandTurns::start();
+        let (_peer, sock) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let asker = Process::of_socket_peer(&sock).expect("peer");
+        let (client, server) = tokio::io::duplex(4096);
+        let (srv_r, srv_w) = tokio::io::split(server);
+        let (cli_r, mut cli_w) = tokio::io::split(client);
+        let mut lines = BufReader::new(cli_r).lines();
+        let task = tokio::spawn(hold(
+            srv_r,
+            srv_w,
+            Some(asker),
+            ask("repo", "a"),
+            turns.clone(),
+        ));
+
+        let held = read_json_line(&mut lines, "held").await;
+        assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+
+        cli_w
+            .write_all(b"{\"step\":\"fenced\"}\n")
+            .await
+            .expect("send fenced");
+        cli_w
+            .write_all(format!("{{\"step\":\"bind\",\"pid\":{}}}\n", std::process::id()).as_bytes())
+            .await
+            .expect("send bind while fenced");
+
+        let answer = read_json_line(&mut lines, "bind refusal while fenced").await;
+        assert_eq!(
+            answer["turn"],
+            serde_json::json!("refused"),
+            "bind on a fenced turn must be refused, not granted: {answer}"
+        );
+        assert!(
+            answer["error"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("fenced")),
+            "bind refusal must name fenced state, not unknown step: {answer}"
+        );
+
+        drop(cli_w);
+        let _ = task.await;
+    }
+
+    /// When an install lifts its fence without restarting, held fenced turns receive
+    /// `{"turn":"unfenced"}` and resume in place (`unfence_clears_fenced`, 05_gateway.md "The read
+    /// fences the turns").
+    #[tokio::test]
+    async fn an_install_that_lifts_its_fence_without_restarting_unfences_held_turns() {
+        let turns = LandTurns::start();
+        let (_peer, sock) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let asker = Process::of_socket_peer(&sock).expect("peer");
+        let (client, server) = tokio::io::duplex(4096);
+        let (srv_r, srv_w) = tokio::io::split(server);
+        let (cli_r, mut cli_w) = tokio::io::split(client);
+        let mut lines = BufReader::new(cli_r).lines();
+        let task = tokio::spawn(hold(
+            srv_r,
+            srv_w,
+            Some(asker),
+            ask("repo", "a"),
+            turns.clone(),
+        ));
+
+        let held = read_json_line(&mut lines, "held").await;
+        assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+
+        let (_queues, fenced_now, waiting) = turns
+            .wait(u64::MAX, Some(std::process::id()))
+            .await
+            .expect("wait_fence");
+        assert!(!fenced_now);
+
+        let fence_notice = read_json_line(&mut lines, "fence notice").await;
+        assert_eq!(
+            fence_notice["turn"],
+            serde_json::json!("fence"),
+            "waiting install must ask live resumable holder to fence: {fence_notice}"
+        );
+        cli_w
+            .write_all(b"{\"step\":\"fenced\"}\n")
+            .await
+            .expect("ack fence");
+        let fence =
+            match tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, waiting.wait())
+                .await
+                .expect("waiting install fences")
+                .expect("wait resolution")
+            {
+                WaitResolution::Fenced(_, fence) => fence,
+                WaitResolution::Withdrawn { .. } => panic!("unexpected withdrawal"),
+            };
+
+        // Install lifts its fence without restarting.
+        fence.lift().await;
+        let unfenced = read_json_line(&mut lines, "unfenced notice").await;
+        assert_eq!(
+            unfenced["turn"],
+            serde_json::json!("unfenced"),
+            "lifting the fence without restart must unmark held turns in place: {unfenced}"
+        );
+        let snap = turns.snapshot(u64::MAX).await.expect("snapshot");
+        assert!(
+            !snap.queues[0].tickets[0].fenced,
+            "ticket fenced mark must clear after unfence: {snap:?}"
+        );
+
+        drop(cli_w);
+        let _ = task.await;
+    }
 }

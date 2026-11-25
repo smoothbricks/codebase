@@ -45,6 +45,8 @@ pub const LAND_TURNS_OP: &str = "land-turns";
 /// The one-shot gateway control operation that withdraws every install currently waiting for the
 /// land turns (never one already fenced).
 pub const LAND_TURNS_WITHDRAW_OP: &str = "land-turns-withdraw";
+/// The gateway control operation that resumes a fenced land turn after a planned gateway restart.
+pub const LAND_TURN_RESUME_OP: &str = "land-turn-resume";
 /// How long a `"class":"bounded"` land or ref turn may stay held once taken (05_gateway.md "Deadlines").
 pub const BOUNDED_TURN_DEADLINE: Duration = Duration::from_secs(120);
 
@@ -112,6 +114,10 @@ pub struct Ticket {
     /// exits, and nothing it starts holds it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bound: Vec<u32>,
+    /// Whether this ticket's asker has acknowledged a fence for a planned gateway restart (or has
+    /// already departed, leaving only bound commands).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fenced: bool,
 }
 
 /// A land that left its queue without ending its turn: its asker closed its connection, was
@@ -939,6 +945,7 @@ mod tests {
             asked_unix_ms: 7,
             command: "land".to_owned(),
             bound: vec![42],
+            fenced: false,
         }
     }
 

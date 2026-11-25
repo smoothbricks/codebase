@@ -1001,3 +1001,63 @@ fn gateway_status_names_a_waiting_install_and_each_parked_ask() {
     );
 }
 //#endregion smoo/cowshed!n/read-fences-turns
+
+/// Option A CLI crash red (05_gateway.md "Land turns", "What still counts as a lost turn"): when
+/// a held `cowshed land-turn` fences for `cowshed gateway await-turns`, and the replacing gateway
+/// restarts at the same socket without the handoff snapshot (lacking the resume token),
+/// `land-turn-resume` is refused, `cowshed land-turn` sends SIGTERM to its bound child, reaps it
+/// within `REAP`, and exits with the wrapper error code naming the lost turn.
+#[test]
+fn a_land_turn_stops_its_command_when_the_restarted_gateway_cannot_resume_its_ticket() {
+    let mut home = Home::new();
+    let mut holder = Land::gated(&home, "H");
+    wait_for_order(&home, &mut holder, &["H"]);
+
+    // `await-turns` waits for the held turn to fence; once fenced, its command prints "fenced"
+    // and blocks on stdin until we finish restarting the gateway.
+    let mut install = Command::new(cowshed())
+        .env("HOME", &home.path)
+        .args(["gateway", "await-turns", "--gateway-socket"])
+        .arg(&home.gateway.socket)
+        .args(["--", "sh", "-c", "echo fenced && read line"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn await-turns");
+    let install_stdout = install.stdout.take().expect("install stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(install_stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    assert_eq!(
+        rx.recv_timeout(BACKSTOP)
+            .expect("await-turns must fence the held resumable turn within one heartbeat"),
+        "fenced"
+    );
+
+    // Real drain, drop the handoff snapshot so the replacing gateway lacks the resume token, and
+    // restart at the same socket.
+    home.gateway.restart_without_handoff();
+    drop(install.stdin.take());
+    assert!(install.wait_bounded().expect("await-turns exits").success());
+
+    // Without the token on the new gateway, `land-turn` must fail closed: SIGTERM its child and
+    // exit nonzero naming the lost turn.
+    let status = holder.wait_exit();
+    holder.finish_stderr();
+    assert!(
+        !matches!(status, ExitStatus::Exited { code: 0 }),
+        "land-turn must exit nonzero when resume is refused: status={status:?}, stderr={:?}",
+        holder.seen
+    );
+    let combined = holder.seen.join("\n");
+    assert!(
+        combined.contains("was lost") && combined.contains("was sent SIGTERM"),
+        "land-turn must report lost turn and SIGTERM to its bound command: {combined}"
+    );
+}

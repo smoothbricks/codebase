@@ -549,6 +549,7 @@ mod tests {
             asked_unix_ms: 0,
             command: format!("land {workspace}"),
             bound: Vec::new(),
+            fenced: false,
         };
         let queue = |repo: &str, tickets| LandTurnQueue {
             repo: LandTurnName::new(repo).unwrap(),

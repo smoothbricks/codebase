@@ -10530,3 +10530,323 @@ async fn directory_injected_memory_pressure_holds_and_releases_a_background_job(
         .expect("stop the real directory project");
     fixture.stop_gateway().await;
 }
+
+/// Helper for build-drift hand-off reds: wait for `fence: "wait"` on `socket` to observe
+/// `fenced: false` then `fenced: true` (skipping heartbeats), proving a held declared land fenced
+/// within a heartbeat.
+async fn await_fenced_wait(
+    socket: &Path,
+) -> tokio::io::Lines<tokio::io::BufReader<tokio::net::UnixStream>> {
+    use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut install = tokio::net::UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect waiting install");
+    let req = serde_json::json!({
+        "op": cowshed_core::land_turn::LAND_TURNS_OP,
+        "abandonedSinceUnixMs": u64::MAX,
+        "fence": "wait",
+    });
+    install
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("send fence wait");
+    let mut lines = BufReader::new(install).lines();
+    let mut saw_fenced = false;
+    while !saw_fenced {
+        let line = tokio::time::timeout(NO_PROGRESS, lines.next_line())
+            .await
+            .expect("waiting install must be fenced within one heartbeat")
+            .expect("read waiting install line")
+            .expect("waiting install connection closed before fencing");
+        let answer: serde_json::Value =
+            serde_json::from_str(&line).expect("parse waiting install answer");
+        if answer.get("progress").is_some() {
+            continue;
+        }
+        if answer["fenced"] == serde_json::json!(true) {
+            saw_fenced = true;
+        }
+    }
+    lines
+}
+
+/// Build-drift hand-off red (05_gateway.md "A land step waits for an install in progress",
+/// 02_workspaces.md "A declared land" step 5, option (i)): while a declared land's gate runs, an
+/// install fences the turn, drains and restarts the gateway onto another build at the same socket,
+/// and replaces the installed cowshed binary. Once the gate passes, the land does NOT re-run the
+/// gate: it invokes the installed build's step 5 as a bound child of its held turn (`bind_at_exec`),
+/// passing the recorded proof (gated head + verdict) explicitly, and lands cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_whose_daemon_changed_build_mid_gate_hands_step_5_to_the_installed_build_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-drift-ok-{}", std::process::id());
+    let main = fixture.checkout.clone();
+    let scratch = fixture.granted.clone();
+    let gate_ready = scratch.join("gate.ready");
+    let gate_release = scratch.join("gate.release");
+    let gates = scratch.join("gates.log");
+    let installed_argv = scratch.join("installed-step5.argv");
+    let bound_check = scratch.join("installed-step5.bound");
+    for fifo in [&gate_ready, &gate_release] {
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .expect("fifo path has no NUL");
+        // SAFETY: mkfifo(3) on a test-owned scratch path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+    git(&main, &["config", "user.name", "fixture"]);
+    git(&main, &["config", "user.email", "fixture@example.invalid"]);
+    fs::write(
+        main.join("gate.sh"),
+        format!(
+            "echo \"$1\" >> '{gates}'\n\
+             echo ready > '{ready}'\n\
+             read x < '{release}'\n\
+             exit 0\n",
+            gates = gates.display(),
+            ready = gate_ready.display(),
+            release = gate_release.display(),
+        ),
+    )
+    .expect("write gate.sh");
+    fs::write(
+        main.join(".cowshed.toml"),
+        format!("[land]\nturn = \"{turn}\"\ngate = [\"sh\", \"gate.sh\", \"{{workspace}}\"]\n"),
+    )
+    .expect("write .cowshed.toml");
+    git(&main, &["add", ".cowshed.toml", "gate.sh"]);
+    git(&main, &["commit", "-q", "-m", "declare land"]);
+
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write topic.txt");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    let socket = fixture.storage.control_socket();
+    let installed_bin =
+        cowshed_core::host_dirs::installed_binary_directory(fixture.storage.home()).join("cowshed");
+
+    let (land_out, _daemon_guard) = tokio::join!(run(&mut service, ["land", "topic"]), async {
+        // Wait until the gate has started under the held land turn.
+        let ready = tokio::task::spawn_blocking({
+            let gate_ready = gate_ready.clone();
+            move || fs::read_to_string(gate_ready).expect("read gate ready fifo")
+        })
+        .await
+        .expect("join gate ready");
+        assert_eq!(ready.trim(), "ready");
+
+        // Install waits for the held land turn to fence, then drains and restarts the real gateway
+        // at the same socket and installs the new build binary + OtherBuildDaemon.
+        let install_fence = await_fenced_wait(&socket).await;
+
+        // Replace the installed binary with a wrapper that records its argv, checks its own PID is
+        // bound on the held land turn, and completes the fast-forward on main.
+        let _ = fs::remove_file(&installed_bin);
+        fs::write(
+            &installed_bin,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$@\" > '{argv}'\n\
+                 python3 -c 'import json, os, socket, sys; \
+                 s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sys.argv[1]); \
+                 s.sendall(json.dumps({{\"op\":\"land-turns\",\"abandonedSinceUnixMs\":0}}).encode()+b\"\\n\"); \
+                 s.shutdown(socket.SHUT_WR); \
+                 d=json.loads(s.makefile().readline()); \
+                 pids=[p for q in d.get(\"landTurns\",[]) for t in q.get(\"tickets\",[]) for p in t.get(\"bound\",[])]; \
+                 open(sys.argv[2],\"w\").write(\"bound\" if os.getppid() in pids or os.getpid() in pids else \"unbound\")' \
+                 '{sock}' '{bound}'\n\
+                 git -C '{main}' merge --ff-only '{head}' >/dev/null\n\
+                 exit 0\n",
+                argv = installed_argv.display(),
+                sock = socket.display(),
+                bound = bound_check.display(),
+                main = main.display(),
+                head = topic_head,
+            ),
+        )
+        .expect("write fake installed build");
+        fs::set_permissions(&installed_bin, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake installed build");
+
+        fixture.stop_gateway().await;
+        drop(install_fence);
+        let daemon = OtherBuildDaemon::serve(fixture.storage.store()).await;
+        fixture.start_gateway().await;
+
+        // Release the gate so it exits 0 and step 5 runs against the new build.
+        tokio::task::spawn_blocking({
+            let gate_release = gate_release.clone();
+            move || fs::write(gate_release, b"go\n").expect("release gate fifo")
+        })
+        .await
+        .expect("join gate release");
+        daemon
+    });
+
+    let (result, _, stderr) = land_out;
+    assert!(
+        matches!(result, Ok(0)),
+        "declared land across a mid-gate build upgrade must hand step 5 to the installed build and succeed: result={result:?}, stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let gated: Vec<String> = fs::read_to_string(&gates)
+        .expect("read gates.log")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        gated.len(),
+        1,
+        "gate must run once (throughput first; never re-gate for a daemon upgrade): {gated:?}"
+    );
+    let passed_argv = fs::read_to_string(&installed_argv)
+        .expect("installed build step-5 wrapper must have been invoked");
+    assert!(
+        passed_argv.contains(&topic_head),
+        "installed build step 5 must receive the recorded gated head proof explicitly: {passed_argv}"
+    );
+    assert_eq!(
+        fs::read_to_string(&bound_check).expect("read bound check"),
+        "bound",
+        "installed build step 5 must run as a bound child of the held land turn"
+    );
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        topic_head,
+        "main must be fast-forwarded to the gated head"
+    );
+
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+    fixture.stop_gateway().await;
+}
+
+/// Build-drift fail-closed red (05_gateway.md "A land step waits for an install in progress",
+/// 02_workspaces.md "A declared land" step 5): if the installed build refuses the explicit step-5
+/// proof format after a build-crossing resume, the land fails closed through the lost-turn path
+/// naming the refusal and never silently re-gates or moves main.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_fails_closed_when_installed_build_refuses_step_5_proof_format_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-drift-bad-{}", std::process::id());
+    let main = fixture.checkout.clone();
+    let scratch = fixture.granted.clone();
+    let gate_ready = scratch.join("gate.ready");
+    let gate_release = scratch.join("gate.release");
+    let gates = scratch.join("gates.log");
+    for fifo in [&gate_ready, &gate_release] {
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .expect("fifo path has no NUL");
+        // SAFETY: mkfifo(3) on a test-owned scratch path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+    git(&main, &["config", "user.name", "fixture"]);
+    git(&main, &["config", "user.email", "fixture@example.invalid"]);
+    fs::write(
+        main.join("gate.sh"),
+        format!(
+            "echo \"$1\" >> '{gates}'\n\
+             echo ready > '{ready}'\n\
+             read x < '{release}'\n\
+             exit 0\n",
+            gates = gates.display(),
+            ready = gate_ready.display(),
+            release = gate_release.display(),
+        ),
+    )
+    .expect("write gate.sh");
+    fs::write(
+        main.join(".cowshed.toml"),
+        format!("[land]\nturn = \"{turn}\"\ngate = [\"sh\", \"gate.sh\", \"{{workspace}}\"]\n"),
+    )
+    .expect("write .cowshed.toml");
+    git(&main, &["add", ".cowshed.toml", "gate.sh"]);
+    git(&main, &["commit", "-q", "-m", "declare land"]);
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write topic.txt");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let socket = fixture.storage.control_socket();
+    let installed_bin =
+        cowshed_core::host_dirs::installed_binary_directory(fixture.storage.home()).join("cowshed");
+
+    let (land_out, _daemon_guard) = tokio::join!(run(&mut service, ["land", "topic"]), async {
+        let ready = tokio::task::spawn_blocking({
+            let gate_ready = gate_ready.clone();
+            move || fs::read_to_string(gate_ready).expect("read gate ready fifo")
+        })
+        .await
+        .expect("join gate ready");
+        assert_eq!(ready.trim(), "ready");
+
+        let install_fence = await_fenced_wait(&socket).await;
+
+        // Installed build refuses the step-5 proof format by name.
+        let _ = fs::remove_file(&installed_bin);
+        fs::write(
+            &installed_bin,
+            "#!/bin/sh\necho 'refused: unsupported step-5 proof format v1' >&2\nexit 2\n",
+        )
+        .expect("write refusing installed build");
+        fs::set_permissions(&installed_bin, fs::Permissions::from_mode(0o755))
+            .expect("chmod refusing installed build");
+
+        fixture.stop_gateway().await;
+        drop(install_fence);
+        let daemon = OtherBuildDaemon::serve(fixture.storage.store()).await;
+        fixture.start_gateway().await;
+
+        tokio::task::spawn_blocking({
+            let gate_release = gate_release.clone();
+            move || fs::write(gate_release, b"go\n").expect("release gate fifo")
+        })
+        .await
+        .expect("join gate release");
+        daemon
+    });
+
+    let (result, _, stderr) = land_out;
+    let refused = match result {
+        Err(refused) => refused,
+        Ok(code) => panic!(
+            "proof format refusal must fail closed, not exit {code}: {}",
+            String::from_utf8_lossy(&stderr)
+        ),
+    };
+    let msg = format!("{}\n{}", refused.message, String::from_utf8_lossy(&stderr));
+    assert!(
+        msg.contains("proof format"),
+        "fail-closed error must name the installed build's proof format refusal: {msg}"
+    );
+    let gated: Vec<String> = fs::read_to_string(&gates)
+        .expect("read gates.log")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        gated.len(),
+        1,
+        "proof format refusal must never silently re-gate: {gated:?}"
+    );
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        main_head,
+        "main must not move when step 5 fails closed"
+    );
+
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+    fixture.stop_gateway().await;
+}

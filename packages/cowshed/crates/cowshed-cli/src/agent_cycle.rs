@@ -259,6 +259,7 @@ mod tests {
             asked_unix_ms: 0,
             command: "land".to_owned(),
             bound: Vec::new(),
+            fenced: false,
         })
     }
 

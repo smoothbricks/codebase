@@ -1553,3 +1553,838 @@ async fn the_recorded_install_restart_never_cuts_a_turn_asked_after_its_read() {
     }
     turn.end("exited 0".to_owned()).expect("end turn");
 }
+
+/// Connect raw to `socket` and ask for a resumable land turn (`"resumable": true`), returning the
+/// split line reader and writer.
+async fn ask_resumable_raw(
+    socket: &Path,
+    repo: &str,
+    workspace: &str,
+) -> (
+    Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    tokio::net::unix::OwnedWriteHalf,
+) {
+    let mut stream = UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect resumable ask");
+    let request = serde_json::json!({
+        "op": land_turn::LAND_TURN_OP,
+        "repo": repo,
+        "workspace": workspace,
+        "command": format!("land {workspace}"),
+        "resumable": true,
+    });
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("send resumable ask");
+    let (read, write) = stream.into_split();
+    (BufReader::new(read).lines(), write)
+}
+
+/// Send `{"op":"land-turn-resume","ticket":...,"token":...}` on a fresh connection to `socket`.
+async fn resume_raw(
+    socket: &Path,
+    ticket: u64,
+    token: &str,
+) -> (
+    Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    tokio::net::unix::OwnedWriteHalf,
+) {
+    let mut stream = UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect land-turn-resume");
+    let request = serde_json::json!({
+        "op": land_turn::LAND_TURN_RESUME_OP,
+        "ticket": ticket,
+        "token": token,
+    });
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("send land-turn-resume");
+    let (read, write) = stream.into_split();
+    (BufReader::new(read).lines(), write)
+}
+
+/// Spawn a separate OS process that connects to `socket`, asks for a resumable turn on `REPO`,
+/// optionally spawns and binds a child `sh -c "exec cat >/dev/null"` (reporting its pid), prints
+/// each received JSON line to stdout, and forwards any stdin lines straight onto the socket.
+/// Dropping or SIGKILLing this child simulates an asker crashing during the restart gap.
+fn spawn_remote_asker(socket: &Path, workspace: &str, bind_child: bool) -> tokio::process::Child {
+    let script = r#"
+import json, os, socket, subprocess, sys, threading
+
+sock_path, repo, ws, bind_flag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.sendall((json.dumps({
+    "op": "land-turn",
+    "repo": repo,
+    "workspace": ws,
+    "command": f"land {ws}",
+    "resumable": True,
+}) + "\n").encode())
+f = s.makefile("r", encoding="utf-8")
+first = f.readline()
+sys.stdout.write(first)
+sys.stdout.flush()
+msg = json.loads(first)
+child = None
+if bind_flag and msg.get("turn") == "held":
+    child = subprocess.Popen(
+        ["sh", "-c", "exec sleep 300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    sys.stdout.write(json.dumps({"spawnedPid": child.pid}) + "\n")
+    sys.stdout.flush()
+    s.sendall((json.dumps({"step": "bind", "pid": child.pid}) + "\n").encode())
+    bound = f.readline()
+    sys.stdout.write(bound)
+    sys.stdout.flush()
+
+def pump_stdin():
+    for line in sys.stdin:
+        s.sendall(line.encode())
+threading.Thread(target=pump_stdin, daemon=True).start()
+for line in f:
+    sys.stdout.write(line)
+    sys.stdout.flush()
+"#;
+    let mut cmd = tokio::process::Command::new("python3");
+    cmd.args([
+        "-c",
+        script,
+        socket.to_str().expect("utf8 socket"),
+        REPO,
+        workspace,
+        if bind_child { "1" } else { "0" },
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::inherit())
+    .kill_on_drop(true);
+    cmd.spawn()
+        .expect("spawn remote asker (python3, which the development shell provides)")
+}
+
+/// Option A happy path (05_gateway.md "The read fences the turns", "Land turns"): a held turn
+/// mid-gate fences within a heartbeat on an install's wait, the install drains and restarts the
+/// gateway at the same socket while the bound gate keeps running, the turn resumes with its token,
+/// and a `RefTurn` (`acme.ref`) queued behind it acquires its turn and lands cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_turn_mid_gate_fences_within_a_heartbeat_survives_restart_and_a_queued_ref_turn_lands()
+ {
+    let (old, root, socket) = gateway().await;
+    let cache = root.path().join("cache");
+    let tg = turn_gateway(&socket);
+    std::fs::create_dir(&tg.support).expect("support");
+
+    let (mut land_r, mut land_w) = ask_resumable_raw(&socket, REPO, "mid-gate").await;
+    let held = raw_answer(&mut land_r).await;
+    assert_eq!(
+        held["turn"],
+        serde_json::json!("held"),
+        "resumable ask must be answered held: {held}"
+    );
+    let ticket_num = held["ticket"]["number"].as_u64().expect("ticket number");
+    let token = held["resumeToken"]
+        .as_str()
+        .expect("first numbered answer must carry a resumeToken")
+        .to_owned();
+    assert!(!token.is_empty(), "resumeToken must be non-empty");
+
+    // Token must never appear in `land-turns` status listings.
+    let raw_status = awaiting(
+        "land-turns status",
+        GatewayControlClient::new(socket.clone())
+            .expect("client")
+            .land_turns(u64::MAX),
+    )
+    .await
+    .expect("land-turns");
+    assert!(
+        !serde_json::to_string(&raw_status)
+            .expect("serialize status")
+            .contains(&token),
+        "resume token must never leak into gateway status"
+    );
+
+    // Spawn and bind a gate child that stays alive across the gateway restart.
+    let mut gate = tokio::process::Command::new("sh");
+    gate.args(["-c", "exec cat >/dev/null"])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut gate = gate.spawn().expect("spawn gate");
+    let gate_pid = gate.id().expect("gate pid");
+    land_w
+        .write_all(format!("{{\"step\":\"bind\",\"pid\":{gate_pid}}}\n").as_bytes())
+        .await
+        .expect("send bind");
+    let bound = raw_answer(&mut land_r).await;
+    assert_eq!(bound["turn"], serde_json::json!("bound"), "{bound}");
+
+    // Install asks `fence: "wait"`: the gateway asks the resumable holder to fence, it replies
+    // `{"step":"fenced"}`, and the install is fenced immediately while the gate keeps running.
+    let mut install = waiting_fence(&socket).await;
+    let initial = control_line(&mut install).await;
+    assert_eq!(initial["fenced"], serde_json::json!(false), "{initial}");
+    let fence_req = raw_answer(&mut land_r).await;
+    assert_eq!(
+        fence_req["turn"],
+        serde_json::json!("fence"),
+        "waiting install must ask resumable holder to fence: {fence_req}"
+    );
+    land_w
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("ack fence");
+    let fenced = control_line(&mut install).await;
+    assert_eq!(
+        fenced["fenced"],
+        serde_json::json!(true),
+        "install must be fenced once held turn acknowledges without waiting for gate: {fenced}"
+    );
+
+    // Real drain and restart of the gateway at the same socket under install.lock.
+    let slot = std::fs::File::create(tg.slot()).expect("install slot");
+    slot.try_lock().expect("take install slot");
+    old.drain().await.expect("old gateway drains");
+    drop(install);
+    drop(land_r);
+    drop(land_w);
+    let new = gateway_at(&socket, &cache).await;
+    drop(slot);
+
+    assert!(
+        gate.try_wait().expect("poll gate").is_none(),
+        "bound gate must keep running untouched across gateway restart"
+    );
+
+    // Asker reconnects and resumes with its token.
+    let (mut resumed_r, mut resumed_w) = resume_raw(&socket, ticket_num, &token).await;
+    let resumed = raw_answer(&mut resumed_r).await;
+    assert_eq!(
+        (&resumed["turn"], &resumed["ticket"]["number"]),
+        (
+            &serde_json::json!("resumed"),
+            &serde_json::json!(ticket_num)
+        ),
+        "replacing gateway must resume the adopted ticket: {resumed}"
+    );
+
+    // A doc-commit ref turn acquires `acme.ref` and finishes on the new gateway while the land
+    // still holds `acme`.
+    let ref_queue = LandTurnName::new("acme.ref").unwrap();
+    let ref_turn = awaiting(
+        "doc-commit ref turn on restarted gateway",
+        RefTurn::acquire_in(&tg, &ref_queue, RefWriter::DocCommit),
+    )
+    .await
+    .expect("doc-commit ref turn takes its turn after restart");
+    ref_turn.end("committed".to_owned());
+
+    // Gate finishes and land ends its turn cleanly.
+    drop(gate.stdin.take());
+    assert!(gate.wait_bounded().await.expect("gate exits").success());
+    resumed_w
+        .write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .await
+        .expect("end resumed turn");
+    drop(resumed_w);
+    drop(resumed_r);
+    let probe = take_after(&socket, "probe").await;
+    assert!(
+        queue(&socket)
+            .await
+            .map_or(true, |q| q.abandoned.is_empty()),
+        "resumed turn must finish cleanly, never abandoned"
+    );
+    probe.end("probed".to_owned());
+    new.drain().await.expect("new gateway drains");
+}
+
+/// Adopting a handoff snapshot preserves both held and queued tickets in FIFO order, continues
+/// ticket numbering past the previous counter, and unlinks the snapshot file after adoption
+/// (05_gateway.md "Land turns").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopting_a_snapshot_preserves_queue_order_and_ticket_numbering_and_settles_gone_processes()
+{
+    let (old, root, socket) = gateway().await;
+    let cache = root.path().join("cache");
+
+    let (mut first_r, mut first_w) = ask_resumable_raw(&socket, REPO, "first").await;
+    let first_held = raw_answer(&mut first_r).await;
+    assert_eq!(
+        first_held["turn"],
+        serde_json::json!("held"),
+        "{first_held}"
+    );
+    let first_num = first_held["ticket"]["number"].as_u64().expect("first num");
+    let first_token = first_held["resumeToken"]
+        .as_str()
+        .expect("first token")
+        .to_owned();
+
+    let (mut second_r, mut second_w) = ask_resumable_raw(&socket, REPO, "second").await;
+    let second_queued = raw_answer(&mut second_r).await;
+    assert_eq!(
+        second_queued["turn"],
+        serde_json::json!("queued"),
+        "{second_queued}"
+    );
+    let second_num = second_queued["ticket"]["number"]
+        .as_u64()
+        .expect("second num");
+    let second_token = second_queued["resumeToken"]
+        .as_str()
+        .expect("second token")
+        .to_owned();
+
+    let mut install = waiting_fence(&socket).await;
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        raw_answer(&mut first_r).await["turn"],
+        serde_json::json!("fence")
+    );
+    assert_eq!(
+        raw_answer(&mut second_r).await["turn"],
+        serde_json::json!("fence")
+    );
+    first_w
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("fence first");
+    second_w
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("fence second");
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(true)
+    );
+
+    old.drain().await.expect("drain old");
+    drop(install);
+    drop(first_r);
+    drop(first_w);
+    drop(second_r);
+    drop(second_w);
+
+    let new = gateway_at(&socket, &cache).await;
+    let handoff = socket
+        .parent()
+        .expect("socket dir")
+        .join("land-turns-handoff.json");
+    assert!(
+        !handoff.exists(),
+        "handoff snapshot must be unlinked immediately after adoption"
+    );
+    assert_eq!(
+        tickets(&socket).await,
+        ["first", "second"],
+        "queue order must survive restart"
+    );
+
+    // A new ask after restart must get a number strictly above `second_num`.
+    let (mut third_r, third_w) = ask_resumable_raw(&socket, REPO, "third").await;
+    let third_queued = raw_answer(&mut third_r).await;
+    let third_num = third_queued["ticket"]["number"]
+        .as_u64()
+        .expect("third num");
+    assert!(
+        third_num > second_num,
+        "numbering must continue past {second_num}, got {third_num}"
+    );
+
+    // Both adopted tickets resume and finish in order.
+    let (mut r1, mut w1) = resume_raw(&socket, first_num, &first_token).await;
+    assert_eq!(
+        raw_answer(&mut r1).await["turn"],
+        serde_json::json!("resumed")
+    );
+    let (mut r2, mut w2) = resume_raw(&socket, second_num, &second_token).await;
+    assert_eq!(
+        raw_answer(&mut r2).await["turn"],
+        serde_json::json!("resumed")
+    );
+    w1.write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .await
+        .expect("end 1");
+    drop(w1);
+    assert_eq!(raw_answer(&mut r2).await["turn"], serde_json::json!("held"));
+    w2.write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .await
+        .expect("end 2");
+    drop(w2);
+    assert_eq!(
+        raw_answer(&mut third_r).await["turn"],
+        serde_json::json!("held")
+    );
+    drop(third_w);
+    drop(third_r);
+    new.drain().await.expect("drain new");
+}
+
+/// Crash case 1: an asker dies (SIGKILL) during the restart gap while its bound command is still
+/// running; the replacing gateway adopts the ticket with `asker = false`, re-arms `ExitWatch` on
+/// the bound command, keeps the turn held until that command exits, then records the ticket
+/// abandoned and promotes the next waiter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_asker_that_dies_during_the_restart_gap_keeps_its_bound_command_holding_the_turn_until_it_exits()
+ {
+    let (old, root, socket) = gateway().await;
+    let cache = root.path().join("cache");
+
+    let mut asker = spawn_remote_asker(&socket, "doomed-asker", true);
+    let mut asker_out = BufReader::new(asker.stdout.take().expect("asker stdout")).lines();
+    let mut asker_in = asker.stdin.take().expect("asker stdin");
+
+    let held = raw_answer(&mut asker_out).await;
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+    let spawned = raw_answer(&mut asker_out).await;
+    let bound_pid = spawned["spawnedPid"].as_u64().expect("bound child pid") as i32;
+    let bound = raw_answer(&mut asker_out).await;
+    assert_eq!(bound["turn"], serde_json::json!("bound"), "{bound}");
+
+    let mut install = waiting_fence(&socket).await;
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        raw_answer(&mut asker_out).await["turn"],
+        serde_json::json!("fence")
+    );
+    asker_in
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("ack fence");
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(true)
+    );
+
+    // Drain old gateway, then SIGKILL the asker during the gap while its bound child lives on.
+    old.drain().await.expect("drain old");
+    drop(install);
+    asker.kill().await.expect("SIGKILL asker during gap");
+    let _ = asker.wait_bounded().await;
+
+    let new = gateway_at(&socket, &cache).await;
+    assert_eq!(
+        tickets(&socket).await,
+        ["doomed-asker"],
+        "bound child must still hold the turn after asker died in the gap"
+    );
+    let (mut next_r, _next_w) = ask_resumable_raw(&socket, REPO, "next").await;
+    assert_eq!(
+        raw_answer(&mut next_r).await["turn"],
+        serde_json::json!("queued"),
+        "next waiter must queue behind the adopted bound command"
+    );
+
+    // Killing the bound child fires the re-armed ExitWatch and promotes `next`.
+    // SAFETY: `bound_pid` is the detached sleep child spawned by our test helper.
+    unsafe {
+        libc::kill(bound_pid, libc::SIGKILL);
+    }
+    let next_held = raw_answer(&mut next_r).await;
+    assert_eq!(
+        next_held["turn"],
+        serde_json::json!("held"),
+        "re-armed ExitWatch must promote next waiter when bound command exits: {next_held}"
+    );
+    let q = queue(&socket).await.expect("queue");
+    assert!(
+        q.abandoned
+            .iter()
+            .any(|gone| gone.ticket.workspace == "doomed-asker"),
+        "asker that died in the gap must be recorded abandoned once its bound command exits: {q:?}"
+    );
+    new.drain().await.expect("drain new");
+}
+
+/// Crash case 2: an asker with no bound command dies (SIGKILL) during the restart gap; the
+/// replacing gateway detects it gone at startup adoption, abandons the ticket immediately, and
+/// promotes the next waiter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_asker_with_no_bound_command_that_dies_during_the_restart_gap_frees_the_turn_at_adoption()
+ {
+    let (old, root, socket) = gateway().await;
+    let cache = root.path().join("cache");
+
+    let mut asker = spawn_remote_asker(&socket, "gone-alone", false);
+    let mut asker_out = BufReader::new(asker.stdout.take().expect("asker stdout")).lines();
+    let mut asker_in = asker.stdin.take().expect("asker stdin");
+    assert_eq!(
+        raw_answer(&mut asker_out).await["turn"],
+        serde_json::json!("held")
+    );
+
+    let (mut waiter_r, mut waiter_w) = ask_resumable_raw(&socket, REPO, "survivor").await;
+    let queued = raw_answer(&mut waiter_r).await;
+    assert_eq!(queued["turn"], serde_json::json!("queued"), "{queued}");
+    let waiter_num = queued["ticket"]["number"].as_u64().expect("waiter num");
+    let waiter_token = queued["resumeToken"]
+        .as_str()
+        .expect("waiter token")
+        .to_owned();
+
+    let mut install = waiting_fence(&socket).await;
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        raw_answer(&mut asker_out).await["turn"],
+        serde_json::json!("fence")
+    );
+    assert_eq!(
+        raw_answer(&mut waiter_r).await["turn"],
+        serde_json::json!("fence")
+    );
+    asker_in
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("fence asker");
+    waiter_w
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("fence waiter");
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(true)
+    );
+
+    old.drain().await.expect("drain old");
+    drop(install);
+    drop(waiter_r);
+    drop(waiter_w);
+    asker.kill().await.expect("SIGKILL asker during gap");
+    let _ = asker.wait_bounded().await;
+
+    let new = gateway_at(&socket, &cache).await;
+    assert_eq!(
+        tickets(&socket).await,
+        ["survivor"],
+        "gone asker with no bound command must be freed at adoption, promoting survivor"
+    );
+    let (mut resumed_r, _resumed_w) = resume_raw(&socket, waiter_num, &waiter_token).await;
+    let resumed = raw_answer(&mut resumed_r).await;
+    assert_eq!(
+        resumed["turn"],
+        serde_json::json!("held"),
+        "promoted waiter resuming after holder died in gap must be told held: {resumed}"
+    );
+    new.drain().await.expect("drain new");
+}
+
+/// Crash case 3: a bound command exits during the restart gap while the asker stays alive; the
+/// replacing gateway clears the exited command from `bound` on adoption (`ProcessExit::Before`),
+/// and the asker resumes and finishes cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_command_that_exits_during_the_restart_gap_is_cleared_on_adoption_while_the_asker_resumes()
+ {
+    let (old, root, socket) = gateway().await;
+    let cache = root.path().join("cache");
+
+    let (mut land_r, mut land_w) = ask_resumable_raw(&socket, REPO, "asker-alive").await;
+    let held = raw_answer(&mut land_r).await;
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+    let ticket_num = held["ticket"]["number"].as_u64().expect("ticket num");
+    let token = held["resumeToken"].as_str().expect("token").to_owned();
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut cmd = cmd.spawn().expect("spawn bound cmd");
+    let cmd_pid = cmd.id().expect("cmd pid");
+    land_w
+        .write_all(format!("{{\"step\":\"bind\",\"pid\":{cmd_pid}}}\n").as_bytes())
+        .await
+        .expect("bind cmd");
+    assert_eq!(
+        raw_answer(&mut land_r).await["turn"],
+        serde_json::json!("bound")
+    );
+
+    let mut install = waiting_fence(&socket).await;
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        raw_answer(&mut land_r).await["turn"],
+        serde_json::json!("fence")
+    );
+    land_w
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("ack fence");
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(true)
+    );
+
+    old.drain().await.expect("drain old");
+    drop(install);
+    drop(land_r);
+    drop(land_w);
+
+    // Bound command exits and is reaped during the gap.
+    drop(cmd.stdin.take());
+    assert!(
+        cmd.wait_bounded()
+            .await
+            .expect("cmd exits in gap")
+            .success()
+    );
+
+    let new = gateway_at(&socket, &cache).await;
+    let adopted = queue(&socket).await.expect("queue adopted");
+    assert_eq!(adopted.tickets.len(), 1);
+    assert!(
+        adopted.tickets[0].bound.is_empty(),
+        "exited bound command must be cleared at adoption: {:?}",
+        adopted.tickets[0]
+    );
+    let (mut resumed_r, mut resumed_w) = resume_raw(&socket, ticket_num, &token).await;
+    assert_eq!(
+        raw_answer(&mut resumed_r).await["turn"],
+        serde_json::json!("resumed")
+    );
+    resumed_w
+        .write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .await
+        .expect("end resumed");
+    drop(resumed_w);
+    drop(resumed_r);
+    new.drain().await.expect("drain new");
+}
+
+/// Crash case 4: the asker sent `end` before drain (so only its bound command held the ticket,
+/// already fenced), and the bound command exits during the restart gap; the replacing gateway
+/// finishes the ticket on adoption without abandoning it and promotes the next waiter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_command_that_exits_during_the_restart_gap_after_asker_ended_finishes_the_ticket_on_adoption()
+ {
+    let (old, root, socket) = gateway().await;
+    let cache = root.path().join("cache");
+
+    let (mut land_r, mut land_w) = ask_resumable_raw(&socket, REPO, "ended-holder").await;
+    let held = raw_answer(&mut land_r).await;
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut cmd = cmd.spawn().expect("spawn bound cmd");
+    let cmd_pid = cmd.id().expect("cmd pid");
+    land_w
+        .write_all(format!("{{\"step\":\"bind\",\"pid\":{cmd_pid}}}\n").as_bytes())
+        .await
+        .expect("bind cmd");
+    assert_eq!(
+        raw_answer(&mut land_r).await["turn"],
+        serde_json::json!("bound")
+    );
+
+    // Asker ends its hold while bound command still runs: ticket has no live asker, so it is
+    // already fenced.
+    land_w
+        .write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .await
+        .expect("end asker");
+    drop(land_w);
+    drop(land_r);
+
+    // Waiting install must fence at once since the only live ticket has no live asker.
+    let mut install = waiting_fence(&socket).await;
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(true),
+        "ticket with departed asker is already fenced"
+    );
+
+    old.drain().await.expect("drain old");
+    drop(install);
+
+    // Bound command exits during the gap.
+    drop(cmd.stdin.take());
+    assert!(
+        cmd.wait_bounded()
+            .await
+            .expect("cmd exits in gap")
+            .success()
+    );
+
+    let new = gateway_at(&socket, &cache).await;
+    assert_eq!(
+        tickets(&socket).await,
+        Vec::<String>::new(),
+        "ticket whose asker ended and whose bound command exited in the gap must finish at adoption"
+    );
+    assert!(
+        queue(&socket)
+            .await
+            .map_or(true, |q| q.abandoned.is_empty()),
+        "finished ticket must not be recorded abandoned"
+    );
+    new.drain().await.expect("drain new");
+}
+
+/// Crash case 5: a replacing gateway that lacks the handoff snapshot (or receives a wrong token)
+/// refuses `land-turn-resume`, leaving the caller on the lost-turn path (05_gateway.md "Land
+/// turns").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_gateway_lacking_the_resume_token_refuses_resume_and_triggers_lost_turn() {
+    let (old, root, socket) = gateway().await;
+    let cache = root.path().join("cache");
+
+    // 1. Fresh gateway with no adopted tickets refuses `land-turn-resume` (and recognizes the op,
+    //    rather than answering "unknown gateway control operation").
+    let (mut missing_r, _missing_w) = resume_raw(&socket, 99, "missing-token").await;
+    let refused = raw_answer(&mut missing_r).await;
+    assert_eq!(
+        refused["turn"],
+        serde_json::json!("refused"),
+        "missing ticket must be refused as a turn answer, not an unknown control op: {refused}"
+    );
+    drop(missing_r);
+
+    // 2. Adopted ticket refuses a wrong token without destroying the ticket for the real token.
+    let (mut land_r, mut land_w) = ask_resumable_raw(&socket, REPO, "token-checked").await;
+    let held = raw_answer(&mut land_r).await;
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+    let ticket_num = held["ticket"]["number"].as_u64().expect("ticket num");
+    let token = held["resumeToken"].as_str().expect("token").to_owned();
+
+    let mut install = waiting_fence(&socket).await;
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        raw_answer(&mut land_r).await["turn"],
+        serde_json::json!("fence")
+    );
+    land_w
+        .write_all(b"{\"step\":\"fenced\"}\n")
+        .await
+        .expect("ack fence");
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(true)
+    );
+
+    old.drain().await.expect("drain old");
+    drop(install);
+    drop(land_r);
+    drop(land_w);
+
+    let new = gateway_at(&socket, &cache).await;
+    let (mut bad_r, _bad_w) = resume_raw(&socket, ticket_num, "definitely-not-the-token").await;
+    let bad = raw_answer(&mut bad_r).await;
+    assert_eq!(
+        bad["turn"],
+        serde_json::json!("refused"),
+        "wrong resume token must be refused: {bad}"
+    );
+    drop(bad_r);
+
+    let (mut ok_r, mut ok_w) = resume_raw(&socket, ticket_num, &token).await;
+    assert_eq!(
+        raw_answer(&mut ok_r).await["turn"],
+        serde_json::json!("resumed"),
+        "real token must still resume after a bad token attempt"
+    );
+    ok_w.write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .await
+        .expect("end");
+    drop(ok_w);
+    drop(ok_r);
+    new.drain().await.expect("drain new");
+}
+
+/// Legacy compatibility (05_gateway.md "The read fences the turns", "Land turns"): an ask that
+/// omits `"resumable"` is never sent `{"turn":"fence"}` (an older client treats any unexpected
+/// line on a held turn as a lost turn and signals its gate), and the waiting install still waits
+/// for the legacy ticket to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_non_resumable_turn_is_never_sent_fence_and_still_waits_to_end() {
+    let (old, _root, socket) = gateway().await;
+
+    // Raw ask omitting `"resumable"`.
+    let mut legacy = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("connect legacy ask");
+    let ask = serde_json::json!({
+        "op": land_turn::LAND_TURN_OP,
+        "repo": REPO,
+        "workspace": "legacy",
+        "command": "land legacy",
+    });
+    legacy
+        .write_all(format!("{ask}\n").as_bytes())
+        .await
+        .expect("send legacy ask");
+    let (legacy_r, mut legacy_w) = legacy.into_split();
+    let mut legacy_answers = BufReader::new(legacy_r).lines();
+    let held = raw_answer(&mut legacy_answers).await;
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+    assert!(
+        held.get("resumeToken").is_none(),
+        "legacy non-resumable ask must not receive a resumeToken: {held}"
+    );
+
+    // Waiting install begins waiting: the actor has now processed `Wait` and would have sent
+    // `{"turn":"fence"}` to any resumable ticket.
+    let mut install = waiting_fence(&socket).await;
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(false)
+    );
+
+    // Sending a bind on the legacy connection proves no `{"turn":"fence"}` was queued ahead of
+    // its `{"turn":"bound"}` answer, and the bind still succeeds.
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut cmd = cmd.spawn().expect("spawn legacy cmd");
+    let cmd_pid = cmd.id().expect("cmd pid");
+    legacy_w
+        .write_all(format!("{{\"step\":\"bind\",\"pid\":{cmd_pid}}}\n").as_bytes())
+        .await
+        .expect("bind legacy cmd");
+    let next = raw_answer(&mut legacy_answers).await;
+    assert_eq!(
+        next["turn"],
+        serde_json::json!("bound"),
+        "legacy ticket must never receive a fence notice before bound: {next}"
+    );
+
+    // Ending the legacy ticket and its bound command fences the waiting install.
+    legacy_w
+        .write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .await
+        .expect("end legacy");
+    drop(legacy_w);
+    drop(cmd.stdin.take());
+    assert!(cmd.wait_bounded().await.expect("legacy cmd ends").success());
+    assert_eq!(
+        control_line(&mut install).await["fenced"],
+        serde_json::json!(true),
+        "install fences once the legacy ticket ends"
+    );
+    old.drain().await.expect("drain old");
+}

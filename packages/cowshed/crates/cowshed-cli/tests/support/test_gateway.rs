@@ -67,6 +67,10 @@ impl AuditSink for DiscardAudit {
 /// One test's gateway: `--gateway-socket` names `socket` to the binary under test.
 pub struct TestGateway {
     pub socket: PathBuf,
+    cache: PathBuf,
+    #[cfg(target_os = "linux")]
+    data: PathBuf,
+    bounded_turn_deadline: Option<std::time::Duration>,
     runtime: tokio::runtime::Runtime,
     gateway: Option<Gateway>,
     /// Declared last: the socket's directory goes after the runtime that serves the socket.
@@ -81,6 +85,25 @@ impl TestGateway {
     #[allow(dead_code)]
     pub fn start_with_bounded_deadline(deadline: std::time::Duration) -> Self {
         Self::start_configured(Some(deadline))
+    }
+
+    fn build_config(
+        socket: &PathBuf,
+        cache: &PathBuf,
+        #[cfg(target_os = "linux")] data: &PathBuf,
+        bounded_turn_deadline: Option<std::time::Duration>,
+    ) -> GatewayConfig {
+        let mut config = GatewayConfig {
+            control_socket: Some(socket.clone()),
+            mirror_cache: MirrorCacheConfig::new(cache.clone()),
+            #[cfg(target_os = "linux")]
+            data_socket_root: Some(data.clone()),
+            ..GatewayConfig::default()
+        };
+        if let Some(deadline) = bounded_turn_deadline {
+            config.bounded_turn_deadline = deadline;
+        }
+        config
     }
 
     fn start_configured(bounded_turn_deadline: Option<std::time::Duration>) -> Self {
@@ -107,16 +130,13 @@ impl TestGateway {
             .enable_all()
             .build()
             .expect("start the test runtime");
-        let mut config = GatewayConfig {
-            control_socket: Some(socket.clone()),
-            mirror_cache: MirrorCacheConfig::new(cache),
+        let config = Self::build_config(
+            &socket,
+            &cache,
             #[cfg(target_os = "linux")]
-            data_socket_root: Some(data),
-            ..GatewayConfig::default()
-        };
-        if let Some(deadline) = bounded_turn_deadline {
-            config.bounded_turn_deadline = deadline;
-        }
+            &data,
+            bounded_turn_deadline,
+        );
         let gateway = runtime
             .block_on(Gateway::start(
                 config,
@@ -127,10 +147,72 @@ impl TestGateway {
             .expect("start the test gateway");
         Self {
             socket,
+            cache,
+            #[cfg(target_os = "linux")]
+            data,
+            bounded_turn_deadline,
             runtime,
             gateway: Some(gateway),
             _root: root,
         }
+    }
+
+    /// Real planned drain and restart of this gateway at the same control socket.
+    #[allow(dead_code)]
+    pub fn restart(&mut self) {
+        if let Some(gateway) = self.gateway.take() {
+            self.runtime
+                .block_on(gateway.drain())
+                .expect("drain old test gateway");
+        }
+        let config = Self::build_config(
+            &self.socket,
+            &self.cache,
+            #[cfg(target_os = "linux")]
+            &self.data,
+            self.bounded_turn_deadline,
+        );
+        self.gateway = Some(
+            self.runtime
+                .block_on(Gateway::start(
+                    config,
+                    Arc::new(NoCredentials),
+                    Arc::new(NoConnector),
+                    Arc::new(DiscardAudit),
+                ))
+                .expect("restart test gateway at same socket"),
+        );
+    }
+
+    /// Real drain, delete any handoff snapshot beside the control socket, and restart at the same
+    /// socket so the replacing gateway lacks every previous resume token.
+    #[allow(dead_code)]
+    pub fn restart_without_handoff(&mut self) {
+        if let Some(gateway) = self.gateway.take() {
+            self.runtime
+                .block_on(gateway.drain())
+                .expect("drain old test gateway");
+        }
+        if let Some(dir) = self.socket.parent() {
+            let _ = fs::remove_file(dir.join("land-turns-handoff.json"));
+        }
+        let config = Self::build_config(
+            &self.socket,
+            &self.cache,
+            #[cfg(target_os = "linux")]
+            &self.data,
+            self.bounded_turn_deadline,
+        );
+        self.gateway = Some(
+            self.runtime
+                .block_on(Gateway::start(
+                    config,
+                    Arc::new(NoCredentials),
+                    Arc::new(NoConnector),
+                    Arc::new(DiscardAudit),
+                ))
+                .expect("restart test gateway without handoff"),
+        );
     }
 
     /// The gateway's land-turn queues, read through its `land-turns` op: every queue with a live

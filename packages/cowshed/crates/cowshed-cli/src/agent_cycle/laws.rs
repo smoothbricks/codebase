@@ -23,7 +23,7 @@ mod model;
 #[path = "../../../cowshed-gateway/src/land_turn/laws/model.rs"]
 mod land_turn_model;
 
-use model::{List, RQ};
+use model::{List, RQ, RT};
 
 fn items<T: Clone>(list: &Rc<List<T>>) -> Vec<T> {
     let mut out = Vec::new();
@@ -57,7 +57,7 @@ fn list<T>(items: Vec<T>) -> Rc<List<T>> {
         })
 }
 
-fn ticket(number: u64, workspace: &str, pid: u32) -> Ticket {
+fn ticket(number: u64, workspace: &str, pid: u32, fenced: bool) -> Ticket {
     Ticket {
         number,
         pid,
@@ -65,6 +65,7 @@ fn ticket(number: u64, workspace: &str, pid: u32) -> Ticket {
         asked_unix_ms: 0,
         command: format!("cowshed land {workspace}"),
         bound: Vec::new(),
+        fenced,
     }
 }
 
@@ -77,9 +78,9 @@ fn code_queues(queues: &Rc<List<RQ>>) -> Vec<LandTurnQueue> {
             repo: LandTurnName::new(format!("repo{repo}")).expect("a land-turn name"),
             tickets: items(&tickets)
                 .into_iter()
-                .map(|number| {
+                .map(|RT::RT(number, fenced)| {
                     let pid = u32::try_from(number + 1).expect("a model ticket fits a pid");
-                    ticket(number, &format!("ws{number}"), pid)
+                    ticket(number, &format!("ws{number}"), pid, fenced)
                 })
                 .collect(),
             abandoned: Vec::new(),
@@ -141,9 +142,12 @@ fn judged_alike(queues: &Rc<List<RQ>>) -> Result<Vec<Busy>, String> {
             ));
         }
     }
-    // The gateway fences exactly when no queue has a ticket (cowshed-gateway `Turns::fence`, bound
-    // to `land_turn.bend`'s `fence_only_when_free`); the install goes on only under that fence.
-    let gateway_fenced = code.iter().all(|queue| queue.tickets.is_empty());
+    // The gateway fences exactly when every ticket in every queue is fenced (cowshed-gateway
+    // `Turns::fence`, bound to `land_turn.bend`'s `fence_only_when_all_fenced`); the install goes
+    // on only under that fence.
+    let gateway_fenced = code
+        .iter()
+        .all(|queue| queue.tickets.iter().all(|ticket| ticket.fenced));
     let goes_on = read_judged(&code, gateway_fenced).is_ok();
     if goes_on != model::read_fences(queues.clone()) {
         return Err(format!(
@@ -159,8 +163,9 @@ fn judged_alike(queues: &Rc<List<RQ>>) -> Result<Vec<Busy>, String> {
     Ok(busy)
 }
 
-/// Every enumerated case of the model's definedness law, the law itself on the model, and the
-/// code on the same queues with the held turn and without it.
+/// Every enumerated case of both definedness laws (`a_held_turn_refuses` and
+/// `a_fenced_turn_does_not_refuse`), the laws themselves on the model, and the code on the same
+/// queues with the unfenced or fenced ticket and without it.
 #[test]
 fn the_blockers_are_the_model_on_its_corpus() {
     let corpus = model::corpus_a_held_turn_refuses();
@@ -170,10 +175,23 @@ fn the_blockers_are_the_model_on_its_corpus() {
             model::law_a_held_turn_refuses(repo, holder, behind.clone(), rest.clone());
         assert!(holds, "the emitted model breaks its own law: {value}");
         let held = Rc::new(List::Con(
-            RQ::RQ(repo, Rc::new(List::Con(holder, behind))),
+            RQ::RQ(repo, Rc::new(List::Con(RT::RT(holder, false), behind))),
             rest.clone(),
         ));
         judged_alike(&held).unwrap();
+        judged_alike(&rest).unwrap();
+    }
+    let fenced_corpus = model::corpus_a_fenced_turn_does_not_refuse();
+    assert!(!fenced_corpus.is_empty());
+    for (repo, holder, behind, rest) in fenced_corpus {
+        let (holds, value) =
+            model::law_a_fenced_turn_does_not_refuse(repo, holder, behind.clone(), rest.clone());
+        assert!(holds, "the emitted model breaks its own law: {value}");
+        let fenced = Rc::new(List::Con(
+            RQ::RQ(repo, Rc::new(List::Con(RT::RT(holder, true), behind))),
+            rest.clone(),
+        ));
+        judged_alike(&fenced).unwrap();
         judged_alike(&rest).unwrap();
     }
 }
@@ -188,26 +206,29 @@ fn the_blockers_are_the_model_on_seeded_queues() {
     }
 }
 
-/// A land-turn model queue as `land-turns` lists it: its ticket numbers in order, and the one
-/// that holds the turn.
-fn reached(ops: &Rc<land_turn_model::List<land_turn_model::Op>>) -> (Vec<u64>, Option<u64>) {
+/// A land-turn model queue as `land-turns` lists it: each ticket's `(number, fenced)` in order
+/// (a ticket whose asker already departed is fenced, matching `land_turn.bend`'s `ticket_fenced`),
+/// and every unfenced ticket's number in order.
+fn reached(ops: &Rc<land_turn_model::List<land_turn_model::Op>>) -> (Vec<(u64, bool)>, Vec<u64>) {
     let queue = turn_items(&land_turn_model::queue(land_turn_model::run(
         ops.clone(),
         land_turn_model::empty(),
     )));
-    let numbers = queue
+    let entries: Vec<(u64, bool)> = queue
         .iter()
-        .map(|land_turn_model::E::E(number, _, _, _, _, _)| *number)
+        .map(|land_turn_model::E::E(number, _, asker, _, _, _, fenced)| {
+            (*number, *fenced || !*asker)
+        })
         .collect();
-    let held = queue
+    let unfenced = entries
         .iter()
-        .find(|land_turn_model::E::E(_, _, _, _, held, _)| *held)
-        .map(|land_turn_model::E::E(number, _, _, _, _, _)| *number);
-    (numbers, held)
+        .filter_map(|&(number, fenced)| (!fenced).then_some(number))
+        .collect();
+    (entries, unfenced)
 }
 
 /// Two repositories' queues the land-turn model reaches: the install is refused exactly while one
-/// of them has a holder, and it names that queue's holding ticket.
+/// of them holds an unfenced ticket, and it names every unfenced ticket in order.
 fn reached_pair(
     first: &Rc<land_turn_model::List<land_turn_model::Op>>,
     second: &Rc<land_turn_model::List<land_turn_model::Op>>,
@@ -216,14 +237,27 @@ fn reached_pair(
     let queues = list(
         pair.iter()
             .zip(0..)
-            .map(|((numbers, _), repo)| RQ::RQ(repo, list(numbers.clone())))
+            .map(|((entries, _), repo)| {
+                RQ::RQ(
+                    repo,
+                    list(
+                        entries
+                            .iter()
+                            .map(|&(number, fenced)| RT::RT(number, fenced))
+                            .collect(),
+                    ),
+                )
+            })
             .collect(),
     );
     let busy = judged_alike(&queues)?;
-    let held: Vec<u64> = pair.iter().filter_map(|(_, held)| *held).collect();
-    if holders(&busy) != held {
+    let unfenced: Vec<u64> = pair
+        .iter()
+        .flat_map(|(_, unfenced)| unfenced.iter().copied())
+        .collect();
+    if holders(&busy) != unfenced {
         return Err(format!(
-            "the install names {:?} where the land-turn model holds {held:?}, on {} and {}",
+            "the install names {:?} where the land-turn model has unfenced {unfenced:?}, on {} and {}",
             holders(&busy),
             land_turn_model::show_ListOp(first),
             land_turn_model::show_ListOp(second)
@@ -283,7 +317,7 @@ fn recorded_refusals_replay_through_the_model_and_the_code() {
             .iter()
             .map(|holder| LandTurnQueue {
                 repo: LandTurnName::new(holder.repo.clone()).expect("a recorded land-turn name"),
-                tickets: vec![ticket(holder.ticket, &holder.workspace, holder.pid)],
+                tickets: vec![ticket(holder.ticket, &holder.workspace, holder.pid, false)],
                 abandoned: Vec::new(),
             })
             .collect();
@@ -304,7 +338,7 @@ fn recorded_refusals_replay_through_the_model_and_the_code() {
             blockers
                 .iter()
                 .zip(0..)
-                .map(|(holder, repo)| RQ::RQ(repo, list(vec![holder.ticket])))
+                .map(|(holder, repo)| RQ::RQ(repo, list(vec![RT::RT(holder.ticket, false)])))
                 .collect(),
         );
         assert!(model::refuses(modelled.clone()), "{at}: the model restarts");

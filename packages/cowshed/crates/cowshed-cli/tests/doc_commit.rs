@@ -1515,3 +1515,111 @@ new file mode 100644
         said(&output)
     );
 }
+
+/// Option A CLI end-to-end red (05_gateway.md "The read fences the turns", "Land turns"): a real
+/// `cowshed land-turn` holds a running child, a real `cowshed gateway await-turns` fences it
+/// within a heartbeat and restarts the gateway at the same socket under `install.lock`, the land
+/// child stays alive and resumes its turn on the replacing gateway, and a real `cowshed
+/// doc-commit` queued behind it lands cleanly.
+#[test]
+fn a_land_turn_command_survives_an_await_turns_gateway_restart_and_a_doc_commit_queued_behind_it_lands()
+ {
+    let mut repo = Repo::new("paths = [\"*.md\"]\n");
+    let before = repo.head();
+
+    let mut land = repo
+        .command(&[
+            "land-turn",
+            TURN,
+            "--gateway-socket",
+            repo.gateway.socket.to_str().unwrap(),
+            "--workspace",
+            "mid-gate",
+            "--",
+            "sh",
+            "-c",
+            "echo held && exec cat >/dev/null",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn land-turn holder");
+    let land_said = lines(land.stdout.take().expect("land stdout"));
+    assert_eq!(
+        land_said
+            .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
+            .expect("land holds its turn"),
+        "held"
+    );
+
+    // `await-turns` fences the held land turn within a heartbeat without waiting for it to end.
+    let mut install = repo
+        .command(&[
+            "gateway",
+            "await-turns",
+            "--gateway-socket",
+            repo.gateway.socket.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            "echo fenced && read line",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn await-turns");
+    let install_out = lines(install.stdout.take().expect("install stdout"));
+    assert_eq!(
+        install_out
+            .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
+            .expect("await-turns must fence the held resumable turn within one heartbeat"),
+        "fenced"
+    );
+
+    // Real gateway drain and restart at the same socket under install.lock.
+    let support = cowshed_core::host_dirs::support_directory(&repo.home());
+    fs::create_dir_all(&support).expect("create support dir");
+    let slot = fs::File::create(support.join(cowshed_core::host_dirs::INSTALL_LOCK_NAME))
+        .expect("create install.lock");
+    slot.try_lock().expect("take install.lock");
+    repo.gateway.restart();
+    drop(slot);
+    drop(install.stdin.take());
+    assert!(install.wait_bounded().expect("await-turns exits").success());
+
+    // The held land's command must still be running after the restart.
+    assert!(
+        land.try_wait().expect("poll land-turn").is_none(),
+        "land-turn and its bound child must survive a fenced gateway restart"
+    );
+
+    // A doc commit queued/running after the restart lands on the restarted gateway.
+    let patch = repo.file("notes.diff", NOTES_PATCH);
+    let output = repo.run(&[
+        "doc-commit",
+        "-m",
+        "docs: after fenced gateway restart",
+        "--patch",
+        patch.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "doc-commit must succeed on the restarted gateway: {}",
+        said(&output)
+    );
+    assert_ne!(repo.head(), before, "doc commit moved HEAD");
+
+    // Releasing the land's command ends the resumed turn cleanly with zero abandonments.
+    drop(land.stdin.take());
+    assert!(
+        land.wait_bounded()
+            .expect("land-turn exits cleanly")
+            .success()
+    );
+    assert!(
+        repo.settled_turns().is_empty(),
+        "resumed land turn must finish cleanly without abandonment"
+    );
+}
