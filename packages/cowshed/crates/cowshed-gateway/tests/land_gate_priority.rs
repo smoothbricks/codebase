@@ -422,19 +422,19 @@ s.recv(16)
         .unwrap();
     assert_eq!(line.trim(), "ready");
 
-    // Supervisor 2 must drain all 3 token bytes via the real gateway's broadcast.
+    // Supervisor 2 must drain all 3 token bytes via the real gateway's broadcast, observed through
+    // its published liveness watch (never by polling telemetry rows).
+    let mut bg_watch = sup_bg.watch_liveness().expect("watch sup_bg liveness");
     within_silence("sup_bg drains 3 tokens", async {
         loop {
-            let _ = sup_bg.trace_health().await.unwrap();
-            let drained: u32 = token_rows(&bg_tel, bg_job)
-                .iter()
-                .filter(|(msg, _)| msg == "job.tokens.withdrawn")
-                .filter_map(|(_, count)| *count)
-                .sum();
-            if drained >= 3 {
+            if bg_watch
+                .borrow_and_update()
+                .job_gate_priority(bg_job)
+                .is_some_and(|state| state.tokens_withdrawn >= 3)
+            {
                 return;
             }
-            tokio::task::yield_now().await;
+            bg_watch.changed().await.expect("sup_bg liveness closed");
         }
     })
     .await;
@@ -551,7 +551,23 @@ async fn real_gateway_clears_darwinbg_from_ledger_on_watch_eof() {
     });
     std::fs::write(&ledger, serde_json::to_vec(&payload).unwrap()).unwrap();
 
-    // Connect `gate-watch`, read the initial `GateWatchState` frame, then close (EOF).
+    // Open a second observer `gate-watch` stream so we observe the exact `active: false`
+    // transition that fires after the dead supervisor's EOF handler clears `PRIO_DARWIN_BG`.
+    let observer = UnixStream::connect(&socket).await.unwrap();
+    let (obs_reader, mut obs_writer) = observer.into_split();
+    let mut obs_open = serde_json::to_vec(&GateWatchOpen::new(None)).unwrap();
+    obs_open.push(b'\n');
+    obs_writer.write_all(&obs_open).await.unwrap();
+    let mut obs_lines = BufReader::new(obs_reader).lines();
+    let obs_first = within_silence("observer initial gate-watch state", obs_lines.next_line())
+        .await
+        .expect("read observer initial state")
+        .expect("gateway closed observer gate-watch");
+    let obs_state: GateWatchState = serde_json::from_str(&obs_first).unwrap();
+    assert!(obs_state.ok && !obs_state.active, "{obs_state:?}");
+
+    // Connect `gate-watch` for the dead supervisor, register a gate job so EOF produces a
+    // deterministic `active: false` event on `observer`, then close (EOF).
     let stream = UnixStream::connect(&socket).await.unwrap();
     let (reader, mut writer) = stream.into_split();
     let mut open = serde_json::to_vec(&GateWatchOpen::new(Some(ledger))).unwrap();
@@ -565,22 +581,38 @@ async fn real_gateway_clears_darwinbg_from_ledger_on_watch_eof() {
     let state: GateWatchState = serde_json::from_str(&first)
         .unwrap_or_else(|error| panic!("gateway answered non-GateWatchState {first:?}: {error}"));
     assert!(state.ok, "{state:?}");
+    let mut start =
+        serde_json::to_vec(&cowshed_core::gate_watch::GateWatchEvent::GateStart { job_id: 1 })
+            .unwrap();
+    start.push(b'\n');
+    writer.write_all(&start).await.unwrap();
+    let obs_on = within_silence("observer active=true", obs_lines.next_line())
+        .await
+        .expect("read observer active=true")
+        .expect("gateway closed observer");
+    let obs_on: GateWatchState = serde_json::from_str(&obs_on).unwrap();
+    assert!(obs_on.ok && obs_on.active, "{obs_on:?}");
     drop(writer);
     drop(lines);
 
-    // Wait for the gateway's EOF handler to clear PRIO_DARWIN_BG on the recorded life.
-    within_silence("gateway clears darwinbg on EOF", async {
-        loop {
-            if procinfo::thread_max_priorities(pid.cast_signed())
-                .unwrap()
-                .is_some_and(|prios| !prios.is_empty() && prios.iter().all(|&p| p == 63))
-            {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
+    // Wait on the observer's `active: false` event, emitted after the gateway's EOF handler
+    // finishes clearing `PRIO_DARWIN_BG` on the dead supervisor's ledger.
+    let obs_off = within_silence("observer active=false after EOF", obs_lines.next_line())
+        .await
+        .expect("read observer active=false")
+        .expect("gateway closed observer");
+    let obs_off: GateWatchState = serde_json::from_str(&obs_off).unwrap();
+    assert!(obs_off.ok && !obs_off.active, "{obs_off:?}");
+    drop(obs_writer);
+    drop(obs_lines);
+
+    let priorities = procinfo::thread_max_priorities(pid.cast_signed())
+        .unwrap()
+        .expect("child still running");
+    assert!(
+        !priorities.is_empty() && priorities.iter().all(|&p| p == 63),
+        "expected PRIO_DARWIN_BG cleared (63) after gate-watch EOF, got {priorities:?}"
+    );
 
     drop(child.stdin.take());
     let _ = child.wait_bounded();

@@ -13277,28 +13277,49 @@ s.recv(16)
         rows
     }
 
-    /// Wait until `telemetry` has recorded at least `expected_tokens` withdrawn for `job_id`,
-    /// bounded by the silence bound.
+    /// Await the supervisor's published liveness watch until `ready` holds, bounded by `bound`.
+    async fn wait_for_liveness(
+        handle: &WorkspaceSupervisorHandle,
+        what: &str,
+        bound: Duration,
+        ready: impl Fn(&cowshed_core::runtime::Liveness) -> bool,
+    ) {
+        let mut watch = handle.watch_liveness().expect("watch supervisor liveness");
+        let wait = async {
+            loop {
+                if ready(watch.borrow_and_update().as_ref()) {
+                    return;
+                }
+                watch
+                    .changed()
+                    .await
+                    .expect("supervisor liveness watch closed before condition was met");
+            }
+        };
+        match tokio::time::timeout(bound, wait).await {
+            Ok(()) => {}
+            Err(_) => panic!("{what} did not happen within {bound:?}"),
+        }
+    }
+
+    /// Wait on the supervisor's published liveness watch until `job_id` has at least
+    /// `expected_tokens` withdrawn, bounded by the silence bound. Telemetry rows are asserted once
+    /// after the job concludes, never polled.
     async fn wait_for_withdrawn(
         handle: &WorkspaceSupervisorHandle,
-        telemetry: &Path,
         job_id: JobId,
         expected_tokens: u32,
     ) {
-        within_silence("job.tokens.withdrawn span row", async {
-            loop {
-                let _ = handle.trace_health().await.unwrap();
-                let withdrawn: u32 = gate_span_rows(telemetry, job_id)
-                    .iter()
-                    .filter(|row| row.message == "job.tokens.withdrawn")
-                    .filter_map(|row| row.tokens)
-                    .sum();
-                if withdrawn >= expected_tokens {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        wait_for_liveness(
+            handle,
+            "job tokens withdrawn on published liveness",
+            deadline::HEARTBEAT_SILENCE,
+            |liveness| {
+                liveness
+                    .job_gate_priority(job_id)
+                    .is_some_and(|state| state.tokens_withdrawn >= expected_tokens)
+            },
+        )
         .await;
     }
 
@@ -13341,7 +13362,7 @@ s.recv(16)
             }
         );
 
-        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 2).await;
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 2).await;
         assert_eq!(
             bg.fionread().await,
             0,
@@ -13350,7 +13371,7 @@ s.recv(16)
 
         // Return the held token while the gate still runs: the server drains it immediately too.
         bg.return_tokens(1).await;
-        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 3).await;
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 3).await;
         assert_eq!(
             bg.fionread().await,
             0,
@@ -13481,7 +13502,7 @@ s.recv(16)
                 job_id: land_gate.job_id.get(),
             }
         );
-        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 3).await;
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 3).await;
         assert_eq!(bg.fionread().await, 0);
         assert_eq!(
             gate_worker.fionread().await,
@@ -13510,7 +13531,7 @@ s.recv(16)
             .to_string(),
         );
         fixture.gateway.push_heartbeat().await;
-        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, interactive.job_id, 3).await;
+        wait_for_withdrawn(&fixture.handle, interactive.job_id, 3).await;
         assert_eq!(
             interactive.fionread().await,
             0,
@@ -13721,26 +13742,33 @@ for pid in children:
             }
         );
 
-        let expected_pids = burner.pids.clone();
-        within_silence(
-            "darwinbg recorded in group ledger",
-            publication::read_when(fixture.ledger.clone(), move |value| {
-                value
-                    .get("darwinbg")
-                    .and_then(|bg| bg.get("lives"))
-                    .and_then(|lives| lives.as_array())
-                    .is_some_and(|lives| {
-                        expected_pids.iter().all(|&pid| {
-                            lives
-                                .iter()
-                                .any(|life| life["pid"].as_u64() == Some(u64::from(pid)))
-                        })
-                    })
-            }),
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg active on published liveness",
+            deadline::HEARTBEAT_SILENCE,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| state.darwinbg_active)
+            },
         )
         .await;
-        // Actor round-trip orders after `setpriority(PRIO_DARWIN_BG)` + readback in the same turn.
-        let _ = fixture.handle.info(burner.job_id).await.unwrap();
+        let ledger_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.ledger).expect("read group ledger"))
+                .expect("parse group ledger");
+        let recorded_lives = ledger_value
+            .get("darwinbg")
+            .and_then(|bg| bg.get("lives"))
+            .and_then(|lives| lives.as_array())
+            .unwrap_or_else(|| panic!("missing darwinbg.lives in ledger: {ledger_value}"));
+        for &pid in &burner.pids {
+            assert!(
+                recorded_lives
+                    .iter()
+                    .any(|life| life["pid"].as_u64() == Some(u64::from(pid))),
+                "pid {pid} missing from darwinbg.lives: {recorded_lives:?}"
+            );
+        }
         assert_tree_max_priority(&burner.pids, 4, "during land gate");
 
         let gate_id = land_gate.job_id;
@@ -13751,13 +13779,24 @@ for pid in children:
                 job_id: gate_id.get(),
             }
         );
-        within_silence(
-            "darwinbg cleared from group ledger",
-            publication::read_when(fixture.ledger.clone(), |value| {
-                value.get("darwinbg").is_none()
-            }),
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg cleared on published liveness",
+            deadline::HEARTBEAT_SILENCE,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| !state.darwinbg_active && state.darwinbg_cleared >= 1)
+            },
         )
         .await;
+        let cleared_ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.ledger).expect("read group ledger"))
+                .expect("parse group ledger");
+        assert!(
+            cleared_ledger.get("darwinbg").is_none(),
+            "darwinbg must be absent from group ledger after clear: {cleared_ledger}"
+        );
         assert_tree_max_priority(&burner.pids, 63, "after land gate");
 
         let burner_id = burner.job_id;
@@ -13991,30 +14030,22 @@ os.read(0, 1)
             }
         );
 
-        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 3).await;
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 3).await;
         assert_eq!(bg.fionread().await, 0);
 
         #[cfg(target_os = "macos")]
         {
-            let expected_pids = burner.pids.clone();
-            within_silence(
-                "darwinbg set before gateway silence",
-                publication::read_when(fixture.ledger.clone(), move |value| {
-                    value
-                        .get("darwinbg")
-                        .and_then(|bg| bg.get("lives"))
-                        .and_then(|lives| lives.as_array())
-                        .is_some_and(|lives| {
-                            expected_pids.iter().all(|&pid| {
-                                lives
-                                    .iter()
-                                    .any(|life| life["pid"].as_u64() == Some(u64::from(pid)))
-                            })
-                        })
-                }),
+            wait_for_liveness(
+                &fixture.handle,
+                "darwinbg active before gateway silence",
+                deadline::HEARTBEAT_SILENCE,
+                |liveness| {
+                    liveness
+                        .job_gate_priority(burner.job_id)
+                        .is_some_and(|state| state.darwinbg_active)
+                },
             )
             .await;
-            let _ = fixture.handle.info(burner.job_id).await.unwrap();
             assert_tree_max_priority(&burner.pids, 4, "before gateway silence");
         }
 
@@ -14026,17 +14057,24 @@ os.read(0, 1)
 
         #[cfg(target_os = "macos")]
         {
-            match tokio::time::timeout(
+            wait_for_liveness(
+                &fixture.handle,
+                "darwinbg cleared after gateway silence",
                 cowshed_os::test_backstop::NO_PROGRESS,
-                publication::read_when(fixture.ledger.clone(), |value| {
-                    value.get("darwinbg").is_none()
-                }),
+                |liveness| {
+                    liveness
+                        .job_gate_priority(burner.job_id)
+                        .is_some_and(|state| !state.darwinbg_active && state.darwinbg_cleared >= 1)
+                },
             )
-            .await
-            {
-                Ok(_) => {}
-                Err(_) => panic!("darwinbg was not cleared from ledger after gateway silence"),
-            }
+            .await;
+            let cleared_ledger: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fixture.ledger).expect("read group ledger"))
+                    .expect("parse group ledger");
+            assert!(
+                cleared_ledger.get("darwinbg").is_none(),
+                "darwinbg must be absent from ledger after gateway silence: {cleared_ledger}"
+            );
             assert_tree_max_priority(&burner.pids, 63, "after gateway silence");
             let burner_id = burner.job_id;
             burner.stop(&fixture.handle).await;
