@@ -971,13 +971,17 @@ fn doc_commit_fails_naming_the_bound_and_signals_its_check_past_the_bounded_dead
 
     let fifo = std::env::temp_dir().join(format!("cowshed-doc-bound-{}.fifo", std::process::id()));
     let _ = fs::remove_file(&fifo);
+    let started =
+        std::env::temp_dir().join(format!("cowshed-doc-bound-{}.started", std::process::id()));
+    let _ = fs::remove_file(&started);
     let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL");
     // SAFETY: mkfifo(3) on a test-owned temp path.
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
     let repo = Repo::new_with_bounded_deadline(
         &format!(
-            "paths = [\"*.md\"]\ncheck = [\"sh\", \"-c\", \"read x < '{}'\"]\n",
+            "paths = [\"*.md\"]\ncheck = [\"sh\", \"-c\", \"touch '{}' && read x < '{}'\"]\n",
+            started.display(),
             fifo.display()
         ),
         std::time::Duration::from_millis(250),
@@ -998,10 +1002,18 @@ fn doc_commit_fails_naming_the_bound_and_signals_its_check_past_the_bounded_dead
         "doc-commit past the bounded deadline must fail: {}",
         said(&output)
     );
+    // The deadline runs on the gateway's clock from the turn's start, so under load it may
+    // expire before the check has started (sb-batch-4 gate 3: expired at 253 ms; the commit
+    // ended at its turn before binding the check). Each phase has its own outcome: the bound is
+    // named and nothing commits either way, and a check that had started is signalled. RE1 meets
+    // a running check by an event, whatever the load.
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let check_started = started.exists();
+    let _ = fs::remove_file(&started);
     assert!(
-        stderr.contains("250 ms") && stderr.contains("was sent SIGTERM"),
-        "failure must name the bound and SIGTERM to the check command: {}",
+        stderr.contains("250 ms") && (!check_started || stderr.contains("was sent SIGTERM")),
+        "failure must name the bound, and SIGTERM to the check command when it had started \
+         (started: {check_started}): {}",
         said(&output)
     );
     assert_eq!(
