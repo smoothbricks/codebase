@@ -26,6 +26,11 @@ use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
 
+#[cfg(target_os = "macos")]
+pub use platform::{
+    DARWIN_BG_MAX_PRIORITY, DARWIN_NORMAL_MAX_PRIORITY, DarwinBgOutcome, clear_darwinbg,
+    has_darwinbg, set_darwinbg,
+};
 pub use platform::{decay_group, placed_nice};
 
 /// The nice a job of `class` runs at: interactive work and an interactive resident 0, since a

@@ -25,6 +25,7 @@ where
             .collect(),
         ended: false,
         unresolved: carried.clone(),
+        darwinbg: None,
     };
     replace(path, &ledger)
 }
@@ -126,6 +127,7 @@ fn borrowed_publication_is_byte_identical_to_the_owned_ledger() {
                         .collect(),
                     ended,
                     unresolved: carried.to_vec(),
+                    darwinbg: None,
                 };
                 let borrowed = Publication {
                     supervisor: u32::MAX,
@@ -135,6 +137,7 @@ fn borrowed_publication_is_byte_identical_to_the_owned_ledger() {
                     },
                     ended,
                     unresolved: carried,
+                    darwinbg: None,
                 };
                 let old = serde_json::to_vec(&owned).unwrap();
                 let new = serde_json::to_vec(&borrowed).unwrap();
@@ -189,6 +192,7 @@ fn ordinary_publication_allocates_only_its_json_output_buffer() {
                 },
                 ended: false,
                 unresolved: &[],
+                darwinbg: None,
             })
             .unwrap()
         });

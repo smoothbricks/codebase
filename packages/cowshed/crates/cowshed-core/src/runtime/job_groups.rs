@@ -71,6 +71,31 @@ struct Ledger {
     /// ids.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unresolved: Vec<UnresolvedGroup>,
+    /// Boot-fenced lives currently held at `PRIO_DARWIN_BG` by this supervisor while a land's gate
+    /// runs (05_gateway.md "A land's gate takes tokens back"). Cleared before ending any group on
+    /// supervisor recovery and cleared at once by the gateway when the supervisor's watch ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    darwinbg: Option<RecordedMembers>,
+}
+
+/// One process life whose `PRIO_DARWIN_BG` recovery cleared before ending any group
+/// (05_gateway.md "A land's gate takes tokens back").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClearedDarwinBg {
+    /// The job that owned this life when recorded under a group, if known.
+    pub job_id: Option<u64>,
+    pub life: ProcessIdentity,
+    /// Whether `PROC_PIDTHREADINFO` read back `pth_maxpriority == 63` after clearing.
+    pub confirmed: bool,
+}
+
+/// Outcome of taking over a lost supervisor's `.groups` ledger ([`take_lost`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LostRecovery {
+    /// Groups whose leaders were gone and could not be signalled.
+    pub unresolved: Vec<UnresolvedGroup>,
+    /// Recorded lives whose `PRIO_DARWIN_BG` was cleared before ending any group.
+    pub darwinbg_cleared: Vec<ClearedDarwinBg>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -326,6 +351,20 @@ impl Recorder {
     where
         I: Iterator<Item = JobGroupClaim> + Clone,
     {
+        self.record_with_darwinbg(groups, inherited, &[])
+    }
+
+    /// Replace the ledger with `groups`, `inherited` unresolved groups, and boot-fenced `darwinbg`
+    /// lives currently held at `PRIO_DARWIN_BG`.
+    pub fn record_with_darwinbg<I>(
+        &mut self,
+        groups: I,
+        inherited: &[UnresolvedGroup],
+        darwinbg: &[ProcessIdentity],
+    ) -> io::Result<Recorded>
+    where
+        I: Iterator<Item = JobGroupClaim> + Clone,
+    {
         let mut carried = Vec::with_capacity(inherited.len());
         let mut uninspected = Vec::new();
         for group in inherited {
@@ -338,6 +377,14 @@ impl Recorder {
                 }
             }
         }
+        let darwinbg = if darwinbg.is_empty() {
+            None
+        } else {
+            Some(MembersView {
+                boot_session: boot_session(&self.boot_session)?,
+                lives: darwinbg,
+            })
+        };
         let ledger = Publication {
             supervisor: std::process::id(),
             groups: Groups {
@@ -346,6 +393,7 @@ impl Recorder {
             },
             ended: false,
             unresolved: &carried,
+            darwinbg,
         };
         let bytes = serde_json::to_vec(&ledger).map_err(io::Error::other)?;
         if self.last_written.as_deref() == Some(bytes.as_slice()) {
@@ -374,6 +422,8 @@ struct Publication<'a, G> {
     ended: bool,
     #[serde(skip_serializing_if = "<[UnresolvedGroup]>::is_empty")]
     unresolved: &'a [UnresolvedGroup],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    darwinbg: Option<MembersView<'a>>,
 }
 
 struct Groups<'a, I> {
@@ -497,6 +547,94 @@ pub struct Ended {
     pub unresolved: Vec<u64>,
 }
 
+/// Clear `PRIO_DARWIN_BG` on every recorded live process in the `.groups` ledger at `path` whose
+/// boot session and kernel unique id still match (05_gateway.md "A land's gate takes tokens back").
+/// Called by the gateway at once when a watching supervisor disconnects, and by supervisor recovery
+/// before ending any group.
+pub fn clear_recorded_darwinbg(path: &Path) -> io::Result<Vec<ClearedDarwinBg>> {
+    let Some(ledger) = read(path)? else {
+        return Ok(Vec::new());
+    };
+    clear_recorded_darwinbg_in(&ledger)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_recorded_darwinbg_in(ledger: &Ledger) -> io::Result<Vec<ClearedDarwinBg>> {
+    use crate::runtime::placement::{DarwinBgOutcome, clear_darwinbg, has_darwinbg};
+    use std::collections::HashMap;
+
+    let boot = platform::boot_session()?;
+    // Map each recorded life to `(job_id, explicit_darwinbg)`.
+    let mut targets: HashMap<ProcessIdentity, (Option<u64>, bool)> = HashMap::new();
+    for group in ledger
+        .groups
+        .iter()
+        .chain(ledger.unresolved.iter().map(|held| &held.group))
+    {
+        if let Some(members) = group
+            .members
+            .as_ref()
+            .filter(|members| members.boot_session == boot)
+        {
+            for &life in &members.lives {
+                targets
+                    .entry(life)
+                    .and_modify(|(job, _)| {
+                        if job.is_none() {
+                            *job = Some(group.job_id);
+                        }
+                    })
+                    .or_insert((Some(group.job_id), false));
+            }
+        }
+    }
+    if let Some(darwinbg) = ledger
+        .darwinbg
+        .as_ref()
+        .filter(|members| members.boot_session == boot)
+    {
+        for &life in &darwinbg.lives {
+            targets
+                .entry(life)
+                .and_modify(|(_, explicit)| *explicit = true)
+                .or_insert((None, true));
+        }
+    }
+    let mut cleared = Vec::new();
+    for (life, (job_id, explicit)) in targets {
+        if recorded_life(life)?.is_none() {
+            continue;
+        }
+        let needs_clear = explicit || has_darwinbg(life.pid)?;
+        if !needs_clear {
+            continue;
+        }
+        // Re-verify life identity right before clearing so a recycled pid is never touched.
+        if recorded_life(life)?.is_none() {
+            continue;
+        }
+        match clear_darwinbg(life.pid)? {
+            DarwinBgOutcome::Exited => {}
+            DarwinBgOutcome::Confirmed => cleared.push(ClearedDarwinBg {
+                job_id,
+                life,
+                confirmed: true,
+            }),
+            DarwinBgOutcome::Unconfirmed => cleared.push(ClearedDarwinBg {
+                job_id,
+                life,
+                confirmed: false,
+            }),
+        }
+    }
+    Ok(cleared)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clear_recorded_darwinbg_in(_ledger: &Ledger) -> io::Result<Vec<ClearedDarwinBg>> {
+    Ok(Vec::new())
+}
+
 /// End every group the ledger at `path` names that is still the job's — TERM, `grace`, then
 /// KILL — when `writer` wrote it, and mark it ended; the ledger stays until the next supervisor
 /// of the workspace takes it ([`take_lost`]).
@@ -507,8 +645,11 @@ pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<
     if !writer.wrote(&ledger) {
         return Ok(Ended::default());
     }
+    // Clear PRIO_DARWIN_BG on every recorded life before sending SIGTERM to any group.
+    let _ = clear_recorded_darwinbg_in(&ledger)?;
     let (signalled, unresolved) = end_groups(&ledger.groups, grace)?;
     ledger.ended = true;
+    ledger.darwinbg = None;
     replace(path, &ledger)?;
     Ok(Ended {
         signalled,
@@ -516,18 +657,21 @@ pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<
     })
 }
 
-/// For the supervisor now holding the workspace's socket: end whatever its lost predecessor's
-/// ledger still names that is still the job's, and take over the ledger. Which jobs to seal as
-/// lost is the job records' to say, not the ledger's: power loss can take the ledger with the
-/// processes it names.
+/// For the supervisor now holding the workspace's socket: clear `PRIO_DARWIN_BG` on every recorded
+/// life still running, end whatever its lost predecessor's ledger still names that is still the
+/// job's, and take over the ledger. Which jobs to seal as lost is the job records' to say, not the
+/// ledger's: power loss can take the ledger with the processes it names.
 ///
 /// Returns the unresolved groups -- the predecessor's, and those it inherited -- that processes
-/// still hold. They are written into a ledger of this process, which its supervisor carries on
-/// ([`record`]); with none, the ledger is removed.
-pub fn take_lost(path: &Path, grace: Duration) -> io::Result<Vec<UnresolvedGroup>> {
+/// still hold, plus every recorded life whose `PRIO_DARWIN_BG` was cleared before ending groups.
+/// Unresolved groups are written into a ledger of this process, which its supervisor carries on
+/// ([`Recorder::record`]); with none, the ledger is removed.
+pub fn take_lost(path: &Path, grace: Duration) -> io::Result<LostRecovery> {
     let Some(ledger) = read(path)? else {
-        return Ok(Vec::new());
+        return Ok(LostRecovery::default());
     };
+    // Clear PRIO_DARWIN_BG on every recorded life BEFORE ending any group (sending SIGTERM).
+    let darwinbg_cleared = clear_recorded_darwinbg_in(&ledger)?;
     // A prior signaling pass is not authority to discard a still-live group's evidence.
     let (_, newly) = end_groups(&ledger.groups, grace)?;
     let inherited: Vec<_> = ledger
@@ -551,10 +695,14 @@ pub fn take_lost(path: &Path, grace: Duration) -> io::Result<Vec<UnresolvedGroup
                 groups: Vec::new(),
                 ended: false,
                 unresolved: unresolved.clone(),
+                darwinbg: None,
             },
         )?;
     }
-    Ok(unresolved)
+    Ok(LostRecovery {
+        unresolved,
+        darwinbg_cleared,
+    })
 }
 
 /// The first recorded job that may still run, without signalling or rewriting its ledger.
@@ -1492,7 +1640,7 @@ os._exit(0)
                 life.unique_id
             );
             let recovered = take_lost(&ledger, Duration::from_millis(20)).unwrap();
-            assert!(recovered.is_empty());
+            assert!(recovered.unresolved.is_empty());
             assert!(!ledger.exists());
             let still_live = super::process_record(i32::try_from(child).unwrap())
                 .unwrap()
@@ -1714,7 +1862,12 @@ os._exit(0)
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!super::group_has_live_members(pgid).unwrap());
-        assert!(take_lost(&ledger, Duration::ZERO).unwrap().is_empty());
+        assert!(
+            take_lost(&ledger, Duration::ZERO)
+                .unwrap()
+                .unresolved
+                .is_empty()
+        );
         assert!(!ledger.exists());
     }
 
@@ -1762,7 +1915,12 @@ os._exit(0)
             super::Ended::default(),
             "an ended ledger ends nothing twice"
         );
-        assert!(take_lost(&ledger, Duration::ZERO).unwrap().is_empty());
+        assert!(
+            take_lost(&ledger, Duration::ZERO)
+                .unwrap()
+                .unresolved
+                .is_empty()
+        );
         assert!(!ledger.exists());
     }
 
@@ -1995,7 +2153,12 @@ os._exit(0)
             end_recorded(&ledger, Writer::Any, Duration::ZERO).unwrap(),
             super::Ended::default()
         );
-        assert!(take_lost(&ledger, Duration::ZERO).unwrap().is_empty());
+        assert!(
+            take_lost(&ledger, Duration::ZERO)
+                .unwrap()
+                .unresolved
+                .is_empty()
+        );
         assert!(
             group_alive(stranger_pgid),
             "the stranger's group was signalled"
@@ -2067,6 +2230,7 @@ os._exit(0)
                         members: None,
                     }],
                     unresolved: Vec::new(),
+                    darwinbg: None,
                 },
             )
             .unwrap();
@@ -2078,7 +2242,7 @@ os._exit(0)
                 },
                 "{label}"
             );
-            let taken = take_lost(&ledger, Duration::ZERO).unwrap();
+            let taken = take_lost(&ledger, Duration::ZERO).unwrap().unresolved;
             assert_eq!(
                 taken
                     .iter()
@@ -2100,7 +2264,7 @@ os._exit(0)
                 "{label}"
             );
             assert_eq!(
-                take_lost(&ledger, Duration::ZERO).unwrap(),
+                take_lost(&ledger, Duration::ZERO).unwrap().unresolved,
                 taken,
                 "{label}"
             );
@@ -2121,7 +2285,10 @@ os._exit(0)
                 "{label}"
             );
             assert!(
-                take_lost(&ledger, Duration::ZERO).unwrap().is_empty(),
+                take_lost(&ledger, Duration::ZERO)
+                    .unwrap()
+                    .unresolved
+                    .is_empty(),
                 "{label}"
             );
             assert!(!ledger.exists(), "{label}");

@@ -1354,10 +1354,16 @@ mod tests {
                 ended: true,
                 groups: vec![group(Some(started + 1), None)],
                 unresolved: Vec::new(),
+                darwinbg: None,
             },
         )
         .unwrap();
-        assert!(take_lost(&ledger, Duration::ZERO).unwrap().is_empty());
+        assert!(
+            take_lost(&ledger, Duration::ZERO)
+                .unwrap()
+                .unresolved
+                .is_empty()
+        );
         assert!(!ledger.exists());
     }
 

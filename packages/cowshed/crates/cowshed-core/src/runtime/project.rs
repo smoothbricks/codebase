@@ -11007,7 +11007,7 @@ self.finish_retire_intent(&workspace).await?;
         use super::supervisor::{CommitmentDraft, CommitmentSink as _};
 
         let ledger = super::job_groups::ledger_path(socket);
-        let unresolved = tokio::task::spawn_blocking(move || {
+        let recovered = tokio::task::spawn_blocking(move || {
             super::job_groups::take_lost(&ledger, LOST_JOB_GRACE)
         })
         .await
@@ -11018,6 +11018,8 @@ self.finish_retire_intent(&workspace).await?;
                 "cowshed doctor --json",
             )
         })?;
+        let unresolved = recovered.unresolved;
+        let darwinbg_cleared = recovered.darwinbg_cleared;
         for group in &unresolved {
             cowshed_os::eprintln!(
                 "cowshed: workspace {}: job {} process group {} (recorded by lost supervisor process \
@@ -11061,6 +11063,35 @@ self.finish_retire_intent(&workspace).await?;
                 error.hint,
             )
         })?;
+        if !darwinbg_cleared.is_empty()
+            && let Some(telemetry_root) = &config.telemetry_root
+        {
+            let publisher = super::job_spans::JobSpanPublisher::start(telemetry_root.clone());
+            let mut cleared_jobs = std::collections::BTreeSet::new();
+            for cleared in &darwinbg_cleared {
+                if let Some(job_id) = cleared.job_id
+                    && let Some((record, _)) = sealed
+                        .iter()
+                        .find(|(record, _)| record.job_id.get() == job_id)
+                {
+                    if !cleared.confirmed {
+                        publisher.record_recovered_gate_priority(
+                            record,
+                            super::job_spans::GatePriorityRow::DarwinBgUnconfirmed {
+                                pid: cleared.life.pid,
+                            },
+                        );
+                    }
+                    if cleared_jobs.insert(job_id) {
+                        publisher.record_recovered_gate_priority(
+                            record,
+                            super::job_spans::GatePriorityRow::DarwinBgCleared,
+                        );
+                    }
+                }
+            }
+            let _ = publisher.health().await;
+        }
         if sealed.is_empty() {
             return Ok(());
         }
@@ -17287,10 +17318,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 })
                 .await
                 {
-                    Ok(Ok(unresolved)) if !unresolved.is_empty() => cowshed_os::eprintln!(
+                    Ok(Ok(recovered)) if !recovered.unresolved.is_empty() => cowshed_os::eprintln!(
                         "cowshed: gc kept retired workspace {workspace}'s ledger {}: {} unresolved process group(s) remain",
                         ledger.display(),
-                        unresolved.len()
+                        recovered.unresolved.len()
                     ),
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => cowshed_os::eprintln!(
@@ -26960,7 +26991,8 @@ pub(crate) async fn require_lost_groups_released(
             ),
             "cowshed doctor --json",
         )
-    })?;
+    })?
+    .unresolved;
     if let Some(group) = groups.first() {
         return Err(CowshedError::conflict(
             format!(

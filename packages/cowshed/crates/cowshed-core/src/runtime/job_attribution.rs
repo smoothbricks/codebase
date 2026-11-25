@@ -185,6 +185,11 @@ impl AttributionSummary {
         Ok(part.summary(|image| image))
     }
 
+    /// Cumulative CPU microseconds observed across every life in the tree.
+    pub(crate) fn observed_cpu(&self) -> CpuMicros {
+        self.observed_cpu
+    }
+
     /// The observed CPU and the winning leaf, which a summary from parts must equal.
     #[cfg(test)]
     pub(crate) fn observed(&self) -> (CpuMicros, Option<&JobProcessLeaf>) {

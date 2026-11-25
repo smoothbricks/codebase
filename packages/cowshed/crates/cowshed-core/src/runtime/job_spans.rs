@@ -452,6 +452,29 @@ impl JobSpanPublisher {
         self.enqueue(info, RowKind::GatePriority(row));
     }
 
+    /// Queue a land-gate priority row during recovery from a sealed [`JobArtifactRecord`],
+    /// without waiting.
+    pub(crate) fn record_recovered_gate_priority(
+        &self,
+        record: &crate::storage::job_artifact::JobArtifactRecord,
+        row: GatePriorityRow,
+    ) {
+        let Some(permit) = self.reserve() else {
+            return;
+        };
+        permit.send(Request::Job(Box::new(JobSpanRow {
+            at: SystemTime::now(),
+            trace: TraceContext::mint(),
+            repo_id: record.repo_id.clone(),
+            workspace_incarnation: record.workspace_incarnation.clone(),
+            job_id: record.job_id,
+            grant_revision: record.grant_revision,
+            facts: SpanFacts::default(),
+            kind: RowKind::GatePriority(row),
+            charged_memory: None,
+        })));
+    }
+
     /// Queue one admitted phase change under the job's existing span and durable identity.
     pub(crate) fn record_admission(&self, info: &JobInfo, phase: AdmissionObservation) {
         self.enqueue(info, RowKind::Admission(phase));

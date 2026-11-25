@@ -3868,7 +3868,9 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
         format!(r#"{{"supervisor":1,"groups":[{{"jobId":9,"pgid":{pgid},"leaderStart":null}}]}}"#),
     )
     .unwrap();
-    let inherited = cowshed_core::runtime::job_groups::take_lost(&ledger, Duration::ZERO).unwrap();
+    let inherited = cowshed_core::runtime::job_groups::take_lost(&ledger, Duration::ZERO)
+        .unwrap()
+        .unresolved;
     assert_eq!(inherited.len(), 1);
     supervisor_config.group_ledger = Some(ledger.clone());
     supervisor_config.inherited_groups = inherited;
@@ -13923,7 +13925,7 @@ os.read(0, 1)
         });
         std::fs::write(&ledger, serde_json::to_vec(&payload).unwrap()).unwrap();
 
-        let _recovered =
+        let recovered =
             cowshed_core::runtime::job_groups::take_lost(&ledger, Duration::from_secs(2))
                 .expect("recovery take_lost");
         let status = child.wait_bounded().expect("reap burner");
@@ -13941,6 +13943,16 @@ os.read(0, 1)
         assert!(
             !observed.is_empty() && observed.iter().all(|&p| p == 63),
             "SIGTERM handler must observe pth_maxpriority == 63 (darwinbg cleared before TERM), got {observed:?}"
+        );
+        assert!(
+            recovered.darwinbg_cleared.iter().any(|cleared| {
+                cleared.job_id == Some(1)
+                    && cleared.life.pid == pid
+                    && cleared.life.birth.0 == record.unique_id
+                    && cleared.confirmed
+            }),
+            "recovery record must name the cleared darwinbg life: {:?}",
+            recovered.darwinbg_cleared
         );
     }
 

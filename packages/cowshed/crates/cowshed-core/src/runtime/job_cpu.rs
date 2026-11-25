@@ -17,9 +17,13 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::io::unix::AsyncFd;
+use tokio::sync::oneshot;
 
 use crate::error::{CowshedError, CpuAdmissionRefusal, Result};
 use crate::metadata::WorkspaceIncarnation;
@@ -131,6 +135,93 @@ impl Jobserver {
         self.tokens
     }
 
+    /// Whether this job owns its fifo (as opposed to sharing a parent job's fifo).
+    pub(crate) fn has_own_fifo(&self) -> bool {
+        self.own.is_some()
+    }
+
+    /// Duplicate the supervisor's own read-write fifo descriptor as non-blocking (`O_NONBLOCK` +
+    /// `FD_CLOEXEC`) for event-driven draining during a land's gate span. Returns `Ok(None)` when
+    /// this job shares a parent's fifo (withdrawn from with its parent) or holds only the implicit
+    /// token (`tokens == 1`).
+    pub(crate) fn start_drain(
+        &self,
+        mut on_withdrawn: impl FnMut(usize) + Send + 'static,
+    ) -> io::Result<Option<FifoDrainer>> {
+        let Some(file) = &self.own else {
+            return Ok(None);
+        };
+        if self.tokens.get() <= 1 {
+            return Ok(None);
+        }
+        // SAFETY: `file` is an open descriptor owned by `self`.
+        let dup = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dup` is a freshly duplicated owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(dup) };
+        // SAFETY: reading and setting `O_NONBLOCK` on our owned duplicated descriptor.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: setting `O_NONBLOCK` on our owned duplicated descriptor.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let async_fd = AsyncFd::new(fd)?;
+        let (stop_tx, mut stop_rx) = oneshot::channel::<bool>();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::<u8>::new();
+            let mut buf = [0_u8; 256];
+            // Drain everything currently sitting in the fifo before waiting for readability.
+            let initial = drain_nonblocking(async_fd.get_ref(), &mut buf, &mut held);
+            if initial > 0 {
+                on_withdrawn(initial);
+            }
+            let restore = loop {
+                tokio::select! {
+                    biased;
+                    stop = &mut stop_rx => break stop.unwrap_or(false),
+                    ready = async_fd.readable() => {
+                        let Ok(mut guard) = ready else {
+                            break false;
+                        };
+                        let count = drain_nonblocking(async_fd.get_ref(), &mut buf, &mut held);
+                        if count > 0 {
+                            on_withdrawn(count);
+                        } else {
+                            guard.clear_ready();
+                        }
+                    }
+                }
+            };
+            if restore && !held.is_empty() {
+                let mut written = 0;
+                while written < held.len() {
+                    match write_nonblocking(async_fd.get_ref(), &held[written..]) {
+                        Ok(0) => break,
+                        Ok(n) => written += n,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            let Ok(mut guard) = async_fd.writable().await else {
+                                break;
+                            };
+                            guard.clear_ready();
+                        }
+                        Err(_) => break,
+                    }
+                }
+                return written;
+            }
+            0
+        });
+        Ok(Some(FifoDrainer {
+            stop: Some(stop_tx),
+            task: Some(task),
+        }))
+    }
+
     /// A fifo of `tokens` in `directory`, for one job. Named by this supervisor's pid and a
     /// sequence, so no two supervisors -- not even two in one process -- name the same fifo.
     fn make(directory: &Path, tokens: NonZeroUsize) -> io::Result<Self> {
@@ -178,6 +269,74 @@ impl Jobserver {
                 self.fifo.display()
             );
         }
+    }
+}
+
+/// Event-driven drainer holding withdrawn token bytes for one job's fifo during a land's gate
+/// span (05_gateway.md "A land's gate takes tokens back"). Dropping it without calling
+/// [`Self::restore`] cancels the drain without writing bytes back (for a job that ended).
+#[derive(Debug)]
+pub(crate) struct FifoDrainer {
+    stop: Option<oneshot::Sender<bool>>,
+    task: Option<tokio::task::JoinHandle<usize>>,
+}
+
+impl FifoDrainer {
+    /// Stop draining, write every withdrawn token byte back to the fifo, and return how many bytes
+    /// were restored.
+    pub(crate) async fn restore(mut self) -> usize {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(true);
+        }
+        match self.task.take() {
+            Some(task) => task.await.unwrap_or(0),
+            None => 0,
+        }
+    }
+}
+
+impl Drop for FifoDrainer {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(false);
+        }
+    }
+}
+
+fn drain_nonblocking(fd: &OwnedFd, buf: &mut [u8], held: &mut Vec<u8>) -> usize {
+    let mut total = 0;
+    loop {
+        // SAFETY: `fd` is a live owned descriptor and `buf` is writable for `buf.len()` bytes.
+        let read = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if read > 0 {
+            let n = usize::try_from(read).expect("positive read");
+            held.extend_from_slice(&buf[..n]);
+            total += n;
+        } else if read == 0 {
+            break;
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+    }
+    total
+}
+
+fn write_nonblocking(fd: &OwnedFd, bytes: &[u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: `fd` is a live owned descriptor and `bytes` is readable for `bytes.len()` bytes.
+        let written = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        if written >= 0 {
+            return Ok(usize::try_from(written).expect("non-negative write"));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
     }
 }
 

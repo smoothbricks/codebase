@@ -184,6 +184,8 @@ struct Snapshot {
     /// Every life the fold holds with no folded exit, by its kernel unique id. Shared with the
     /// ledger's claims, so a publication never copies it.
     running: Arc<[ProcessIdentity]>,
+    /// Monotonic timestamp of the latest process-tree rusage sample folded into `attribution`.
+    sampled_at: Instant,
 }
 
 struct Driver {
@@ -274,6 +276,7 @@ impl ProcessMonitor {
             },
             attribution: AttributionSummary::from_observed(std::iter::empty()),
             running: Arc::from([]),
+            sampled_at: Instant::now(),
         }));
         let (requests, receiver) = mpsc::channel();
         let published = Arc::clone(&snapshot);
@@ -507,6 +510,17 @@ impl ProcessMonitor {
     /// members the fold never adopted are not here; a retirement's membership read adopts them.
     pub fn running_lives(&self) -> Arc<[ProcessIdentity]> {
         Arc::clone(&self.driver.snapshot.load().running)
+    }
+
+    /// Lock-free read of the latest process-tree cumulative CPU sample (`(sampled_at, observed_cpu)`),
+    /// for measuring rusage gained between two window-end samples without triggering another
+    /// kernel scan (05_gateway.md "A land's gate takes tokens back").
+    pub(crate) fn observed_cpu_sample(
+        &self,
+    ) -> Option<(Instant, crate::api::resources::CpuMicros)> {
+        let snapshot = self.driver.snapshot.load();
+        let cpu = snapshot.attribution.as_ref().ok()?.observed_cpu();
+        Some((snapshot.sampled_at, cpu))
     }
 
     /// One publication load and the canonical B13 comparison; no resample or CPU-window move.
@@ -769,6 +783,7 @@ impl<P: ProcessReads> Writer<P> {
             tree,
             attribution: self.observer.attribution_summary(),
             running,
+            sampled_at: Instant::now(),
         }));
         if membership_changed && let Some(changed) = &self.ledger_changes {
             changed.notify_one();

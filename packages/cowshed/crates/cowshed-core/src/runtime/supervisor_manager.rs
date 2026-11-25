@@ -968,7 +968,8 @@ pub async fn stop_other_build(
                     ),
                     "end the jobs' process groups yourself, remove that file, then retry",
                 )
-            })?;
+            })?
+            .unresolved;
     for group in &unresolved {
         cowshed_os::eprintln!(
             "cowshed: job {} process group {} that pid {pid} left still has processes but its \

@@ -20,17 +20,47 @@ use std::time::{Duration, Instant};
 
 use crate::api::dto::JobId;
 use crate::runtime::job_groups::{JobGroupClaim, Recorder, UnresolvedGroup};
+use crate::runtime::process_tree::ProcessIdentity;
 use crate::runtime::supervisor_socket::PublicationLease;
 
 use super::JobStateRecord;
 
 /// Minimum interval between ordinary ledger publications on disk (11_shell.md §Supervisor
-/// recovery). Final retirement and runtime teardown bypass this bound and flush at once.
+/// recovery). Final retirement, runtime teardown, and `PRIO_DARWIN_BG` durability flushes bypass
+/// this bound and flush at once.
 const MIN_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// One immutable cut of the actor's current claims. Each claim's member lives are the `Arc` the
-/// job's observation published, shared as handed and never reloaded here.
-type Cut = Vec<JobGroupClaim>;
+/// One immutable cut of the actor's current claims and active `PRIO_DARWIN_BG` lives. Each
+/// claim's member lives are the `Arc` the job's observation published, shared as handed and never
+/// reloaded here.
+struct Cut {
+    claims: Vec<JobGroupClaim>,
+    darwinbg: Vec<ProcessIdentity>,
+    /// Optional completion reply when a caller requires the cut on disk before acting (such as
+    /// persisting lives before setting `PRIO_DARWIN_BG`).
+    ack: Option<tokio::sync::oneshot::Sender<io::Result<()>>>,
+}
+
+impl Cut {
+    fn new() -> Self {
+        Self {
+            claims: Vec::new(),
+            darwinbg: Vec::new(),
+            ack: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.claims.clear();
+        self.darwinbg.clear();
+        self.ack = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.claims.is_empty() && self.darwinbg.is_empty() && self.ack.is_none()
+    }
+}
+
 type FinishReply = tokio::sync::oneshot::Sender<io::Result<()>>;
 
 /// Runtime teardown's custody of every job, retired on the writer thread.
@@ -46,6 +76,8 @@ struct Custody {
 struct Slot<C, F, T> {
     /// The newest cut the writer has not taken; a newer one replaces it.
     latest: Option<C>,
+    /// Whether the waiting cut bypasses `min_interval` and must flush immediately.
+    urgent: bool,
     /// Whether the writer is writing a cut it took.
     in_flight: bool,
     /// Why the newest finished write failed, until a later write succeeds. Never retried.
@@ -115,6 +147,7 @@ impl<C, F, T> Slot<C, F, T> {
     fn with_interval(min_interval: Duration) -> Self {
         Self {
             latest: None,
+            urgent: false,
             in_flight: false,
             failure: None,
             min_interval,
@@ -127,6 +160,17 @@ impl<C, F, T> Slot<C, F, T> {
     fn publish(&mut self, cut: C) -> Result<Option<C>, C> {
         match self.phase {
             Phase::Open => Ok(self.latest.replace(cut)),
+            _ => Err(cut),
+        }
+    }
+
+    /// Replace the waiting cut and mark it urgent so it bypasses `min_interval`.
+    fn publish_urgent(&mut self, cut: C) -> Result<Option<C>, C> {
+        match self.phase {
+            Phase::Open => {
+                self.urgent = true;
+                Ok(self.latest.replace(cut))
+            }
             _ => Err(cut),
         }
     }
@@ -181,7 +225,8 @@ impl<C, F, T> Slot<C, F, T> {
         match &self.phase {
             Phase::Open => {
                 if self.latest.is_some() {
-                    if !self.min_interval.is_zero()
+                    if !self.urgent
+                        && !self.min_interval.is_zero()
                         && let Some(last) = self.last_published
                         && let Some(deadline) = last.checked_add(self.min_interval)
                         && now < deadline
@@ -189,6 +234,7 @@ impl<C, F, T> Slot<C, F, T> {
                         return Next::WaitUntil(deadline);
                     }
                     if let Some(cut) = self.latest.take() {
+                        self.urgent = false;
                         self.in_flight = true;
                         return Next::Work(Work::Write(cut));
                     }
@@ -197,6 +243,7 @@ impl<C, F, T> Slot<C, F, T> {
             }
             Phase::Finishing(_) => {
                 if let Some(cut) = self.latest.take() {
+                    self.urgent = false;
                     self.in_flight = true;
                     return Next::Work(Work::Write(cut));
                 }
@@ -275,7 +322,9 @@ struct State {
 impl State {
     fn recycle(&mut self, cut: Cut) {
         debug_assert!(cut.is_empty(), "a recycled cut holds no member lives");
-        if cut.capacity() > self.spare.capacity() {
+        if cut.claims.capacity() > self.spare.claims.capacity()
+            || cut.darwinbg.capacity() > self.spare.darwinbg.capacity()
+        {
             self.spare = cut;
         }
     }
@@ -311,7 +360,7 @@ impl GroupLedgerWriter {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 slot: Slot::with_interval(MIN_PUBLISH_INTERVAL),
-                spare: Vec::new(),
+                spare: Cut::new(),
             }),
             wake: Condvar::new(),
         });
@@ -331,15 +380,28 @@ impl GroupLedgerWriter {
         Ok(Self { shared, path })
     }
 
-    /// Hand the current claims to the writer without waiting on its I/O: they replace any cut
-    /// still waiting. Refused once the final flush or teardown has begun.
-    pub(super) fn publish(&self, claims: impl Iterator<Item = JobGroupClaim>) -> io::Result<()> {
-        let mut cut = std::mem::take(&mut self.shared.lock().spare);
-        cut.extend(claims);
+    /// Hand the current claims and active `PRIO_DARWIN_BG` lives to the writer without waiting on
+    /// its I/O: they replace any cut still waiting. Refused once the final flush or teardown has
+    /// begun.
+    pub(super) fn publish(
+        &self,
+        claims: impl Iterator<Item = JobGroupClaim>,
+        darwinbg: &[ProcessIdentity],
+    ) -> io::Result<()> {
+        let mut cut = std::mem::replace(&mut self.shared.lock().spare, Cut::new());
+        cut.claims.extend(claims);
+        cut.darwinbg.extend_from_slice(darwinbg);
         let mut state = self.shared.lock();
         match state.slot.publish(cut) {
             Ok(replaced) => {
                 if let Some(mut replaced) = replaced {
+                    if let Some(ack) = replaced.ack.take() {
+                        // A superseded urgent cut's waiter is answered by the newer cut: move it.
+                        if let Some(latest) = state.slot.latest.as_mut() {
+                            latest.ack = Some(ack);
+                            state.slot.urgent = true;
+                        }
+                    }
                     replaced.clear();
                     state.recycle(replaced);
                 }
@@ -355,6 +417,46 @@ impl GroupLedgerWriter {
                 Err(error)
             }
         }
+    }
+
+    /// Hand `claims` and `darwinbg` to the writer, bypassing `MIN_PUBLISH_INTERVAL`, and answer on
+    /// the returned channel once the cut has been published on disk (05_gateway.md "What a crash
+    /// leaves": append to `.groups` before setting `PRIO_DARWIN_BG`).
+    pub(super) fn publish_immediate(
+        &self,
+        claims: impl Iterator<Item = JobGroupClaim>,
+        darwinbg: &[ProcessIdentity],
+    ) -> tokio::sync::oneshot::Receiver<io::Result<()>> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let mut cut = std::mem::replace(&mut self.shared.lock().spare, Cut::new());
+        cut.claims.extend(claims);
+        cut.darwinbg.extend_from_slice(darwinbg);
+        cut.ack = Some(reply);
+        let mut state = self.shared.lock();
+        match state.slot.publish_urgent(cut) {
+            Ok(replaced) => {
+                if let Some(mut replaced) = replaced {
+                    if let Some(old_ack) = replaced.ack.take() {
+                        let _ = old_ack.send(Ok(()));
+                    }
+                    replaced.clear();
+                    state.recycle(replaced);
+                }
+                drop(state);
+                self.shared.wake.notify_one();
+            }
+            Err(mut cut) => {
+                let ack = cut.ack.take();
+                cut.clear();
+                state.recycle(cut);
+                let error = self.refused(state.slot.describe());
+                drop(state);
+                if let Some(ack) = ack {
+                    let _ = ack.send(Err(error));
+                }
+            }
+        }
+        answer
     }
 
     /// Close admission and flush the waiting cut after the in-flight one. The answer comes
@@ -482,8 +584,21 @@ fn write_ledger(
         drop(state);
         match work {
             Work::Write(mut cut) => {
-                let result = record(&mut recorder, cut.iter().cloned(), &mut inherited);
+                let ack = cut.ack.take();
+                let result = record(
+                    &mut recorder,
+                    cut.claims.iter().cloned(),
+                    &cut.darwinbg,
+                    &mut inherited,
+                );
                 let finished_at = Instant::now();
+                if let Some(ack) = ack {
+                    let answer = match &result {
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+                    };
+                    let _ = ack.send(answer);
+                }
                 cut.clear();
                 state = shared.lock();
                 state.slot.written(result, finished_at);
@@ -504,6 +619,7 @@ fn write_ledger(
                 let _ = record(
                     &mut recorder,
                     super::job_group_claims(&jobs),
+                    &[],
                     &mut inherited,
                 );
                 let result =
@@ -526,9 +642,10 @@ fn write_ledger(
 fn record(
     recorder: &mut Recorder,
     claims: impl Iterator<Item = JobGroupClaim> + Clone,
+    darwinbg: &[ProcessIdentity],
     inherited: &mut Vec<UnresolvedGroup>,
 ) -> io::Result<bool> {
-    match recorder.record(claims, inherited) {
+    match recorder.record_with_darwinbg(claims, inherited, darwinbg) {
         Ok(recorded) => {
             for error in &recorded.uninspected {
                 cowshed_os::eprintln!(
@@ -902,7 +1019,7 @@ mod tests {
         // pace the remaining 19 so an unthrottled writer would rewrite on every cut.
         let same = GroupLeader::from_parts(42, 1, 100).expect("valid group leader");
         writer
-            .publish([JobGroupClaim::group(1, same)].into_iter())
+            .publish([JobGroupClaim::group(1, same)].into_iter(), &[])
             .expect("publish initial cut");
         let first_inode = loop {
             if let Some(inode) = sample_inode(&ledger) {
@@ -914,7 +1031,7 @@ mod tests {
         let mut identical_rewrites = 1_usize;
         for _ in 1..20 {
             writer
-                .publish([JobGroupClaim::group(1, same)].into_iter())
+                .publish([JobGroupClaim::group(1, same)].into_iter(), &[])
                 .expect("publish identical cut");
             tokio::time::sleep(Duration::from_millis(10)).await;
             record_inode(&ledger, &mut last_inode, &mut identical_rewrites);
@@ -930,7 +1047,7 @@ mod tests {
             let pgid = i32::try_from(100 + step).expect("pgid");
             let leader = GroupLeader::from_parts(pgid, 1 + step, 1000 + step).expect("leader");
             writer
-                .publish([JobGroupClaim::group(10 + step, leader)].into_iter())
+                .publish([JobGroupClaim::group(10 + step, leader)].into_iter(), &[])
                 .expect("publish distinct cut");
             tokio::time::sleep(Duration::from_millis(25)).await;
             record_inode(&ledger, &mut last_inode, &mut distinct_rewrites);

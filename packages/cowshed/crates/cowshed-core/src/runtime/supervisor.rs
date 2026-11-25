@@ -6677,7 +6677,7 @@ impl SupervisorActor {
             return;
         }
         if let Some(writer) = &self.group_ledger
-            && let Err(error) = writer.publish(job_group_claims(&self.jobs))
+            && let Err(error) = writer.publish(job_group_claims(&self.jobs), &[])
         {
             cowshed_os::eprintln!(
                 "cowshed: cannot queue process-group ledger {}: {error}",

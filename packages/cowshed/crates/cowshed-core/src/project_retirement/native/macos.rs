@@ -704,7 +704,9 @@ mod tests {
             release: Some(release),
             output: Some(output),
         };
-        let taken = crate::runtime::job_groups::take_lost(&staged_ledger, Duration::ZERO).unwrap();
+        let taken = crate::runtime::job_groups::take_lost(&staged_ledger, Duration::ZERO)
+            .unwrap()
+            .unresolved;
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].pgid(), held.pgid);
 

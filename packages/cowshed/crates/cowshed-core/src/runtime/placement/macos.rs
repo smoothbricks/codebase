@@ -127,6 +127,80 @@ pub fn decay_group(pgid: i32, nice: i32) -> io::Result<()> {
     place_group_nice(pgid, nice).map(drop)
 }
 
+/// Thread priority ceiling reported by `PROC_PIDTHREADINFO` (`pth_maxpriority`) while
+/// `PRIO_DARWIN_BG` is active on a process (05_gateway.md "A land's gate takes tokens back").
+pub const DARWIN_BG_MAX_PRIORITY: i32 = 4;
+
+/// Thread priority ceiling reported by `PROC_PIDTHREADINFO` (`pth_maxpriority`) when
+/// `PRIO_DARWIN_BG` is not active on a process.
+pub const DARWIN_NORMAL_MAX_PRIORITY: i32 = 63;
+
+/// Result of setting or clearing `PRIO_DARWIN_BG` on one process, checked via `PROC_PIDTHREADINFO`
+/// (`procinfo::thread_max_priorities`) — never `getpriority` or `getiopolicy_np`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DarwinBgOutcome {
+    /// Every thread read back the expected `pth_maxpriority` (`4` on set, `63` on clear).
+    Confirmed,
+    /// `setpriority` succeeded, but `PROC_PIDTHREADINFO` readback disagreed (emit warn row).
+    Unconfirmed,
+    /// The process exited before or during the call (`ESRCH` / absent from `proc_pidinfo`).
+    Exited,
+}
+
+/// Set `PRIO_DARWIN_BG` on `pid` and confirm via `PROC_PIDTHREADINFO` (`pth_maxpriority == 4`).
+pub fn set_darwinbg(pid: u32) -> io::Result<DarwinBgOutcome> {
+    apply_darwinbg(pid, libc::PRIO_DARWIN_BG, DARWIN_BG_MAX_PRIORITY)
+}
+
+/// Clear `PRIO_DARWIN_BG` on `pid` and confirm via `PROC_PIDTHREADINFO` (`pth_maxpriority == 63`).
+pub fn clear_darwinbg(pid: u32) -> io::Result<DarwinBgOutcome> {
+    apply_darwinbg(pid, 0, DARWIN_NORMAL_MAX_PRIORITY)
+}
+
+/// Whether any live thread of `pid` currently has `PRIO_DARWIN_BG` (`pth_maxpriority == 4`), read
+/// solely via `PROC_PIDTHREADINFO`.
+pub fn has_darwinbg(pid: u32) -> io::Result<bool> {
+    let signed = i32::try_from(pid).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pid {pid} exceeds i32"),
+        )
+    })?;
+    Ok(procinfo::thread_max_priorities(signed)?
+        .is_some_and(|priorities| priorities.contains(&DARWIN_BG_MAX_PRIORITY)))
+}
+
+fn apply_darwinbg(
+    pid: u32,
+    policy: i32,
+    expected_max_priority: i32,
+) -> io::Result<DarwinBgOutcome> {
+    let signed = i32::try_from(pid).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pid {pid} exceeds i32"),
+        )
+    })?;
+    // SAFETY: `setpriority(PRIO_DARWIN_PROCESS, pid, policy)` takes plain integer arguments.
+    if unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, policy) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(DarwinBgOutcome::Exited);
+        }
+        return Err(error);
+    }
+    match procinfo::thread_max_priorities(signed)? {
+        None => Ok(DarwinBgOutcome::Exited),
+        Some(priorities)
+            if !priorities.is_empty()
+                && priorities.iter().all(|&prio| prio == expected_max_priority) =>
+        {
+            Ok(DarwinBgOutcome::Confirmed)
+        }
+        Some(_) => Ok(DarwinBgOutcome::Unconfirmed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

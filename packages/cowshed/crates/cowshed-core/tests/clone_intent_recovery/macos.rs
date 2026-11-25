@@ -4687,7 +4687,8 @@ async fn land_fold_retires_empty_ledger_and_refuses_while_unresolved_group_remai
     let held = LeaderlessGroup::start(&unresolved_ledger, 9);
     let taken =
         cowshed_core::runtime::job_groups::take_lost(&unresolved_ledger, std::time::Duration::ZERO)
-            .expect("take lost into unresolved");
+            .expect("take lost into unresolved")
+            .unresolved;
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].pgid(), held.pgid);
 
@@ -4754,7 +4755,8 @@ async fn retire_pending_workspace_retires_empty_ledger_and_refuses_while_unresol
     ));
     let held = LeaderlessGroup::start(&ledger, 11);
     let taken = cowshed_core::runtime::job_groups::take_lost(&ledger, std::time::Duration::ZERO)
-        .expect("take lost into unresolved");
+        .expect("take lost into unresolved")
+        .unresolved;
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].pgid(), held.pgid);
 
