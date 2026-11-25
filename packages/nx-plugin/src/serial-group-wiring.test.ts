@@ -279,7 +279,7 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
     const grouped = records(profile.overrides).filter(
       (override) => override['test-group'] === 'real-apfs' || override['test-group'] === 'real-apfs-host',
     );
-    const setups = records(profile.scripts).filter((rule) => rule.setup !== undefined);
+    const setups = records(profile.scripts).filter((rule) => rule.setup === 'apfs-sweep');
     expect(setups.map(({ setup, platform, filter }) => ({ setup, platform, filter }))).toEqual([
       {
         setup: 'apfs-sweep',

@@ -118,3 +118,16 @@ setup = 'apfs-sweep'
 filter = 'binary_id(cowshed-core::apfs_integration)'
 platform = 'cfg(target_os="macos")'
 setup = 'apfs-sweep'
+
+# A cowshed test thread starts with production's stack. The gateway, each workspace supervisor and
+# each client run their whole runtime on the process's main thread, 8 MiB on macOS, while a test
+# drives the same chain in process on libtest's thread, 2 MiB by default. Measured 2026-11-25 on a
+# debug build: adopting a checkout (open, recover, replay an unfinished intent, re-adopt, ensure its
+# supervisor, render its sandbox, detect capabilities) used 2,109,744 bytes of the test thread's
+# stack in about 100 frames, and a fixture change of a few kilobytes overflowed it.
+[scripts.setup.production-stack]
+command = { command-line = "sh -c 'echo RUST_MIN_STACK=8388608 >> \"$NEXTEST_ENV\"'", relative-to = "none" }
+
+[[profile.default.scripts]]
+filter = 'package(cowshed-core) or package(cowshed-cli) or package(cowshed-shell)'
+setup = 'production-stack'
