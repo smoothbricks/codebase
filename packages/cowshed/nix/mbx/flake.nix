@@ -23,8 +23,8 @@
 # -Zosx-rpath-install-name keyed as written rather than bypassing every compilation that carries
 # it, and each pool priority ordered by predicted run time with aged requests first, a reservation
 # named by its class (`mbx reserve --name`, the endpoint's `name`) so its run time is predicted, and an
-# interactive priority above the gate's that decays to normal at 120 s and low at 240 s of its job's
-# age (MBX_SCHEDULER_JOB_STARTED_MS), each band its own lane, and a Nix shell's link variables refused
+# interactive priority above the gate's that decays to normal at 120 s and low at 240 s from its job's
+# first admitted ask (MBX_SCHEDULER_JOB_ID, MBX_SCHEDULER_JOB_STARTED_MS), each band its own lane, and a Nix shell's link variables refused
 # only when the driver's own ld is a wrapper, the background collector's unlinks paced (1,000 a
 # second, flights 200), a size budget that never takes a present checkout's target, a compilation's
 # paths resolved once, flights reclaimed after an hour unpublished or seven days unused, and a
@@ -33,7 +33,10 @@
 # settled, the proven pool model emitted with native compares, and an over-budget sweep that evicts
 # what was stored or hit since the last sweep last, rooted or not, and build-script runs that record
 # key diagnostics, and a test runner that asks a supervisor's gate (MBX_TEST_GATE) before it starts each
-# nextest test, which the reservation endpoint says of itself (`capabilities`), from smoothbricks/mr-boxington at the pinned revision.
+# nextest test, which the reservation endpoint says of itself (`capabilities`) with the pool's aging
+# bound (`aging_ms`), build-script launchers repaired in a target mbx did not place, and each interactive
+# job's first admission published by `mbx stats --scheduler --json` (`first_admitted`), from
+# smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -45,7 +48,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/76928db00908297c16a386be0a0439fe05f44dc5";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/26b27707f8e115e28c89657eb3d3055f7e9dd720";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
