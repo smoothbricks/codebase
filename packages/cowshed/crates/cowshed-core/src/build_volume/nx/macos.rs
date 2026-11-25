@@ -11,6 +11,11 @@ use cowshed_os::process::Holder;
 use super::{Hold, TreeHold, command_line, listed, walk_begins};
 use crate::census::{Asked, CensusScope, Lineage};
 
+/// Whether `pid` runs inside a sandbox: Darwin's `sandbox_check` (`procinfo::sandboxed`).
+pub(super) fn daemon_is_sandboxed(pid: libc::pid_t) -> io::Result<bool> {
+    procinfo::sandboxed(pid)
+}
+
 /// The processes with a descriptor open on each of `files`, in order, from one pass over the
 /// processes a census asks about ([`census_pids`]): each vnode descriptor's device and inode
 /// (`PROC_PIDFDVNODEINFO`) against each file's. Event-only opens hold nothing. A missing file has

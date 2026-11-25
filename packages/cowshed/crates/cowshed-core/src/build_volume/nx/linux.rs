@@ -10,8 +10,46 @@ use std::path::{Path, PathBuf};
 
 use cowshed_os::process::Holder;
 
-use super::{Hold, TreeHold, command_line, listed, walk_begins};
+use super::{Hold, TreeHold, command_line, linux_process_is_sandboxed, listed, walk_begins};
 use crate::census::{Asked, CensusScope, Lineage};
+
+/// Whether `pid` runs inside cowshed's Linux sandbox: either in a different user or network
+/// namespace from this controller (`sandbox/linux/launcher.rs` unshares both) or inside a job
+/// cgroup (`runtime/job_cgroup.rs`). A host daemon under a `NoNewPrivileges` systemd service
+/// shares both namespaces and sits in no job cgroup, so it is recognized as a host daemon.
+/// An exited or unreadable (`ENOENT`/`ESRCH`/`EACCES`) process fails closed as `true`.
+pub(super) fn daemon_is_sandboxed(pid: libc::pid_t) -> io::Result<bool> {
+    let own_user = fs::read_link("/proc/self/ns/user")?;
+    let own_net = fs::read_link("/proc/self/ns/net")?;
+    let read_ns = |kind: &str| -> io::Result<Option<std::ffi::OsString>> {
+        let path = format!("/proc/{pid}/ns/{kind}");
+        match fs::read_link(&path) {
+            Ok(target) => Ok(Some(target.into_os_string())),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(io::Error::new(error.kind(), format!("{path}: {error}"))),
+        }
+    };
+    let process_user = read_ns("user")?;
+    let process_net = read_ns("net")?;
+    let in_job_cgroup = match crate::runtime::job_cgroup::job_cgroup_of(pid) {
+        Ok(cgroup) => Some(cgroup.is_some()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    Ok(linux_process_is_sandboxed(
+        own_user.as_os_str(),
+        own_net.as_os_str(),
+        process_user.as_deref(),
+        process_net.as_deref(),
+        in_job_cgroup,
+    ))
+}
 
 /// The processes with a descriptor open on each of `files`, in order, from one pass over the
 /// processes a census asks about ([`census_pids`]): each descriptor's device and inode

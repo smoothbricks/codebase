@@ -42,8 +42,30 @@ use linux as platform;
 use macos as platform;
 
 pub(crate) use platform::inode_holders;
-use platform::{all_pids, census_pids, descriptor_holders, executable, lineage_of};
+use platform::{
+    all_pids, census_pids, daemon_is_sandboxed, descriptor_holders, executable, lineage_of,
+};
 pub use platform::{tree_holds, volume_holders};
+
+/// Whether a Linux process's observed sandbox signals place it inside cowshed's sandbox: either
+/// its user or network namespace differs from this controller's (`sandbox/linux/launcher.rs`
+/// unshares both), or it runs in a job cgroup (`runtime/job_cgroup.rs`). Any unread or exited
+/// signal (`None`) fails closed as sandboxed.
+#[cfg(any(target_os = "linux", test))]
+fn linux_process_is_sandboxed(
+    own_user_ns: &std::ffi::OsStr,
+    own_net_ns: &std::ffi::OsStr,
+    process_user_ns: Option<&std::ffi::OsStr>,
+    process_net_ns: Option<&std::ffi::OsStr>,
+    in_job_cgroup: Option<bool>,
+) -> bool {
+    match (process_user_ns, process_net_ns, in_job_cgroup) {
+        (Some(user_ns), Some(net_ns), Some(in_cgroup)) => {
+            user_ns != own_user_ns || net_ns != own_net_ns || in_cgroup
+        }
+        _ => true,
+    }
+}
 
 /// Processes, each as `pid <n> (<argv>)`, joined by `; `.
 pub struct Holders<'a>(pub &'a [Holder]);
@@ -168,7 +190,7 @@ pub fn hand_over_daemon_records(
         let Some(live) = crate::runtime::nx_daemon::live_record(&record) else {
             continue;
         };
-        if procinfo::sandboxed(live.pid)? {
+        if daemon_is_sandboxed(live.pid)? {
             continue;
         }
         let directory = into.join(data).join(DAEMON_DIRECTORY);
@@ -1872,7 +1894,7 @@ mod tests {
         let linked = Linked::new(&root, &stock);
         stock.daemon("--start");
         let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
-        assert!(!procinfo::sandboxed(daemon).unwrap());
+        assert!(!daemon_is_sandboxed(daemon).unwrap());
 
         hand_over_daemon_records(&linked.from, &linked.state, &linked.into).unwrap();
         super::super::link::point(&stock.checkout, &linked.into).unwrap();
@@ -1892,6 +1914,76 @@ mod tests {
         super::super::link::point(&stock.checkout, &linked.from).unwrap();
         assert_eq!(events.next(), Event::Exit);
         assert!(!procinfo::running(daemon).unwrap());
+    }
+
+    /// A Linux process counts as sandboxed when its user or network namespace differs from the
+    /// controller's or it runs in a job cgroup, and fails closed when any reading is missing.
+    #[test]
+    fn linux_sandbox_classification_distinguishes_host_daemons_from_cowshed_sandboxes() {
+        use std::ffi::OsStr;
+
+        let own_user = OsStr::new("user:[4026531837]");
+        let own_net = OsStr::new("net:[4026531840]");
+        let other_user = OsStr::new("user:[4026532200]");
+        let other_net = OsStr::new("net:[4026532201]");
+
+        for (label, user, net, cgroup, expected) in [
+            (
+                "host daemon shares namespaces and sits in no job cgroup",
+                Some(own_user),
+                Some(own_net),
+                Some(false),
+                false,
+            ),
+            (
+                "different user namespace is sandboxed",
+                Some(other_user),
+                Some(own_net),
+                Some(false),
+                true,
+            ),
+            (
+                "different network namespace is sandboxed",
+                Some(own_user),
+                Some(other_net),
+                Some(false),
+                true,
+            ),
+            (
+                "job cgroup is sandboxed even in the same namespaces",
+                Some(own_user),
+                Some(own_net),
+                Some(true),
+                true,
+            ),
+            (
+                "unreadable user namespace fails closed",
+                None,
+                Some(own_net),
+                Some(false),
+                true,
+            ),
+            (
+                "unreadable network namespace fails closed",
+                Some(own_user),
+                None,
+                Some(false),
+                true,
+            ),
+            (
+                "exited process with unreadable cgroup fails closed",
+                Some(own_user),
+                Some(own_net),
+                None,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                linux_process_is_sandboxed(own_user, own_net, user, net, cgroup),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     /// Land 5.3's output enumeration (16_build_volumes.md): a root whose package graph resolves no
