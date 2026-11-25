@@ -13106,6 +13106,25 @@ for line in f_in:
             );
         }
 
+        async fn wait_tokens_backstop(&mut self, n: usize) {
+            self.writer
+                .write_all(format!("wait_tokens {n}\n").as_bytes())
+                .await
+                .unwrap();
+            self.writer.flush().await.unwrap();
+            let mut line = String::new();
+            match tokio::time::timeout(
+                cowshed_os::test_backstop::NO_PROGRESS,
+                self.reader.read_line(&mut line),
+            )
+            .await
+            {
+                Ok(Ok(_)) => assert_eq!(line.trim(), format!("restored {n}")),
+                Ok(Err(error)) => panic!("wait_tokens_backstop read error: {error}"),
+                Err(_) => panic!("wait_tokens({n}) did not complete before NO_PROGRESS"),
+            }
+        }
+
         async fn exit(mut self, handle: &WorkspaceSupervisorHandle) {
             assert_eq!(self.cmd("exit").await, "bye");
             let ended = within_silence("jobserver client exit", handle.wait(self.job_id))
@@ -13923,5 +13942,120 @@ os.read(0, 1)
             !observed.is_empty() && observed.iter().all(|&p| p == 63),
             "SIGTERM handler must observe pth_maxpriority == 63 (darwinbg cleared before TERM), got {observed:?}"
         );
+    }
+
+    /// Red (d): a gateway that goes silent while a land's gate runs (without closing the socket).
+    /// Waiting the real 15 s `deadline::HEARTBEAT_SILENCE` bound (no test knob), the supervisor
+    /// treats gate state as off, restores every drained token byte (`job.tokens.restored`), and
+    /// on macOS clears `PRIO_DARWIN_BG` (`pth_maxpriority == 63`, `job.darwinbg.cleared`).
+    #[tokio::test]
+    async fn gateway_silence_restores_tokens_and_clears_darwinbg_within_silence_bound() {
+        let mut fixture = start_fixture("gate-silence", false);
+        let mut bg = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "bg",
+            ExecClass::Background,
+            4,
+        )
+        .await;
+        #[cfg(target_os = "macos")]
+        let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
+
+        let land_gate = GateJob::start(
+            &fixture.handle,
+            &fixture.root,
+            "land-gate",
+            Some(JobLander {
+                pid: std::process::id(),
+                start: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+
+        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 3).await;
+        assert_eq!(bg.fionread().await, 0);
+
+        #[cfg(target_os = "macos")]
+        {
+            let expected_pids = burner.pids.clone();
+            within_silence(
+                "darwinbg set before gateway silence",
+                publication::read_when(fixture.ledger.clone(), move |value| {
+                    value
+                        .get("darwinbg")
+                        .and_then(|bg| bg.get("lives"))
+                        .and_then(|lives| lives.as_array())
+                        .is_some_and(|lives| {
+                            expected_pids.iter().all(|&pid| {
+                                lives
+                                    .iter()
+                                    .any(|life| life["pid"].as_u64() == Some(u64::from(pid)))
+                            })
+                        })
+                }),
+            )
+            .await;
+            let _ = fixture.handle.info(burner.job_id).await.unwrap();
+            assert_tree_max_priority(&burner.pids, 4, "before gateway silence");
+        }
+
+        // Gateway goes silent without closing the socket while the land's gate still runs.
+        fixture.gateway.go_silent();
+
+        // Wait on fifo readability across the real 15 s silence bound.
+        bg.wait_tokens_backstop(3).await;
+
+        #[cfg(target_os = "macos")]
+        {
+            match tokio::time::timeout(
+                cowshed_os::test_backstop::NO_PROGRESS,
+                publication::read_when(fixture.ledger.clone(), |value| {
+                    value.get("darwinbg").is_none()
+                }),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => panic!("darwinbg was not cleared from ledger after gateway silence"),
+            }
+            assert_tree_max_priority(&burner.pids, 63, "after gateway silence");
+            let burner_id = burner.job_id;
+            burner.stop(&fixture.handle).await;
+            let _ = fixture.handle.trace_health().await.unwrap();
+            let burner_rows = gate_span_rows(&fixture.telemetry, burner_id);
+            assert!(
+                burner_rows
+                    .iter()
+                    .any(|row| row.entry_type == "info" && row.message == "job.darwinbg.cleared"),
+                "missing job.darwinbg.cleared after gateway silence: {burner_rows:?}"
+            );
+        }
+
+        land_gate.finish(&fixture.handle).await;
+        let bg_id = bg.job_id;
+        bg.exit(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let bg_rows = gate_span_rows(&fixture.telemetry, bg_id);
+        assert!(
+            bg_rows.iter().any(|row| {
+                row.entry_type == "info"
+                    && row.message == "job.tokens.restored"
+                    && row.tokens == Some(3)
+            }),
+            "missing job.tokens.restored(3) after gateway silence: {bg_rows:?}"
+        );
+
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
     }
 }
