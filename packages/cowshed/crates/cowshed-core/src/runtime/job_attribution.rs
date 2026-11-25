@@ -186,6 +186,7 @@ impl AttributionSummary {
     }
 
     /// Cumulative CPU microseconds observed across every life in the tree.
+    #[cfg(target_os = "macos")]
     pub(crate) fn observed_cpu(&self) -> CpuMicros {
         self.observed_cpu
     }

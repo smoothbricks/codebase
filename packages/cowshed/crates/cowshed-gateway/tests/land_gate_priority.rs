@@ -22,6 +22,7 @@ use cowshed_core::api::{
     CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, ExitStatus, JobId, JobLander,
     RunSandboxMode, StdinSource,
 };
+#[cfg(target_os = "macos")]
 use cowshed_core::gate_watch::{GateWatchOpen, GateWatchState};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
@@ -40,7 +41,9 @@ use cowshed_gateway::{
 use cowshed_os::deadline;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
+#[cfg(target_os = "macos")]
+use tokio::net::UnixStream;
 
 struct NoCredentials;
 
@@ -93,6 +96,17 @@ async fn within_silence<T>(what: &str, fut: impl std::future::Future<Output = T>
     }
 }
 
+/// The gateway's listener handoff socket, which only macOS's launchd-held listener has.
+#[cfg(target_os = "macos")]
+fn listener_handoff(socket: &Path) -> Option<PathBuf> {
+    Some(cowshed_gateway::handoff_path(socket))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn listener_handoff(_socket: &Path) -> Option<PathBuf> {
+    None
+}
+
 async fn start_gateway(store_root: &Path) -> (Gateway, PathBuf) {
     let cache = store_root.join("cache");
     std::fs::create_dir_all(&cache).expect("cache");
@@ -102,7 +116,7 @@ async fn start_gateway(store_root: &Path) -> (Gateway, PathBuf) {
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
-            listener_handoff: Some(cowshed_gateway::handoff_path(&socket)),
+            listener_handoff: listener_handoff(&socket),
             mirror_cache: MirrorCacheConfig::new(cache),
             ..GatewayConfig::default()
         },

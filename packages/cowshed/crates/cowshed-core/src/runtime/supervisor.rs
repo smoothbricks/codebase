@@ -1164,7 +1164,9 @@ impl ProcessEvent {
             Self::GateWatchState { .. } => "gate-watch-state",
             Self::MbxFirstAdmitted { .. } => "mbx-first-admitted",
             Self::TokensWithdrawn { .. } => "tokens-withdrawn",
+            #[cfg(target_os = "macos")]
             Self::DarwinBgGraceElapsed { .. } => "darwinbg-grace-elapsed",
+            #[cfg(target_os = "macos")]
             Self::DarwinBgWindowElapsed { .. } => "darwinbg-window-elapsed",
         }
     }
@@ -5194,6 +5196,7 @@ enum CpuStanding {
     /// The jobserver the command runs with, held until the job concludes, whatever ends it.
     Admitted {
         jobserver: OffActor<Jobserver>,
+        #[cfg(target_os = "macos")]
         granted_tokens: std::num::NonZeroUsize,
     },
     /// Holding nothing: the admission failed, or the job concluded and let its jobserver go.
@@ -7851,6 +7854,7 @@ impl SupervisorActor {
         job.info.state = JobState::Running;
         job.cpu = CpuStanding::Admitted {
             jobserver: OffActor::new(jobserver),
+            #[cfg(target_os = "macos")]
             granted_tokens,
         };
         // Read before the job's first process is dispatched, so nothing it writes precedes its

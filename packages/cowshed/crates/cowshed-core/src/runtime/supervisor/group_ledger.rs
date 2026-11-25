@@ -165,6 +165,7 @@ impl<C, F, T> Slot<C, F, T> {
     }
 
     /// Replace the waiting cut and mark it urgent so it bypasses `min_interval`.
+    #[cfg(target_os = "macos")]
     fn publish_urgent(&mut self, cut: C) -> Result<Option<C>, C> {
         match self.phase {
             Phase::Open => {
@@ -422,6 +423,7 @@ impl GroupLedgerWriter {
     /// Hand `claims` and `darwinbg` to the writer, bypassing `MIN_PUBLISH_INTERVAL`, and answer on
     /// the returned channel once the cut has been published on disk (05_gateway.md "What a crash
     /// leaves": append to `.groups` before setting `PRIO_DARWIN_BG`).
+    #[cfg(target_os = "macos")]
     pub(super) fn publish_immediate(
         &self,
         claims: impl Iterator<Item = JobGroupClaim>,

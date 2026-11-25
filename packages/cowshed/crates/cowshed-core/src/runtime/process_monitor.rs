@@ -185,6 +185,7 @@ struct Snapshot {
     /// ledger's claims, so a publication never copies it.
     running: Arc<[ProcessIdentity]>,
     /// Monotonic timestamp of the latest process-tree rusage sample folded into `attribution`.
+    #[cfg(target_os = "macos")]
     sampled_at: Instant,
 }
 
@@ -276,6 +277,7 @@ impl ProcessMonitor {
             },
             attribution: AttributionSummary::from_observed(std::iter::empty()),
             running: Arc::from([]),
+            #[cfg(target_os = "macos")]
             sampled_at: Instant::now(),
         }));
         let (requests, receiver) = mpsc::channel();
@@ -515,6 +517,7 @@ impl ProcessMonitor {
     /// Lock-free read of the latest process-tree cumulative CPU sample (`(sampled_at, observed_cpu)`),
     /// for measuring rusage gained between two window-end samples without triggering another
     /// kernel scan (05_gateway.md "A land's gate takes tokens back").
+    #[cfg(target_os = "macos")]
     pub(crate) fn observed_cpu_sample(
         &self,
     ) -> Option<(Instant, crate::api::resources::CpuMicros)> {
@@ -659,6 +662,7 @@ struct Writer<P> {
     next_id: u64,
     next_sample: Instant,
     /// Monotonic timestamp of the latest rusage sample folded into the observer.
+    #[cfg(target_os = "macos")]
     last_sampled_at: Instant,
     /// The job-accounting boundary is complete. Live registrations still sample.
     finished: bool,
@@ -690,6 +694,7 @@ impl<P: ProcessReads> Writer<P> {
             subscribers: HashMap::new(),
             next_id: 1,
             next_sample: Instant::now() + DEFAULT_SAMPLE,
+            #[cfg(target_os = "macos")]
             last_sampled_at: Instant::now(),
             finished: false,
             ended: false,
@@ -786,6 +791,7 @@ impl<P: ProcessReads> Writer<P> {
             tree,
             attribution: self.observer.attribution_summary(),
             running,
+            #[cfg(target_os = "macos")]
             sampled_at: self.last_sampled_at,
         }));
         if membership_changed && let Some(changed) = &self.ledger_changes {
@@ -830,7 +836,10 @@ impl<P: ProcessReads> Writer<P> {
                     }
                     Request::Watch { pid, reply } => {
                         let result = self.observer.watch_root(pid).map_err(observation_error);
-                        self.last_sampled_at = Instant::now();
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.last_sampled_at = Instant::now();
+                        }
                         self.publish(result.clone());
                         let _ = reply.send(result);
                     }
@@ -945,7 +954,10 @@ impl<P: ProcessReads> Writer<P> {
                     // readable.
                     let now = Instant::now();
                     let sampled = self.observer.sample(now);
-                    self.last_sampled_at = now;
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.last_sampled_at = now;
+                    }
                     let _ = self.publish_drained(sampled);
                 }
                 let every = self
