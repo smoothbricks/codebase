@@ -1370,31 +1370,19 @@ fn doc_commit_put_back_after_loss_skips_path_rewritten_by_another_holder() {
     make_fifo(&hold_fifo);
     let main = repo.main();
 
-    // The check stands for a running check. Its SIGTERM trap is the "other holder": after the
-    // loss and before the check ends (so before put-back, which waits for the signalled commands
-    // to end), it rewrites docs/a.md, stages docs/c.md (same bytes, new index entry) and moves
-    // docs/b.md's mtime without changing its bytes. Doing this inside the trap orders it by the
-    // signal itself: no test step runs between the signal and the reap bound, which an earlier
-    // version raced under gate load (sb-batch-4 gate 2: the reap ended the check first and the
-    // test then blocked opening a fifo no one would read).
+    // The check stands for a running check: it reports that it started and then blocks opening a
+    // fifo no one writes, so SIGTERM ends it at once and its reap never waits on any work of its
+    // own. An earlier version played the other holder inside the check's SIGTERM trap (a write,
+    // a `git add` and a `touch`), which raced the 5 s reap bound under gate load (sb-batch-6
+    // gate 1: the trap's `git add` still ran at the bound, the reap timed out and the put-back
+    // never ran), and before that a test step after the cut raced the same bound (sb-batch-4
+    // gate 2).
     let check_script = repo.file(
         "re2-check.sh",
         &format!(
             "#!/bin/sh\n\
-             bg=\"\"\n\
-             on_term() {{\n\
-                 if [ -n \"$bg\" ]; then kill \"$bg\" 2>/dev/null || true; wait \"$bg\" 2>/dev/null || true; fi\n\
-                 printf 'written by next holder\\n' > '{main}/docs/a.md'\n\
-                 git -C '{main}' add docs/c.md\n\
-                 touch -t 202311141313.20 '{main}/docs/b.md'\n\
-                 exit 143\n\
-             }}\n\
-             trap on_term TERM\n\
-             cat < '{hold}' >/dev/null &\n\
-             bg=$!\n\
              printf 'started\\n' > '{started}'\n\
-             wait \"$bg\"\n",
-            main = main.display(),
+             exec cat '{hold}' >/dev/null\n",
             hold = hold_fifo.display(),
             started = started_fifo.display(),
         ),
@@ -1459,7 +1447,8 @@ new file mode 100644
         .spawn()
         .expect("spawn doc-commit for re2");
 
-    // 1. Wait for apply to finish and check to start.
+    // 1. Wait for apply to finish and check to start: the doc commit has written every path and
+    //    recorded what it wrote, and it holds the turn while the check runs.
     assert_eq!(
         fs::read_to_string(&started_fifo)
             .expect("read started")
@@ -1467,8 +1456,21 @@ new file mode 100644
         "started"
     );
 
-    // 2. The gateway cuts the turn. doc-commit sends SIGTERM to the check, whose trap plays the
-    //    other holder and then exits; doc-commit reaps it and runs the guarded put-back.
+    // 2. The other holder writes main after the doc commit wrote it: it rewrites docs/a.md,
+    //    stages docs/c.md (same bytes, new index entry) and moves docs/b.md's mtime without
+    //    changing its bytes. The guarded put-back compares each path with what the doc commit
+    //    wrote, so these changes count as made after the loss whenever they land before it.
+    fs::write(main.join("docs/a.md"), "written by next holder\n").expect("rewrite docs/a.md");
+    git(&main, &["add", "docs/c.md"]);
+    let moved = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(main.join("docs/b.md"))
+        .and_then(|file| file.set_modified(moved))
+        .expect("move docs/b.md's mtime");
+
+    // 3. The gateway cuts the turn. doc-commit sends SIGTERM to the check, which ends at once;
+    //    doc-commit reaps it and runs the guarded put-back.
     stand_in.cut_now();
 
     let output = child
