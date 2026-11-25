@@ -761,8 +761,8 @@ mod cpu_placement_tests {
     #[test]
     fn an_mbx_job_names_its_pool_priority_and_cargo_ceiling_and_a_plain_job_neither() {
         for (class, mbx, held, priority) in [
-            (ExecClass::Gate, true, false, Some("normal")),
             (ExecClass::Interactive, true, false, Some("interactive")),
+            (ExecClass::Gate, true, false, Some("normal")),
             (
                 ExecClass::InteractiveResident,
                 true,
@@ -806,6 +806,16 @@ mod cpu_placement_tests {
                 }),
                 "only interactive work names its start to mbx, from which its asks decay; every other \
                  job names none over its caller's: {class:?}"
+            );
+            assert_eq!(
+                read("MBX_SCHEDULER_JOB_ID").as_deref(),
+                mbx.then_some(if class == ExecClass::Interactive {
+                    "job-0198f2c0b7e34dc795f17b238b331c80-7"
+                } else {
+                    ""
+                }),
+                "only interactive work names its incarnation-qualified id to mbx, keyed beside \
+                 its start; every other job names none over its caller's: {class:?}"
             );
             assert_eq!(
                 read("CARGO_BUILD_JOBS").as_deref(),
