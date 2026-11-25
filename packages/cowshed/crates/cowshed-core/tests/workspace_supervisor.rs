@@ -15079,3 +15079,275 @@ os.read(0, 1)
             .unwrap();
     }
 }
+
+#[cfg(target_os = "macos")]
+fn write_workspace_token(workspace_root: &Path) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(workspace_root.join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH))
+        .unwrap()
+        .write_all(
+            cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                .encode()
+                .as_bytes(),
+        )
+        .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn write_main_scratch_toml(main: &Path, provider: &[&str]) {
+    let quoted: Vec<String> = provider
+        .iter()
+        .map(|arg| serde_json::to_string(arg).expect("quote toml string"))
+        .collect();
+    std::fs::write(
+        main.join(".cowshed.toml"),
+        format!("[scratch]\nprovider = [{}]\n", quoted.join(", ")),
+    )
+    .unwrap();
+}
+
+/// Main's `.cowshed.toml` declares `[scratch] provider`: a sandboxed job receives the provider's
+/// 0700 directory as `TMPDIR`, can write inside it, and cannot list the parent or read/list a
+/// sibling directory under the same parent.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_scratch_provider_supplies_isolated_tmpdir() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (mut supervisor_config, root) =
+        isolated_config(&temp_parent::canonical_parent(), "scratch-ok");
+    supervisor_config.default_cwd = None;
+    supervisor_config.artifacts.combined_output_quota_bytes = 64 * 1024;
+    let main = root.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+
+    // Fixture parent outside HOME, store, workspace mount and mount_root, so sibling isolation
+    // must hold by cowshed's own profile rules rather than an accidental enclosing deny.
+    let scratch_parent = TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-sp");
+    let scratch_parent_path = std::fs::canonicalize(&*scratch_parent).unwrap();
+    let sibling = scratch_parent_path.join("sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(sibling.join("secret"), b"sibling-secret\n").unwrap();
+
+    let lease_dir = scratch_parent_path.join("h00001");
+    let settled_marker = scratch_parent_path.join("settled");
+    let provider_script = main.join("provider.sh");
+    std::fs::write(
+        &provider_script,
+        format!(
+            "#!/bin/sh\nset -eu\nmkdir -m 0700 \"{}\"\nprintf '{{\"directory\":\"%s\"}}\\n' \"{}\"\n/bin/cat >/dev/null\n/bin/rm -rf \"{}\"\nprintf 'settled\\n' > \"{}\"\n",
+            lease_dir.display(),
+            lease_dir.display(),
+            lease_dir.display(),
+            settled_marker.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&provider_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_main_scratch_toml(&main, &["/bin/sh", "provider.sh"]);
+
+    supervisor_config.sandbox.main_mount = Some(main.clone());
+    std::fs::create_dir_all(&supervisor_config.sandbox.home).unwrap();
+    std::fs::create_dir_all(&supervisor_config.sandbox.exec_temp_dir).unwrap();
+    std::fs::create_dir_all(supervisor_config.workspace_root.join(".cowshed/bin")).unwrap();
+    write_workspace_token(&supervisor_config.workspace_root);
+
+    let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+        Box::new(cowshed_core::storage::audit::NullAuditSink),
+        8,
+    )
+    .unwrap();
+    let handle = WorkspaceSupervisor::start(supervisor_config, commitments).unwrap();
+
+    let script = format!(
+        r#"
+set -eu
+printf 'TMPDIR=%s\n' "$TMPDIR"
+printf 'written' > "$TMPDIR/probe"
+printf 'READ=%s\n' "$(/bin/cat "$TMPDIR/probe")"
+if /bin/ls "{parent}" >/dev/null 2>&1; then printf 'PARENT_LIST=allowed\n'; else printf 'PARENT_LIST=denied\n'; fi
+if /bin/ls "{sibling}" >/dev/null 2>&1; then printf 'SIBLING_LIST=allowed\n'; else printf 'SIBLING_LIST=denied\n'; fi
+if /bin/cat "{sibling}/secret" >/dev/null 2>&1; then printf 'SIBLING_READ=allowed\n'; else printf 'SIBLING_READ=denied\n'; fi
+"#,
+        parent = scratch_parent_path.display(),
+        sibling = sibling.display(),
+    );
+    let job = handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                command: ExecCommand::Argv(vec!["/bin/sh".into(), "-c".into(), script.into()]),
+                cwd: None,
+                ..request(StdinSource::Empty)
+            },
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let info = handle.wait(job).await.unwrap();
+    let stdout = handle
+        .log_read(job, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    let stderr = handle
+        .log_read(job, StreamKind::Stderr, 0, false)
+        .await
+        .unwrap();
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    assert_eq!(
+        info.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "job failed: stdout={stdout_text} stderr={stderr_text}"
+    );
+    assert!(
+        stdout_text.contains(&format!("TMPDIR={}\n", lease_dir.display())),
+        "expected provider TMPDIR {}, got stdout={stdout_text} stderr={stderr_text}",
+        lease_dir.display()
+    );
+    assert!(stdout_text.contains("READ=written\n"), "{stdout_text}");
+    assert!(
+        stdout_text.contains("PARENT_LIST=denied\n"),
+        "parent directory must not be listable: {stdout_text}"
+    );
+    assert!(
+        stdout_text.contains("SIBLING_LIST=denied\n"),
+        "sibling directory must not be listable: {stdout_text}"
+    );
+    assert!(
+        stdout_text.contains("SIBLING_READ=denied\n"),
+        "sibling file must not be readable: {stdout_text}"
+    );
+    assert!(stderr_text.is_empty(), "unexpected stderr: {stderr_text}");
+    drop((scratch_parent, root));
+}
+
+/// A scratch provider that answers `{"unavailable": ...}` or exits without a directory leaves
+/// `TMPDIR` as the store directory and reports the reason on the job's stderr once per supervisor
+/// per distinct reason; a second job meeting the same reason prints nothing.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_scratch_provider_fallback_reports_reason_once() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for (label, body, expected_fragment) in [
+        (
+            "scratch-unavailable",
+            "#!/bin/sh\nprintf '{\"unavailable\":\"volume absent\"}\\n'\n",
+            "volume absent",
+        ),
+        ("scratch-exit", "#!/bin/sh\nexit 1\n", "exited"),
+    ] {
+        let (mut supervisor_config, root) =
+            isolated_config(&temp_parent::canonical_parent(), label);
+        supervisor_config.default_cwd = None;
+        supervisor_config.artifacts.combined_output_quota_bytes = 64 * 1024;
+        let expected_store_tmp = supervisor_config.sandbox.exec_temp_dir.clone();
+
+        let main = root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let provider_script = main.join("provider.sh");
+        std::fs::write(&provider_script, body).unwrap();
+        std::fs::set_permissions(&provider_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_main_scratch_toml(&main, &["/bin/sh", "provider.sh"]);
+
+        supervisor_config.sandbox.main_mount = Some(main.clone());
+        std::fs::create_dir_all(&supervisor_config.sandbox.home).unwrap();
+        std::fs::create_dir_all(&supervisor_config.sandbox.exec_temp_dir).unwrap();
+        std::fs::create_dir_all(supervisor_config.workspace_root.join(".cowshed/bin")).unwrap();
+        write_workspace_token(&supervisor_config.workspace_root);
+
+        let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+            Box::new(cowshed_core::storage::audit::NullAuditSink),
+            8,
+        )
+        .unwrap();
+        let handle = WorkspaceSupervisor::start(supervisor_config, commitments).unwrap();
+
+        let run_tmpdir = |handle: &WorkspaceSupervisorHandle| {
+            let handle = handle.clone();
+            async move {
+                let job = handle
+                    .exec(
+                        None,
+                        None,
+                        ExecRequest {
+                            command: ExecCommand::Argv(vec![
+                                "/bin/sh".into(),
+                                "-c".into(),
+                                "printf '%s' \"$TMPDIR\"".into(),
+                            ]),
+                            cwd: None,
+                            ..request(StdinSource::Empty)
+                        },
+                        AdmissionSource::Worker,
+                    )
+                    .await
+                    .unwrap();
+                let info = handle.wait(job).await.unwrap();
+                let stdout = handle
+                    .log_read(job, StreamKind::Stdout, 0, false)
+                    .await
+                    .unwrap();
+                let stderr = handle
+                    .log_read(job, StreamKind::Stderr, 0, false)
+                    .await
+                    .unwrap();
+                (
+                    info,
+                    String::from_utf8_lossy(&stdout.bytes).into_owned(),
+                    String::from_utf8_lossy(&stderr.bytes).into_owned(),
+                )
+            }
+        };
+
+        let (first_info, first_out, first_err) = run_tmpdir(&handle).await;
+        let (second_info, second_out, second_err) = run_tmpdir(&handle).await;
+        handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+
+        assert_eq!(
+            first_info.exit,
+            Some(ExitStatus::Exited { code: 0 }),
+            "{label}: {first_err}"
+        );
+        assert_eq!(
+            first_out,
+            expected_store_tmp.display().to_string(),
+            "{label}: fallback must keep store TMPDIR"
+        );
+        let expected_tail = format!("; TMPDIR stays {}", expected_store_tmp.display());
+        assert!(
+            first_err.contains("cowshed: scratch provider ")
+                && first_err.contains(expected_fragment)
+                && first_err.contains(&expected_tail),
+            "{label}: expected fallback notice on first job stderr, got: {first_err:?}"
+        );
+
+        assert_eq!(
+            second_info.exit,
+            Some(ExitStatus::Exited { code: 0 }),
+            "{label}: {second_err}"
+        );
+        assert_eq!(
+            second_out,
+            expected_store_tmp.display().to_string(),
+            "{label}: second fallback must keep store TMPDIR"
+        );
+        assert!(
+            second_err.is_empty(),
+            "{label}: second job with same reason must print nothing, got: {second_err:?}"
+        );
+        drop(root);
+    }
+}
