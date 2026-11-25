@@ -250,6 +250,18 @@ pub fn outside_holders(me: i32, open: Result<Vec<Holder>, String>) -> OutsideHol
 
 /// One buffered reader/writer over a land-turn connection: cancel-safe async line reads and
 /// non-blocking drains share one buffer, so no second reader ever splits the stream.
+///
+/// It is not tokio's `Lines<BufReader<UnixStream>>` plus `UnixStream::try_read`, for two reasons
+/// (reviewed 2026-11-25, tokio 1.53.1):
+/// - `try_read` is gated on the reactor's cached readiness (`runtime/io/registration.rs:175-177`,
+///   which starts at `Ready::EMPTY`, `scheduled_io.rs:176-184`), and on the CLI's current_thread
+///   runtime the driver polls the kernel only when the thread parks. `loss()` and `end()` run
+///   synchronously right after a step returns, before any park, so `try_read` answers WouldBlock
+///   without calling read(2) while the gateway's `expired` line and EOF sit in the kernel buffer:
+///   the race sb-batch-4's gate hit. The drain here is a kernel-level `recv(MSG_DONTWAIT)`.
+/// - `Lines` keeps a partial line in private state (`io/util/lines.rs:23-29`) and `BufReader` has
+///   no push-back (`io/util/buf_reader.rs:58,65` warn against reading the inner stream), so a sync
+///   drain beneath a live `Lines` would lose or reorder bytes.
 #[derive(Debug)]
 struct Connection {
     stream: Fenced<UnixStream>,
