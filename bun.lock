@@ -51,7 +51,7 @@
     },
     "packages/bend-emit": {
       "name": "@smoothbricks/bend-emit",
-      "version": "0.0.4",
+      "version": "0.0.5-next.0",
       "bin": {
         "bend-emit": "./bin/bend-emit.ts",
       },
@@ -102,7 +102,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.25",
+      "version": "0.13.26-next.0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -332,7 +332,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.24",
+      "version": "0.7.25-next.0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
