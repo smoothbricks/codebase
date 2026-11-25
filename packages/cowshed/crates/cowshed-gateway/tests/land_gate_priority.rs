@@ -198,6 +198,7 @@ fn start_supervisor(
         inherited_groups: Vec::new(),
         volume_labels: None,
         workspace_volume: None,
+        host_job_path: cowshed_core::runtime::HostJobPath::Host,
         job_sampling: Default::default(),
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
