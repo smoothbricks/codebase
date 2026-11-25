@@ -1103,9 +1103,14 @@ mod tests {
         let bin = home.join("bin");
         let seen = home.join("seen-flake.nix");
         let store = home.join("store/mbx");
+        let test_path = std::env::var("PATH")
+            .expect("the test PATH supplies mkdir")
+            .replace('\'', "'\\''");
         script(
             &store.join("bin/mbx"),
-            "#!/bin/sh\nmkdir -p \"$XDG_DATA_HOME/mbx/bin\" && printf '#!/bin/sh\\n' > \"$XDG_DATA_HOME/mbx/bin/cargo\" && printf 'target\\n' > \"$XDG_DATA_HOME/mbx/bin/mbx-target\"\n",
+            &format!(
+                "#!/bin/sh\nexport PATH='{test_path}'\nmkdir -p \"$XDG_DATA_HOME/mbx/bin\" && printf '#!/bin/sh\\n' > \"$XDG_DATA_HOME/mbx/bin/cargo\" && printf 'target\\n' > \"$XDG_DATA_HOME/mbx/bin/mbx-target\"\n"
+            ),
         );
         script(
             &bin.join("nix"),
