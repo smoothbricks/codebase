@@ -135,19 +135,11 @@ impl Jobserver {
         self.tokens
     }
 
-    /// Whether this job owns its fifo (as opposed to sharing a parent job's fifo).
-    pub(crate) fn has_own_fifo(&self) -> bool {
-        self.own.is_some()
-    }
-
-    /// Duplicate the supervisor's own read-write fifo descriptor as non-blocking (`O_NONBLOCK` +
-    /// `FD_CLOEXEC`) for event-driven draining during a land's gate span. Returns `Ok(None)` when
-    /// this job shares a parent's fifo (withdrawn from with its parent) or holds only the implicit
-    /// token (`tokens == 1`).
-    pub(crate) fn start_drain(
-        &self,
-        mut on_withdrawn: impl FnMut(usize) + Send + 'static,
-    ) -> io::Result<Option<FifoDrainer>> {
+    /// Duplicate the supervisor's own read-write fifo descriptor as a non-blocking [`File`]
+    /// (`O_NONBLOCK` + `FD_CLOEXEC`) for event-driven draining during a land's gate span. Returns
+    /// `Ok(None)` when this job shares a parent's fifo (withdrawn from with its parent) or holds
+    /// only the implicit token (`tokens == 1`).
+    pub(crate) fn dup_nonblocking_fd(&self) -> io::Result<Option<File>> {
         let Some(file) = &self.own else {
             return Ok(None);
         };
@@ -170,56 +162,7 @@ impl Jobserver {
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let async_fd = AsyncFd::new(fd)?;
-        let (stop_tx, mut stop_rx) = oneshot::channel::<bool>();
-        let task = tokio::spawn(async move {
-            let mut held = Vec::<u8>::new();
-            let mut buf = [0_u8; 256];
-            // Drain everything currently sitting in the fifo before waiting for readability.
-            let initial = drain_nonblocking(async_fd.get_ref(), &mut buf, &mut held);
-            if initial > 0 {
-                on_withdrawn(initial);
-            }
-            let restore = loop {
-                tokio::select! {
-                    biased;
-                    stop = &mut stop_rx => break stop.unwrap_or(false),
-                    ready = async_fd.readable() => {
-                        let Ok(mut guard) = ready else {
-                            break false;
-                        };
-                        let count = drain_nonblocking(async_fd.get_ref(), &mut buf, &mut held);
-                        if count > 0 {
-                            on_withdrawn(count);
-                        } else {
-                            guard.clear_ready();
-                        }
-                    }
-                }
-            };
-            if restore && !held.is_empty() {
-                let mut written = 0;
-                while written < held.len() {
-                    match write_nonblocking(async_fd.get_ref(), &held[written..]) {
-                        Ok(0) => break,
-                        Ok(n) => written += n,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            let Ok(mut guard) = async_fd.writable().await else {
-                                break;
-                            };
-                            guard.clear_ready();
-                        }
-                        Err(_) => break,
-                    }
-                }
-                return written;
-            }
-            0
-        });
-        Ok(Some(FifoDrainer {
-            stop: Some(stop_tx),
-            task: Some(task),
-        }))
+        Ok(Some(File::from(fd)))
     }
 
     /// A fifo of `tokens` in `directory`, for one job. Named by this supervisor's pid and a
@@ -282,6 +225,64 @@ pub(crate) struct FifoDrainer {
 }
 
 impl FifoDrainer {
+    /// Start draining `file` (a non-blocking duplicated read-write descriptor from
+    /// [`Jobserver::dup_nonblocking_fd`]), sending each withdrawn byte count through `tx`.
+    pub(crate) fn start<T: Send + 'static>(
+        file: File,
+        tx: tokio::sync::mpsc::Sender<T>,
+        map: impl Fn(usize) -> T + Send + 'static,
+    ) -> io::Result<Self> {
+        let async_fd = AsyncFd::new(file)?;
+        let (stop_tx, mut stop_rx) = oneshot::channel::<bool>();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::<u8>::new();
+            let mut buf = [0_u8; 256];
+            let initial = drain_file(async_fd.get_ref(), &mut buf, &mut held);
+            if initial > 0 {
+                let _ = tx.send(map(initial)).await;
+            }
+            let restore = loop {
+                tokio::select! {
+                    biased;
+                    stop = &mut stop_rx => break stop.unwrap_or(false),
+                    ready = async_fd.readable() => {
+                        let Ok(mut guard) = ready else {
+                            break false;
+                        };
+                        let count = drain_file(async_fd.get_ref(), &mut buf, &mut held);
+                        if count > 0 {
+                            let _ = tx.send(map(count)).await;
+                        } else {
+                            guard.clear_ready();
+                        }
+                    }
+                }
+            };
+            if restore && !held.is_empty() {
+                let mut written = 0;
+                while written < held.len() {
+                    match write_file(async_fd.get_ref(), &held[written..]) {
+                        Ok(0) => break,
+                        Ok(n) => written += n,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            let Ok(mut guard) = async_fd.writable().await else {
+                                break;
+                            };
+                            guard.clear_ready();
+                        }
+                        Err(_) => break,
+                    }
+                }
+                return written;
+            }
+            0
+        });
+        Ok(Self {
+            stop: Some(stop_tx),
+            task: Some(task),
+        })
+    }
+
     /// Stop draining, write every withdrawn token byte back to the fifo, and return how many bytes
     /// were restored.
     pub(crate) async fn restore(mut self) -> usize {
@@ -303,40 +304,30 @@ impl Drop for FifoDrainer {
     }
 }
 
-fn drain_nonblocking(fd: &OwnedFd, buf: &mut [u8], held: &mut Vec<u8>) -> usize {
+fn drain_file(mut file: &File, buf: &mut [u8], held: &mut Vec<u8>) -> usize {
+    use std::io::Read as _;
     let mut total = 0;
     loop {
-        // SAFETY: `fd` is a live owned descriptor and `buf` is writable for `buf.len()` bytes.
-        let read = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if read > 0 {
-            let n = usize::try_from(read).expect("positive read");
-            held.extend_from_slice(&buf[..n]);
-            total += n;
-        } else if read == 0 {
-            break;
-        } else {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
+        match file.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                held.extend_from_slice(&buf[..n]);
+                total += n;
             }
-            break;
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
     }
     total
 }
 
-fn write_nonblocking(fd: &OwnedFd, bytes: &[u8]) -> io::Result<usize> {
+fn write_file(mut file: &File, bytes: &[u8]) -> io::Result<usize> {
     loop {
-        // SAFETY: `fd` is a live owned descriptor and `bytes` is readable for `bytes.len()` bytes.
-        let written = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-        if written >= 0 {
-            return Ok(usize::try_from(written).expect("non-negative write"));
+        match file.write(bytes) {
+            Ok(n) => return Ok(n),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(error);
     }
 }
 

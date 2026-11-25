@@ -77,6 +77,7 @@ use crate::storage::job_artifact::{
 
 #[cfg(test)]
 mod actor_census;
+mod gate_priority;
 mod group_ledger;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -87,7 +88,8 @@ mod off_actor;
 use group_ledger::GroupLedgerWriter;
 #[cfg(target_os = "linux")]
 use linux as platform;
-use liveness::{Liveness, LivenessSlot, LivenessWriter};
+pub use liveness::{JobGatePriority, Liveness};
+use liveness::{LivenessSlot, LivenessWriter};
 #[cfg(target_os = "macos")]
 use macos as platform;
 pub(super) use off_actor::Spawned;
@@ -1067,6 +1069,32 @@ pub enum ProcessEvent {
         job_id: JobId,
         step: super::placement::DecayStep,
     },
+    /// The gateway's land-gate watch delivered a state transition or periodic heartbeat (or timed
+    /// out / closed, reporting `active: false, heartbeat: false`).
+    GateWatchState {
+        active: bool,
+        heartbeat: bool,
+    },
+    /// Result of one heartbeat's `mbx stats --scheduler --json --activity` inspection for
+    /// interactive jobs' first-band decay.
+    MbxFirstAdmitted {
+        entries: Vec<super::host_hold::FirstAdmitted>,
+    },
+    /// `count` token bytes were drained from `job_id`'s jobserver fifo during a land's gate span.
+    TokensWithdrawn {
+        job_id: JobId,
+        count: usize,
+    },
+    /// The 1 s grace period from drain start elapsed; open the first 3 s CPU window for `job_id`.
+    #[cfg(target_os = "macos")]
+    DarwinBgGraceElapsed {
+        job_id: JobId,
+    },
+    /// One 3 s CPU measurement window elapsed for `job_id`; evaluate `PRIO_DARWIN_BG`.
+    #[cfg(target_os = "macos")]
+    DarwinBgWindowElapsed {
+        job_id: JobId,
+    },
     /// A cold exec host spawned to activate for a job: the job's first process, which it owns
     /// until its command starts.
     Activating {
@@ -1133,6 +1161,11 @@ impl ProcessEvent {
             Self::HoldRefused { .. } => "hold-refused",
             Self::HoldLost { .. } => "hold-lost",
             Self::Decay { .. } => "decay",
+            Self::GateWatchState { .. } => "gate-watch-state",
+            Self::MbxFirstAdmitted { .. } => "mbx-first-admitted",
+            Self::TokensWithdrawn { .. } => "tokens-withdrawn",
+            Self::DarwinBgGraceElapsed { .. } => "darwinbg-grace-elapsed",
+            Self::DarwinBgWindowElapsed { .. } => "darwinbg-window-elapsed",
         }
     }
 }
@@ -3586,11 +3619,11 @@ impl WorkspaceSupervisorHandle {
         &self.authority
     }
 
-    /// What the actor last published of itself (05_gateway.md, "Deadlines"), read without a
-    /// round trip through it, so a turn waiting on the blocking pool never delays it. Refused
-    /// for a handle to another process's supervisor, which publishes nothing here, and once the
-    /// actor has stopped, since what it last published then says nothing more.
-    pub(super) fn liveness(&self) -> Result<Arc<Liveness>> {
+    /// Subscribe to the supervisor actor's published liveness snapshots (05_gateway.md, "Deadlines"
+    /// and "A land's gate takes tokens back") without a round trip through the actor, so a caller
+    /// waiting on state changes (such as token withdrawal or `PRIO_DARWIN_BG` transitions) awaits
+    /// `changed()` instead of polling. Refused for a remote handle and once the actor has stopped.
+    pub fn watch_liveness(&self) -> Result<tokio::sync::watch::Receiver<Arc<Liveness>>> {
         let Some(slot) = &self.liveness else {
             return Err(CowshedError::internal(
                 "a handle to another process's supervisor reads no published liveness",
@@ -3602,7 +3635,16 @@ impl WorkspaceSupervisorHandle {
                 "reattach the workspace",
             ));
         }
-        Ok(slot.load())
+        Ok(slot.watch())
+    }
+
+    /// What the actor last published of itself (05_gateway.md, "Deadlines"), read without a
+    /// round trip through it, so a turn waiting on the blocking pool never delays it. Refused
+    /// for a handle to another process's supervisor, which publishes nothing here, and once the
+    /// actor has stopped, since what it last published then says nothing more.
+    pub(super) fn liveness(&self) -> Result<Arc<Liveness>> {
+        let rx = self.watch_liveness()?;
+        Ok(Arc::clone(&rx.borrow()))
     }
 
     /// How this supervisor's job-span writer has fared, once every span row queued before the
@@ -4252,6 +4294,18 @@ impl WorkspaceSupervisor {
                 None
             }
         };
+        let gate_watch_socket = policy
+            .ceiling()
+            .store_root
+            .join(crate::storage::bootstrap::GATEWAY_SOCKET_NAME);
+        let gate_watch_ledger = group_ledger
+            .as_ref()
+            .map(|writer| writer.path().to_path_buf());
+        let gate_watch = gate_priority::GateWatchClient::start(
+            gate_watch_socket,
+            gate_watch_ledger,
+            events.clone(),
+        );
         let mut actor = SupervisorActor {
             lifecycle_journal,
             authority: config.authority,
@@ -4302,6 +4356,10 @@ impl WorkspaceSupervisor {
             caller_keys: std::collections::HashMap::new(),
             output_quota: config.artifacts.combined_output_quota_bytes,
             holds: BTreeMap::new(),
+            gate_watch,
+            gate_active: false,
+            mbx_inspection_in_flight: false,
+            past_first_band: BTreeSet::new(),
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -5061,6 +5119,20 @@ struct JobStateRecord {
     /// What the actor keeps of a caller-owned job in place of its records; `None` for a job
     /// cowshed records.
     caller: Option<CallerOwned>,
+    /// Whether this job is a land's gate (`ExecClass::Gate` with `lander: Some(_)`) registered on
+    /// the gateway's `gate-watch`.
+    is_land_gate: bool,
+    /// Unix epoch milliseconds stamped in `MBX_SCHEDULER_JOB_STARTED_MS` when the job spawned.
+    mbx_started_ms: Option<u64>,
+    /// Active fifo token drainer while a land's gate runs and this job is withdrawn from.
+    token_drainer: Option<super::job_cpu::FifoDrainer>,
+    /// Total token bytes drained from this job's fifo during the current land's gate span.
+    tokens_withdrawn: usize,
+    /// Completed `PRIO_DARWIN_BG` clear transitions for this job.
+    darwinbg_cleared: u64,
+    /// macOS `PRIO_DARWIN_BG` measurement window and active set for this job during a land's gate.
+    #[cfg(target_os = "macos")]
+    darwinbg: Option<gate_priority::JobDarwinBg>,
 }
 
 /// Process, volume and CPU claims remain held through draining and every refusal.
@@ -5102,7 +5174,10 @@ enum CpuStanding {
     /// Cancelled while queued: nothing ever spawned.
     Withdrawn,
     /// The jobserver the command runs with, held until the job concludes, whatever ends it.
-    Admitted { jobserver: OffActor<Jobserver> },
+    Admitted {
+        jobserver: OffActor<Jobserver>,
+        granted_tokens: std::num::NonZeroUsize,
+    },
     /// Holding nothing: the admission failed, or the job concluded and let its jobserver go.
     Settled,
 }
@@ -5441,6 +5516,14 @@ struct SupervisorActor {
     /// Each held job's hold on mbx's pool, from its reserve to its release; dropping one ends it
     /// (05_gateway.md "Held jobs").
     holds: BTreeMap<JobId, super::host_hold::Hold>,
+    /// Persistent bidirectional watch on the gateway's active land-gate state.
+    gate_watch: gate_priority::GateWatchClient,
+    /// Whether the gateway currently reports a land's gate active.
+    gate_active: bool,
+    /// Whether an off-actor `mbx stats --scheduler --json --activity` inspection is in flight.
+    mbx_inspection_in_flight: bool,
+    /// Interactive jobs already observed past their 120 s first band via mbx inspection.
+    past_first_band: BTreeSet<JobId>,
 }
 
 /// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
@@ -5691,12 +5774,21 @@ fn report_unsignalled(job: JobId, signalled: Result<()>) {
 fn unconcluded(
     jobs: &BTreeMap<JobId, JobStateRecord>,
 ) -> impl Iterator<Item = liveness::LiveJob> + Clone + '_ {
-    jobs.values()
-        .filter(|job| !job.terminal())
-        .map(|job| liveness::LiveJob {
-            pulse: super::supervisor_socket::JobPulse::of(&job.info),
+    jobs.values().filter(|job| !job.terminal()).map(|job| {
+        #[cfg(target_os = "macos")]
+        let darwinbg_active = job.darwinbg.as_ref().is_some_and(|bg| bg.active);
+        #[cfg(not(target_os = "macos"))]
+        let darwinbg_active = false;
+        let gate_priority = JobGatePriority {
+            tokens_withdrawn: u32::try_from(job.tokens_withdrawn).unwrap_or(u32::MAX),
+            darwinbg_active,
+            darwinbg_cleared: job.darwinbg_cleared,
+        };
+        liveness::LiveJob {
+            pulse: super::supervisor_socket::JobPulse::of(&job.info, gate_priority),
             class: job.info.class,
-        })
+        }
+    })
 }
 
 /// The refusal of a call made under an authority the supervisor does not serve.
@@ -5784,6 +5876,8 @@ impl SupervisorActor {
                 Wake::Membership => {
                     self.record_groups();
                     self.rerun_refused();
+                    #[cfg(target_os = "macos")]
+                    self.extend_darwinbg_for_new_lives().await;
                 }
                 Wake::Event(Some(event)) => self.handle_event(event).await,
                 Wake::Event(None) => break,
@@ -5842,7 +5936,7 @@ impl SupervisorActor {
     /// The turn `span` times ended: published with every job it left unconcluded, as a
     /// heartbeat about one reports it.
     fn end_turn(&mut self, span: cowshed_os::timing::Span) {
-        self.liveness.end(unconcluded(&self.jobs));
+        self.liveness.end(self.gate_active, unconcluded(&self.jobs));
         drop(span);
     }
 
@@ -6173,7 +6267,8 @@ impl SupervisorActor {
                 // waiting on the blocking pool, and its caller's `hold` is answered at once from
                 // what the actor published (11_shell.md, "Protocol").
                 if admitted.is_ok() {
-                    self.liveness.publish_jobs(unconcluded(&self.jobs));
+                    self.liveness
+                        .publish_jobs(self.gate_active, unconcluded(&self.jobs));
                 }
                 let _ = reply.send(admitted);
             }
@@ -6676,13 +6771,59 @@ impl SupervisorActor {
         if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
             return;
         }
+        let darwinbg = self.active_darwinbg_lives();
         if let Some(writer) = &self.group_ledger
-            && let Err(error) = writer.publish(job_group_claims(&self.jobs), &[])
+            && let Err(error) = writer.publish(job_group_claims(&self.jobs), &darwinbg)
         {
             cowshed_os::eprintln!(
                 "cowshed: cannot queue process-group ledger {}: {error}",
                 writer.path().display()
             );
+        }
+    }
+
+    /// Collect every live process identity currently held at `PRIO_DARWIN_BG` across all jobs.
+    fn active_darwinbg_lives(&self) -> Vec<super::process_tree::ProcessIdentity> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut lives = Vec::new();
+            for job in self.jobs.values() {
+                if let Some(bg) = &job.darwinbg
+                    && bg.active
+                {
+                    lives.extend(bg.applied.iter().copied());
+                }
+            }
+            lives
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Flush the current claims and active `PRIO_DARWIN_BG` lives to `.groups` immediately,
+    /// bypassing the 1 s rate limit and awaiting disk publication before returning.
+    #[cfg(target_os = "macos")]
+    async fn flush_groups_darwinbg(&mut self) {
+        if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
+            return;
+        }
+        let darwinbg = self.active_darwinbg_lives();
+        let Some(writer) = &self.group_ledger else {
+            return;
+        };
+        let path = writer.path().to_path_buf();
+        let pending = writer.publish_immediate(job_group_claims(&self.jobs), &darwinbg);
+        match pending.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot flush PRIO_DARWIN_BG lives to {}: {error}",
+                    path.display()
+                );
+            }
+            Err(_) => {}
         }
     }
 
@@ -7271,7 +7412,7 @@ impl SupervisorActor {
             stderr_copy,
             admission_key: _,
             class: _,
-            lander: _,
+            lander,
             want: _,
             hold: _,
             scope: _,
@@ -7514,6 +7655,7 @@ impl SupervisorActor {
         // The job's tree runs under a hold: its own, or the one its requester runs under.
         let held = matches!(ledger, super::job_admission::Ledger::Mbx { hold: Some(_) })
             || parent_jobserver.as_ref().is_some_and(|parent| parent.held);
+        let is_land_gate = scheduling.class() == ExecClass::Gate && lander.is_some();
         let job = JobStateRecord {
             info,
             started_at: Instant::now(),
@@ -7576,11 +7718,21 @@ impl SupervisorActor {
                 stderr_digest: Sha256::new(),
                 read: EndRead::default(),
             }),
+            is_land_gate,
+            mbx_started_ms: None,
+            token_drainer: None,
+            tokens_withdrawn: 0,
+            darwinbg_cleared: 0,
+            #[cfg(target_os = "macos")]
+            darwinbg: None,
         };
         if let Some(kept) = caller_key {
             self.caller_keys.insert(kept.admission.key.clone(), kept);
         }
         self.jobs.insert(job_id, job);
+        if is_land_gate {
+            self.gate_watch.gate_start(job_id);
+        }
         self.admission_event(super::job_admission::Event::Requested {
             job: job_id,
             class: scheduling.class(),
@@ -7662,9 +7814,10 @@ impl SupervisorActor {
                 return;
             }
         };
+        let granted_tokens = jobserver.tokens();
         let cpu = CpuPlacement {
             fifo: jobserver.fifo().to_path_buf(),
-            tokens: jobserver.tokens(),
+            tokens: granted_tokens,
             class: job.info.class,
             held,
             started_ms: u64::try_from(
@@ -7676,9 +7829,11 @@ impl SupervisorActor {
             .expect("milliseconds since 1970 fit u64"),
             nice: super::placement::placed_nice(job.info.class),
         };
+        job.mbx_started_ms = Some(cpu.started_ms);
         job.info.state = JobState::Running;
         job.cpu = CpuStanding::Admitted {
             jobserver: OffActor::new(jobserver),
+            granted_tokens,
         };
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here. Its
@@ -7786,6 +7941,12 @@ impl SupervisorActor {
         }
         // Input a client wrote while the job waited for its grant goes to the command now.
         self.flush_stdin(job_id);
+        if self.gate_active
+            && let Some(class) = self.jobs.get(&job_id).map(|job| job.info.class)
+            && gate_priority::should_withdraw_class(class, false)
+        {
+            self.begin_job_withdrawal(job_id).await;
+        }
     }
 
     /// End a job whose command never ran, failed by `error`: its exit is the failure's wrapper
@@ -8312,7 +8473,8 @@ impl SupervisorActor {
         }
         // Published before the turn goes on: a `hold` judged from what the actor published must
         // not take a forgotten job for one it holds (11_shell.md, "Protocol").
-        self.liveness.publish_jobs(unconcluded(&self.jobs));
+        self.liveness
+            .publish_jobs(self.gate_active, unconcluded(&self.jobs));
     }
     fn kill(
         &mut self,
@@ -8713,6 +8875,23 @@ impl SupervisorActor {
                 }
             }
             ProcessEvent::Decay { job_id, step } => self.decay(job_id, step),
+            ProcessEvent::GateWatchState { active, heartbeat } => {
+                self.handle_gate_watch_state(active, heartbeat).await;
+            }
+            ProcessEvent::MbxFirstAdmitted { entries } => {
+                self.handle_mbx_first_admitted(entries).await;
+            }
+            ProcessEvent::TokensWithdrawn { job_id, count } => {
+                self.handle_tokens_withdrawn(job_id, count);
+            }
+            #[cfg(target_os = "macos")]
+            ProcessEvent::DarwinBgGraceElapsed { job_id } => {
+                self.handle_darwinbg_grace(job_id);
+            }
+            #[cfg(target_os = "macos")]
+            ProcessEvent::DarwinBgWindowElapsed { job_id } => {
+                self.handle_darwinbg_window(job_id).await;
+            }
             ProcessEvent::SignalFailed { job_id, error } => {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
                     return;
@@ -8762,6 +8941,411 @@ impl SupervisorActor {
             && job.caller.is_none()
         {
             job_spans.record_decay(&job.info, step);
+        }
+    }
+
+    async fn handle_gate_watch_state(&mut self, active: bool, heartbeat: bool) {
+        if active {
+            let became_active = !self.gate_active;
+            self.gate_active = true;
+            if became_active {
+                let candidates: Vec<JobId> = self
+                    .jobs
+                    .iter()
+                    .filter(|(id, job)| {
+                        !job.terminal()
+                            && matches!(job.cpu, CpuStanding::Admitted { .. })
+                            && gate_priority::should_withdraw_class(
+                                job.info.class,
+                                self.past_first_band.contains(id),
+                            )
+                    })
+                    .map(|(&id, _)| id)
+                    .collect();
+                for job_id in candidates {
+                    self.begin_job_withdrawal(job_id).await;
+                }
+            }
+            if heartbeat {
+                self.maybe_inspect_mbx_first_admitted();
+            }
+        } else if self.gate_active {
+            self.gate_active = false;
+            let jobs: Vec<JobId> = self.jobs.keys().copied().collect();
+            for job_id in jobs {
+                self.end_job_withdrawal(job_id, true).await;
+            }
+        }
+    }
+
+    /// Inspect `mbx stats --scheduler --json --activity` at most once per heartbeat while a land's
+    /// gate span is active, and only when at least one running interactive job is not yet
+    /// withdrawn from (05_gateway.md "Whom it withdraws from").
+    fn maybe_inspect_mbx_first_admitted(&mut self) {
+        if self.mbx_inspection_in_flight {
+            return;
+        }
+        let has_interactive_candidate = self.jobs.iter().any(|(id, job)| {
+            !job.terminal()
+                && matches!(job.cpu, CpuStanding::Admitted { .. })
+                && matches!(
+                    job.info.class,
+                    ExecClass::Interactive | ExecClass::InteractiveResident
+                )
+                && !self.past_first_band.contains(id)
+                && job.token_drainer.is_none()
+        });
+        if !has_interactive_candidate {
+            return;
+        }
+        let ceiling = self.policy.ceiling();
+        if !ceiling
+            .capabilities
+            .active
+            .contains(&crate::capabilities::CapabilityId::Mbx)
+        {
+            return;
+        }
+        self.mbx_inspection_in_flight = true;
+        let pool = super::host_hold::Pool::installed(
+            &ceiling.home,
+            &ceiling.capabilities.contribution.env,
+        );
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let entries = pool.first_admitted().await.unwrap_or_default();
+            let _ = events
+                .send(ProcessEvent::MbxFirstAdmitted { entries })
+                .await;
+        });
+    }
+
+    async fn handle_mbx_first_admitted(&mut self, entries: Vec<super::host_hold::FirstAdmitted>) {
+        self.mbx_inspection_in_flight = false;
+        if !self.gate_active {
+            return;
+        }
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let incarnation = self.authority.workspace_incarnation.clone();
+        let newly_decayed: Vec<JobId> = self
+            .jobs
+            .iter()
+            .filter(|(id, job)| {
+                !job.terminal()
+                    && matches!(job.cpu, CpuStanding::Admitted { .. })
+                    && matches!(
+                        job.info.class,
+                        ExecClass::Interactive | ExecClass::InteractiveResident
+                    )
+                    && !self.past_first_band.contains(id)
+                    && job.mbx_started_ms.is_some_and(|started_ms| {
+                        let host_id = super::placement::host_job_id(&incarnation, **id);
+                        super::host_hold::interactive_past_first_band(
+                            &entries, &host_id, started_ms, now_ms,
+                        )
+                    })
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for job_id in newly_decayed {
+            self.past_first_band.insert(job_id);
+            self.begin_job_withdrawal(job_id).await;
+        }
+    }
+
+    async fn begin_job_withdrawal(&mut self, job_id: JobId) {
+        let dup_result = {
+            let Some(job) = self.jobs.get_mut(&job_id) else {
+                return;
+            };
+            if job.terminal() || job.token_drainer.is_some() {
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            if job.darwinbg.is_some() {
+                return;
+            }
+            match &mut job.cpu {
+                CpuStanding::Admitted { jobserver, .. } => {
+                    Some(jobserver.run(|js| js.dup_nonblocking_fd()).await)
+                }
+                _ => None,
+            }
+        };
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if job.terminal() || !self.gate_active {
+            return;
+        }
+        if let Some(Ok(Some(fd))) = dup_result {
+            match super::job_cpu::FifoDrainer::start(fd, self.events.clone(), move |count| {
+                ProcessEvent::TokensWithdrawn { job_id, count }
+            }) {
+                Ok(drainer) => job.token_drainer = Some(drainer),
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: cannot watch job {}'s jobserver fifo for withdrawal: {error}",
+                        job_id.get()
+                    );
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if job.darwinbg.is_none() {
+            job.darwinbg = Some(gate_priority::JobDarwinBg::start(
+                job_id,
+                self.events.clone(),
+            ));
+        }
+    }
+
+    fn handle_tokens_withdrawn(&mut self, job_id: JobId, count: usize) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.tokens_withdrawn = job.tokens_withdrawn.saturating_add(count);
+        if let Some(job_spans) = &self.job_spans
+            && job.caller.is_none()
+        {
+            job_spans.record_gate_priority(
+                &job.info,
+                super::job_spans::GatePriorityRow::TokensWithdrawn {
+                    tokens: u32::try_from(count).unwrap_or(u32::MAX),
+                },
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_darwinbg_grace(&mut self, job_id: JobId) {
+        if !self.gate_active {
+            return;
+        }
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if job.terminal() {
+            return;
+        }
+        let sample = job
+            .monitor
+            .as_ref()
+            .and_then(ProcessMonitor::observed_cpu_sample);
+        if let Some(bg) = &mut job.darwinbg
+            && !bg.active
+        {
+            bg.window_start = sample;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn handle_darwinbg_window(&mut self, job_id: JobId) {
+        if !self.gate_active {
+            return;
+        }
+        let (cpu_millicores, held, lives) = {
+            let Some(job) = self.jobs.get_mut(&job_id) else {
+                return;
+            };
+            if job.terminal() {
+                return;
+            }
+            let granted = match &job.cpu {
+                CpuStanding::Admitted { granted_tokens, .. } => *granted_tokens,
+                _ => return,
+            };
+            let end = job
+                .monitor
+                .as_ref()
+                .and_then(ProcessMonitor::observed_cpu_sample);
+            let Some(bg) = &mut job.darwinbg else {
+                return;
+            };
+            if bg.active {
+                return;
+            }
+            let Some(end) = end else {
+                return;
+            };
+            let Some(start) = bg.window_start.replace(end) else {
+                return;
+            };
+            let Some(cpu_millicores) = gate_priority::window_cpu_millicores(start, end) else {
+                return;
+            };
+            let held = gate_priority::held_tokens(granted, job.tokens_withdrawn);
+            if !gate_priority::exceeds_token_budget(cpu_millicores, held) {
+                return;
+            }
+            bg.stop_window_task();
+            bg.active = true;
+            let mut lives: Vec<super::process_tree::ProcessIdentity> = job
+                .monitor
+                .as_ref()
+                .map(|monitor| monitor.running_lives().to_vec())
+                .unwrap_or_default();
+            for &life in &lives {
+                bg.applied.insert(life);
+            }
+            lives.sort_unstable_by_key(|life| (life.pid, life.birth.0));
+            lives.dedup();
+            (cpu_millicores, held, lives)
+        };
+        if lives.is_empty() {
+            return;
+        }
+        // Persist every life to `.groups` BEFORE calling `setpriority(PRIO_DARWIN_BG)`.
+        self.flush_groups_darwinbg().await;
+        let outcomes = off_actor::run(move || gate_priority::apply_darwinbg_to_lives(lives)).await;
+        let Some(job) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if let Some(job_spans) = &self.job_spans
+            && job.caller.is_none()
+        {
+            for (pid, outcome) in outcomes {
+                if outcome == super::placement::DarwinBgOutcome::Unconfirmed {
+                    job_spans.record_gate_priority(
+                        &job.info,
+                        super::job_spans::GatePriorityRow::DarwinBgUnconfirmed { pid },
+                    );
+                }
+            }
+            job_spans.record_gate_priority(
+                &job.info,
+                super::job_spans::GatePriorityRow::DarwinBgSet {
+                    cpu_millicores,
+                    tokens: held,
+                },
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn extend_darwinbg_for_new_lives(&mut self) {
+        if !self.gate_active {
+            return;
+        }
+        let mut additions: Vec<(JobId, Vec<super::process_tree::ProcessIdentity>)> = Vec::new();
+        for (&job_id, job) in &mut self.jobs {
+            if job.terminal() {
+                continue;
+            }
+            let Some(bg) = &mut job.darwinbg else {
+                continue;
+            };
+            if !bg.active {
+                continue;
+            }
+            let Some(monitor) = &job.monitor else {
+                continue;
+            };
+            let mut new_lives = Vec::new();
+            for &life in monitor.running_lives().iter() {
+                if bg.applied.insert(life) {
+                    new_lives.push(life);
+                }
+            }
+            if !new_lives.is_empty() {
+                additions.push((job_id, new_lives));
+            }
+        }
+        if additions.is_empty() {
+            return;
+        }
+        self.flush_groups_darwinbg().await;
+        for (job_id, new_lives) in additions {
+            let outcomes =
+                off_actor::run(move || gate_priority::apply_darwinbg_to_lives(new_lives)).await;
+            if let Some(job) = self.jobs.get(&job_id)
+                && let Some(job_spans) = &self.job_spans
+                && job.caller.is_none()
+            {
+                for (pid, outcome) in outcomes {
+                    if outcome == super::placement::DarwinBgOutcome::Unconfirmed {
+                        job_spans.record_gate_priority(
+                            &job.info,
+                            super::job_spans::GatePriorityRow::DarwinBgUnconfirmed { pid },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    async fn end_job_withdrawal(&mut self, job_id: JobId, restore_tokens: bool) {
+        let drainer = self.jobs.get_mut(&job_id).and_then(|job| {
+            job.tokens_withdrawn = 0;
+            job.token_drainer.take()
+        });
+        if let Some(drainer) = drainer {
+            if restore_tokens {
+                let restored = drainer.restore().await;
+                if restored > 0
+                    && let Some(job) = self.jobs.get(&job_id)
+                    && let Some(job_spans) = &self.job_spans
+                    && job.caller.is_none()
+                {
+                    job_spans.record_gate_priority(
+                        &job.info,
+                        super::job_spans::GatePriorityRow::TokensRestored {
+                            tokens: u32::try_from(restored).unwrap_or(u32::MAX),
+                        },
+                    );
+                }
+            } else {
+                drop(drainer);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let clear_lives = self.jobs.get_mut(&job_id).and_then(|job| {
+                let mut bg = job.darwinbg.take()?;
+                bg.stop_window_task();
+                if !bg.active {
+                    return None;
+                }
+                let mut lives = std::mem::take(&mut bg.applied);
+                if let Some(monitor) = &job.monitor {
+                    for &life in monitor.running_lives().iter() {
+                        lives.insert(life);
+                    }
+                }
+                Some(lives.into_iter().collect::<Vec<_>>())
+            });
+            if let Some(lives) = clear_lives {
+                // Clear PRIO_DARWIN_BG on every live process FIRST, then remove from `.groups`.
+                let outcomes =
+                    off_actor::run(move || gate_priority::clear_darwinbg_from_lives(lives)).await;
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    job.darwinbg_cleared = job.darwinbg_cleared.saturating_add(1);
+                }
+                if let Some(job) = self.jobs.get(&job_id)
+                    && let Some(job_spans) = &self.job_spans
+                    && job.caller.is_none()
+                {
+                    for (pid, outcome) in outcomes {
+                        if outcome == super::placement::DarwinBgOutcome::Unconfirmed {
+                            job_spans.record_gate_priority(
+                                &job.info,
+                                super::job_spans::GatePriorityRow::DarwinBgUnconfirmed { pid },
+                            );
+                        }
+                    }
+                    job_spans.record_gate_priority(
+                        &job.info,
+                        super::job_spans::GatePriorityRow::DarwinBgCleared,
+                    );
+                }
+                self.flush_groups_darwinbg().await;
+            }
         }
     }
 
@@ -9351,7 +9935,16 @@ impl SupervisorActor {
                 job.terminal_cleanup_failure.get_or_insert(error);
             }
         }
-        if let CpuStanding::Admitted { jobserver } =
+        if job.is_land_gate {
+            job.is_land_gate = false;
+            self.gate_watch.gate_end(job_id);
+        }
+        self.past_first_band.remove(&job_id);
+        self.end_job_withdrawal(job_id, false).await;
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if let CpuStanding::Admitted { jobserver, .. } =
             std::mem::replace(&mut job.cpu, CpuStanding::Settled)
         {
             jobserver.release().await;

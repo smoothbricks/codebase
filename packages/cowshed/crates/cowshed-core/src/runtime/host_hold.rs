@@ -539,7 +539,7 @@ async fn queue_note(pool: &Pool, group: libc::pid_t) -> String {
 /// One interactive job's first admitted ask in mbx's scheduler pool
 /// (`mbx stats --scheduler --json --activity`, `scheduler.first_admitted`).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub(crate) struct FirstAdmitted {
+pub struct FirstAdmitted {
     pub job_id: String,
     pub job_started_ms: u64,
     pub first_admitted_ms: u64,

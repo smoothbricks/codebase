@@ -658,6 +658,8 @@ struct Writer<P> {
     subscribers: HashMap<u64, Subscriber>,
     next_id: u64,
     next_sample: Instant,
+    /// Monotonic timestamp of the latest rusage sample folded into the observer.
+    last_sampled_at: Instant,
     /// The job-accounting boundary is complete. Live registrations still sample.
     finished: bool,
     /// `finished` and no retained registration remains. Readers then see the end.
@@ -688,6 +690,7 @@ impl<P: ProcessReads> Writer<P> {
             subscribers: HashMap::new(),
             next_id: 1,
             next_sample: Instant::now() + DEFAULT_SAMPLE,
+            last_sampled_at: Instant::now(),
             finished: false,
             ended: false,
             trace: None,
@@ -783,7 +786,7 @@ impl<P: ProcessReads> Writer<P> {
             tree,
             attribution: self.observer.attribution_summary(),
             running,
-            sampled_at: Instant::now(),
+            sampled_at: self.last_sampled_at,
         }));
         if membership_changed && let Some(changed) = &self.ledger_changes {
             changed.notify_one();
@@ -827,6 +830,7 @@ impl<P: ProcessReads> Writer<P> {
                     }
                     Request::Watch { pid, reply } => {
                         let result = self.observer.watch_root(pid).map_err(observation_error);
+                        self.last_sampled_at = Instant::now();
                         self.publish(result.clone());
                         let _ = reply.send(result);
                     }
@@ -939,7 +943,9 @@ impl<P: ProcessReads> Writer<P> {
                     // The tick is also where the source is asked for what it reports only when
                     // asked; a read it failed that the fold holds as a gap leaves the tree
                     // readable.
-                    let sampled = self.observer.sample(Instant::now());
+                    let now = Instant::now();
+                    let sampled = self.observer.sample(now);
+                    self.last_sampled_at = now;
                     let _ = self.publish_drained(sampled);
                 }
                 let every = self

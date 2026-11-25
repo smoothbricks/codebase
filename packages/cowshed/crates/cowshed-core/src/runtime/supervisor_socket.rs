@@ -226,6 +226,11 @@ enum Request {
 struct LiveJobWire {
     class: ExecClass,
     state: JobState,
+    #[serde(
+        default,
+        skip_serializing_if = "super::supervisor::JobGatePriority::is_default"
+    )]
+    gate_priority: super::supervisor::JobGatePriority,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -634,6 +639,8 @@ struct ProgressWire {
 struct ActorPulse {
     turns: u64,
     busy: Option<TurnBusy>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    gate_active: bool,
 }
 
 /// The turn an actor is in: the command or event it handles, and for how long so far.
@@ -660,14 +667,22 @@ pub(crate) struct JobPulse {
     /// How many processes of the job's group its latest sample found running; absent before the
     /// job's first sample.
     members: Option<usize>,
+    /// Per-job land-gate withdrawal and `PRIO_DARWIN_BG` state (05_gateway.md "A land's gate takes
+    /// tokens back").
+    #[serde(
+        default,
+        skip_serializing_if = "super::supervisor::JobGatePriority::is_default"
+    )]
+    pub(crate) gate_priority: super::supervisor::JobGatePriority,
 }
 
 impl JobPulse {
-    pub(crate) fn of(info: &JobInfo) -> Self {
+    pub(crate) fn of(info: &JobInfo, gate_priority: super::supervisor::JobGatePriority) -> Self {
         Self {
             job_id: info.job_id,
             state: info.state,
             members: info.resources.as_ref().map(|sample| sample.members.len()),
+            gate_priority,
         }
     }
 
@@ -755,6 +770,7 @@ fn pulse(supervisor: &WorkspaceSupervisorHandle, job: Option<JobId>) -> Result<P
                 turn: turn.kind.to_owned(),
                 for_ms: u64::try_from(turn.since.elapsed().as_millis()).unwrap_or(u64::MAX),
             }),
+            gate_active: liveness.gate_active(),
         },
     })
 }
@@ -2747,6 +2763,9 @@ async fn serve_call(
                 .map(|job| LiveJobWire {
                     class: job.class,
                     state: job.pulse.state,
+                    gate_priority: liveness
+                        .job_gate_priority(job.pulse.job_id)
+                        .unwrap_or_default(),
                 })
                 .collect::<Vec<_>>();
             let value = to_value(&jobs)?;
@@ -4447,6 +4466,7 @@ mod process_demand_tests {
             actor: ActorPulse {
                 turns: 0,
                 busy: None,
+                gate_active: false,
             },
         })
     }
@@ -5740,6 +5760,7 @@ mod call_deadline_tests {
             job_id: JobId::new(7).unwrap(),
             state,
             members,
+            gate_priority: crate::runtime::JobGatePriority::default(),
         }
     }
 
@@ -5784,6 +5805,7 @@ mod call_deadline_tests {
         ActorPulse {
             turns: 1,
             busy: None,
+            gate_active: false,
         }
     }
 
@@ -5863,6 +5885,7 @@ mod call_deadline_tests {
                     turn: turn.to_owned(),
                     for_ms: seq * 5000,
                 }),
+                gate_active: false,
             };
             let supervisor = tokio::spawn(async move {
                 beat_with(

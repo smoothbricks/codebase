@@ -219,7 +219,6 @@ pub(crate) async fn serve<R, W>(
             }
         }
     }
-    gate_watch.disconnect(conn_id);
     if let Some(ledger) = ledger {
         let cleared = tokio::task::spawn_blocking(move || {
             cowshed_core::runtime::job_groups::clear_recorded_darwinbg(&ledger)
@@ -231,6 +230,7 @@ pub(crate) async fn serve<R, W>(
             );
         }
     }
+    gate_watch.disconnect(conn_id);
 }
 
 #[cfg(test)]

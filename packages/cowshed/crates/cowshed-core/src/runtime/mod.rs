@@ -57,7 +57,7 @@ pub use project::{
 };
 pub use storage_host::{NativeHost, native_host, require_platform_filesystem};
 pub use supervisor::{
-    CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, HostJobPath, LogChunk,
-    SessionSnapshot, SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
-    WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+    CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, HostJobPath, JobGatePriority,
+    Liveness, LogChunk, SessionSnapshot, SessionToken, WorkspaceAuthoritySnapshot,
+    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
