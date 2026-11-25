@@ -27,7 +27,8 @@ bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--manifest path]
   `{ name, proven, digest, params, hypsCount, corpusCount, propsCount, reachedFns }`, and per-machine
   `{ name, init, step, stateType, inputType, handled, inputCount }`. Each law `digest` is the 256-bit BLAKE3 hex digest
   over the de-Bruijn-normalized checked core type of the law, so alpha-equivalent laws with renamed binders produce
-  identical digests.
+  identical digests. A law is `proven: true` only when its checked proof body exists and contains no hole (`?TODO`)
+  directly or in any user proof def it reaches.
 
 The command always takes both positionals; module mode does not use the output directory. Without module mode, it writes
 `<stem>.rs`, `<stem>.goose`, `<stem>.go`, `<stem>.ts` and `run_<stem>.ts`.
@@ -81,9 +82,9 @@ const output = book.emit({
 // output.manifest holds the deterministic provenance manifest and BLAKE3 law digests.
 ```
 
-`checkBendFile` loads and checks once; `emit` returns the sources, counts, and `manifest` without writing files.
-Multiple emissions from one checked book are independent. The package runs on Bun. To test a local package in another
-checkout:
+`checkBendFile` loads and checks once; `emit` returns the sources, counts, and `manifest` without writing files, and
+`skeleton` derives proof skeletons from the same checked book without re-checking `Base`. Multiple calls on one checked
+book are independent. The package runs on Bun. To test a local package in another checkout:
 
 ```sh
 (cd <provider>/packages/bend-emit && bun link)
@@ -93,6 +94,42 @@ checkout:
 
 The linked command needs no build or checker environment variable. The regular package build emits the public TypeScript
 declarations for publication.
+
+## Proof skeletons
+
+`bend-emit skeleton` derives Bend 2 proof skeletons directly from the checked core terms of a book's functions and laws,
+splitting open binders in Bend 2's legal `match` order and emitting definitions in callee-before-caller dependency
+order.
+
+```sh
+bend-emit skeleton <book.bend> --law x,y
+bend-emit skeleton <book.bend> --all
+```
+
+```ts
+import { checkBendFile } from '@smoothbricks/bend-emit';
+
+const book = await checkBendFile('model.bend');
+const result = book.skeleton({ laws: ['x'] }); // omit `laws` for all eligible proof defs
+// result.defs    -> SkeletonDef[] in dependency order (each verified with Bend2 `def_check`)
+// result.skipped -> already-proved defs left untouched
+// result.source  -> formatted Bend 2 source ready to splice
+```
+
+- **Non-overwrite rule:** `skeleton` never overwrites an existing proof. It generates skeletons only for unfilled `law`
+  declarations (no `def` body yet) and proof defs whose body is a single hole (`?TODO`).
+  - `book.skeleton(...)` returns any already-proved def names in `result.skipped` without emitting them.
+  - `bend-emit skeleton <book.bend> --all` (or omitting `--law`) skips already-proved defs and reports them on stderr.
+  - `bend-emit skeleton <book.bend> --law x` refuses with a nonzero exit naming `x` if `x` already has a non-hole proof.
+- **Leaves:** each branch of the generated match tree terminates in one of:
+  - `{==}` (when Bend 2's `term_compare("EQ", ...)` accepts the branch's equality goal by computation) or `Unit{}` (for
+    a `IsTrue(p)` goal reducing to `Unit`),
+  - `Empty.absurd(<goal>, h)` (when an in-scope hypothesis reduces to `Empty`, e.g. `IsTrue(False{})`),
+  - `h` (when an in-scope live hypothesis already has a type fitting the branch goal),
+  - a direct structurally decreasing self-call verified against Bend 2's left-to-right `term_descend` termination rule,
+    or
+  - a typed hole `{?TODO : <remaining goal>}` naming the remaining goal where a lemma or rewrite is needed.
+- Every emitted skeleton is parsed back and checked with Bend 2's `def_check` before being returned.
 
 ## State machines and model-based testing
 

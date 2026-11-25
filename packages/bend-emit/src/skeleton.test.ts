@@ -469,11 +469,12 @@ def sum_boxes(+bs: +List<Box>) -> Nat:
     expect(impliesZero?.leaves.refl).toBe(2);
     expect(impliesZero?.leaves.holes).toBe(0);
 
-    // sum_boxes_same splits bs, and inside Con{+b, +bt} splits b on Box{+xs}
+    // sum_boxes_same splits bs, and inside Con{head, tail} splits head on Box{items}
     const sumBoxes = byName.get('sum_boxes_same');
     expect(sumBoxes).toBeDefined();
     expect(sumBoxes?.source).toContain('match bs:');
-    expect(sumBoxes?.source).toContain('match b:');
+    expect(sumBoxes?.source).toContain('match head:');
+    expect(sumBoxes?.source).toContain('case Box{items}:');
     expect(sumBoxes?.leaves.refl).toBe(1);
     expect(sumBoxes?.leaves.holes).toBe(1);
 

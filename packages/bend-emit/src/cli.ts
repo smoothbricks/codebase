@@ -38,7 +38,52 @@ function parseMachineSpec(raw: string): MachineSpec {
   return { name, init, step, input, ...(handled !== undefined ? { handled } : {}) };
 }
 
+async function runSkeleton(argv: readonly string[]): Promise<void> {
+  const [file, ...rest] = argv;
+  if (file === undefined || file.startsWith('-')) {
+    throw new Error('bend-emit refuses: usage: bend-emit skeleton <book.bend> [--law a,b | --all]');
+  }
+  const laws: string[] = [];
+  let all = false;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === '--all') {
+      all = true;
+    } else if (arg === '--law' || arg === '--laws') {
+      const val = rest[i + 1];
+      if (val === undefined || val === '' || val.startsWith('-')) {
+        throw new Error(`bend-emit refuses: ${arg} requires a law or lemma name`);
+      }
+      for (const item of val.split(',').filter(Boolean)) {
+        laws.push(item);
+      }
+      i++;
+    } else {
+      throw new Error(`bend-emit refuses: unknown option ${JSON.stringify(arg)} for skeleton`);
+    }
+  }
+  if (all && laws.length > 0) {
+    throw new Error('bend-emit refuses: pass either --law <name> or --all, not both');
+  }
+  const book = await checkBendFile(file);
+  const explicit = laws.length > 0;
+  const result = book.skeleton(explicit ? { laws } : {});
+  if (explicit && result.skipped.length > 0) {
+    throw new Error(`bend-emit refuses: existing proof will not be overwritten: ${result.skipped.join(', ')}`);
+  }
+  if (!explicit && result.skipped.length > 0) {
+    console.error(`bend-emit skeleton: skipped already-proved defs: ${result.skipped.join(', ')}`);
+  }
+  if (result.source.length > 0) {
+    console.log(result.source);
+  }
+}
+
 export async function run(argv: readonly string[]): Promise<void> {
+  if (argv[0] === 'skeleton') {
+    await runSkeleton(argv.slice(1));
+    return;
+  }
   const [file, outdir, ...rest] = argv;
   if (file === undefined || outdir === undefined) {
     throw new Error(

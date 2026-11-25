@@ -21,6 +21,16 @@
 
 import * as Bend from '../vendor/bend2/bend.js';
 import { blake3Hex } from './blake3.js';
+import {
+  defIsProven,
+  generateSkeletons,
+  type SkeletonDef,
+  type SkeletonLeafCounts,
+  type SkeletonOptions,
+  type SkeletonResult,
+} from './skeleton.js';
+
+export type { SkeletonDef, SkeletonLeafCounts, SkeletonOptions, SkeletonResult };
 
 type H = Bend.HTerm;
 
@@ -627,11 +637,11 @@ function compileFn(k: string): Fn {
   return { name: k, params: s.params, ret: s.ret, body, recursive, tailRecursive: false };
 }
 
-// A law is proven when its def has a body the checker accepted; a law with no
-// def is an open claim: the driver still runs it, as a strong test, not a proof.
+// A law is proven when its def has a body the checker accepted and contains no
+// hole (`?TODO`) directly or in any user proof def it reaches; otherwise it is
+// an open claim: the driver still runs it, as a strong test, not a proof.
 function lawProven(k: string): boolean {
-  const t = BOOK.tlds[k];
-  return t !== undefined && t.$ === 'Def' && t.v !== null;
+  return defIsProven(BOOK, k);
 }
 
 function compileLaw(k: string): Law {
@@ -2701,6 +2711,8 @@ export type Emission = {
 export interface CheckedBendBook {
   /** Emit from the checked book without writing files or reading process arguments. */
   emit(options: EmitOptions): Emission;
+  /** Generate proof skeletons for unfilled or single-hole laws and proof lemmas in dependency order. */
+  skeleton(options?: SkeletonOptions): SkeletonResult;
 }
 
 function exprDirectCalls(e: Expr): string[] {
@@ -3030,6 +3042,9 @@ export async function checkBendFile(file: string): Promise<CheckedBendBook> {
         USED.clear();
         USED_BASE_NAT.clear();
       }
+    },
+    skeleton(options) {
+      return generateSkeletons(book, options);
     },
   };
 }
