@@ -1903,7 +1903,13 @@ say() {
 case "$1" in
 settings) exit 0 ;;
 stats)
-  printf '{"version":2,"scheduler":{"activity":[]}}\n'
+  if [ -r "$HOME/stats.json" ]; then
+    while IFS= read -r line; do
+      printf '%s\n' "$line"
+    done < "$HOME/stats.json"
+  else
+    printf '{"version":2,"scheduler":{"activity":[]}}\n'
+  fi
   exit 0
   ;;
 reserve) shift ;;
@@ -2131,6 +2137,14 @@ impl TestMbx {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Replace the JSON payload `stats --scheduler --json --activity` prints.
+    fn set_stats_json(&self, json: &str) {
+        let tmp = self.home.join("stats.json.tmp");
+        let target = self.home.join("stats.json");
+        std::fs::write(&tmp, format!("{json}\n")).expect("write test mbx stats temp");
+        std::fs::rename(&tmp, &target).expect("publish test mbx stats");
     }
 }
 
@@ -12620,4 +12634,900 @@ fn census() -> cowshed_core::census::CensusScope {
         cowshed_os::namespace::HostNamespace::Test(namespace),
         std::sync::Arc::from(std::path::Path::new("/var/empty")),
     )
+}
+
+/// Land's gate token withdrawal, macOS `PRIO_DARWIN_BG` fallback, recovery, and silence-bound
+/// restoration (05_gateway.md "A land's gate takes tokens back"), tested against the real
+/// `WorkspaceSupervisor` and a stand-in gateway speaking the typed `gate-watch` protocol.
+mod land_gate_priority {
+    use super::*;
+    use cowshed_core::api::JobLander;
+    use cowshed_core::gate_watch::{GATE_WATCH_OP, GateWatchEvent, GateWatchOpen, GateWatchState};
+    use cowshed_os::deadline;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::net::UnixListener;
+    use tokio::sync::{Mutex, Notify, mpsc, watch};
+
+    /// Await `fut` bounded only by the spec's heartbeat silence bound (`deadline::HEARTBEAT_SILENCE`).
+    async fn within_silence<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(deadline::HEARTBEAT_SILENCE, fut).await {
+            Ok(value) => value,
+            Err(_) => panic!(
+                "{what} did not happen within the silence bound ({:?})",
+                deadline::HEARTBEAT_SILENCE
+            ),
+        }
+    }
+
+    /// Shared stand-in gateway speaking the typed `gate-watch` wire protocol at
+    /// `<store_root>/gateway.sock`.
+    struct StandInGateway {
+        events: mpsc::UnboundedReceiver<GateWatchEvent>,
+        silent: Arc<std::sync::atomic::AtomicBool>,
+        active_tx: watch::Sender<(bool, u64)>,
+        state: Arc<Mutex<StandInState>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    #[derive(Default)]
+    struct StandInState {
+        next_conn_id: u64,
+        active_jobs: BTreeSet<(u64, u64)>,
+        seq: u64,
+        ledgers: Vec<Option<PathBuf>>,
+    }
+
+    impl StandInGateway {
+        fn start(store_root: &Path) -> Self {
+            std::fs::create_dir_all(store_root).expect("create fixture store root");
+            let socket = store_root.join(cowshed_core::storage::bootstrap::GATEWAY_SOCKET_NAME);
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket).expect("bind stand-in gateway socket");
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (active_tx, _active_rx) = watch::channel((false, 0_u64));
+            let state = Arc::new(Mutex::new(StandInState::default()));
+            let heartbeat_wake = Arc::new(Notify::new());
+
+            let task = {
+                let silent = Arc::clone(&silent);
+                let active_tx = active_tx.clone();
+                let state = Arc::clone(&state);
+                let heartbeat_wake = Arc::clone(&heartbeat_wake);
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((stream, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let events_tx = events_tx.clone();
+                        let silent = Arc::clone(&silent);
+                        let active_tx = active_tx.clone();
+                        let mut active_rx = active_tx.subscribe();
+                        let state = Arc::clone(&state);
+                        let _wake = Arc::clone(&heartbeat_wake);
+                        tokio::spawn(async move {
+                            let (reader, mut writer) = stream.into_split();
+                            let mut lines = BufReader::new(reader).lines();
+                            let Ok(Some(first)) = lines.next_line().await else {
+                                return;
+                            };
+                            let Ok(open) = serde_json::from_str::<GateWatchOpen>(&first) else {
+                                return;
+                            };
+                            if open.op != GATE_WATCH_OP {
+                                return;
+                            }
+                            let (conn_id, initial) = {
+                                let mut guard = state.lock().await;
+                                guard.next_conn_id += 1;
+                                let conn_id = guard.next_conn_id;
+                                guard.ledgers.push(open.ledger);
+                                (conn_id, (!guard.active_jobs.is_empty(), guard.seq))
+                            };
+                            if !silent.load(std::sync::atomic::Ordering::SeqCst) {
+                                let frame = GateWatchState {
+                                    ok: true,
+                                    active: initial.0,
+                                    seq: initial.1,
+                                };
+                                let mut bytes = serde_json::to_vec(&frame).unwrap();
+                                bytes.push(b'\n');
+                                if writer.write_all(&bytes).await.is_err() {
+                                    return;
+                                }
+                            }
+                            let mut beats = deadline::beats();
+                            loop {
+                                tokio::select! {
+                                    line = lines.next_line() => {
+                                        let Ok(Some(line)) = line else {
+                                            break;
+                                        };
+                                        let Ok(event) = serde_json::from_str::<GateWatchEvent>(&line) else {
+                                            break;
+                                        };
+                                        let _ = events_tx.send(event.clone());
+                                        let changed = {
+                                            let mut guard = state.lock().await;
+                                            let before = !guard.active_jobs.is_empty();
+                                            match event {
+                                                GateWatchEvent::GateStart { job_id } => {
+                                                    guard.active_jobs.insert((conn_id, job_id));
+                                                }
+                                                GateWatchEvent::GateEnd { job_id } => {
+                                                    guard.active_jobs.remove(&(conn_id, job_id));
+                                                }
+                                            }
+                                            let after = !guard.active_jobs.is_empty();
+                                            if before != after {
+                                                guard.seq += 1;
+                                                Some((after, guard.seq))
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        if let Some(next) = changed {
+                                            let _ = active_tx.send(next);
+                                        }
+                                    }
+                                    changed = active_rx.changed() => {
+                                        if changed.is_err() {
+                                            break;
+                                        }
+                                        let (active, seq) = *active_rx.borrow_and_update();
+                                        if !silent.load(std::sync::atomic::Ordering::SeqCst) {
+                                            let frame = GateWatchState { ok: true, active, seq };
+                                            let mut bytes = serde_json::to_vec(&frame).unwrap();
+                                            bytes.push(b'\n');
+                                            if writer.write_all(&bytes).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ = beats.tick() => {
+                                        if !silent.load(std::sync::atomic::Ordering::SeqCst) {
+                                            let (active, seq) = *active_rx.borrow();
+                                            let frame = GateWatchState { ok: true, active, seq };
+                                            let mut bytes = serde_json::to_vec(&frame).unwrap();
+                                            bytes.push(b'\n');
+                                            if writer.write_all(&bytes).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let changed = {
+                                let mut guard = state.lock().await;
+                                let before = !guard.active_jobs.is_empty();
+                                guard.active_jobs.retain(|(owner, _)| *owner != conn_id);
+                                let after = !guard.active_jobs.is_empty();
+                                if before != after {
+                                    guard.seq += 1;
+                                    Some((after, guard.seq))
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(next) = changed {
+                                let _ = active_tx.send(next);
+                            }
+                        });
+                    }
+                })
+            };
+            Self {
+                events: events_rx,
+                silent,
+                active_tx,
+                state,
+                _task: task,
+            }
+        }
+
+        async fn recv_event(&mut self, what: &str) -> GateWatchEvent {
+            within_silence(what, self.events.recv())
+                .await
+                .expect("stand-in gateway event channel closed")
+        }
+
+        fn try_recv_event(&mut self) -> Option<GateWatchEvent> {
+            self.events.try_recv().ok()
+        }
+
+        #[allow(dead_code)]
+        fn go_silent(&self) {
+            self.silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        #[allow(dead_code)]
+        async fn push_heartbeat(&self) {
+            let mut guard = self.state.lock().await;
+            guard.seq += 1;
+            let active = !guard.active_jobs.is_empty();
+            let seq = guard.seq;
+            drop(guard);
+            let _ = self.active_tx.send((active, seq));
+        }
+    }
+
+    struct GateFixture {
+        handle: WorkspaceSupervisorHandle,
+        gateway: StandInGateway,
+        telemetry: PathBuf,
+        #[allow(dead_code)]
+        ledger: PathBuf,
+        mbx: Option<TestMbx>,
+        root: TempRoot,
+    }
+
+    fn start_fixture(name: &str, with_mbx: bool) -> GateFixture {
+        let (mut config, root) = isolated_config(&temp_parent::canonical_parent(), name);
+        config.default_cwd = None;
+        config.term_grace = Duration::from_secs(1);
+        std::fs::create_dir_all(&config.sandbox.home).unwrap();
+        std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    config
+                        .workspace_root
+                        .join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH),
+                )
+                .unwrap()
+                .write_all(
+                    cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                        .encode()
+                        .as_bytes(),
+                )
+                .unwrap();
+        }
+        let mbx = with_mbx.then(|| TestMbx::install(&mut config));
+        let telemetry = root.join("telemetry");
+        std::fs::create_dir_all(&telemetry).unwrap();
+        let ledger = root.join("supervisor.groups");
+        config.telemetry_root = Some(telemetry.clone());
+        config.group_ledger = Some(ledger.clone());
+        let gateway = StandInGateway::start(&config.sandbox.store_root);
+        let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+            Box::new(cowshed_core::storage::audit::NullAuditSink),
+            8,
+        )
+        .unwrap();
+        let handle = WorkspaceSupervisor::start(config, commitments).unwrap();
+        GateFixture {
+            handle,
+            gateway,
+            telemetry,
+            ledger,
+            mbx,
+            root,
+        }
+    }
+
+    /// One jobserver client running inside a real supervisor job, controlled over a test-owned
+    /// Unix socket with zero timers.
+    struct JobserverClient {
+        job_id: JobId,
+        reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: tokio::net::unix::OwnedWriteHalf,
+        mbx_job_id: String,
+        mbx_started_ms: u64,
+    }
+
+    const JOBSERVER_CLIENT_PY: &str = r#"
+import fcntl, os, select, socket, struct, sys
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sys.argv[1])
+f_in = sock.makefile('r', encoding='utf-8')
+f_out = sock.makefile('w', encoding='utf-8')
+
+flags = os.environ.get('CARGO_MAKEFLAGS', '')
+marker = '--jobserver-auth=fifo:'
+idx = flags.find(marker)
+assert idx >= 0, f'missing jobserver fifo in CARGO_MAKEFLAGS={flags!r}'
+fifo_path = flags[idx + len(marker):].split()[0]
+fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+if sys.platform == 'darwin':
+    kq = select.kqueue()
+    kq.control([select.kevent(fd, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0)
+    def avail():
+        evs = kq.control([], 1, 0)
+        return evs[0].data if evs else 0
+else:
+    def avail():
+        buf = fcntl.ioctl(fd, 0x541b, struct.pack('I', 0))
+        return struct.unpack('I', buf)[0]
+
+held = bytearray()
+f_out.write(f"ready {os.environ.get('MBX_SCHEDULER_JOB_ID', '')} {os.environ.get('MBX_SCHEDULER_JOB_STARTED_MS', '0')}\n")
+f_out.flush()
+
+for line in f_in:
+    parts = line.strip().split()
+    if not parts:
+        continue
+    cmd = parts[0]
+    if cmd == 'fionread':
+        f_out.write(f"avail {avail()}\n")
+        f_out.flush()
+    elif cmd == 'hold':
+        n = int(parts[1])
+        os.set_blocking(fd, True)
+        got = b''
+        while len(got) < n:
+            got += os.read(fd, n - len(got))
+        os.set_blocking(fd, False)
+        held.extend(got)
+        f_out.write(f"held {len(got)}\n")
+        f_out.flush()
+    elif cmd == 'return':
+        n = int(parts[1])
+        chunk = bytes(held[:n])
+        del held[:n]
+        os.write(fd, chunk)
+        f_out.write(f"returned {len(chunk)}\n")
+        f_out.flush()
+    elif cmd == 'wait_tokens':
+        n = int(parts[1])
+        os.set_blocking(fd, True)
+        got = b''
+        while len(got) < n:
+            got += os.read(fd, n - len(got))
+        os.set_blocking(fd, False)
+        os.write(fd, got)
+        f_out.write(f"restored {len(got)}\n")
+        f_out.flush()
+    elif cmd == 'exit':
+        if held:
+            os.write(fd, bytes(held))
+            held.clear()
+        f_out.write("bye\n")
+        f_out.flush()
+        break
+"#;
+
+    impl JobserverClient {
+        async fn start(
+            handle: &WorkspaceSupervisorHandle,
+            root: &Path,
+            label: &str,
+            class: ExecClass,
+            want: usize,
+        ) -> Self {
+            let sock_path = root.join(format!("{label}.sock"));
+            let _ = std::fs::remove_file(&sock_path);
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            let job_id = handle
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            r#"exec python3 -c "$1" "$2""#.into(),
+                            "jobserver-client".into(),
+                            JOBSERVER_CLIENT_PY.into(),
+                            CommandArg::from(sock_path.into_os_string()),
+                        ]),
+                        cwd: None,
+                        scope: ExecScope::HostGate,
+                        class,
+                        lander: None,
+                        want: Some(NonZeroUsize::new(want).unwrap()),
+                        hold: false,
+                        env: [(
+                            "PATH".into(),
+                            std::env::var("PATH").expect("development shell supplies python3"),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ..request(StdinSource::Empty)
+                    },
+                    AdmissionSource::Coordinator,
+                )
+                .await
+                .unwrap();
+            let (stream, _) = within_silence("jobserver client connect", listener.accept())
+                .await
+                .unwrap();
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            within_silence("jobserver client ready", reader.read_line(&mut line))
+                .await
+                .unwrap();
+            let mut parts = line.trim().split(' ');
+            assert_eq!(
+                parts.next(),
+                Some("ready"),
+                "unexpected client line: {line:?}"
+            );
+            let mbx_job_id = parts.next().unwrap_or_default().to_owned();
+            let mbx_started_ms = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            Self {
+                job_id,
+                reader,
+                writer: write_half,
+                mbx_job_id,
+                mbx_started_ms,
+            }
+        }
+
+        async fn cmd(&mut self, command: &str) -> String {
+            self.writer
+                .write_all(format!("{command}\n").as_bytes())
+                .await
+                .unwrap();
+            self.writer.flush().await.unwrap();
+            let mut line = String::new();
+            within_silence(command, self.reader.read_line(&mut line))
+                .await
+                .unwrap();
+            line.trim().to_owned()
+        }
+
+        async fn fionread(&mut self) -> usize {
+            let reply = self.cmd("fionread").await;
+            reply
+                .strip_prefix("avail ")
+                .unwrap_or_else(|| panic!("unexpected fionread reply: {reply:?}"))
+                .parse()
+                .unwrap()
+        }
+
+        async fn hold(&mut self, n: usize) {
+            assert_eq!(self.cmd(&format!("hold {n}")).await, format!("held {n}"));
+        }
+
+        async fn return_tokens(&mut self, n: usize) {
+            assert_eq!(
+                self.cmd(&format!("return {n}")).await,
+                format!("returned {n}")
+            );
+        }
+
+        async fn wait_tokens(&mut self, n: usize) {
+            assert_eq!(
+                self.cmd(&format!("wait_tokens {n}")).await,
+                format!("restored {n}")
+            );
+        }
+
+        async fn exit(mut self, handle: &WorkspaceSupervisorHandle) {
+            assert_eq!(self.cmd("exit").await, "bye");
+            let ended = within_silence("jobserver client exit", handle.wait(self.job_id))
+                .await
+                .unwrap();
+            assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
+        }
+    }
+
+    /// A gate job controlled over a Unix socket: prints `ready` once running and exits cleanly
+    /// when told `exit`.
+    struct GateJob {
+        job_id: JobId,
+        writer: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl GateJob {
+        async fn start(
+            handle: &WorkspaceSupervisorHandle,
+            root: &Path,
+            label: &str,
+            lander: Option<JobLander>,
+        ) -> Self {
+            let sock_path = root.join(format!("{label}.sock"));
+            let _ = std::fs::remove_file(&sock_path);
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            let script = r#"
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall(b"ready\n")
+s.recv(16)
+"#;
+            let job_id = handle
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            r#"exec python3 -c "$1" "$2""#.into(),
+                            "gate-job".into(),
+                            script.into(),
+                            CommandArg::from(sock_path.into_os_string()),
+                        ]),
+                        cwd: None,
+                        scope: ExecScope::HostGate,
+                        class: ExecClass::Gate,
+                        lander,
+                        want: None,
+                        hold: false,
+                        env: [(
+                            "PATH".into(),
+                            std::env::var("PATH").expect("development shell supplies python3"),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ..request(StdinSource::Empty)
+                    },
+                    AdmissionSource::Coordinator,
+                )
+                .await
+                .unwrap();
+            let (stream, _) = within_silence("gate job connect", listener.accept())
+                .await
+                .unwrap();
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            within_silence("gate job ready", reader.read_line(&mut line))
+                .await
+                .unwrap();
+            assert_eq!(line.trim(), "ready");
+            Self {
+                job_id,
+                writer: write_half,
+            }
+        }
+
+        async fn finish(mut self, handle: &WorkspaceSupervisorHandle) {
+            let _ = self.writer.write_all(b"go\n").await;
+            let _ = self.writer.shutdown().await;
+            let ended = within_silence("gate job exit", handle.wait(self.job_id))
+                .await
+                .unwrap();
+            assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct GateSpanRow {
+        entry_type: String,
+        message: String,
+        tokens: Option<u32>,
+        cpu_millicores: Option<u32>,
+        pid: Option<u32>,
+    }
+
+    fn gate_span_rows(telemetry: &Path, job_id: JobId) -> Vec<GateSpanRow> {
+        use arrow_array::Array as _;
+        use arrow_array::cast::AsArray as _;
+        use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
+
+        let mut rows = Vec::new();
+        for (_, batch) in job_span_batches(telemetry) {
+            let job_ids = batch
+                .column_by_name("job_id")
+                .expect("job_id")
+                .as_primitive::<UInt64Type>();
+            let entry_types = batch
+                .column_by_name("entry_type")
+                .expect("entry_type")
+                .as_dictionary::<UInt8Type>();
+            let messages = batch
+                .column_by_name("message")
+                .expect("message")
+                .as_dictionary::<UInt32Type>();
+            let opt_u32 = |name: &str, row: usize| {
+                batch.column_by_name(name).and_then(|column| {
+                    let values = column.as_primitive::<UInt32Type>();
+                    values.is_valid(row).then(|| values.value(row))
+                })
+            };
+            for row in 0..batch.num_rows() {
+                if job_ids.value(row) != job_id.get() {
+                    continue;
+                }
+                let entry_type = entry_types
+                    .values()
+                    .as_string::<i32>()
+                    .value(usize::from(entry_types.keys().value(row)))
+                    .to_owned();
+                let message = messages
+                    .values()
+                    .as_string::<i32>()
+                    .value(usize::try_from(messages.keys().value(row)).unwrap())
+                    .to_owned();
+                rows.push(GateSpanRow {
+                    entry_type,
+                    message,
+                    tokens: opt_u32("tokens", row),
+                    cpu_millicores: opt_u32("cpu_millicores", row),
+                    pid: opt_u32("pid", row),
+                });
+            }
+        }
+        rows
+    }
+
+    /// Wait until `telemetry` has recorded at least `expected_tokens` withdrawn for `job_id`,
+    /// bounded by the silence bound.
+    async fn wait_for_withdrawn(
+        handle: &WorkspaceSupervisorHandle,
+        telemetry: &Path,
+        job_id: JobId,
+        expected_tokens: u32,
+    ) {
+        within_silence("job.tokens.withdrawn span row", async {
+            loop {
+                let _ = handle.trace_health().await.unwrap();
+                let withdrawn: u32 = gate_span_rows(telemetry, job_id)
+                    .iter()
+                    .filter(|row| row.message == "job.tokens.withdrawn")
+                    .filter_map(|row| row.tokens)
+                    .sum();
+                if withdrawn >= expected_tokens {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    /// Red (a): a background jobserver client has its fifo drained while a land's gate runs
+    /// (including a token returned while the gate is running), and gets every token byte back
+    /// within one heartbeat of the gate's end, with `job.tokens.withdrawn` and
+    /// `job.tokens.restored` span rows.
+    #[tokio::test]
+    async fn land_gate_drains_and_restores_background_jobserver_tokens() {
+        let mut fixture = start_fixture("gate-drain-bg", false);
+        let mut bg = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "bg",
+            ExecClass::Background,
+            4,
+        )
+        .await;
+        assert_eq!(bg.fionread().await, 3, "want=4 puts 3 token bytes in fifo");
+        bg.hold(1).await;
+        assert_eq!(bg.fionread().await, 2);
+
+        let gate = GateJob::start(
+            &fixture.handle,
+            &fixture.root,
+            "land-gate",
+            Some(JobLander {
+                pid: std::process::id(),
+                start: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .gateway
+                .recv_event("gate-start from supervisor")
+                .await,
+            GateWatchEvent::GateStart {
+                job_id: gate.job_id.get(),
+            }
+        );
+
+        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 2).await;
+        assert_eq!(
+            bg.fionread().await,
+            0,
+            "the 2 free token bytes are drained from the fifo"
+        );
+
+        // Return the held token while the gate still runs: the server drains it immediately too.
+        bg.return_tokens(1).await;
+        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 3).await;
+        assert_eq!(
+            bg.fionread().await,
+            0,
+            "the returned 3rd token byte is drained too"
+        );
+
+        // Wait on fifo readability for all 3 token bytes to come back once the gate ends.
+        let gate_id = gate.job_id;
+        gate.finish(&fixture.handle).await;
+        assert_eq!(
+            fixture.gateway.recv_event("gate-end from supervisor").await,
+            GateWatchEvent::GateEnd {
+                job_id: gate_id.get(),
+            }
+        );
+        bg.wait_tokens(3).await;
+
+        let bg_id = bg.job_id;
+        bg.exit(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let rows = gate_span_rows(&fixture.telemetry, bg_id);
+        let withdrawn: u32 = rows
+            .iter()
+            .filter(|row| row.entry_type == "info" && row.message == "job.tokens.withdrawn")
+            .map(|row| row.tokens.expect("tokens column on job.tokens.withdrawn"))
+            .sum();
+        let restored: Vec<u32> = rows
+            .iter()
+            .filter(|row| row.entry_type == "info" && row.message == "job.tokens.restored")
+            .map(|row| row.tokens.expect("tokens column on job.tokens.restored"))
+            .collect();
+        assert_eq!(withdrawn, 3, "all 3 token bytes withdrawn: {rows:?}");
+        assert_eq!(restored, vec![3], "all 3 token bytes restored: {rows:?}");
+
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
+    /// Scope cases for land-gate token withdrawal:
+    /// - A train's proof (`ExecClass::Gate`, `lander: None`) starts no gate span.
+    /// - A gate-class job is never drained during a land's gate.
+    /// - An interactive job inside its 120 s first band (per mbx `first_admitted`) is never
+    ///   drained, and once past 120 s it is drained on the next heartbeat.
+    #[tokio::test]
+    async fn land_gate_token_withdrawal_scope() {
+        let mut fixture = start_fixture("gate-drain-scope", true);
+        let mbx = fixture.mbx.as_ref().expect("TestMbx installed");
+        let mut bg = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "bg",
+            ExecClass::Background,
+            4,
+        )
+        .await;
+        let mut gate_worker = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "gate-worker",
+            ExecClass::Gate,
+            4,
+        )
+        .await;
+        let mut interactive = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "interactive",
+            ExecClass::Interactive,
+            4,
+        )
+        .await;
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        // Inside the 120 s first band (10 s ago).
+        mbx.set_stats_json(
+            &serde_json::json!({
+                "version": 2,
+                "scheduler": {
+                    "activity": [],
+                    "first_admitted": [{
+                        "job_id": interactive.mbx_job_id,
+                        "job_started_ms": interactive.mbx_started_ms,
+                        "first_admitted_ms": now_ms.saturating_sub(10_000),
+                    }]
+                }
+            })
+            .to_string(),
+        );
+
+        // 1. Train's proof (`ExecClass::Gate`, `lander: None`): starts no span.
+        let proof = GateJob::start(&fixture.handle, &fixture.root, "proof", None).await;
+        assert_eq!(
+            fixture.gateway.try_recv_event(),
+            None,
+            "a train's proof with lander: None must not send gate-start"
+        );
+        assert_eq!(bg.fionread().await, 3);
+        proof.finish(&fixture.handle).await;
+        assert_eq!(
+            fixture.gateway.try_recv_event(),
+            None,
+            "a train's proof must not send gate-end"
+        );
+
+        // 2. Real land's gate (`lander: Some`): drains bg, leaves gate_worker & interactive alone.
+        let land_gate = GateJob::start(
+            &fixture.handle,
+            &fixture.root,
+            "land-gate",
+            Some(JobLander {
+                pid: std::process::id(),
+                start: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, bg.job_id, 3).await;
+        assert_eq!(bg.fionread().await, 0);
+        assert_eq!(
+            gate_worker.fionread().await,
+            3,
+            "gate-class job is never drained"
+        );
+        assert_eq!(
+            interactive.fionread().await,
+            3,
+            "interactive job inside its 120 s band is never drained"
+        );
+
+        // 3. Interactive job crosses its 120 s band: next heartbeat drains it.
+        mbx.set_stats_json(
+            &serde_json::json!({
+                "version": 2,
+                "scheduler": {
+                    "activity": [],
+                    "first_admitted": [{
+                        "job_id": interactive.mbx_job_id,
+                        "job_started_ms": interactive.mbx_started_ms,
+                        "first_admitted_ms": now_ms.saturating_sub(130_000),
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        fixture.gateway.push_heartbeat().await;
+        wait_for_withdrawn(&fixture.handle, &fixture.telemetry, interactive.job_id, 3).await;
+        assert_eq!(
+            interactive.fionread().await,
+            0,
+            "interactive job past its first band is drained on the next heartbeat"
+        );
+        assert_eq!(
+            gate_worker.fionread().await,
+            3,
+            "gate-class job is still never drained"
+        );
+
+        let gate_id = land_gate.job_id;
+        land_gate.finish(&fixture.handle).await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-end").await,
+            GateWatchEvent::GateEnd {
+                job_id: gate_id.get(),
+            }
+        );
+        bg.wait_tokens(3).await;
+        interactive.wait_tokens(3).await;
+
+        let gate_worker_id = gate_worker.job_id;
+        bg.exit(&fixture.handle).await;
+        gate_worker.exit(&fixture.handle).await;
+        interactive.exit(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let gate_rows = gate_span_rows(&fixture.telemetry, gate_worker_id);
+        assert!(
+            !gate_rows
+                .iter()
+                .any(|row| row.message == "job.tokens.withdrawn"),
+            "gate-class job never records job.tokens.withdrawn: {gate_rows:?}"
+        );
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
 }
