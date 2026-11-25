@@ -365,7 +365,9 @@ impl Gateway {
                         ram_leases: crate::ram_lease::Records::beside(path),
                         first_launch: config.first_launch.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
-                        land_turns: crate::land_turn::LandTurns::start(),
+                        land_turns: crate::land_turn::LandTurns::start_with_bounded_deadline(
+                            config.bounded_turn_deadline,
+                        ),
                         task_server: crate::task_server::TaskServer::start(config.task_server),
                         cleanup: Arc::clone(&cleanup),
                     },

@@ -13,20 +13,25 @@
 # fences hold. An install may wait for the turns instead (`TWait`): with no
 # ticket it is fenced at once; otherwise it waits (`waiting` counts such
 # installs), and the step that ends the last ticket fences every waiting install.
-# `TWaitLeave` is a waiting install's connection closing first. An ask while any
-# install waits or any fence holds is parked (`parked` keeps their askers, in
-# arrival order), never numbered; once no install waits and no fence holds, the
-# parked asks are numbered in the order they arrived.
+# `TWaitLeave` is a waiting install's connection closing first.
 #
 # Every ask names its asker, the process the kernel names as the connection's
-# peer (`TAsk{pid}`), and a ticket keeps it. An ask made inside a held turn, by
-# the asker of a ticket that holds its turn before it ends its hold or by a
-# command bound to a turn (`inside`), is not an ask from outside: a land takes
-# its ref turn inside its land turn ("A ref turn"), and the install waits for
-# that turn, which ends only once the ask made inside it is served. So it is
-# numbered whatever installs wait. It enters the one queue of this model, as
-# every ask does: which queue an ask names changes neither its number nor
-# whether it is parked.
+# peer, and whether the ask is bounded (`TAsk{pid, bounded}`: True for
+# `"class":"bounded"`, False for an ordinary land turn), and a ticket keeps both.
+# While any fence holds (`f > 0`), every ask from outside every held turn is
+# parked (`parked` keeps `P{pid, bounded}` in arrival order), never numbered.
+# While an install waits with no fence held (`w > 0, f = 0`), a non-bounded ask
+# from outside is parked; a bounded ask from outside is numbered while any
+# non-bounded ticket remains in the queue (`has_unbounded`), and parks once only
+# bounded tickets remain so the install waits at most one bound past the last
+# land ticket. Once no install waits and no fence holds, the parked asks are
+# numbered in the order they arrived.
+#
+# An ask made inside a held turn, by the asker of a ticket that holds its turn
+# before it ends its hold or by a command bound to a turn (`inside`), is not an
+# ask from outside: a land takes its ref turn inside its land turn ("A ref
+# turn"), and the install waits for that turn, which ends only once the ask made
+# inside it is served. So it is numbered whatever installs wait or fences hold.
 #
 # Check: bun bend2/main.ts land_turn.bend --verdict
 # Bound to the code by cowshed-gateway src/land_turn/laws.rs, which runs the
@@ -34,10 +39,13 @@
 import Base
 
 type E is Data:
-  E{num: Nat, pid: Nat, asker: Bool, bound: +List<Nat>, held: Bool}
+  E{num: Nat, pid: Nat, asker: Bool, bound: +List<Nat>, held: Bool, bounded: Bool}
+
+type P is Data:
+  P{pid: Nat, bounded: Bool}
 
 type Op is Data:
-  TAsk{pid: Nat}
+  TAsk{pid: Nat, bounded: Bool}
   TBind{num: Nat, pid: Nat}
   TExit{num: Nat, pid: Nat}
   TLeave{num: Nat}
@@ -52,7 +60,7 @@ type Bound is Data:
   BWaiting{}
 
 type St is Data:
-  St{q: +List<E>, numbered: Nat, fences: Nat, waiting: Nat, parked: +List<Nat>}
+  St{q: +List<E>, numbered: Nat, fences: Nat, waiting: Nat, parked: +List<P>}
 
 # --- Nat and list helpers ---------------------------------------------------
 
@@ -109,6 +117,13 @@ def push(xs: +List<Nat>, +x: Nat) -> +List<Nat>:
     case Con{h, t}:
       h <> push(t, x)
 
+def push_p(xs: +List<P>, +x: P) -> +List<P>:
+  match xs:
+    case Nil{}:
+      [x]
+    case Con{h, t}:
+      h <> push_p(t, x)
+
 def add.if(+x: Nat, xs: +List<Nat>, b: Bool) -> +List<Nat>:
   match b:
     case True{}:
@@ -131,18 +146,31 @@ def is_nil(xs: +List<Nat>) -> Bool:
 
 def num(e: E) -> Nat:
   match e:
-    case E{n, z, a, b, h}:
+    case E{n, z, a, b, h, d}:
       n
 
 def held(e: E) -> Bool:
   match e:
-    case E{n, z, a, b, h}:
+    case E{n, z, a, b, h, d}:
       h
+
+def bounded(e: E) -> Bool:
+  match e:
+    case E{n, z, a, b, h, d}:
+      d
+
+# some queued ticket is non-bounded (land_turn.rs `has_unbounded`)
+def has_unbounded(q: +List<E>) -> Bool:
+  match q:
+    case Nil{}:
+      False{}
+    case Con{e, t}:
+      or(not(bounded(e)), has_unbounded(t))
 
 # nothing holds the ticket: neither its asker nor a bound command
 def done(e: E) -> Bool:
   match e:
-    case E{n, z, a, b, h}:
+    case E{n, z, a, b, h, d}:
       match a:
         case True{}:
           False{}
@@ -161,8 +189,8 @@ def tell(q: +List<E>) -> +List<E>:
   match q:
     case Nil{}:
       []
-    case Con{E{n, z, a, b, h}, t}:
-      E{n, z, a, b, True{}} <> t
+    case Con{E{n, z, a, b, h, d}, t}:
+      E{n, z, a, b, True{}, d} <> t
 
 # what one input does to the ticket it names
 type Edit is Data:
@@ -172,12 +200,12 @@ type Edit is Data:
 
 def apply(k: Edit, e: E) -> E:
   match k e:
-    case AddPid{p} E{n, z, a, +b, h}:
-      E{n, z, a, add(p, b), h}
-    case DropPid{p} E{n, z, a, +b, h}:
-      E{n, z, a, remove(p, b), h}
-    case Depart{} E{n, z, a, b, h}:
-      E{n, z, False{}, b, h}
+    case AddPid{p} E{n, z, a, +b, h, d}:
+      E{n, z, a, add(p, b), h, d}
+    case DropPid{p} E{n, z, a, +b, h, d}:
+      E{n, z, a, remove(p, b), h, d}
+    case Depart{} E{n, z, a, b, h, d}:
+      E{n, z, False{}, b, h, d}
 
 def edit.if(+k: Edit, +e: E, t: +List<E>, r: +List<E>, b: Bool) -> +List<E>:
   match b:
@@ -244,7 +272,7 @@ def verdict(o: Op, s: St) -> Bound:
   match o s:
     case TBind{n, p} St{+q, c, f, w, k}:
       find(n, q)
-    case TAsk{x} St{q, c, f, w, k}:
+    case TAsk{x, d} St{q, c, f, w, k}:
       BGranted{}
     case TExit{n, p} St{q, c, f, w, k}:
       BGranted{}
@@ -268,23 +296,34 @@ def bind.if(+n: Nat, +p: Nat, +q: +List<E>, v: Bound) -> +List<E>:
     case BWaiting{}:
       q
 
-# an ask from outside every held turn: with no install waiting and no fence held
-# it is numbered and enters its queue (land_turn.rs `ask`); one that meets a
-# waiting install is parked, never numbered, and changes no queue
-def ask.w(+q: +List<E>, +c: Nat, w: Nat, p: +List<Nat>, +x: Nat) -> St:
+# a bounded ask from outside under a waiting install (f = 0, w > 0): numbered while
+# some non-bounded ticket remains in q, parked once only bounded tickets remain
+def ask.wb(+q: +List<E>, +c: Nat, +v: Nat, p: +List<P>, +x: Nat, u: Bool) -> St:
+  match u:
+    case True{}:
+      St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, True{}})), 1n+c, 0n, 1n+v, p}
+    case False{}:
+      St{q, c, 0n, 1n+v, push_p(p, P{x, True{}})}
+
+# an ask from outside every held turn, with no fence held (f = 0)
+def ask.w(+q: +List<E>, +c: Nat, w: Nat, p: +List<P>, +x: Nat, +d: Bool) -> St:
   match w:
     case 0n:
-      St{tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c, 0n, 0n, p}
+      St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c, 0n, 0n, p}
     case 1n+v:
-      St{q, c, 0n, 1n+v, push(p, x)}
+      match d:
+        case False{}:
+          St{q, c, 0n, 1n+v, push_p(p, P{x, False{}})}
+        case True{}:
+          ask.wb(q, c, v, p, x, has_unbounded(q))
 
-# ... and one under a fence is parked too
-def ask(+q: +List<E>, +c: Nat, f: Nat, w: Nat, p: +List<Nat>, +x: Nat) -> St:
+# ... and any ask from outside under a fence (f > 0) is parked
+def ask(+q: +List<E>, +c: Nat, f: Nat, w: Nat, p: +List<P>, +x: Nat, +d: Bool) -> St:
   match f:
     case 0n:
-      ask.w(q, c, w, p, x)
+      ask.w(q, c, w, p, x, d)
     case 1n+g:
-      St{q, c, 1n+g, w, push(p, x)}
+      St{q, c, 1n+g, w, push_p(p, P{x, d})}
 
 # the asker of a ticket holds its turn once the ticket holds it and until the
 # asker ends its hold
@@ -305,7 +344,7 @@ def mine.if(a: Bool, h: Bool, s: Bool) -> Bool:
 # the process x holds this ticket's turn: a command bound to it, or its asker
 def within(+x: Nat, e: E) -> Bool:
   match e:
-    case E{n, z, a, +b, h}:
+    case E{n, z, a, +b, h, d}:
       or(mem(x, b), mine.if(a, h, same(x, z)))
 
 # the process x asks from inside a held turn (land_turn.rs `inside`)
@@ -319,12 +358,13 @@ def inside(+x: Nat, q: +List<E>) -> Bool:
 # an ask made inside a held turn is numbered and enters its queue whatever
 # installs wait and whatever fences hold, and changes neither them nor the
 # parked asks; any other is an ask from outside (land_turn.rs `ask`)
-def ask.in(+q: +List<E>, +c: Nat, f: Nat, w: Nat, p: +List<Nat>, +x: Nat, i: Bool) -> St:
+def ask.in(+q: +List<E>, +c: Nat, f: Nat, w: Nat, p: +List<P>, +x: Nat, +d: Bool, i: Bool) -> St:
   match i:
     case True{}:
-      St{tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c, f, w, p}
+      St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c, f, w, p}
     case False{}:
-      ask(q, c, f, w, p, x)
+      ask(q, c, f, w, p, x, d)
+
 # a read fences only an empty queue (land_turn.rs `fence`)
 def fence(q: +List<E>, f: Nat) -> Nat:
   match q:
@@ -351,7 +391,7 @@ def plus(+a: Nat, b: Nat) -> Nat:
 
 # an install waits for the turns: on an empty queue it is fenced at once, and
 # otherwise it waits (land_turn.rs `wait_fence`)
-def wait(q: +List<E>, c: Nat, f: Nat, w: Nat, p: +List<Nat>) -> St:
+def wait(q: +List<E>, c: Nat, f: Nat, w: Nat, p: +List<P>) -> St:
   match q:
     case Nil{}:
       St{[], c, 1n+f, w, p}
@@ -360,7 +400,7 @@ def wait(q: +List<E>, c: Nat, f: Nat, w: Nat, p: +List<Nat>) -> St:
 
 # the step that leaves the queue empty fences every waiting install
 # (land_turn.rs `settle`)
-def wake(q: +List<E>, c: Nat, f: Nat, w: Nat, p: +List<Nat>) -> St:
+def wake(q: +List<E>, c: Nat, f: Nat, w: Nat, p: +List<P>) -> St:
   match q:
     case Nil{}:
       St{[], c, plus(w, f), 0n, p}
@@ -369,14 +409,14 @@ def wake(q: +List<E>, c: Nat, f: Nat, w: Nat, p: +List<Nat>) -> St:
 
 # every parked ask numbered in arrival order and put at the end of its queue
 # (land_turn.rs `release`)
-def admit(p: +List<Nat>, +q: +List<E>, +c: Nat) -> St:
+def admit(p: +List<P>, +q: +List<E>, +c: Nat) -> St:
   match p:
     case Nil{}:
       St{q, c, 0n, 0n, []}
-    case Con{+x, r}:
-      admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c)
+    case Con{P{+x, +d}, r}:
+      admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c)
 
-def lift.w(+q: +List<E>, +c: Nat, w: Nat, p: +List<Nat>) -> St:
+def lift.w(+q: +List<E>, +c: Nat, w: Nat, p: +List<P>) -> St:
   match w:
     case 0n:
       admit(p, q, c)
@@ -385,7 +425,7 @@ def lift.w(+q: +List<E>, +c: Nat, w: Nat, p: +List<Nat>) -> St:
 
 # once no install waits and no fence holds, the parked asks are admitted
 # (land_turn.rs `release`)
-def lift(+q: +List<E>, +c: Nat, f: Nat, w: Nat, p: +List<Nat>) -> St:
+def lift(+q: +List<E>, +c: Nat, f: Nat, w: Nat, p: +List<P>) -> St:
   match f:
     case 0n:
       lift.w(q, c, w, p)
@@ -394,8 +434,8 @@ def lift(+q: +List<E>, +c: Nat, f: Nat, w: Nat, p: +List<Nat>) -> St:
 
 def step(o: Op, s: St) -> St:
   match o s:
-    case TAsk{+x} St{+q, +c, f, w, p}:
-      ask.in(q, c, f, w, p, x, inside(x, q))
+    case TAsk{+x, +d} St{+q, +c, f, w, p}:
+      ask.in(q, c, f, w, p, x, d, inside(x, q))
     case TBind{+n, +p} St{+q, c, f, w, k}:
       St{bind.if(n, p, q, find(n, q)), c, f, w, k}
     case TExit{+n, +p} St{+q, c, f, w, k}:
@@ -441,10 +481,11 @@ def waiting(s: St) -> Nat:
     case St{q, c, f, w, p}:
       w
 
-def parked(s: St) -> +List<Nat>:
+def parked(s: St) -> +List<P>:
   match s:
     case St{q, c, f, w, p}:
       p
+
 # --- order facts --------------------------------------------------------------
 
 def LE(a: Nat, b: Nat) -> Data:
@@ -519,7 +560,7 @@ def IsNil(xs: +List<Nat>) -> Data:
 # a waiting ticket: it does not hold the turn and no command is bound to it
 def Idle(e: E) -> Data:
   match e:
-    case E{n, z, a, b, h}:
+    case E{n, z, a, b, h, d}:
       Sigma<&2, &2, IsF(h), u => IsNil(b)>
 
 def Waiters(q: +List<E>) -> Data:
@@ -549,6 +590,7 @@ def Inv(s: St) -> Data:
   match s:
     case St{+q, +c, f, w, p}:
       Sigma<&2, &2, TurnOk(q), u => Chain(0n, q, c)>
+
 # --- FIFO is kept ---------------------------------------------------------------
 
 def chain_weaken(+lo: Nat, +n: Nat, +t: +List<E>, +top: Nat, le: LE(lo, n), ch: Chain(n, t, top)) -> Chain(lo, t, top):
@@ -559,28 +601,28 @@ def chain_weaken(+lo: Nat, +n: Nat, +t: +List<E>, +top: Nat, le: LE(lo, n), ch: 
       (lt, rest) = ch
       (le_trans(1n+lo, 1n+n, num(e), le, lt), rest)
 
-def chain_snoc(+q: +List<E>, +lo: Nat, +top: Nat, +z: Nat, +a: Bool, +b: +List<Nat>, +h: Bool, ch: Chain(lo, q, top)) -> Chain(lo, snoc(q, E{1n+top, z, a, b, h}), 1n+top):
+def chain_snoc(+q: +List<E>, +lo: Nat, +top: Nat, +z: Nat, +a: Bool, +b: +List<Nat>, +h: Bool, +d: Bool, ch: Chain(lo, q, top)) -> Chain(lo, snoc(q, E{1n+top, z, a, b, h, d}), 1n+top):
   match q:
     case Nil{}:
       (ch, le_refl(1n+top))
     case Con{e, t}:
       (lt, rest) = ch
-      (lt, chain_snoc(t, num(e), top, z, a, b, h, rest))
+      (lt, chain_snoc(t, num(e), top, z, a, b, h, d, rest))
 
 def chain_tell(+lo: Nat, +q: +List<E>, +top: Nat, ch: Chain(lo, q, top)) -> Chain(lo, tell(q), top):
   match q:
     case Nil{}:
       ch
-    case Con{E{n, z, a, b, h}, t}:
+    case Con{E{n, z, a, b, h, d}, t}:
       ch
 
 def chain_apply(+lo: Nat, +k: Edit, +e: E, +t: +List<E>, +top: Nat, ch: Chain(lo, e <> t, top)) -> Chain(lo, apply(k, e) <> t, top):
   match k e:
-    case AddPid{p} E{n, z, a, b, h}:
+    case AddPid{p} E{n, z, a, b, h, d}:
       ch
-    case DropPid{p} E{n, z, a, b, h}:
+    case DropPid{p} E{n, z, a, b, h, d}:
       ch
-    case Depart{} E{n, z, a, b, h}:
+    case Depart{} E{n, z, a, b, h, d}:
       ch
 
 def chain_edit.if(+lo: Nat, +k: Edit, +e: E, +t: +List<E>, +r: +List<E>, +top: Nat, b: Bool, ch: Chain(lo, e <> t, top), cr: Chain(num(e), r, top)) -> Chain(lo, edit.if(k, e, t, r, b), top):
@@ -629,7 +671,7 @@ def pre_tell(+q: +List<E>, p: Pre(q)) -> TurnOk(tell(q)):
   match q:
     case Nil{}:
       Unit{}
-    case Con{E{n, z, a, b, h}, t}:
+    case Con{E{n, z, a, b, h, d}, t}:
       (Unit{}, p)
 
 def waiters_pre(+t: +List<E>, w: Waiters(t)) -> Pre(t):
@@ -668,14 +710,14 @@ def NotAdd(k: Edit) -> Data:
 
 def idle_apply(+k: Edit, +e: E, nk: NotAdd(k), ie: Idle(e)) -> Idle(apply(k, e)):
   match k e:
-    case AddPid{p} E{n, z, a, b, h}:
+    case AddPid{p} E{n, z, a, b, h, d}:
       match nk:
-    case DropPid{p} E{n, z, a, Nil{}, h}:
+    case DropPid{p} E{n, z, a, Nil{}, h, d}:
       ie
-    case DropPid{p} E{n, z, a, Con{x, xs}, h}:
+    case DropPid{p} E{n, z, a, Con{x, xs}, h, d}:
       (fh, nb) = ie
       match nb:
-    case Depart{} E{n, z, a, b, h}:
+    case Depart{} E{n, z, a, b, h, d}:
       ie
 
 def waiters_edit.if(+k: Edit, +e: E, +t: +List<E>, +r: +List<E>, b: Bool, nk: NotAdd(k), ie: Idle(e), wt: Waiters(t), wr: Waiters(r)) -> Waiters(edit.if(k, e, t, r, b)):
@@ -695,11 +737,11 @@ def waiters_edit(+t: +List<E>, +n: Nat, +k: Edit, +nk: NotAdd(k), +w: Waiters(t)
 
 def pre_apply(+k: Edit, +e: E, +t: +List<E>, wt: Waiters(t)) -> Pre(apply(k, e) <> t):
   match k e:
-    case AddPid{p} E{n, z, a, x, h}:
+    case AddPid{p} E{n, z, a, x, h, d}:
       wt
-    case DropPid{p} E{n, z, a, x, h}:
+    case DropPid{p} E{n, z, a, x, h, d}:
       wt
-    case Depart{} E{n, z, a, x, h}:
+    case Depart{} E{n, z, a, x, h, d}:
       wt
 
 def pre_edit.if(+k: Edit, +e: E, +t: +List<E>, +r: +List<E>, b: Bool, wt: Waiters(t), wr: Waiters(r)) -> Pre(edit.if(k, e, t, r, b)):
@@ -784,10 +826,10 @@ def waiting_not_granted(g: {BWaiting{} == BGranted{} : Bound}) -> Empty:
 
 def idle_not_granted(+e: E, ie: Idle(e), g: {find.held(held(e)) == BGranted{} : Bound}) -> Empty:
   match e:
-    case E{n, z, a, b, True{}}:
+    case E{n, z, a, b, True{}, d}:
       (fh, nb) = ie
       match fh:
-    case E{n, z, a, b, False{}}:
+    case E{n, z, a, b, False{}, d}:
       waiting_not_granted(g)
 
 def wng.if(+e: E, +r: Bound, b: Bool, ie: Idle(e), ih: {r == BGranted{} : Bound} -> Empty, g: {find.if(e, r, b) == BGranted{} : Bound}) -> Empty:
@@ -808,7 +850,7 @@ def waiters_not_granted(+t: +List<E>, +n: Nat, w: Waiters(t), g: {find(n, t) == 
 
 def add_head(+p: Nat, +e: E, +t: +List<E>, w: Waiters(t)) -> TurnOk(tell(apply(AddPid{p}, e) <> t)):
   match e:
-    case E{m, z, a, x, h}:
+    case E{m, z, a, x, h, d}:
       (Unit{}, w)
 
 def add_ok.if(+n: Nat, +p: Nat, +e: E, +t: +List<E>, b: Bool, he: IsT(held(e)), w: Waiters(t), g: {find.if(e, find(n, t), b) == BGranted{} : Bound}) -> TurnOk(tell(edit.if(AddPid{p}, e, t, edit(n, AddPid{p}, t), b))):
@@ -846,36 +888,48 @@ def bind_chain(+q: +List<E>, +n: Nat, +p: Nat, +v: Bound, +top: Nat, ch: Chain(0
 
 # --- every input keeps both invariants -------------------------------------------
 
-# an ask keeps them whether it is numbered or parked
-def inv_ask.w(+q: +List<E>, +c: Nat, +w: Nat, +p: +List<Nat>, +x: Nat, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(ask.w(q, c, w, p, x)):
-  match w:
-    case 0n:
-      (pre_tell(snoc(q, E{1n+c, x, True{}, [], False{}}), pre_snoc(q, E{1n+c, x, True{}, [], False{}}, ok, (Unit{}, Unit{}))), chain_tell(0n, snoc(q, E{1n+c, x, True{}, [], False{}}), 1n+c, chain_snoc(q, 0n, c, x, True{}, [], False{}, ch)))
-    case 1n+v:
+def inv_ask.wb(+q: +List<E>, +c: Nat, +v: Nat, +p: +List<P>, +x: Nat, +u: Bool, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(ask.wb(q, c, v, p, x, u)):
+  match u:
+    case True{}:
+      (pre_tell(snoc(q, E{1n+c, x, True{}, [], False{}, True{}}), pre_snoc(q, E{1n+c, x, True{}, [], False{}, True{}}, ok, (Unit{}, Unit{}))), chain_tell(0n, snoc(q, E{1n+c, x, True{}, [], False{}, True{}}), 1n+c, chain_snoc(q, 0n, c, x, True{}, [], False{}, True{}, ch)))
+    case False{}:
       (ok, ch)
 
-def inv_ask(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>, +x: Nat, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(ask(q, c, f, w, p, x)):
+# an ask keeps them whether it is numbered or parked
+def inv_ask.w(+q: +List<E>, +c: Nat, +w: Nat, +p: +List<P>, +x: Nat, +d: Bool, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(ask.w(q, c, w, p, x, d)):
+  match w:
+    case 0n:
+      (pre_tell(snoc(q, E{1n+c, x, True{}, [], False{}, d}), pre_snoc(q, E{1n+c, x, True{}, [], False{}, d}, ok, (Unit{}, Unit{}))), chain_tell(0n, snoc(q, E{1n+c, x, True{}, [], False{}, d}), 1n+c, chain_snoc(q, 0n, c, x, True{}, [], False{}, d, ch)))
+    case 1n+v:
+      match d:
+        case False{}:
+          (ok, ch)
+        case True{}:
+          inv_ask.wb(q, c, v, p, x, has_unbounded(q), ok, ch)
+
+def inv_ask(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<P>, +x: Nat, +d: Bool, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(ask(q, c, f, w, p, x, d)):
   match f:
     case 0n:
-      inv_ask.w(q, c, w, p, x, ok, ch)
+      inv_ask.w(q, c, w, p, x, d, ok, ch)
     case 1n+g:
       (ok, ch)
 
-def inv_ask.in(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>, +x: Nat, +i: Bool, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(ask.in(q, c, f, w, p, x, i)):
+def inv_ask.in(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<P>, +x: Nat, +d: Bool, +i: Bool, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(ask.in(q, c, f, w, p, x, d, i)):
   match i:
     case True{}:
-      (pre_tell(snoc(q, E{1n+c, x, True{}, [], False{}}), pre_snoc(q, E{1n+c, x, True{}, [], False{}}, ok, (Unit{}, Unit{}))), chain_tell(0n, snoc(q, E{1n+c, x, True{}, [], False{}}), 1n+c, chain_snoc(q, 0n, c, x, True{}, [], False{}, ch)))
+      (pre_tell(snoc(q, E{1n+c, x, True{}, [], False{}, d}), pre_snoc(q, E{1n+c, x, True{}, [], False{}, d}, ok, (Unit{}, Unit{}))), chain_tell(0n, snoc(q, E{1n+c, x, True{}, [], False{}, d}), 1n+c, chain_snoc(q, 0n, c, x, True{}, [], False{}, d, ch)))
     case False{}:
-      inv_ask(q, c, f, w, p, x, ok, ch)
+      inv_ask(q, c, f, w, p, x, d, ok, ch)
+
 # a wait and a wake keep the queue as it is
-def inv_wait(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(wait(q, c, f, w, p)):
+def inv_wait(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<P>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(wait(q, c, f, w, p)):
   match q:
     case Nil{}:
       (ok, ch)
     case Con{e, t}:
       (ok, ch)
 
-def inv_wake(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(wake(q, c, f, w, p)):
+def inv_wake(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<P>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(wake(q, c, f, w, p)):
   match q:
     case Nil{}:
       (ok, ch)
@@ -883,21 +937,21 @@ def inv_wake(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>, ok: TurnOk
       (ok, ch)
 
 # the parked asks enter the queue as numbered asks do
-def inv_admit(+p: +List<Nat>, +q: +List<E>, +c: Nat, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(admit(p, q, c)):
+def inv_admit(+p: +List<P>, +q: +List<E>, +c: Nat, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(admit(p, q, c)):
   match p:
     case Nil{}:
       (ok, ch)
-    case Con{+x, r}:
-      inv_admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c, pre_tell(snoc(q, E{1n+c, x, True{}, [], False{}}), pre_snoc(q, E{1n+c, x, True{}, [], False{}}, ok, (Unit{}, Unit{}))), chain_tell(0n, snoc(q, E{1n+c, x, True{}, [], False{}}), 1n+c, chain_snoc(q, 0n, c, x, True{}, [], False{}, ch)))
+    case Con{P{+x, +d}, r}:
+      inv_admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c, pre_tell(snoc(q, E{1n+c, x, True{}, [], False{}, d}), pre_snoc(q, E{1n+c, x, True{}, [], False{}, d}, ok, (Unit{}, Unit{}))), chain_tell(0n, snoc(q, E{1n+c, x, True{}, [], False{}, d}), 1n+c, chain_snoc(q, 0n, c, x, True{}, [], False{}, d, ch)))
 
-def inv_lift.w(+q: +List<E>, +c: Nat, +w: Nat, +p: +List<Nat>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(lift.w(q, c, w, p)):
+def inv_lift.w(+q: +List<E>, +c: Nat, +w: Nat, +p: +List<P>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(lift.w(q, c, w, p)):
   match w:
     case 0n:
       inv_admit(p, q, c, ok, ch)
     case 1n+v:
       (ok, ch)
 
-def inv_lift(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(lift(q, c, f, w, p)):
+def inv_lift(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<P>, ok: TurnOk(q), ch: Chain(0n, q, c)) -> Inv(lift(q, c, f, w, p)):
   match f:
     case 0n:
       inv_lift.w(q, c, w, p, ok, ch)
@@ -906,9 +960,9 @@ def inv_lift(+q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>, ok: TurnOk
 
 def inv_step(+o: Op, +s: St, i: Inv(s)) -> Inv(step(o, s)):
   match o s:
-    case TAsk{x} St{q, c, f, w, p}:
+    case TAsk{x, d} St{q, c, f, w, p}:
       (ok, ch) = i
-      inv_ask.in(q, c, f, w, p, x, inside(x, q), ok, ch)
+      inv_ask.in(q, c, f, w, p, x, d, inside(x, q), ok, ch)
     case TBind{n, p} St{q, c, f, w, k}:
       (ok, ch) = i
       (bind_ok(q, n, p, find(n, q), ok, {==}), bind_chain(q, n, p, find(n, q), c, ch))
@@ -952,6 +1006,7 @@ def chain_of(+s: St, i: Inv(s)) -> Chain(0n, queue(s), counter(s)):
     case St{q, c, f, w, p}:
       (ok, ch) = i
       ch
+
 def nums(q: +List<E>) -> +List<Nat>:
   match q:
     case Nil{}:
@@ -970,7 +1025,7 @@ def nums_tell(+q: +List<E>) -> {nums(tell(q)) == nums(q) : +List<Nat>}:
   match q:
     case Nil{}:
       {==}
-    case Con{E{n, z, a, b, h}, t}:
+    case Con{E{n, z, a, b, h, d}, t}:
       {==}
 
 def nums_snoc(+q: +List<E>, +x: E) -> {nums(snoc(q, x)) == snocn(nums(q), num(x)) : +List<Nat>}:
@@ -983,21 +1038,21 @@ def nums_snoc(+q: +List<E>, +x: E) -> {nums(snoc(q, x)) == snocn(nums(q), num(x)
 
 # the numbers the parked asks `p` are given past the last number `c`, each put
 # after those before it
-def arrived(p: +List<Nat>, xs: +List<Nat>, +c: Nat) -> +List<Nat>:
+def arrived(p: +List<P>, xs: +List<Nat>, +c: Nat) -> +List<Nat>:
   match p:
     case Nil{}:
       xs
-    case Con{x, r}:
+    case Con{P{x, d}, r}:
       arrived(r, snocn(xs, 1n+c), 1n+c)
 
-def nums_admit(+p: +List<Nat>, +q: +List<E>, +c: Nat) -> {nums(queue(admit(p, q, c))) == arrived(p, nums(q), c) : +List<Nat>}:
+def nums_admit(+p: +List<P>, +q: +List<E>, +c: Nat) -> {nums(queue(admit(p, q, c))) == arrived(p, nums(q), c) : +List<Nat>}:
   match p:
     case Nil{}:
       {==}
-    case Con{+x, r}:
-      %nums_snoc(q, E{1n+c, x, True{}, [], False{}}) : {nums(queue(admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c))) == arrived(r, _, 1n+c) : +List<Nat>}
-      %nums_tell(snoc(q, E{1n+c, x, True{}, [], False{}})) : {nums(queue(admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c))) == arrived(r, _, 1n+c) : +List<Nat>}
-      nums_admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c)
+    case Con{P{+x, +d}, r}:
+      %nums_snoc(q, E{1n+c, x, True{}, [], False{}, d}) : {nums(queue(admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c))) == arrived(r, _, 1n+c) : +List<Nat>}
+      %nums_tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})) : {nums(queue(admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c))) == arrived(r, _, 1n+c) : +List<Nat>}
+      nums_admit(r, tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c)
 
 # --- laws -------------------------------------------------------------------------
 
@@ -1021,46 +1076,77 @@ law waiting_bind_refused:
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +k: +List<Nat>
+  for +k: +List<P>
   for +n: Nat
   for +p: Nat
   for g: {find(n, q) == BWaiting{} : Bound}
   {step(TBind{n, p}, St{q, c, f, w, k}) == St{q, c, f, w, k} : St}
 
 # Definedness: an ask with no install waiting and no fence held enters its queue
-# last, numbered one past the last number, whoever asks it.
+# last, numbered one past the last number, whoever asks it and whatever its class.
 law ask_enters:
   for +x: Nat
+  for +d: Bool
   for +q: +List<E>
   for +c: Nat
-  for +p: +List<Nat>
-  {nums(queue(step(TAsk{x}, St{q, c, 0n, 0n, p}))) == snocn(nums(q), 1n+c) : +List<Nat>}
+  for +p: +List<P>
+  {nums(queue(step(TAsk{x, d}, St{q, c, 0n, 0n, p}))) == snocn(nums(q), 1n+c) : +List<Nat>}
 
-# A fenced ask is parked: an ask from outside every held turn changes no queue,
-# numbers nothing and keeps the fence (05_gateway.md "The read fences the
-# turns").
+# A fenced ask is parked: an ask from outside every held turn that meets a fence
+# changes no queue, numbers nothing and keeps the fence (05_gateway.md "The read
+# fences the turns").
 law fenced_ask_parked:
   for +x: Nat
+  for +d: Bool
   for +q: +List<E>
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   for g: {inside(x, q) == False{} : Bool}
-  {step(TAsk{x}, St{q, c, 1n+f, w, p}) == St{q, c, 1n+f, w, push(p, x)} : St}
+  {step(TAsk{x, d}, St{q, c, 1n+f, w, p}) == St{q, c, 1n+f, w, push_p(p, P{x, d})} : St}
 
-# An ask from outside every held turn that meets a waiting install is parked: it
-# changes no queue and numbers nothing, so no ask from outside lengthens the
-# install's wait.
+# A non-bounded ask from outside every held turn that meets a waiting install is
+# parked: it changes no queue and numbers nothing, so no land from outside
+# lengthens the install's wait.
 law waiting_install_numbers_no_ask:
   for +x: Nat
   for +q: +List<E>
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   for g: {inside(x, q) == False{} : Bool}
-  {step(TAsk{x}, St{q, c, f, 1n+w, p}) == St{q, c, f, 1n+w, push(p, x)} : St}
+  {step(TAsk{x, False{}}, St{q, c, f, 1n+w, p}) == St{q, c, f, 1n+w, push_p(p, P{x, False{}})} : St}
+
+# While an install waits with no fence held and some non-bounded ticket remains
+# queued, a bounded ask from outside enters the queue last, numbered one past the
+# last number given, without disturbing the waiting install or parked asks.
+law waiting_install_numbers_a_bounded_ask_behind_a_land:
+  for +x: Nat
+  for +q: +List<E>
+  for +c: Nat
+  for +w: Nat
+  for +p: +List<P>
+  for g: {inside(x, q) == False{} : Bool}
+  for u: {has_unbounded(q) == True{} : Bool}
+  {step(TAsk{x, True{}}, St{q, c, 0n, 1n+w, p}) == St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, True{}})), 1n+c, 0n, 1n+w, p} : St}
+
+# Once no non-bounded ticket remains in the queue while an install waits, no ask
+# from outside — bounded or non-bounded — is numbered before the install fences,
+# so the install's remaining wait past the last land is bounded by the bounded
+# tickets already queued.
+law install_delay_is_one_bound:
+  for +x: Nat
+  for +d: Bool
+  for +q: +List<E>
+  for +c: Nat
+  for +f: Nat
+  for +w: Nat
+  for +p: +List<P>
+  for g: {inside(x, q) == False{} : Bool}
+  for u: {has_unbounded(q) == False{} : Bool}
+  {step(TAsk{x, d}, St{q, c, f, 1n+w, p}) == St{q, c, f, 1n+w, push_p(p, P{x, d})} : St}
 
 # An ask made inside a held turn is numbered whatever installs wait and whatever
 # fences hold: it enters its queue last, and the waiting installs, the fences
@@ -1069,13 +1155,14 @@ law waiting_install_numbers_no_ask:
 # turn": a land takes its ref turn inside its land turn).
 law held_turn_ask_numbered:
   for +x: Nat
+  for +d: Bool
   for +q: +List<E>
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   for g: {inside(x, q) == True{} : Bool}
-  {step(TAsk{x}, St{q, c, f, w, p}) == St{tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c, f, w, p} : St}
+  {step(TAsk{x, d}, St{q, c, f, w, p}) == St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c, f, w, p} : St}
 
 # The asker of the ticket that holds the turn asks from inside it until it ends
 # its hold, whatever else is queued ...
@@ -1083,8 +1170,9 @@ law the_holder_asks_inside_its_turn:
   for +x: Nat
   for +n: Nat
   for +b: +List<Nat>
+  for +d: Bool
   for +t: +List<E>
-  {inside(x, E{n, x, True{}, b, True{}} <> t) == True{} : Bool}
+  {inside(x, E{n, x, True{}, b, True{}, d} <> t) == True{} : Bool}
 
 # ... and so does a command bound to it.
 law a_bound_command_asks_inside_its_turn:
@@ -1094,8 +1182,9 @@ law a_bound_command_asks_inside_its_turn:
   for +a: Bool
   for +b: +List<Nat>
   for +h: Bool
+  for +d: Bool
   for +t: +List<E>
-  {inside(x, E{n, z, a, x <> b, h} <> t) == True{} : Bool}
+  {inside(x, E{n, z, a, x <> b, h, d} <> t) == True{} : Bool}
 
 # Recorded 2026-11-16: a land held its turn, the install of the land before it
 # waited for that turn, and the land's ask for its ref turn was parked behind
@@ -1105,18 +1194,20 @@ law a_bound_command_asks_inside_its_turn:
 # outside is parked behind it.
 law a_land_takes_its_ref_turn_under_a_waiting_install:
   for +b: Bool
-  {run([TAsk{7n}, TWait{}, TAsk{8n}, TAsk{7n}, TLeave{2n}, TLeave{1n}], empty()) == St{[], 2n, 1n, 0n, [8n]} : St}
+  {run([TAsk{7n, False{}}, TWait{}, TAsk{8n, False{}}, TAsk{7n, False{}}, TLeave{2n}, TLeave{1n}], empty()) == St{[], 2n, 1n, 0n, [P{8n, False{}}]} : St}
+
 # The step that ends the last ticket, a departure or a bound command's exit,
-# fences every waiting install. With waiting_install_numbers_no_ask, an install
-# is fenced once the k tickets queued when it asked have ended, however many
-# lands ask meanwhile.
+# fences every waiting install. With waiting_install_numbers_no_ask and
+# install_delay_is_one_bound, an install is fenced once the tickets queued when
+# it asked, the turns their holders take inside them, and any bounded tickets
+# admitted before the last land left have ended.
 law install_fenced_when_queue_empties:
   for +n: Nat
   for +q: +List<E>
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   for g: {settle(n, edit(n, Depart{}, q)) == [] : +List<E>}
   {step(TLeave{n}, St{q, c, f, 1n+w, p}) == St{[], c, 1n+plus(w, f), 0n, p} : St}
 
@@ -1127,7 +1218,7 @@ law install_fenced_when_the_last_command_exits:
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   for g: {settle(n, edit(n, DropPid{x}, q)) == [] : +List<E>}
   {step(TExit{n, x}, St{q, c, f, 1n+w, p}) == St{[], c, 1n+plus(w, f), 0n, p} : St}
 
@@ -1137,7 +1228,7 @@ law install_fenced_when_the_last_command_exits:
 law parked_asks_enter_in_order:
   for +q: +List<E>
   for +c: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   {nums(queue(step(TUnfence{}, St{q, c, 1n, 0n, p}))) == arrived(p, nums(q), c) : +List<Nat>}
 
 # A fence is set only on an empty queue: a read that finds a ticket, whose
@@ -1148,7 +1239,7 @@ law fence_only_when_free:
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   {step(TFence{}, St{e <> t, c, f, w, p}) == St{e <> t, c, f, w, p} : St}
 
 # Definedness: a read that finds no ticket fences the queue.
@@ -1156,7 +1247,7 @@ law free_read_fences:
   for +c: Nat
   for +f: Nat
   for +w: Nat
-  for +p: +List<Nat>
+  for +p: +List<P>
   {fences(step(TFence{}, St{[], c, f, w, p})) == 1n+f : Nat}
 
 # The install of land 124380eca9, 2026-11-10, as today's install met it: it read
@@ -1165,13 +1256,13 @@ law free_read_fences:
 # refutes).
 law a_reading_install_is_overtaken_by_every_later_ask:
   for +b: Bool
-  {fences(run([TAsk{1n}, TFence{}, TAsk{2n}, TLeave{1n}, TFence{}, TAsk{3n}, TLeave{2n}, TFence{}], empty())) == 0n : Nat}
+  {fences(run([TAsk{1n, False{}}, TFence{}, TAsk{2n, False{}}, TLeave{1n}, TFence{}, TAsk{3n, False{}}, TLeave{2n}, TFence{}], empty())) == 0n : Nat}
 
 # ... and as the waiting install meets it: the lands that ask after it are
 # parked, and it is fenced the step the ticket queued before it ends.
 law a_waiting_install_is_fenced_after_the_ticket_before_it:
   for +b: Bool
-  {run([TAsk{1n}, TWait{}, TAsk{2n}, TLeave{1n}, TAsk{3n}], empty()) == St{[], 1n, 1n, 0n, [2n, 3n]} : St}
+  {run([TAsk{1n, False{}}, TWait{}, TAsk{2n, False{}}, TLeave{1n}, TAsk{3n, False{}}], empty()) == St{[], 1n, 1n, 0n, [P{2n, False{}}, P{3n, False{}}]} : St}
 
 def one_holder(os):
   turn_of(run(os, empty()), inv_run(os, empty(), inv_empty()))
@@ -1183,23 +1274,23 @@ def waiting_bind_refused(q, c, f, w, k, n, p, g):
   %Equal.sym(Bound, find(n, q), BWaiting{}, g) : {St{bind.if(n, p, q, _), c, f, w, k} == St{q, c, f, w, k} : St}
   {==}
 
-def ask_enters.in(+x: Nat, +q: +List<E>, +c: Nat, +p: +List<Nat>, +i: Bool) -> {nums(queue(ask.in(q, c, 0n, 0n, p, x, i))) == snocn(nums(q), 1n+c) : +List<Nat>}:
+def ask_enters.in(+x: Nat, +d: Bool, +q: +List<E>, +c: Nat, +p: +List<P>, +i: Bool) -> {nums(queue(ask.in(q, c, 0n, 0n, p, x, d, i))) == snocn(nums(q), 1n+c) : +List<Nat>}:
   match i:
     case True{}:
-      %nums_snoc(q, E{1n+c, x, True{}, [], False{}}) : {nums(tell(snoc(q, E{1n+c, x, True{}, [], False{}}))) == _ : +List<Nat>}
-      nums_tell(snoc(q, E{1n+c, x, True{}, [], False{}}))
+      %nums_snoc(q, E{1n+c, x, True{}, [], False{}, d}) : {nums(tell(snoc(q, E{1n+c, x, True{}, [], False{}, d}))) == _ : +List<Nat>}
+      nums_tell(snoc(q, E{1n+c, x, True{}, [], False{}, d}))
     case False{}:
-      %nums_snoc(q, E{1n+c, x, True{}, [], False{}}) : {nums(tell(snoc(q, E{1n+c, x, True{}, [], False{}}))) == _ : +List<Nat>}
-      nums_tell(snoc(q, E{1n+c, x, True{}, [], False{}}))
+      %nums_snoc(q, E{1n+c, x, True{}, [], False{}, d}) : {nums(tell(snoc(q, E{1n+c, x, True{}, [], False{}, d}))) == _ : +List<Nat>}
+      nums_tell(snoc(q, E{1n+c, x, True{}, [], False{}, d}))
 
-def ask_enters(x, q, c, p):
-  ask_enters.in(x, q, c, p, inside(x, q))
+def ask_enters(x, d, q, c, p):
+  ask_enters.in(x, d, q, c, p, inside(x, q))
 
-def fenced_ask_parked(x, q, c, f, w, p, g):
-  %Equal.sym(Bool, inside(x, q), False{}, g) : {ask.in(q, c, 1n+f, w, p, x, _) == St{q, c, 1n+f, w, push(p, x)} : St}
+def fenced_ask_parked(x, d, q, c, f, w, p, g):
+  %Equal.sym(Bool, inside(x, q), False{}, g) : {ask.in(q, c, 1n+f, w, p, x, d, _) == St{q, c, 1n+f, w, push_p(p, P{x, d})} : St}
   {==}
 
-def waiting_install_numbers_no_ask.f(+x: Nat, +q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<Nat>) -> {ask(q, c, f, 1n+w, p, x) == St{q, c, f, 1n+w, push(p, x)} : St}:
+def waiting_install_numbers_no_ask.f(+x: Nat, +q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<P>) -> {ask(q, c, f, 1n+w, p, x, False{}) == St{q, c, f, 1n+w, push_p(p, P{x, False{}})} : St}:
   match f:
     case 0n:
       {==}
@@ -1207,11 +1298,35 @@ def waiting_install_numbers_no_ask.f(+x: Nat, +q: +List<E>, +c: Nat, +f: Nat, +w
       {==}
 
 def waiting_install_numbers_no_ask(x, q, c, f, w, p, g):
-  %Equal.sym(Bool, inside(x, q), False{}, g) : {ask.in(q, c, f, 1n+w, p, x, _) == St{q, c, f, 1n+w, push(p, x)} : St}
+  %Equal.sym(Bool, inside(x, q), False{}, g) : {ask.in(q, c, f, 1n+w, p, x, False{}, _) == St{q, c, f, 1n+w, push_p(p, P{x, False{}})} : St}
   waiting_install_numbers_no_ask.f(x, q, c, f, w, p)
 
-def held_turn_ask_numbered(x, q, c, f, w, p, g):
-  %Equal.sym(Bool, inside(x, q), True{}, g) : {ask.in(q, c, f, w, p, x, _) == St{tell(snoc(q, E{1n+c, x, True{}, [], False{}})), 1n+c, f, w, p} : St}
+def waiting_install_numbers_a_bounded_ask_behind_a_land(x, q, c, w, p, g, u):
+  %Equal.sym(Bool, inside(x, q), False{}, g) : {ask.in(q, c, 0n, 1n+w, p, x, True{}, _) == St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, True{}})), 1n+c, 0n, 1n+w, p} : St}
+  %Equal.sym(Bool, has_unbounded(q), True{}, u) : {ask.wb(q, c, w, p, x, _) == St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, True{}})), 1n+c, 0n, 1n+w, p} : St}
+  {==}
+
+def install_delay_is_one_bound.d(+x: Nat, +d: Bool, +q: +List<E>, +c: Nat, +w: Nat, +p: +List<P>, u: {has_unbounded(q) == False{} : Bool}) -> {ask.w(q, c, 1n+w, p, x, d) == St{q, c, 0n, 1n+w, push_p(p, P{x, d})} : St}:
+  match d:
+    case False{}:
+      {==}
+    case True{}:
+      %Equal.sym(Bool, has_unbounded(q), False{}, u) : {ask.wb(q, c, w, p, x, _) == St{q, c, 0n, 1n+w, push_p(p, P{x, True{}})} : St}
+      {==}
+
+def install_delay_is_one_bound.f(+x: Nat, +d: Bool, +q: +List<E>, +c: Nat, +f: Nat, +w: Nat, +p: +List<P>, u: {has_unbounded(q) == False{} : Bool}) -> {ask(q, c, f, 1n+w, p, x, d) == St{q, c, f, 1n+w, push_p(p, P{x, d})} : St}:
+  match f:
+    case 0n:
+      install_delay_is_one_bound.d(x, d, q, c, w, p, u)
+    case 1n+g:
+      {==}
+
+def install_delay_is_one_bound(x, d, q, c, f, w, p, g, u):
+  %Equal.sym(Bool, inside(x, q), False{}, g) : {ask.in(q, c, f, 1n+w, p, x, d, _) == St{q, c, f, 1n+w, push_p(p, P{x, d})} : St}
+  install_delay_is_one_bound.f(x, d, q, c, f, w, p, u)
+
+def held_turn_ask_numbered(x, d, q, c, f, w, p, g):
+  %Equal.sym(Bool, inside(x, q), True{}, g) : {ask.in(q, c, f, w, p, x, d, _) == St{tell(snoc(q, E{1n+c, x, True{}, [], False{}, d})), 1n+c, f, w, p} : St}
   {==}
 
 def same_refl(+x: Nat) -> {same(x, x) == True{} : Bool}:
@@ -1228,12 +1343,12 @@ def or_true(+a: Bool) -> {or(a, True{}) == True{} : Bool}:
     case False{}:
       {==}
 
-def the_holder_asks_inside_its_turn(x, n, b, t):
+def the_holder_asks_inside_its_turn(x, n, b, d, t):
   %Equal.sym(Bool, same(x, x), True{}, same_refl(x)) : {or(or(mem(x, b), mine.if(True{}, True{}, _)), inside(x, t)) == True{} : Bool}
   %Equal.sym(Bool, or(mem(x, b), True{}), True{}, or_true(mem(x, b))) : {or(_, inside(x, t)) == True{} : Bool}
   {==}
 
-def a_bound_command_asks_inside_its_turn(x, n, z, a, b, h, t):
+def a_bound_command_asks_inside_its_turn(x, n, z, a, b, h, d, t):
   %Equal.sym(Bool, same(x, x), True{}, same_refl(x)) : {or(or(or(_, mem(x, b)), mine.if(a, h, same(x, z))), inside(x, t)) == True{} : Bool}
   {==}
 
@@ -1262,6 +1377,7 @@ def a_reading_install_is_overtaken_by_every_later_ask(b):
 
 def a_waiting_install_is_fenced_after_the_ticket_before_it(b):
   {==}
+
 # --- the laws as checks a driver evaluates on the code's own state ----------------
 
 def and(a: Bool, b: Bool) -> Bool:
@@ -1282,7 +1398,7 @@ def le_b(a: Nat, b: Nat) -> Bool:
 
 def idle_b(e: E) -> Bool:
   match e:
-    case E{n, z, a, b, h}:
+    case E{n, z, a, b, h, d}:
       and(not(h), is_nil(b))
 
 def waiters_b(q: +List<E>) -> Bool:
@@ -1319,13 +1435,13 @@ def waiters_refl(+q: +List<E>, w: Waiters(q)) -> {waiters_b(q) == True{} : Bool}
   match q:
     case Nil{}:
       {==}
-    case Con{E{n, z, a, Nil{}, False{}}, t}:
+    case Con{E{n, z, a, Nil{}, False{}, d}, t}:
       (ie, wt) = w
       waiters_refl(t, wt)
-    case Con{E{n, z, a, Con{x, xs}, False{}}, t}:
+    case Con{E{n, z, a, Con{x, xs}, False{}, d}, t}:
       ((fh, nb), wt) = w
       match nb:
-    case Con{E{n, z, a, b, True{}}, t}:
+    case Con{E{n, z, a, b, True{}, d}, t}:
       ((fh, nb), wt) = w
       match fh:
 
@@ -1333,10 +1449,10 @@ def turn_refl(+q: +List<E>, ok: TurnOk(q)) -> {turn_ok_b(q) == True{} : Bool}:
   match q:
     case Nil{}:
       {==}
-    case Con{E{n, z, a, b, True{}}, t}:
+    case Con{E{n, z, a, b, True{}, d}, t}:
       (ht, w) = ok
       waiters_refl(t, w)
-    case Con{E{n, z, a, b, False{}}, t}:
+    case Con{E{n, z, a, b, False{}, d}, t}:
       (ht, w) = ok
       match ht:
 

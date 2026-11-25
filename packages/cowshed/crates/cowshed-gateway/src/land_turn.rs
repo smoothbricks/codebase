@@ -33,12 +33,12 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::dto::{
     LandTurnName, LandTurnQueue, ParkedLandTurn, WaitingInstall, WithdrawnInstall,
 };
-use cowshed_core::land_turn::{Abandonment, Ticket, TurnAnswer, TurnAsk, TurnStep};
+use cowshed_core::land_turn::{Abandonment, Ticket, TurnAnswer, TurnAsk, TurnStep, format_bound};
 use cowshed_core::runtime::job_groups::{Life, Process, ProcessExit};
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -55,6 +55,10 @@ struct Entry {
     asker: bool,
     /// The ticket holds the turn: it was its queue's first when the turn last passed on.
     held: bool,
+    /// When the ticket took the turn, in milliseconds since the Unix epoch.
+    held_unix_ms: Option<u64>,
+    /// Whether the ticket was asked with `"class":"bounded"`.
+    bounded: bool,
     /// How the asker ended its hold, once it has.
     outcome: Option<String>,
 }
@@ -77,11 +81,18 @@ pub(crate) struct Notice {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Ended {
     /// Its asker ended its hold with `outcome`, and every bound command has exited.
-    Finished { ticket: Ticket, outcome: String },
+    Finished {
+        ticket: Ticket,
+        outcome: String,
+        bounded: bool,
+        held_ms: Option<u64>,
+    },
     /// Its asker went without ending its hold.
     Abandoned {
         repo: LandTurnName,
         abandonment: Abandonment,
+        bounded: bool,
+        held_ms: Option<u64>,
     },
 }
 
@@ -174,7 +185,10 @@ impl Turns {
         pid: u32,
         asked_unix_ms: u64,
     ) -> Result<(u64, Settled), Parked> {
-        if (self.fences > 0 || !self.waiting.is_empty()) && !self.inside(pid) {
+        let should_park = !self.inside(pid)
+            && (self.fences > 0
+                || (!self.waiting.is_empty() && (!ask.is_bounded() || !self.has_unbounded())));
+        if should_park {
             self.parked.push_back(ParkedAsk {
                 key,
                 ask,
@@ -183,7 +197,7 @@ impl Turns {
             });
             return Err(Parked);
         }
-        let (number, notices) = self.number(ask, pid, asked_unix_ms);
+        let (number, notices) = self.number(ask, pid, asked_unix_ms, asked_unix_ms);
         Ok((
             number,
             Settled {
@@ -191,6 +205,13 @@ impl Turns {
                 ..Settled::default()
             },
         ))
+    }
+
+    /// Whether any queue currently holds a non-bounded ticket: while one remains and no fence
+    /// holds, a bounded ask from outside may still enter behind it while an install waits
+    /// (05_gateway.md "The read fences the turns").
+    fn has_unbounded(&self) -> bool {
+        self.queues.values().flatten().any(|entry| !entry.bounded)
     }
 
     /// `pid` asks from inside a held turn: it is a command bound to a turn, or the asker of a
@@ -209,13 +230,21 @@ impl Turns {
     }
     /// Number `ask` one past the last number given and put it at the end of its queue: its number
     /// and what its queue is told.
-    fn number(&mut self, ask: TurnAsk, pid: u32, asked_unix_ms: u64) -> (u64, Vec<Notice>) {
+    fn number(
+        &mut self,
+        ask: TurnAsk,
+        pid: u32,
+        asked_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> (u64, Vec<Notice>) {
         self.numbered += 1;
         let number = self.numbered;
+        let bounded = ask.is_bounded();
         let TurnAsk {
             repo,
             workspace,
             command,
+            class: _,
         } = ask;
         let queue = self.queues.entry(repo).or_default();
         queue.push(Entry {
@@ -229,9 +258,11 @@ impl Turns {
             },
             asker: true,
             held: false,
+            held_unix_ms: None,
+            bounded,
             outcome: None,
         });
-        (number, tell(queue))
+        (number, tell(queue, now_unix_ms))
     }
 
     /// An install's read of the turns asked with the fence: with no ticket in any queue, so no
@@ -269,7 +300,7 @@ impl Turns {
     /// The install `install` that waited for the turns leaves: it no longer waits, or the fence
     /// its wait was given is lifted; once no install waits and no fence holds, the parked asks are
     /// numbered. An install that has already left changes nothing: leaving is ensuring it is gone.
-    pub(crate) fn wait_left(&mut self, install: u64) -> Settled {
+    pub(crate) fn wait_left(&mut self, install: u64, now_unix_ms: u64) -> Settled {
         if let Some(index) = self
             .waiting
             .iter()
@@ -286,7 +317,7 @@ impl Turns {
         } else {
             return Settled::default();
         }
-        self.release()
+        self.release(now_unix_ms)
     }
 
     /// Withdraw every install currently waiting for the queues to empty, never touching an install
@@ -300,7 +331,7 @@ impl Turns {
         let mut withdrawn = Vec::with_capacity(entries.len());
         let mut settled = Settled::default();
         for entry in entries {
-            let step = self.wait_left(entry.install);
+            let step = self.wait_left(entry.install, now_unix_ms);
             settled.notices.extend(step.notices);
             settled.numbered.extend(step.numbered);
             withdrawn.push((
@@ -342,9 +373,9 @@ impl Turns {
 
     /// A fenced read's connection closed: its fence is lifted, and once no install waits and no
     /// fence holds, the parked asks are numbered.
-    pub(crate) fn unfence(&mut self) -> Settled {
+    pub(crate) fn unfence(&mut self, now_unix_ms: u64) -> Settled {
         self.fences = self.fences.saturating_sub(1);
-        self.release()
+        self.release(now_unix_ms)
     }
 
     /// The parked asker keyed `key` left: it is never numbered.
@@ -353,7 +384,7 @@ impl Turns {
     }
 
     /// Number every parked ask in arrival order once no install waits and no fence holds.
-    fn release(&mut self) -> Settled {
+    fn release(&mut self, now_unix_ms: u64) -> Settled {
         let mut settled = Settled::default();
         if self.fences > 0 || !self.waiting.is_empty() {
             return settled;
@@ -365,7 +396,7 @@ impl Turns {
             asked_unix_ms,
         }) = self.parked.pop_front()
         {
-            let (number, notices) = self.number(ask, pid, asked_unix_ms);
+            let (number, notices) = self.number(ask, pid, asked_unix_ms, now_unix_ms);
             settled.numbered.push((key, number));
             settled.notices.extend(notices);
         }
@@ -383,7 +414,7 @@ impl Turns {
             entry.ticket.bound.push(pid);
         }
         Ok(Settled {
-            notices: tell(queue),
+            notices: tell(queue, 0),
             ..Settled::default()
         })
     }
@@ -482,11 +513,19 @@ impl Turns {
             let Entry {
                 ticket,
                 held,
+                held_unix_ms,
+                bounded,
                 outcome,
                 ..
             } = queue.remove(index);
+            let held_ms = held_unix_ms.map(|since| now_unix_ms.saturating_sub(since));
             Some(match outcome {
-                Some(outcome) => Ended::Finished { ticket, outcome },
+                Some(outcome) => Ended::Finished {
+                    ticket,
+                    outcome,
+                    bounded,
+                    held_ms,
+                },
                 None => {
                     let abandonment = Abandonment {
                         at_unix_ms: now_unix_ms,
@@ -505,13 +544,15 @@ impl Turns {
                     Ended::Abandoned {
                         repo: repo.clone(),
                         abandonment,
+                        bounded,
+                        held_ms,
                     }
                 }
             })
         } else {
             None
         };
-        let notices = tell(queue);
+        let notices = tell(queue, now_unix_ms);
         if queue.is_empty() {
             self.queues.remove(&repo);
         }
@@ -536,13 +577,14 @@ impl Turns {
 
 /// What every land in `queue` is told now: its first ticket that it holds the turn, once, when it
 /// takes it; every other who holds the turn and how many are ahead of it.
-fn tell(queue: &mut [Entry]) -> Vec<Notice> {
+fn tell(queue: &mut [Entry], now_unix_ms: u64) -> Vec<Notice> {
     let Some((head, waiters)) = queue.split_first_mut() else {
         return Vec::new();
     };
     let mut notices = Vec::with_capacity(waiters.len() + 1);
     if !head.held {
         head.held = true;
+        head.held_unix_ms = Some(now_unix_ms);
         notices.push(Notice {
             number: head.ticket.number,
             answer: TurnAnswer::Held {
@@ -653,15 +695,23 @@ pub(crate) struct LandTurns {
     messages: mpsc::UnboundedSender<Message>,
     /// Names each land-turn connection; the actor alone gives ticket numbers.
     connections: Arc<AtomicU64>,
+    /// How long a `"class":"bounded"` ticket may stay held once taken.
+    bounded_deadline: Duration,
 }
 
 impl LandTurns {
+    #[cfg(test)]
     pub(crate) fn start() -> Self {
+        Self::start_with_bounded_deadline(cowshed_core::land_turn::BOUNDED_TURN_DEADLINE)
+    }
+
+    pub(crate) fn start_with_bounded_deadline(bounded_deadline: Duration) -> Self {
         let (messages, receiver) = mpsc::unbounded_channel();
         tokio::spawn(run(receiver));
         Self {
             messages,
             connections: Arc::new(AtomicU64::new(0)),
+            bounded_deadline,
         }
     }
 
@@ -850,16 +900,21 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 let repo = ask.repo.clone();
                 let asked = format!("{} (pid {pid}) for `{}`", ask.workspace, ask.command);
                 let ahead_of_install = !turns.waiting.is_empty();
+                let inside = turns.inside(pid);
+                let bounded = ask.is_bounded();
                 match turns.ask(connection, ask, pid, now_unix_ms()) {
                     Ok((given, settled)) => {
+                        let why = if !ahead_of_install {
+                            if bounded { ", class bounded" } else { "" }
+                        } else if inside {
+                            ", inside a turn it holds: numbered ahead of the install that \
+                             waits for that turn"
+                        } else {
+                            ", class bounded behind a non-bounded ticket: numbered while an \
+                             install waits"
+                        };
                         cowshed_os::eprintln!(
-                            "cowshed: land turn {repo}: ticket {given} asked by {asked}{}",
-                            if ahead_of_install {
-                                ", inside a turn it holds: numbered ahead of the install that \
-                                 waits for that turn"
-                            } else {
-                                ""
-                            }
+                            "cowshed: land turn {repo}: ticket {given} asked by {asked}{why}",
                         );
                         // A connection that has gone hears nothing; its departure is on its way.
                         let _ = number.send(given);
@@ -989,11 +1044,11 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                             "cowshed: land turns: an install that waited has left; its wait or \
                              its fence is gone"
                         );
-                        turns.wait_left(install)
+                        turns.wait_left(install, now_unix_ms())
                     }
                     None => {
                         cowshed_os::eprintln!("cowshed: land turns: an install's fence is lifted");
-                        turns.unfence()
+                        turns.unfence(now_unix_ms())
                     }
                 };
                 if let Some(lifted) = lifted {
@@ -1039,19 +1094,35 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
         }
         match settled.ended {
             None => {}
-            Some(Ended::Finished { ticket, outcome }) => {
+            Some(Ended::Finished {
+                ticket,
+                outcome,
+                bounded,
+                held_ms,
+            }) => {
                 answers.remove(&ticket.number);
+                let held = held_ms
+                    .map_or_else(String::new, |ms| format!(" after holding the turn {ms} ms"));
+                let class = if bounded { ", class bounded" } else { "" };
                 cowshed_os::eprintln!(
-                    "cowshed: land turn ticket {}: {} (pid {}) finished: {outcome}",
+                    "cowshed: land turn ticket {}: {} (pid {}) finished: {outcome}{held}{class}",
                     ticket.number,
                     ticket.workspace,
                     ticket.pid,
                 );
             }
-            Some(Ended::Abandoned { repo, abandonment }) => {
+            Some(Ended::Abandoned {
+                repo,
+                abandonment,
+                bounded,
+                held_ms,
+            }) => {
                 answers.remove(&abandonment.ticket.number);
+                let held = held_ms
+                    .map_or_else(String::new, |ms| format!(" after holding the turn {ms} ms"));
+                let class = if bounded { ", class bounded" } else { "" };
                 cowshed_os::eprintln!(
-                    "cowshed: land turn {repo}: ticket {} of {} (pid {}) abandoned: {}",
+                    "cowshed: land turn {repo}: ticket {} of {} (pid {}) abandoned: {}{held}{class}",
                     abandonment.ticket.number,
                     abandonment.ticket.workspace,
                     abandonment.ticket.pid,
@@ -1117,6 +1188,8 @@ pub(crate) async fn hold<R, W>(
             return;
         }
     };
+    let is_bounded = ask.is_bounded();
+    let bounded_deadline = turns.bounded_deadline;
     let connection = turns.connections.fetch_add(1, Ordering::Relaxed);
     let (sender, mut answers) = mpsc::unbounded_channel();
     let (numbered, mut number) = oneshot::channel();
@@ -1170,6 +1243,7 @@ pub(crate) async fn hold<R, W>(
         }
     };
     let mut held = false;
+    let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     loop {
         // Biased, in this order: an asker that sends its end and exits leaves both ready, and its
         // end, already in the socket's buffer, is read before its exit, so the turn records how
@@ -1179,7 +1253,12 @@ pub(crate) async fn hold<R, W>(
             biased;
             answer = answers.recv() => {
                 let Some(answer) = answer else { return };
-                held |= matches!(answer, TurnAnswer::Held { .. });
+                if matches!(answer, TurnAnswer::Held { .. }) {
+                    held = true;
+                    if is_bounded && deadline.is_none() {
+                        deadline = Some(Box::pin(tokio::time::sleep(bounded_deadline)));
+                    }
+                }
                 if write(&mut writer, &answer).await.is_err() {
                     break;
                 }
@@ -1193,6 +1272,22 @@ pub(crate) async fn hold<R, W>(
                 if write(&mut writer, &answer).await.is_err() {
                     break;
                 }
+            }
+            () = async {
+                if let Some(sleep) = deadline.as_mut() {
+                    sleep.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                let bound_ms = u64::try_from(bounded_deadline.as_millis()).unwrap_or(u64::MAX);
+                place.outcome = Some(format!(
+                    "expired: exceeded bounded-turn deadline ({})",
+                    format_bound(bound_ms)
+                ));
+                let _ = write(&mut writer, &TurnAnswer::Expired { bound_ms }).await;
+                let _ = writer.shutdown().await;
+                return;
             }
             () = &mut asker_gone => break,
         }
@@ -1308,6 +1403,7 @@ mod tests {
             repo: LandTurnName::new(repo).unwrap(),
             workspace: workspace.to_owned(),
             command: format!("land {workspace}"),
+            class: None,
         }
     }
 
@@ -1475,6 +1571,8 @@ mod tests {
                     bound: Vec::new(),
                 },
                 outcome: "exited 0".to_owned(),
+                bounded: false,
+                held_ms: Some(5),
             })
         );
         assert!(
@@ -1560,8 +1658,8 @@ mod tests {
             turns.fence(),
             "a parked ask is no ticket: a second read fences too"
         );
-        assert_eq!(turns.unfence(), Settled::default(), "a fence still holds");
-        let lifted = turns.unfence();
+        assert_eq!(turns.unfence(1), Settled::default(), "a fence still holds");
+        let lifted = turns.unfence(2);
         assert_eq!(
             lifted.numbered,
             [(7, 1)],
@@ -1617,7 +1715,7 @@ mod tests {
             turns.queues(u64::MAX).is_empty(),
             "the parked asks wait behind the install's fence"
         );
-        let lifted = turns.unfence();
+        let lifted = turns.unfence(5);
         assert_eq!(
             lifted.numbered,
             [(3, 3), (4, 4), (5, 5)],
@@ -1639,7 +1737,7 @@ mod tests {
         assert_eq!(turns.ask(2, ask("repo", "b"), 20, 1), Err(Parked));
         assert_eq!(turns.ask(3, ask("repo", "c"), 30, 2), Err(Parked));
         turns.unpark(2);
-        let left = turns.wait_left(INSTALL);
+        let left = turns.wait_left(INSTALL, 2);
         assert_eq!(
             left.numbered,
             [(3, 2)],
@@ -1647,7 +1745,7 @@ mod tests {
         );
         assert_eq!(holders(&turns, "repo"), [first, 2]);
         assert_eq!(
-            turns.wait_left(INSTALL),
+            turns.wait_left(INSTALL, 2),
             Settled::default(),
             "an install that has left leaves again as a no-op"
         );
@@ -1663,9 +1761,9 @@ mod tests {
             "no ticket: the install is fenced at once"
         );
         assert_eq!(turns.ask(4, ask("repo", "d"), 40, 5), Err(Parked));
-        assert_eq!(turns.wait_left(INSTALL + 1).numbered, [(4, 3)]);
+        assert_eq!(turns.wait_left(INSTALL + 1, 6).numbered, [(4, 3)]);
         assert_eq!(
-            turns.wait_left(INSTALL + 1),
+            turns.wait_left(INSTALL + 1, 6),
             Settled::default(),
             "a fence lifted once is lifted"
         );

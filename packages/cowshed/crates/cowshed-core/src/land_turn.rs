@@ -55,6 +55,16 @@ pub fn land_turn_root(support_directory: &Path) -> PathBuf {
     support_directory.join("land-turn")
 }
 
+/// The class of a land or ref turn ask (05_gateway.md "Land turns").
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnClass {
+    /// A short, bounded turn (such as `cowshed doc-commit`): may enter behind a non-bounded ticket
+    /// while an install waits, parks once only bounded tickets remain, and expires at
+    /// [`BOUNDED_TURN_DEADLINE`] once held.
+    Bounded,
+}
+
 /// What a land asks for: its repository's queue, the workspace it lands, and the command its turn
 /// runs, which the queue names to whoever waits behind it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -63,6 +73,25 @@ pub struct TurnAsk {
     pub repo: LandTurnName,
     pub workspace: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<TurnClass>,
+}
+
+impl TurnAsk {
+    /// Whether this ask requests a bounded turn (`"class":"bounded"`).
+    pub const fn is_bounded(&self) -> bool {
+        matches!(self.class, Some(TurnClass::Bounded))
+    }
+}
+
+/// Format a turn deadline in human units: whole seconds as `<n> s`, sub-second or non-whole as
+/// `<ms> ms`.
+pub fn format_bound(bound_ms: u64) -> String {
+    if bound_ms > 0 && bound_ms.is_multiple_of(1000) {
+        format!("{} s", bound_ms / 1000)
+    } else {
+        format!("{bound_ms} ms")
+    }
 }
 
 /// One land's place in its repository's queue, as the gateway records it.
@@ -129,6 +158,13 @@ pub enum TurnAnswer {
     /// or closes as the install's restart drains the gateway; then the asker waits for the install
     /// slot and asks the gateway the install leaves (05_gateway.md "The read fences the turns").
     Fenced,
+    /// A bounded ticket exceeded its deadline once held: the gateway ends the ticket and closes
+    /// its connection, and the holder treats this as a lost turn naming the bound
+    /// (05_gateway.md "Deadlines").
+    Expired {
+        #[serde(rename = "boundMs")]
+        bound_ms: u64,
+    },
 }
 
 /// What a waiting land is told: who holds the turn and how many tickets are ahead of its own.
@@ -257,6 +293,7 @@ impl Turn {
     pub async fn bound(&mut self, pid: u32) -> io::Result<()> {
         match answer(&mut self.connection).await? {
             TurnAnswer::Bound { pid: bound } if bound == pid => Ok(()),
+            TurnAnswer::Expired { bound_ms } => Err(expired_error(bound_ms)),
             TurnAnswer::Refused { error } => Err(io::Error::other(format!(
                 "the gateway refused to bind pid {pid} to land turn ticket {}: {error}",
                 self.ticket.number
@@ -306,10 +343,13 @@ impl Turn {
                 io::ErrorKind::UnexpectedEof,
                 "the gateway closed the connection that holds the turn",
             ),
-            Ok(Some(line)) => io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the gateway sent {line:?} to a held turn that asked nothing"),
-            ),
+            Ok(Some(line)) => match decode(&line) {
+                Ok(TurnAnswer::Expired { bound_ms }) => expired_error(bound_ms),
+                _ => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the gateway sent {line:?} to a held turn that asked nothing"),
+                ),
+            },
             Err(error) => error,
         }
     }
@@ -401,6 +441,16 @@ fn decode(line: &str) -> io::Result<TurnAnswer> {
             )),
         }
     })
+}
+
+fn expired_error(bound_ms: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "the bounded turn exceeded its {} deadline",
+            format_bound(bound_ms)
+        ),
+    )
 }
 
 fn unexpected(answer: &TurnAnswer, step: &str) -> io::Error {
@@ -517,7 +567,9 @@ async fn queued(
                             ask.repo,
                         )));
                     }
-                    other @ TurnAnswer::Bound { .. } => return Err(unexpected(&other, "an ask")),
+                    other @ (TurnAnswer::Bound { .. } | TurnAnswer::Expired { .. }) => {
+                        return Err(unexpected(&other, "an ask"));
+                    }
                 };
                 if told.as_ref() != Some(&wait) {
                     waiting(&wait);

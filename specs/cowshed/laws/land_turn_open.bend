@@ -25,4 +25,4 @@ law install_read_holds_back_later_asks:
   for +t: +List<L.E>
   for +c: Nat
   for +x: Nat
-  {L.queue(L.step(L.TAsk{x}, L.step(L.TFence{}, L.St{e <> t, c, 0n, 0n, []}))) == e <> t : +List<L.E>}
+  {L.queue(L.step(L.TAsk{x, False{}}, L.step(L.TFence{}, L.St{e <> t, c, 0n, 0n, []}))) == e <> t : +List<L.E>}

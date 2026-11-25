@@ -113,6 +113,7 @@ where
             repo: declaration.turn().clone(),
             workspace: land.workspace.to_owned(),
             command: format!("cowshed land {}", land.workspace),
+            class: None,
         },
         None,
         output,

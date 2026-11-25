@@ -11,13 +11,13 @@ use std::rc::Rc;
 
 use super::{BindRefusal, Parked, Turns};
 use cowshed_core::api::dto::LandTurnName;
-use cowshed_core::land_turn::TurnAsk;
+use cowshed_core::land_turn::{TurnAsk, TurnClass};
 
 // Regenerate with bun run --filter @smoothbricks/cowshed emit-land-turn-law.
 #[rustfmt::skip]
 mod model;
 
-use model::{Bound, E, List, Op, St};
+use model::{Bound, E, List, Op, P, St};
 
 fn items<T: Clone>(list: &Rc<List<T>>) -> Vec<T> {
     let mut out = Vec::new();
@@ -94,6 +94,7 @@ impl Pair {
                                         .collect(),
                                 ),
                                 entry.held,
+                                entry.bounded,
                             )
                         })
                         .collect()
@@ -114,7 +115,7 @@ impl Pair {
         self.inputs.push(model::show_Op(op));
         let pid = |p: u64| u32::try_from(p).expect("a model pid fits a pid");
         let answers = match op {
-            Op::TAsk(asker) => {
+            Op::TAsk(asker, bounded) => {
                 let workspace = format!("ws{}", self.inputs.len());
                 let asked = self.turns.ask(
                     u64::try_from(self.inputs.len()).expect("an input count fits a key"),
@@ -122,6 +123,7 @@ impl Pair {
                         repo: self.repo.clone(),
                         command: format!("land {workspace}"),
                         workspace,
+                        class: bounded.then_some(TurnClass::Bounded),
                     },
                     pid(*asker),
                     self.now_unix_ms,
@@ -130,7 +132,8 @@ impl Pair {
                     matches!(asked, Err(Parked)),
                     !model::inside(*asker, self.model_queue())
                         && (model::fences(self.model.clone()) > 0
-                            || model::waiting(self.model.clone()) > 0),
+                            || (model::waiting(self.model.clone()) > 0
+                                && (!*bounded || !model::has_unbounded(self.model_queue())))),
                 );
                 if code != model {
                     let said = |parked: bool| if parked { "parked" } else { "numbered" };
@@ -147,7 +150,7 @@ impl Pair {
                 None
             }
             Op::TUnfence => {
-                self.turns.unfence();
+                self.turns.unfence(self.now_unix_ms);
                 None
             }
             Op::TWait => {
@@ -160,7 +163,7 @@ impl Pair {
             }
             Op::TWaitLeave => {
                 if let Some(install) = self.waiting.pop_front() {
-                    self.turns.wait_left(install);
+                    self.turns.wait_left(install, self.now_unix_ms);
                 }
                 None
             }
@@ -209,7 +212,10 @@ impl Pair {
             model::counter(self.model.clone()),
             model::fences(self.model.clone()),
             model::waiting(self.model.clone()),
-            items(&model::parked(self.model.clone())),
+            items(&model::parked(self.model.clone()))
+                .into_iter()
+                .map(|P::P(pid, bounded)| (pid, bounded))
+                .collect::<Vec<_>>(),
         );
         let code_numbering = (
             self.turns.numbered,
@@ -218,7 +224,7 @@ impl Pair {
             self.turns
                 .parked
                 .iter()
-                .map(|parked| u64::from(parked.pid))
+                .map(|parked| (u64::from(parked.pid), parked.ask.is_bounded()))
                 .collect::<Vec<_>>(),
         );
         if model_numbering != code_numbering {
@@ -291,11 +297,11 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
     let mut pair = Pair::new("acme");
     for op in [
         Op::TFence,
-        Op::TAsk(41),
+        Op::TAsk(41, false),
         Op::TUnfence,
         Op::TBind(1, 7),
         Op::TFence,
-        Op::TAsk(42),
+        Op::TAsk(42, false),
         Op::TExit(1, 7),
     ] {
         pair.input(&op, None).unwrap();
@@ -308,7 +314,7 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
          nothing"
     );
     assert_eq!(shown(&pair.code_queue()), shown(&pair.model_queue()));
-    let E::E(holder, _, _, _, held) = items(&pair.code_queue())[0].clone();
+    let E::E(holder, _, _, _, held, _) = items(&pair.code_queue())[0].clone();
     assert_eq!((holder, held), (2, true), "the next land holds the turn");
 }
 
@@ -319,11 +325,11 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
 #[test]
 fn the_recorded_deferred_install_waits_in_order_through_the_model_and_turns() {
     let mut pair = Pair::new("smoothbricks");
-    for op in [Op::TAsk(41), Op::TWait, Op::TAsk(42)] {
+    for op in [Op::TAsk(41, false), Op::TWait, Op::TAsk(42, false)] {
         pair.input(&op, None).unwrap();
     }
     pair.input(&Op::TLeave(1), Some("exited 0")).unwrap();
-    pair.input(&Op::TAsk(43), None).unwrap();
+    pair.input(&Op::TAsk(43, false), None).unwrap();
     assert_eq!(
         (
             pair.turns.fences,
@@ -341,7 +347,7 @@ fn the_recorded_deferred_install_waits_in_order_through_the_model_and_turns() {
     assert_eq!(
         items(&pair.code_queue())
             .into_iter()
-            .map(|E::E(number, _, _, _, held)| (number, held))
+            .map(|E::E(number, _, _, _, held, _)| (number, held))
             .collect::<Vec<_>>(),
         [(2, true), (3, false)],
         "the parked lands are numbered in arrival order once the install's fence lifts"
@@ -358,14 +364,19 @@ fn the_recorded_deferred_install_waits_in_order_through_the_model_and_turns() {
 #[test]
 fn the_recorded_ref_turn_under_a_waiting_install_replays_through_the_model_and_turns() {
     let mut pair = Pair::new("smoothbricks");
-    for op in [Op::TAsk(41), Op::TWait, Op::TAsk(42), Op::TAsk(41)] {
+    for op in [
+        Op::TAsk(41, false),
+        Op::TWait,
+        Op::TAsk(42, false),
+        Op::TAsk(41, false),
+    ] {
         pair.input(&op, None).unwrap();
     }
     assert_eq!(
         (
             items(&pair.code_queue())
                 .into_iter()
-                .map(|E::E(number, asker, _, _, held)| (number, asker, held))
+                .map(|E::E(number, asker, _, _, held, _)| (number, asker, held))
                 .collect::<Vec<_>>(),
             pair.turns.waiting.len(),
             pair.turns.parked.len()
@@ -384,7 +395,7 @@ fn the_recorded_ref_turn_under_a_waiting_install_replays_through_the_model_and_t
     assert_eq!(
         items(&pair.code_queue())
             .into_iter()
-            .map(|E::E(number, asker, _, _, held)| (number, asker, held))
+            .map(|E::E(number, asker, _, _, held, _)| (number, asker, held))
             .collect::<Vec<_>>(),
         [(3, 42, true)],
         "the land parked behind the install holds the turn once its fence lifts"
@@ -412,7 +423,7 @@ fn recorded_turns_replay_through_the_model_and_turns() {
         match e.as_str() {
             "queued" => {
                 // Each recorded land is a process of its own: no ask comes from inside a turn.
-                pair.input(&Op::TAsk(n), None).unwrap();
+                pair.input(&Op::TAsk(n, false), None).unwrap();
                 numbers.insert(n, pair.turns.numbered);
             }
             "taken" => {
@@ -420,7 +431,7 @@ fn recorded_turns_replay_through_the_model_and_turns() {
                 let held = |queue: Rc<List<E>>| {
                     items(&queue)
                         .first()
-                        .is_some_and(|E::E(first, _, _, _, held)| *first == number && *held)
+                        .is_some_and(|E::E(first, _, _, _, held, _)| *first == number && *held)
                 };
                 assert!(
                     held(pair.model_queue()) && held(pair.code_queue()),
@@ -439,20 +450,39 @@ fn recorded_turns_replay_through_the_model_and_turns() {
     assert_eq!(pairs.len(), 6, "six repositories' queues were recorded");
 }
 
-/// Option B law-driver red (05_gateway.md "The read fences the turns"): while an install waits
+/// Option B law-driver check (05_gateway.md "The read fences the turns"): while an install waits
 /// behind a non-bounded land ticket, a bounded ask from outside enters the queue (not parked), and
-/// once the land ticket leaves leaving only bounded tickets, a later bounded ask parks.
+/// once the land ticket leaves leaving only bounded tickets, a later bounded ask parks until the
+/// install is fenced and lifts its fence.
 #[test]
 fn a_bounded_ask_enters_behind_a_land_while_an_install_waits_and_parks_once_the_land_leaves() {
     let mut pair = Pair::new("acme");
-    pair.input(&Op::TAsk(1), None).unwrap();
+    pair.input(&Op::TAsk(1, false), None).unwrap();
     pair.input(&Op::TWait, None).unwrap();
-    // Against today's model (which has no bounded class), this ask from outside is parked instead
-    // of numbered behind land 1.
-    pair.input(&Op::TAsk(2), None).unwrap();
+    pair.input(&Op::TAsk(2, true), None).unwrap();
     assert_eq!(
         (pair.turns.numbered, pair.turns.parked.len()),
         (2, 0),
         "bounded ask behind a held land while an install waits must be numbered, not parked"
+    );
+    // Land leaves: only bounded ticket 2 remains, so a later bounded ask must park.
+    pair.input(&Op::TLeave(1), Some("exited 0")).unwrap();
+    pair.input(&Op::TAsk(3, true), None).unwrap();
+    assert_eq!(
+        (pair.turns.numbered, pair.turns.parked.len()),
+        (2, 1),
+        "bounded ask must park once only bounded tickets remain"
+    );
+    // Bounded ticket 2 leaves: install is fenced; lift admits parked bounded ask 3.
+    pair.input(&Op::TLeave(2), Some("committed")).unwrap();
+    assert_eq!((pair.turns.fences, pair.turns.waiting.len()), (1, 0));
+    pair.input(&Op::TUnfence, None).unwrap();
+    assert_eq!(
+        items(&pair.code_queue())
+            .into_iter()
+            .map(|E::E(number, asker, _, _, held, bounded)| (number, asker, held, bounded))
+            .collect::<Vec<_>>(),
+        [(3, 3, true, true)],
+        "the parked bounded ask holds the turn as bounded once the install's fence lifts"
     );
 }

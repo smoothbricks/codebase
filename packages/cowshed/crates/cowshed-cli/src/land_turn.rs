@@ -84,6 +84,7 @@ where
             repo: args.repo.clone(),
             workspace: args.workspace.clone(),
             command: description,
+            class: None,
         },
         args.outside_lock.clone(),
         output,

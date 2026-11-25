@@ -6104,6 +6104,7 @@ mod tests {
                         .expect("a queue name"),
                     workspace: "widget-land".to_owned(),
                     command: "land".to_owned(),
+                    class: None,
                 },
                 None,
                 Duration::from_secs(90),

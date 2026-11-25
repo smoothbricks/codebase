@@ -8,7 +8,7 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::dto::LandTurnName;
-use crate::land_turn::{self, OutsideHolders, Turn, TurnAsk, TurnGateway, Wait};
+use crate::land_turn::{self, OutsideHolders, Turn, TurnAsk, TurnClass, TurnGateway, Wait};
 use crate::{CowshedError, Result};
 
 /// Who takes a ref turn: a land's ref fence, for its workspace, or a doc commit. It names the
@@ -67,6 +67,10 @@ impl RefTurn {
             repo: queue.clone(),
             workspace: writer.workspace(),
             command: writer.command(),
+            class: match writer {
+                RefWriter::DocCommit => Some(TurnClass::Bounded),
+                RefWriter::Land { .. } => None,
+            },
         };
         let verb = writer.verb();
         let started = Instant::now();

@@ -17,6 +17,7 @@ const functions = [
   'parked',
   'find',
   'inside',
+  'has_unbounded',
   'turn_ok_b',
   'chain_b',
 ];

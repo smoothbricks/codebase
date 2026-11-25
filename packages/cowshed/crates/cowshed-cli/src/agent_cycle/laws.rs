@@ -197,12 +197,12 @@ fn reached(ops: &Rc<land_turn_model::List<land_turn_model::Op>>) -> (Vec<u64>, O
     )));
     let numbers = queue
         .iter()
-        .map(|land_turn_model::E::E(number, _, _, _, _)| *number)
+        .map(|land_turn_model::E::E(number, _, _, _, _, _)| *number)
         .collect();
     let held = queue
         .iter()
-        .find(|land_turn_model::E::E(_, _, _, _, held)| *held)
-        .map(|land_turn_model::E::E(number, _, _, _, _)| *number);
+        .find(|land_turn_model::E::E(_, _, _, _, held, _)| *held)
+        .map(|land_turn_model::E::E(number, _, _, _, _, _)| *number);
     (numbers, held)
 }
 

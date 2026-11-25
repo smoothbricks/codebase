@@ -106,6 +106,7 @@ fn ask(workspace: &str) -> TurnAsk {
         repo: LandTurnName::new(REPO).unwrap(),
         workspace: workspace.to_owned(),
         command: format!("land {workspace}"),
+        class: None,
     }
 }
 
@@ -998,6 +999,7 @@ async fn a_land_takes_its_ref_turn_inside_its_turn_though_an_install_waits_for_t
             repo: LandTurnName::new("acme.ref").unwrap(),
             workspace: "second".to_owned(),
             command: "cowshed land second (ref fence)".to_owned(),
+            class: None,
         },
     )
     .await;

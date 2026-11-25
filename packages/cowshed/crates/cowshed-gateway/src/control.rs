@@ -1542,7 +1542,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-boot" => &["op", "repoId", "device"],
         cowshed_core::land_turn::LAND_TURNS_OP => &["op", "abandonedSinceUnixMs", "fence"],
         cowshed_core::land_turn::LAND_TURNS_WITHDRAW_OP => &["op"],
-        cowshed_core::land_turn::LAND_TURN_OP => &["op", "repo", "workspace", "command"],
+        cowshed_core::land_turn::LAND_TURN_OP => &["op", "repo", "workspace", "command", "class"],
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
@@ -1620,17 +1620,21 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             repo: cowshed_core::api::dto::LandTurnName,
             workspace: String,
             command: String,
+            #[serde(default)]
+            class: Option<cowshed_core::land_turn::TurnClass>,
         }
         let LandTurnIn {
             repo,
             workspace,
             command,
+            class,
         } = serde_json::from_value(value).map_err(encoding)?;
         return Ok(Incoming::LandTurn {
             ask: cowshed_core::land_turn::TurnAsk {
                 repo,
                 workspace,
                 command,
+                class,
             },
         });
     }
