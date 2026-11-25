@@ -35,7 +35,8 @@
 # key diagnostics, and a test runner that asks a supervisor's gate (MBX_TEST_GATE) before it starts each
 # nextest test, which the reservation endpoint says of itself (`capabilities`) with the pool's aging
 # bound (`aging_ms`), build-script launchers repaired in a target mbx did not place, and each interactive
-# job's first admission published by `mbx stats --scheduler --json` (`first_admitted`), from
+# job's first admission published by `mbx stats --scheduler --json` (`first_admitted`), and a
+# prediction looked up by its invocation when its lockfile's manifest has none, from
 # smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
@@ -48,7 +49,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/26b27707f8e115e28c89657eb3d3055f7e9dd720";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/b307e62e2377c6a51116fb9f3a8278e0dc8e1183";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
