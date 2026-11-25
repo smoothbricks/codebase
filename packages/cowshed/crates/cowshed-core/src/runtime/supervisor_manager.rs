@@ -1609,6 +1609,75 @@ mod tests {
         drop((recovery, holder));
     }
 
+    /// The startup pass's one listing of `run` sweeps orphan socket lease files
+    /// (`<digest>.sock.lock`, `<digest>.members.sock.lock`, and `manager.sock.lock`) whose paired
+    /// socket is absent, under the named-lease protocol without following links: a lease held by
+    /// another process, a lease beside a present socket, or a symlink at a lease name is left
+    /// untouched.
+    #[test]
+    fn the_startup_listing_sweeps_only_unheld_orphan_lease_files_whose_socket_is_absent() {
+        let store = recovery_store("cowshed-orphan-leases", &["live"]);
+        let gone_socket = supervisor_socket_of(&store, "gone");
+        let gone_lease = gone_socket.with_extension("sock.lock");
+        let gone_members_lease =
+            supervisor_socket::membership_socket_path(&gone_socket).with_extension("sock.lock");
+        let manager_lease = manager_socket_path(&store).with_extension("sock.lock");
+        std::fs::write(&gone_lease, b"").expect("orphan supervisor lease");
+        std::fs::write(&gone_members_lease, b"").expect("orphan membership lease");
+        std::fs::write(&manager_lease, b"").expect("orphan manager lease");
+
+        let held_socket = supervisor_socket_of(&store, "held");
+        let held_lease = held_socket.with_extension("sock.lock");
+        let holder = supervisor_socket::lease_unserved(&held_socket)
+            .expect("take the lease")
+            .expect("the test holds the lease");
+
+        let live_socket = supervisor_socket_of(&store, "live");
+        let live_lease = live_socket.with_extension("sock.lock");
+        let live_members = supervisor_socket::membership_socket_path(&live_socket);
+        let live_members_lease = live_members.with_extension("sock.lock");
+        std::fs::write(&live_lease, b"").expect("lease beside live socket");
+        std::fs::write(&live_members, b"").expect("live membership socket");
+        std::fs::write(&live_members_lease, b"").expect("lease beside live membership socket");
+
+        let target = store.join("outside-target");
+        std::fs::write(&target, b"keep").expect("symlink target");
+        let linked_lease = supervisor_socket_of(&store, "linked").with_extension("sock.lock");
+        std::os::unix::fs::symlink(&target, &linked_lease).expect("symlink at lease name");
+
+        let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
+        let recovery = manager.recovery();
+
+        assert!(
+            !gone_lease.exists(),
+            "unheld orphan supervisor lease is swept"
+        );
+        assert!(
+            !gone_members_lease.exists(),
+            "unheld orphan membership lease is swept"
+        );
+        assert!(
+            !manager_lease.exists(),
+            "unheld orphan manager lease is swept"
+        );
+        assert!(held_lease.exists(), "held orphan lease stays");
+        assert!(live_lease.exists(), "lease beside present socket stays");
+        assert!(
+            live_members_lease.exists(),
+            "lease beside present membership socket stays"
+        );
+        assert!(
+            std::fs::symlink_metadata(&linked_lease).is_ok(),
+            "symlink at a lease name is not unlinked"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("symlink target"),
+            b"keep",
+            "symlink target is untouched"
+        );
+        drop((recovery, holder));
+    }
+
     /// While a supervisor from before the manager started still drains, the manager refuses an
     /// ensure of its workspace by type, carrying how many supervisors are left, rather than start
     /// a second supervisor that would race the recovery for the socket; once it is recovered,

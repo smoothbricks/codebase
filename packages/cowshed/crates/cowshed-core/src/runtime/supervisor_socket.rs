@@ -4927,6 +4927,68 @@ mod socket_ownership_tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    /// Releasing a bound socket or an unserved lease unlinks its lease file under the lease once
+    /// the last holder drops: after the socket's own inode is removed, and only once every shared
+    /// `PublicationLease` has dropped too. Applies to `<digest>.sock`, `<digest>.members.sock`,
+    /// and `manager.sock`, which all share `bind`.
+    #[tokio::test]
+    async fn releasing_a_socket_or_lease_unlinks_its_lease_file_once_the_last_holder_drops() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-lease-unlink",
+        );
+        let path = root.join("run").join("s.sock");
+        let socket = bind(&path).await.unwrap();
+        let pub_lease = socket.publication_lease();
+        assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
+
+        drop(socket);
+        assert_eq!(
+            entries(&path),
+            ["s.sock.lock"],
+            "the socket inode goes on drop while a PublicationLease still holds the lease"
+        );
+        drop(pub_lease);
+        assert!(
+            entries(&path).is_empty(),
+            "dropping the last PublicationLease unlinks the socket lease file"
+        );
+
+        let members_path = membership_socket_path(&path);
+        let members = bind(&members_path).await.unwrap();
+        assert_eq!(
+            entries(&members_path),
+            ["s.members.sock", "s.members.sock.lock"]
+        );
+        drop(members);
+        assert!(
+            entries(&members_path).is_empty(),
+            "dropping the membership socket unlinks its lease file"
+        );
+
+        let manager_path = root.join("run").join("manager.sock");
+        let manager = bind(&manager_path).await.unwrap();
+        assert_eq!(
+            entries(&manager_path),
+            ["manager.sock", "manager.sock.lock"]
+        );
+        drop(manager);
+        assert!(
+            entries(&manager_path).is_empty(),
+            "dropping the manager socket unlinks its lease file"
+        );
+
+        let unserved = lease_unserved(&path)
+            .unwrap()
+            .expect("the free lease is taken");
+        assert_eq!(entries(&path), ["s.sock.lock"]);
+        drop(unserved);
+        assert!(
+            entries(&path).is_empty(),
+            "dropping an unserved lease unlinks its lease file"
+        );
+    }
 }
 
 #[cfg(test)]
