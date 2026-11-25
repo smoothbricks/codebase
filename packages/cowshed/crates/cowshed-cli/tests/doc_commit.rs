@@ -1058,3 +1058,471 @@ fn doc_commit_asks_for_its_ref_turn_with_class_bounded() {
         "doc-commit must ask its ref turn with class bounded: {ask}"
     );
 }
+
+fn make_fifo(path: &Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let _ = fs::remove_file(path);
+    let c_path = CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+    // SAFETY: mkfifo(3) on a test-owned path inside the test temp root.
+    assert_eq!(
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}",
+        path.display()
+    );
+}
+
+enum StandInEvent {
+    Step(String),
+    StepsClosed,
+    Cut,
+}
+
+/// Stand-in gateway control socket that grants one ref turn, binds commands on demand, and cuts
+/// the connection with `{"turn":"expired","boundMs":bound_ms}` on the test's signal (or on the
+/// `cut_on_bind`-th bind step when given), with no sleeps or polling.
+struct StandInGateway {
+    socket: PathBuf,
+    events: Option<mpsc::Sender<StandInEvent>>,
+    cut_done: mpsc::Receiver<()>,
+    server: Option<thread::JoinHandle<()>>,
+    /// Declared last so the socket's directory is removed after the server thread stops.
+    _root: temp_root::TempRoot,
+}
+
+impl StandInGateway {
+    fn start(bound_ms: u64, cut_on_bind: Option<usize>) -> Self {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+
+        let root = temp_root::TempRoot::new_in(&temp_parent::scratch_parent(), "csre");
+        let socket = root.join("gw.sock");
+        let listener = UnixListener::bind(&socket).expect("bind stand-in gateway socket");
+        let (events_tx, events_rx) = mpsc::channel::<StandInEvent>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let reader_tx = events_tx.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept doc-commit connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut ask_line = String::new();
+            reader.read_line(&mut ask_line).expect("read ask line");
+            let held = serde_json::json!({
+                "turn": "held",
+                "ticket": {
+                    "number": 1,
+                    "pid": 1,
+                    "workspace": "doc-commit",
+                    "askedUnixMs": 0,
+                    "command": "cowshed doc-commit",
+                }
+            });
+            writeln!(stream, "{held}").expect("write held");
+            stream.flush().expect("flush held");
+
+            thread::spawn(move || {
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => {
+                            let _ = reader_tx.send(StandInEvent::StepsClosed);
+                            break;
+                        }
+                        Ok(_) => {
+                            if reader_tx.send(StandInEvent::Step(line)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let mut binds = 0usize;
+            while let Ok(event) = events_rx.recv() {
+                match event {
+                    StandInEvent::Cut => {
+                        let _ = writeln!(
+                            stream,
+                            "{}",
+                            serde_json::json!({"turn": "expired", "boundMs": bound_ms})
+                        );
+                        let _ = stream.flush();
+                        drop(stream);
+                        let _ = done_tx.send(());
+                        return;
+                    }
+                    StandInEvent::StepsClosed => return,
+                    StandInEvent::Step(step_line) => {
+                        let step: serde_json::Value =
+                            serde_json::from_str(&step_line).expect("parse turn step JSON");
+                        match step["step"].as_str() {
+                            Some("bind") => {
+                                binds += 1;
+                                if cut_on_bind == Some(binds) {
+                                    let _ = writeln!(
+                                        stream,
+                                        "{}",
+                                        serde_json::json!({
+                                            "turn": "expired",
+                                            "boundMs": bound_ms
+                                        })
+                                    );
+                                    let _ = stream.flush();
+                                    drop(stream);
+                                    let _ = done_tx.send(());
+                                    return;
+                                }
+                                let pid = step["pid"].as_u64().expect("bind pid");
+                                let _ = writeln!(
+                                    stream,
+                                    "{}",
+                                    serde_json::json!({"turn": "bound", "pid": pid})
+                                );
+                                let _ = stream.flush();
+                            }
+                            Some("end") => return,
+                            other => panic!("unexpected turn step: {other:?}"),
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            socket,
+            events: Some(events_tx),
+            cut_done: done_rx,
+            server: Some(server),
+            _root: root,
+        }
+    }
+
+    fn cut_now(&mut self) {
+        if let Some(events) = self.events.take() {
+            events
+                .send(StandInEvent::Cut)
+                .expect("signal stand-in gateway to expire");
+        }
+        self.cut_done
+            .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
+            .expect("stand-in gateway wrote expired and closed");
+    }
+}
+
+impl Drop for StandInGateway {
+    fn drop(&mut self) {
+        self.events.take();
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+    }
+}
+
+/// RE1: deterministic expiry race while `[doc] check` runs. The stand-in gateway sends
+/// `{"turn":"expired","boundMs":250}` and closes before the client sends its end: the doc commit
+/// fails naming the bound (`expired … (250 ms)`), its running check gets SIGTERM, and the edit
+/// is put back.
+#[test]
+fn doc_commit_expiry_during_check_names_bound_signals_check_and_puts_back() {
+    let repo = Repo::new("paths = [\"*.md\"]\n");
+    let started_fifo = repo.root.join("re1-started.fifo");
+    let hold_fifo = repo.root.join("re1-hold.fifo");
+    make_fifo(&started_fifo);
+    make_fifo(&hold_fifo);
+
+    fs::write(
+        repo.main().join(".cowshed.toml"),
+        format!(
+            "[land]\nturn = \"{TURN}\"\ngate = [\"true\"]\n\n[doc]\npaths = [\"*.md\"]\ncheck = [\"sh\", \"-c\", \"printf 'started\\\\n' > '{}'; exec cat < '{}'\"]\n",
+            started_fifo.display(),
+            hold_fifo.display()
+        ),
+    )
+    .expect("write .cowshed.toml with deterministic check");
+    git(&repo.main(), &["commit", "-q", "-am", "configure check"]);
+    let before = repo.head();
+
+    let mut stand_in = StandInGateway::start(250, None);
+    let patch = repo.file("notes.diff", NOTES_PATCH);
+    let child = repo
+        .command(&[
+            "doc-commit",
+            "-m",
+            "docs: re1",
+            "--patch",
+            patch.to_str().unwrap(),
+            "--gateway-socket",
+            stand_in.socket.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn doc-commit");
+
+    // Wait until `git apply -` has written `docs/notes.md` and `check` is running and bound.
+    let started = fs::read_to_string(&started_fifo).expect("read started from check");
+    assert_eq!(started.trim(), "started");
+    assert!(
+        repo.main().join("docs/notes.md").exists(),
+        "apply wrote docs/notes.md before the check started"
+    );
+
+    // Gateway cuts the turn with `expired` and closes before doc-commit sends its end.
+    stand_in.cut_now();
+
+    let output = child
+        .wait_with_output_bounded()
+        .expect("doc-commit finishes after expiry");
+    assert!(!output.status.success(), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expired") && stderr.contains("(250 ms)"),
+        "failure must name the bound as expired … (250 ms): {}",
+        said(&output)
+    );
+    assert!(
+        stderr.contains("was sent SIGTERM"),
+        "running check must receive SIGTERM: {}",
+        said(&output)
+    );
+    assert_eq!(repo.head(), before, "expired doc-commit must not commit");
+    assert!(
+        !repo.main().join("docs/notes.md").exists(),
+        "edit must be put back after lost turn: {}",
+        said(&output)
+    );
+    assert_eq!(
+        repo.status(),
+        "",
+        "main's tree must be clean after put-back: {}",
+        said(&output)
+    );
+}
+
+/// RE1 (post-add commit bind): when `git apply`, `check`, and `git add` succeed and the gateway
+/// cuts with `expired` when `git commit` binds, the doc commit fails naming the bound and puts
+/// back the staged edit cleanly.
+#[test]
+fn doc_commit_expiry_at_commit_bind_names_bound_and_puts_back_staged_edit() {
+    let repo = Repo::new("paths = [\"*.md\"]\ncheck = [\"true\"]\n");
+    let before = repo.head();
+    // Bind sequence for a patch with check:
+    // 1: status, 2: read-tree, 3: apply --cached, 4: diff --cached,
+    // 5: apply -, 6: check, 7: status (after check), 8: add -A, 9: commit.
+    let stand_in = StandInGateway::start(250, Some(9));
+    let patch = repo.file("notes.diff", NOTES_PATCH);
+    let output = repo
+        .command(&[
+            "doc-commit",
+            "-m",
+            "docs: re1 commit bind",
+            "--patch",
+            patch.to_str().unwrap(),
+            "--gateway-socket",
+            stand_in.socket.to_str().unwrap(),
+        ])
+        .output_bounded()
+        .expect("run doc-commit");
+    assert!(!output.status.success(), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expired") && stderr.contains("(250 ms)"),
+        "failure must name the bound as expired … (250 ms): {}",
+        said(&output)
+    );
+    assert_eq!(repo.head(), before, "expired doc-commit must not commit");
+    assert!(
+        !repo.main().join("docs/notes.md").exists(),
+        "staged edit must be put back after lost turn: {}",
+        said(&output)
+    );
+    assert_eq!(
+        repo.status(),
+        "",
+        "main's tree and index must be clean after put-back: {}",
+        said(&output)
+    );
+}
+
+/// RE2: guarded put-back after a lost turn skips a path another holder rewrote after the loss,
+/// names it as "changed by another holder after the loss", and restores the remaining paths
+/// (comparing by content, not mtime).
+#[test]
+fn doc_commit_put_back_after_loss_skips_path_rewritten_by_another_holder() {
+    let repo = Repo::new("paths = [\"*.md\"]\n");
+    let started_fifo = repo.root.join("re2-started.fifo");
+    let signalled_fifo = repo.root.join("re2-signalled.fifo");
+    let resume_fifo = repo.root.join("re2-resume.fifo");
+    let hold_fifo = repo.root.join("re2-hold.fifo");
+    make_fifo(&started_fifo);
+    make_fifo(&signalled_fifo);
+    make_fifo(&resume_fifo);
+    make_fifo(&hold_fifo);
+
+    let check_script = repo.file(
+        "re2-check.sh",
+        &format!(
+            "#!/bin/sh\n\
+             bg=\"\"\n\
+             on_term() {{\n\
+                 if [ -n \"$bg\" ]; then kill \"$bg\" 2>/dev/null || true; fi\n\
+                 printf 'signalled\\n' > '{}'\n\
+                 read _go < '{}'\n\
+                 exit 143\n\
+             }}\n\
+             trap on_term TERM\n\
+             cat < '{}' >/dev/null &\n\
+             bg=$!\n\
+             printf 'started\\n' > '{}'\n\
+             wait \"$bg\"\n",
+            signalled_fifo.display(),
+            resume_fifo.display(),
+            hold_fifo.display(),
+            started_fifo.display(),
+        ),
+    );
+    fs::set_permissions(&check_script, fs::Permissions::from_mode(0o755))
+        .expect("make check script executable");
+
+    fs::write(
+        repo.main().join(".cowshed.toml"),
+        format!(
+            "[land]\nturn = \"{TURN}\"\ngate = [\"true\"]\n\n[doc]\npaths = [\"*.md\"]\ncheck = [\"{}\"]\n",
+            check_script.display()
+        ),
+    )
+    .expect("write .cowshed.toml with trapping check");
+    git(
+        &repo.main(),
+        &["commit", "-q", "-am", "configure re2 check"],
+    );
+    let before = repo.head();
+
+    let multi_patch = "\
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,2 @@
+ # readme
++more
+diff --git a/docs/a.md b/docs/a.md
+new file mode 100644
+--- /dev/null
++++ b/docs/a.md
+@@ -0,0 +1 @@
++from doc commit a
+diff --git a/docs/b.md b/docs/b.md
+new file mode 100644
+--- /dev/null
++++ b/docs/b.md
+@@ -0,0 +1 @@
++from doc commit b
+diff --git a/docs/c.md b/docs/c.md
+new file mode 100644
+--- /dev/null
++++ b/docs/c.md
+@@ -0,0 +1 @@
++from doc commit c
+";
+    let patch = repo.file("multi.diff", multi_patch);
+    let mut stand_in = StandInGateway::start(250, None);
+    let child = repo
+        .command(&[
+            "doc-commit",
+            "-m",
+            "docs: re2",
+            "--patch",
+            patch.to_str().unwrap(),
+            "--gateway-socket",
+            stand_in.socket.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn doc-commit for re2");
+
+    // 1. Wait for apply to finish and check to start.
+    assert_eq!(
+        fs::read_to_string(&started_fifo)
+            .expect("read started")
+            .trim(),
+        "started"
+    );
+
+    // 2. Gateway cuts the turn; doc-commit sends SIGTERM to check, which pauses in its trap
+    //    before exiting (so put-back has not started yet).
+    stand_in.cut_now();
+    assert_eq!(
+        fs::read_to_string(&signalled_fifo)
+            .expect("read signalled")
+            .trim(),
+        "signalled"
+    );
+
+    // 3. After the loss and before put-back, another holder rewrites `docs/a.md` on disk and
+    //    stages `docs/c.md` in the index (same bytes, different index entry), while `docs/b.md`
+    //    only has its mtime changed (identical bytes and index) and `README.md` is untouched.
+    fs::write(repo.main().join("docs/a.md"), "written by next holder\n")
+        .expect("rewrite docs/a.md as another holder");
+    git(&repo.main(), &["add", "docs/c.md"]);
+    let b_path = repo.main().join("docs/b.md");
+    let b_file = fs::OpenOptions::new()
+        .write(true)
+        .open(&b_path)
+        .expect("open docs/b.md to bump mtime");
+    b_file
+        .set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        )
+        .expect("change docs/b.md mtime without changing its bytes");
+    drop(b_file);
+
+    // 4. Release check so doc-commit reaps it and runs guarded put-back.
+    fs::write(&resume_fifo, "go\n").expect("release trapping check");
+
+    let output = child
+        .wait_with_output_bounded()
+        .expect("doc-commit finishes after re2");
+    assert!(!output.status.success(), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expired") && stderr.contains("(250 ms)"),
+        "failure must name the bound as expired … (250 ms): {}",
+        said(&output)
+    );
+    assert!(
+        stderr.contains("changed by another holder after the loss")
+            && stderr.contains("docs/a.md")
+            && stderr.contains("docs/c.md"),
+        "failure must name docs/a.md and docs/c.md as changed by another holder after the loss: {}",
+        said(&output)
+    );
+    assert_eq!(repo.head(), before);
+    assert_eq!(
+        fs::read_to_string(repo.main().join("docs/a.md")).expect("docs/a.md left alone"),
+        "written by next holder\n",
+        "put-back must leave the path rewritten by another holder alone"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.main().join("docs/c.md")).expect("docs/c.md left alone"),
+        "from doc commit c\n",
+        "put-back must leave the path staged by another holder alone"
+    );
+    assert!(
+        !repo.main().join("docs/b.md").exists(),
+        "put-back must restore docs/b.md (mtime changed, content identical): {}",
+        said(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.main().join("README.md")).expect("README.md restored"),
+        "# readme\n",
+        "put-back must restore README.md: {}",
+        said(&output)
+    );
+    assert_eq!(
+        repo.status(),
+        "A  docs/c.md\n?? docs/a.md",
+        "only the paths changed by another holder remain: {}",
+        said(&output)
+    );
+}
