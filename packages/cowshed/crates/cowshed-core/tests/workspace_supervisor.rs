@@ -12645,6 +12645,7 @@ mod land_gate_priority {
     use super::*;
     use cowshed_core::api::JobLander;
     use cowshed_core::gate_watch::{GATE_WATCH_OP, GateWatchEvent, GateWatchOpen, GateWatchState};
+    use cowshed_core::runtime::supervisor_socket;
     use cowshed_os::deadline;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -12670,7 +12671,10 @@ mod land_gate_priority {
         silent: Arc<std::sync::atomic::AtomicBool>,
         active_tx: watch::Sender<(bool, u64)>,
         state: Arc<Mutex<StandInState>>,
-        _task: tokio::task::JoinHandle<()>,
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        shutdown_tx: watch::Sender<bool>,
+        socket_path: PathBuf,
+        task: tokio::task::JoinHandle<()>,
     }
 
     #[derive(Default)]
@@ -12691,22 +12695,39 @@ mod land_gate_priority {
             let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (active_tx, _active_rx) = watch::channel((false, 0_u64));
             let state = Arc::new(Mutex::new(StandInState::default()));
+            let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
             let heartbeat_wake = Arc::new(Notify::new());
 
             let task = {
                 let silent = Arc::clone(&silent);
                 let active_tx = active_tx.clone();
                 let state = Arc::clone(&state);
+                let connections = Arc::clone(&connections);
+                let shutdown_tx_loop = shutdown_tx.clone();
                 let heartbeat_wake = Arc::clone(&heartbeat_wake);
                 tokio::spawn(async move {
                     loop {
-                        let Ok((stream, _)) = listener.accept().await else {
-                            break;
+                        let stream = tokio::select! {
+                            accepted = listener.accept() => {
+                                let Ok((stream, _)) = accepted else {
+                                    break;
+                                };
+                                stream
+                            }
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    break;
+                                }
+                                continue;
+                            }
                         };
+                        connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let events_tx = events_tx.clone();
                         let silent = Arc::clone(&silent);
                         let active_tx = active_tx.clone();
                         let mut active_rx = active_tx.subscribe();
+                        let mut conn_shutdown = shutdown_tx_loop.subscribe();
                         let state = Arc::clone(&state);
                         let _wake = Arc::clone(&heartbeat_wake);
                         tokio::spawn(async move {
@@ -12743,6 +12764,11 @@ mod land_gate_priority {
                             let mut beats = deadline::beats();
                             loop {
                                 tokio::select! {
+                                    _ = conn_shutdown.changed() => {
+                                        if *conn_shutdown.borrow() {
+                                            break;
+                                        }
+                                    }
                                     line = lines.next_line() => {
                                         let Ok(Some(line)) = line else {
                                             break;
@@ -12825,7 +12851,10 @@ mod land_gate_priority {
                 silent,
                 active_tx,
                 state,
-                _task: task,
+                connections,
+                shutdown_tx,
+                socket_path: socket,
+                task,
             }
         }
 
@@ -12845,6 +12874,18 @@ mod land_gate_priority {
         }
 
         #[allow(dead_code)]
+        fn connection_count(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        #[allow(dead_code)]
+        async fn close(self) {
+            let _ = self.shutdown_tx.send(true);
+            let _ = self.task.await;
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+
+        #[allow(dead_code)]
         async fn push_heartbeat(&self) {
             let mut guard = self.state.lock().await;
             guard.seq += 1;
@@ -12858,6 +12899,7 @@ mod land_gate_priority {
     struct GateFixture {
         handle: WorkspaceSupervisorHandle,
         gateway: StandInGateway,
+        store_root: PathBuf,
         telemetry: PathBuf,
         #[allow(dead_code)]
         ledger: PathBuf,
@@ -12902,7 +12944,8 @@ mod land_gate_priority {
         let ledger = root.join("supervisor.groups");
         config.telemetry_root = Some(telemetry.clone());
         config.group_ledger = Some(ledger.clone());
-        let gateway = StandInGateway::start(&config.sandbox.store_root);
+        let store_root = config.sandbox.store_root.clone();
+        let gateway = StandInGateway::start(&store_root);
         let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
             Box::new(cowshed_core::storage::audit::NullAuditSink),
             8,
@@ -12912,6 +12955,7 @@ mod land_gate_priority {
         GateFixture {
             handle,
             gateway,
+            store_root,
             telemetry,
             ledger,
             mbx,
@@ -13858,7 +13902,8 @@ s.recv(16)
         let ledger = root.join("supervisor.groups");
         config.telemetry_root = Some(telemetry.clone());
         config.group_ledger = Some(ledger.clone());
-        let gateway = StandInGateway::start(&config.sandbox.store_root);
+        let store_root = config.sandbox.store_root.clone();
+        let gateway = StandInGateway::start(&store_root);
         let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
             Box::new(cowshed_core::storage::audit::NullAuditSink),
             8,
@@ -13887,6 +13932,7 @@ s.recv(16)
         GateFixture {
             handle,
             gateway,
+            store_root,
             telemetry,
             ledger,
             mbx: None,
@@ -14405,6 +14451,200 @@ os.read(0, 1)
             "missing job.tokens.restored(3) after gateway silence: {bg_rows:?}"
         );
 
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
+    /// Red for defect 1: while the gateway is silent, a continuous stream of local `gate-start`
+    /// and `gate-end` commands must NOT reset the gateway silence deadline; the span must end and
+    /// restore tokens once `deadline::HEARTBEAT_SILENCE` elapses from the gateway's last frame.
+    #[tokio::test]
+    async fn land_gate_local_commands_do_not_extend_gateway_silence() {
+        let mut fixture = start_fixture("gate-silence-cmds", false);
+        let mut bg = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "bg",
+            ExecClass::Background,
+            4,
+        )
+        .await;
+        let lander = Some(JobLander {
+            pid: std::process::id(),
+            start: 1,
+        });
+        let land_gate = GateJob::start(&fixture.handle, &fixture.root, "land-gate", lander).await;
+        assert_eq!(
+            fixture.gateway.recv_event("initial gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 3).await;
+        assert_eq!(bg.fionread().await, 0);
+
+        // Gateway stops sending frames without closing the socket.
+        fixture.gateway.go_silent();
+
+        // Concurrently send local `gate-start`/`gate-end` commands driven purely by real job
+        // start/exit events while awaiting the real silence bound (`HEARTBEAT_SILENCE` +
+        // `HEARTBEAT` slack for delivery). On buggy code where each command resets the silence
+        // timer, the span never ends and this wait expires.
+        let handle_ref = &fixture.handle;
+        let root_ref = &fixture.root;
+        let bg_id = bg.job_id;
+        let wait_span_off = wait_for_liveness(
+            handle_ref,
+            "span off past silence despite local gate commands",
+            deadline::HEARTBEAT_SILENCE + deadline::HEARTBEAT,
+            |liveness| {
+                !liveness.gate_active()
+                    && liveness
+                        .job_gate_priority(bg_id)
+                        .is_some_and(|state| state.tokens_withdrawn == 0)
+            },
+        );
+        let local_commands = async {
+            let mut n = 0_u64;
+            loop {
+                n += 1;
+                let pulse_gate =
+                    GateJob::start(handle_ref, root_ref, &format!("pulse-gate-{n}"), lander).await;
+                pulse_gate.finish(handle_ref).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            () = wait_span_off => {}
+            () = local_commands => unreachable!("local gate command stream is endless"),
+        }
+
+        bg.wait_tokens(3).await;
+        land_gate.finish(&fixture.handle).await;
+        bg.exit(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let bg_rows = gate_span_rows(&fixture.telemetry, bg_id);
+        assert!(
+            bg_rows.iter().any(|row| {
+                row.entry_type == "info"
+                    && row.message == "job.tokens.restored"
+                    && row.tokens == Some(3)
+            }),
+            "missing job.tokens.restored(3) after silent gateway with local commands: {bg_rows:?}"
+        );
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
+    /// Red for defect 2: when the gateway closes its watch connection, the supervisor gives back
+    /// tokens and waits for the next gateway `Request::Hello` on its supervisor socket rather than
+    /// running a retry timer. A restarted gateway bound on `<store>/gateway.sock` receives no
+    /// connection until it sends `hello`, at which point the supervisor re-establishes the watch
+    /// and replays active local gates.
+    #[tokio::test]
+    async fn land_gate_gateway_restart_reconnects_only_on_hello() {
+        let mut fixture = start_fixture("ghr", false);
+        let sup_sock = fixture.root.join("s.sock");
+        let sup_listener = supervisor_socket::bind(&sup_sock)
+            .await
+            .expect("bind supervisor socket");
+        let serve_task = tokio::spawn(supervisor_socket::serve(
+            sup_listener,
+            fixture.handle.clone(),
+            None,
+            None,
+        ));
+
+        let mut bg = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "bg",
+            ExecClass::Background,
+            4,
+        )
+        .await;
+        let lander = Some(JobLander {
+            pid: std::process::id(),
+            start: 1,
+        });
+        let land_gate = GateJob::start(&fixture.handle, &fixture.root, "land-gate", lander).await;
+        assert_eq!(
+            fixture.gateway.recv_event("initial gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 3).await;
+        assert_eq!(bg.fionread().await, 0);
+
+        // Close gateway #1: supervisor observes EOF, turns span off, and restores tokens.
+        fixture.gateway.close().await;
+        wait_for_liveness(
+            &fixture.handle,
+            "span off after gateway #1 close",
+            deadline::HEARTBEAT_SILENCE,
+            |liveness| {
+                !liveness.gate_active()
+                    && liveness
+                        .job_gate_priority(bg.job_id)
+                        .is_some_and(|state| state.tokens_withdrawn == 0)
+            },
+        )
+        .await;
+        bg.wait_tokens(3).await;
+
+        // Bind gateway #2 on the same store socket without sending `hello` yet. Run a local
+        // gate job while disconnected: neither a timer nor local commands may reconnect before
+        // the restarted gateway says `hello`.
+        let mut gateway_2 = StandInGateway::start(&fixture.store_root);
+        let between_gate =
+            GateJob::start(&fixture.handle, &fixture.root, "between-gate", lander).await;
+        between_gate.finish(&fixture.handle).await;
+        let _ = fixture.handle.info(bg.job_id).await.unwrap();
+        assert_eq!(
+            gateway_2.connection_count(),
+            0,
+            "supervisor must not reconnect to restarted gateway before Request::Hello"
+        );
+
+        // Restarted gateway sends `Request::Hello` (as SupervisorManager does on re-adoption):
+        // supervisor immediately opens a new `gate-watch`, replays the still-running `land_gate`,
+        // and withdraws `bg`'s tokens again.
+        let _ = supervisor_socket::hello(&sup_sock)
+            .await
+            .expect("gateway hello on supervisor socket");
+        assert_eq!(
+            gateway_2
+                .recv_event("replayed gate-start after hello")
+                .await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+        assert_eq!(gateway_2.connection_count(), 1);
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 3).await;
+        assert_eq!(bg.fionread().await, 0);
+
+        // Ending `land_gate` restores `bg`'s tokens through gateway #2.
+        let gate_id = land_gate.job_id;
+        land_gate.finish(&fixture.handle).await;
+        assert_eq!(
+            gateway_2.recv_event("gate-end on gateway #2").await,
+            GateWatchEvent::GateEnd {
+                job_id: gate_id.get(),
+            }
+        );
+        bg.wait_tokens(3).await;
+
+        bg.exit(&fixture.handle).await;
+        gateway_2.close().await;
+        serve_task.abort();
         fixture
             .handle
             .retire(NxDaemonRetirement::Recorded)
