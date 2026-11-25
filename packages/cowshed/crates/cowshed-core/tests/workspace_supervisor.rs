@@ -1780,10 +1780,10 @@ async fn a_follow_opened_while_queued_behind_memory_pressure_ends_at_terminal() 
     complete(&spawned, b"ran\n", b"", ExitStatus::Exited { code: 0 }).await;
     assert_eq!(h.handle.wait(held).await.unwrap().state, JobState::Exited);
 
-    let rest = tokio::time::timeout(Duration::from_secs(5), follower)
+    // A follow that never saw the terminal would never end: the leg's no-progress bound decides it.
+    let rest = follower
         .await
-        .expect("follow opened while queued must end once the job is terminal")
-        .unwrap();
+        .expect("the follow opened while queued ends once the job is terminal");
     let rest_text = String::from_utf8_lossy(&rest);
     assert!(
         rest_text.contains("cowshed: jobserver wait done elapsed=")

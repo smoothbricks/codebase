@@ -7981,7 +7981,6 @@ mod tests {
         use cowshed_core::repository::{BoundIdentity, RepositoryBinding};
         use std::num::NonZeroUsize;
         use std::os::fd::OwnedFd;
-        use std::time::Duration;
 
         let repo_id = RepoId::parse("fixture/shutdown").expect("repo id");
         let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
@@ -8040,16 +8039,15 @@ mod tests {
             backend: GatewayStoreBackend::Directory,
         };
 
-        tokio::time::timeout(Duration::from_secs(2), bridge.shutdown())
+        // A shutdown that waited on the derived handle's sender would never return: the leg's
+        // no-progress bound, not a clock here, decides that hang.
+        bridge
+            .shutdown()
             .await
-            .expect("ActorBridge::shutdown must close its connection while derived handles live")
-            .expect("clean ActorBridge shutdown");
+            .expect("ActorBridge::shutdown closes its connection while derived handles live");
 
-        // Any subsequent call on the stale derived handle must fail immediately rather than hang.
-        let Err(error) = tokio::time::timeout(Duration::from_secs(2), derived.list(None))
-            .await
-            .expect("stale handle after shutdown must not hang")
-        else {
+        // Any later call on the stale derived handle fails at once rather than waiting.
+        let Err(error) = derived.list(None).await else {
             panic!("stale handle after shutdown must fail");
         };
         assert_eq!(error.code, ErrorCode::EnvironmentMissing, "{error:?}");
