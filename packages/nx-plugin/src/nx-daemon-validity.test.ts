@@ -1530,6 +1530,38 @@ it('keeps an idle daemon off the lockfiles, record, and socket between its safet
 });
 
 /**
+ * A fixture-only hold on daemon boot, before a daemon claims the workspace, set by
+ * TEST_DAEMON_SUCCESSOR_BOOT_DELAY_MS: the first client-started daemon boots at once, every later one (a successor it
+ * spawns itself) waits that long, and a kept daemon waits five seconds more. It orders a successor's claim against the
+ * test's next daemon by construction, so a handoff that races them fails every time instead of under load. Unset, it
+ * adds nothing to the environment.
+ */
+async function daemonBootDelay(root: string): Promise<Record<string, string>> {
+  const delayMs = process.env.TEST_DAEMON_SUCCESSOR_BOOT_DELAY_MS;
+  if (delayMs === undefined || delayMs === '') return {};
+  const preload = join(root, 'daemon-boot-delay.cjs');
+  await writeFile(
+    preload,
+    `const { existsSync, writeFileSync } = require('node:fs');
+if ((process.argv[1] ?? '').endsWith('/daemon/server/start.js')) {
+  const kept = process.argv.includes('--kept');
+  const mark = process.env.TEST_DAEMON_BOOT_MARK;
+  const first = !kept && !existsSync(mark);
+  if (first) writeFileSync(mark, String(process.pid));
+  const successorMs = Number(process.env.TEST_DAEMON_SUCCESSOR_BOOT_DELAY_MS);
+  const ms = kept ? successorMs + 5000 : first ? 0 : successorMs;
+  if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+`,
+  );
+  return {
+    TEST_DAEMON_SUCCESSOR_BOOT_DELAY_MS: delayMs,
+    TEST_DAEMON_BOOT_MARK: join(root, 'daemon-boot-mark'),
+    BUN_OPTIONS: `--preload ${preload}`,
+    NODE_OPTIONS: `--require ${preload}`,
+  };
+}
+/**
  * The code that computed a run's project graph is the code its tasks were planned and keyed by. A plugin linked from
  * another checkout that changes under the run (a land there rebuilds it mid-gate) leaves the run's remaining requests
  * no daemon that computes that graph: a successor loads the new plugin, and so would the client's own process. The run
@@ -1559,7 +1591,7 @@ it('fails a run at once, naming LINKED_PLUGIN_CHANGED, when its linked plugin ch
           },
         }),
       );
-      const env = fixtureNxEnv(workspace, socketDirectory);
+      const env = { ...fixtureNxEnv(workspace, socketDirectory), ...(await daemonBootDelay(root)) };
       // `p:build` rebuilds the linked plugin with other bytes. Each step's bytes differ, so its command does, and the
       // task misses the cache. The run's next daemon request, recording p's outputs or hashing q, finds the change.
       const failsNamingTheChange = async (title: string, version: string, client: Record<string, string>) => {
