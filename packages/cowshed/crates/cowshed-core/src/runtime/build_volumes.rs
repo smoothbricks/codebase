@@ -1402,12 +1402,17 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     }
 
     /// Only a foreground fork consumes this receipt; compaction's own refresh never starts one.
-    pub fn advise_fork_compaction(&self, prepared: Option<&PreparedFork>, project_root: &Path) {
+    pub async fn advise_fork_compaction(
+        &self,
+        prepared: Option<&PreparedFork>,
+        project_root: &Path,
+    ) {
         let Some(prepared) = prepared else {
             return;
         };
-        let advice =
-            self.advise_compaction(&prepared.source, prepared.operation_elapsed, project_root);
+        let advice = self
+            .advise_compaction(&prepared.source, prepared.operation_elapsed, project_root)
+            .await;
         if matches!(
             advice,
             crate::api::dto::LandSeedCompaction::Started { .. }
@@ -2224,30 +2229,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// stdio, its run its span (16_build_volumes.md, Land 6.5; 13_telemetry.md, "Background verb
     /// spans"), and a detached reaper for it: the land that starts it answers without waiting.
     /// Answers the process's pid.
-    pub fn start_collection(&self, program: &Path, project_root: &Path) -> Result<u32> {
-        let mut child = compaction::start_background_verb(
-            program,
+    pub async fn start_collection(&self, program: &Path, project_root: &Path) -> Result<u32> {
+        compaction::start_background_verb_detached(
+            program.to_path_buf(),
             crate::runtime::project::BUILD_VOLUME_COLLECTION_VERB,
-            project_root,
-        )?;
-        let pid = child.id();
-        // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
-        #[allow(clippy::disallowed_methods)]
-        let reaper = std::thread::Builder::new()
-            .name("build-volume-collection-reaper".to_owned())
-            .spawn(move || {
-                if let Err(error) = child.wait() {
-                    cowshed_os::eprintln!(
-                        "cowshed: the build-volume collection process {pid} could not be reaped: {error}"
-                    );
-                }
-            });
-        if let Err(error) = reaper {
-            cowshed_os::eprintln!(
-                "cowshed: build-volume collection process {pid} started, but its reaper could not be created: {error}"
-            );
-        }
-        Ok(pid)
+            project_root.to_path_buf(),
+            "build-volume-collection-reaper",
+        )
+        .await
     }
 
     /// Next-open recovery of interrupted creations (16_build_volumes.md, "Garbage collection"):
@@ -7526,11 +7515,14 @@ fn main() {
             );
         }
         assert_eq!(
-            scratch.volumes.advise_compaction(
-                &target,
-                Some(Duration::from_secs(11)),
-                &scratch.root.path().join("main")
-            ),
+            scratch
+                .volumes
+                .advise_compaction(
+                    &target,
+                    Some(Duration::from_secs(11)),
+                    &scratch.root.path().join("main")
+                )
+                .await,
             crate::api::dto::LandSeedCompaction::NotAdvised
         );
         scratch.release_all();

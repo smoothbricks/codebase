@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 use crate::api::dto::{GitOid, Sha256Digest, UnlandedChange, UnlandedPath};
 use crate::error::{CowshedError, Result};
-use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use cowshed_os::timing::timed_async;
 
 mod confined;
@@ -2024,35 +2024,46 @@ impl GitRepository {
         mut visit: impl FnMut(&str, &str) -> bool,
     ) -> Result<()> {
         use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
-        let git = || {
-            git_command_with_objects(
-                &self.store_root,
-                &self.root,
-                self.alternate_objects.as_deref(),
-                None,
-            )
-        };
-        let mut log = git()?
-            .args(PATCH_ID_LOG)
-            .args(revisions)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn_locked()
-            .map_err(|error| git_spawn_error(&error))?;
-        let patches: std::process::Stdio = log
-            .stdout
-            .take()
-            .ok_or_else(|| CowshedError::internal("git log started without its stdout"))?
-            .try_into()
-            .map_err(|error: std::io::Error| git_spawn_error(&error))?;
-        let mut ids = git()?
-            .args(["patch-id", "--stable"])
-            .stdin(patches)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn_locked()
-            .map_err(|error| git_spawn_error(&error))?;
+        let store_root = self.store_root.clone();
+        let root = self.root.clone();
+        let alternate_objects = self.alternate_objects.clone();
+        let revisions: Vec<String> = revisions.iter().map(|rev| (*rev).to_owned()).collect();
+        let handle = tokio::runtime::Handle::current();
+        let (mut log, mut ids) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let git =
+                || git_command_with_objects(&store_root, &root, alternate_objects.as_deref(), None);
+            let mut log_cmd = git()?;
+            log_cmd
+                .args(PATCH_ID_LOG)
+                .args(&revisions)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut ids_cmd = git()?;
+            ids_cmd
+                .args(["patch-id", "--stable"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let _enter = handle.enter();
+            let mut log = log_cmd
+                .spawn_locked()
+                .map_err(|error| git_spawn_error(&error))?;
+            let patches: std::process::Stdio = log
+                .stdout
+                .take()
+                .ok_or_else(|| CowshedError::internal("git log started without its stdout"))?
+                .try_into()
+                .map_err(|error: std::io::Error| git_spawn_error(&error))?;
+            let ids = ids_cmd
+                .stdin(patches)
+                .spawn_locked()
+                .map_err(|error| git_spawn_error(&error))?;
+            Ok((log, ids))
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("git patch-id spawn task failed: {error}"))
+        })??;
         let (Some(log_stderr), Some(ids_stdout), Some(ids_stderr)) =
             (log.stderr.take(), ids.stdout.take(), ids.stderr.take())
         else {
@@ -2408,26 +2419,39 @@ impl GitRepository {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = git_command_with_objects(
+        let overrides = merge.overrides.clone();
+        let scratch_path = merge.scratch.path.clone();
+        let read = merge.read.clone();
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
+        let child = spawn_confined_git(
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
             None,
-        )?;
-        for setting in &merge.overrides {
-            command.arg("-c").arg(setting);
-        }
+            move |command| {
+                for setting in &overrides {
+                    command.arg("-c").arg(setting);
+                }
+                command
+                    .env("GIT_OBJECT_DIRECTORY", &scratch_path)
+                    .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &read)
+                    .args(&args)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+            },
+        )
+        .await?;
         // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
         // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its
         // lock files exclusively: a held index lock refuses at once, a held ref lock after the
         // pinned timeout (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never
         // waited out.
         #[allow(clippy::disallowed_methods)]
-        command
-            .env("GIT_OBJECT_DIRECTORY", &merge.scratch.path)
-            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &merge.read)
-            .args(args)
-            .output_locked()
+        child
+            .wait_with_output()
             .await
             .map_err(|error| git_spawn_error(&error))
     }
@@ -4361,19 +4385,26 @@ impl GitRepository {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = git_command_with_objects(
+        let index = index.to_path_buf();
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
+        let mut child = spawn_confined_git(
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
             None,
-        )?
-        .env("GIT_INDEX_FILE", index)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn_locked()
-        .map_err(|error| git_spawn_error(&error))?;
+            move |command| {
+                command
+                    .env("GIT_INDEX_FILE", &index)
+                    .args(&args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+            },
+        )
+        .await?;
         let stdin = child.stdin.take();
         let write = async move {
             if let Some(mut stdin) = stdin {
@@ -4399,18 +4430,24 @@ impl GitRepository {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = git_command_with_objects(
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
+        let mut child = spawn_confined_git(
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
             None,
-        )?
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn_locked()
-        .map_err(|error| git_spawn_error(&error))?;
+            move |command| {
+                command
+                    .args(&args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+            },
+        )
+        .await?;
         let stdin = child.stdin.take();
         let write = async move {
             if let Some(mut stdin) = stdin {
@@ -4449,10 +4486,21 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = bundle_git_command(root, alternate_objects);
-    command.args(args);
-    command.kill_on_drop(true);
     command
-        .output_locked()
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let handle = tokio::runtime::Handle::current();
+    let child = tokio::task::spawn_blocking(move || {
+        let _enter = handle.enter();
+        command.spawn_locked()
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("git bundle spawn task failed: {error}")))?
+    .map_err(|error| git_spawn_error(&error))?;
+    child
+        .wait_with_output()
         .await
         .map_err(|error| git_spawn_error(&error))
 }
@@ -4497,6 +4545,30 @@ async fn is_git_repository(store_root: &Path, path: &Path) -> Result<bool> {
         .success())
 }
 
+/// The host `git` executable, resolved once per process along `PATH` via
+/// [`crate::runtime::job_program::Lookup::along`] so repeated spawns avoid per-`PATH`-entry child
+/// forks on Darwin (`cowshed-os/src/fork_lock.rs`, `11_shell.md`). Falls back to bare `"git"`
+/// only when `PATH` is unset or holds no executable `git`.
+pub fn resolved_git_program() -> &'static Path {
+    static GIT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    GIT.get_or_init(|| {
+        std::env::var_os("PATH")
+            .and_then(
+                |path| match crate::runtime::job_program::Lookup::along(&path, "git") {
+                    crate::runtime::job_program::Lookup::Found(program) => {
+                        if program.is_absolute() {
+                            Some(program)
+                        } else {
+                            std::env::current_dir().ok().map(|cwd| cwd.join(program))
+                        }
+                    }
+                    _ => None,
+                },
+            )
+            .unwrap_or_else(|| PathBuf::from("git"))
+    })
+}
+
 /// Point git at a checkout without allowing repository metadata to run hooks or
 /// filesystem monitors in the controller's process. Other executable config
 /// (merge drivers, filters and transports) is confined by the controller's
@@ -4504,7 +4576,7 @@ async fn is_git_repository(store_root: &Path, path: &Path) -> Result<bool> {
 /// held ref lock is pinned to its defaults (100 ms per ref, 1 s for packed refs),
 /// so a repository config cannot make it wait out the holder.
 pub fn git_command_at(root: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
+    let mut command = std::process::Command::new(resolved_git_program());
     command
         .arg("-C")
         .arg(root)
@@ -4674,6 +4746,38 @@ fn git_command_with_objects(
     Ok(command)
 }
 
+/// Build a confined controller Git command and spawn it on the blocking pool, keeping profile
+/// writes, linked-worktree config probes, and the fork-locked spawn off the controller's runtime
+/// thread. `kill_on_drop(true)` ends an unadopted child if the awaiting future is cancelled.
+async fn spawn_confined_git(
+    store_root: &Path,
+    root: &Path,
+    alternate_objects: Option<&Path>,
+    writable: Option<&Path>,
+    configure: impl FnOnce(&mut Command) + Send + 'static,
+) -> Result<tokio::process::Child> {
+    let store_root = store_root.to_path_buf();
+    let root = root.to_path_buf();
+    let alternate_objects = alternate_objects.map(Path::to_path_buf);
+    let writable = writable.map(Path::to_path_buf);
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let mut command = git_command_with_objects(
+            &store_root,
+            &root,
+            alternate_objects.as_deref(),
+            writable.as_deref(),
+        )?;
+        configure(&mut command);
+        let _enter = handle.enter();
+        command
+            .spawn_locked()
+            .map_err(|error| git_spawn_error(&error))
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("git spawn task failed: {error}")))?
+}
+
 // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
 // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
 // files exclusively: a held index lock refuses at once, a held ref lock after the pinned timeout
@@ -4690,9 +4794,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    git_command_with_objects(store_root, root, alternate_objects, writable)?
-        .args(args)
-        .output_locked()
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect();
+    let child = spawn_confined_git(
+        store_root,
+        root,
+        alternate_objects,
+        writable,
+        move |command| {
+            command
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+        },
+    )
+    .await?;
+    child
+        .wait_with_output()
         .await
         .map_err(|error| git_spawn_error(&error))
 }

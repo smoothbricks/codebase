@@ -44,7 +44,6 @@ use crate::runtime::process_stream::JobProcessStream;
 use crate::runtime::supervisor::{NxDaemonRetirement, RetireWhen};
 use crate::runtime::supervisor_socket::AdmissionSource;
 use crate::storage::recovery::RetireOptions;
-use cowshed_os::fork_lock::RunAsync as _;
 use cowshed_os::timing::timed_async;
 
 const ROUTER_CAPACITY: usize = 64;
@@ -6099,6 +6098,7 @@ self.finish_retire_intent(&workspace).await?;
         match self
             .build_volumes()?
             .start_collection(&program, &self.descriptor.git_root)
+            .await
         {
             Ok(pid) => {
                 cowshed_os::eprintln!("cowshed: build-volume collection runs as process {pid}");
@@ -6619,7 +6619,9 @@ self.finish_retire_intent(&workspace).await?;
                     volumes.retire_superseded(superseded).await;
                 }
                 return Ok(LandBuildVolume {
-                    seed: self.land_seed(&owner, unfrozen, operation_elapsed, &volumes),
+                    seed: self
+                        .land_seed(&owner, unfrozen, operation_elapsed, &volumes)
+                        .await,
                     adoption: Adoption::Skipped { reason },
                 });
             }
@@ -6691,7 +6693,9 @@ self.finish_retire_intent(&workspace).await?;
             }
         };
         Ok(LandBuildVolume {
-            seed: self.land_seed(&owner, unfrozen, operation_elapsed, &volumes),
+            seed: self
+                .land_seed(&owner, unfrozen, operation_elapsed, &volumes)
+                .await,
             adoption,
         })
     }
@@ -6699,20 +6703,21 @@ self.finish_retire_intent(&workspace).await?;
     /// The land's seed report: `unfrozen` when its freeze minted no seed, otherwise the frozen
     /// seed's foreground advice, the necessary operation's live receipt, not an extent query.
     /// Background start failures remain report values and retain the build hold.
-    fn land_seed(
+    async fn land_seed(
         &self,
         target: &super::build_volumes::Owner,
         unfrozen: Option<crate::api::dto::LandSeed>,
         operation_elapsed: Option<std::time::Duration>,
         volumes: &super::build_volumes::BuildVolumes<H>,
     ) -> crate::api::dto::LandSeed {
-        unfrozen.unwrap_or_else(|| crate::api::dto::LandSeed::Frozen {
-            compaction: volumes.advise_compaction(
-                target,
-                operation_elapsed,
-                &self.descriptor.git_root,
-            ),
-        })
+        match unfrozen {
+            Some(seed) => seed,
+            None => crate::api::dto::LandSeed::Frozen {
+                compaction: volumes
+                    .advise_compaction(target, operation_elapsed, &self.descriptor.git_root)
+                    .await,
+            },
+        }
     }
 
     /// `coordinator.compactSeed` (16_build_volumes.md, "Seed compaction"). Under the project's
@@ -8898,17 +8903,46 @@ self.finish_retire_intent(&workspace).await?;
         if refs.is_empty() {
             return Ok(());
         }
-        let mut command = tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(
-            store_root, retained, &main_root,
-        )?);
-        command
-            .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"])
-            .arg(&main_root)
-            .args(refs.iter().map(|(name, _)| format!("{name}:{name}")));
+        let store_root_owned = store_root.to_path_buf();
+        let retained_owned = retained.to_path_buf();
+        let main_root_owned = main_root.clone();
+        let refspecs: Vec<String> = refs
+            .iter()
+            .map(|(name, _)| format!("{name}:{name}"))
+            .collect();
+        let handle = tokio::runtime::Handle::current();
+        let child = tokio::task::spawn_blocking(move || -> Result<tokio::process::Child> {
+            use cowshed_os::fork_lock::Spawn as _;
+
+            let mut command =
+                tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(
+                    &store_root_owned,
+                    &retained_owned,
+                    &main_root_owned,
+                )?);
+            command
+                .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"])
+                .arg(&main_root_owned)
+                .args(&refspecs)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let _enter = handle.enter();
+            command.spawn_locked().map_err(|error| {
+                CowshedError::environment_missing(
+                    error.to_string(),
+                    "restore /usr/bin/git and sandbox-exec",
+                )
+            })
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("carry refs spawn task failed: {error}"))
+        })??;
         // WHY unbounded: a sandboxed git fetching from a repository on this host's own disk: it
         // waits on no other process.
         #[allow(clippy::disallowed_methods)]
-        let output = command.output_locked().await.map_err(|error| {
+        let output = child.wait_with_output().await.map_err(|error| {
             CowshedError::environment_missing(
                 error.to_string(),
                 "restore /usr/bin/git and sandbox-exec",
@@ -15451,7 +15485,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     ),
                                 )
                                 .await?;
-                                readying.advise_fork_compaction(prepared.as_ref(), &project_root);
+                                readying
+                                    .advise_fork_compaction(prepared.as_ref(), &project_root)
+                                    .await;
                                 Ok(prepared)
                             }
                         },
@@ -15921,7 +15957,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                         ),
                                     )
                                     .await?;
-                                    readying.advise_fork_compaction(prepared.as_ref(), &project_root);
+                                    readying
+                                    .advise_fork_compaction(prepared.as_ref(), &project_root)
+                                    .await;
                                     Ok(prepared)
                                 }
                             },
@@ -18281,7 +18319,15 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if tokio::fs::try_exists(&root).await.map_err(|error| {
             CowshedError::environment_missing(error.to_string(), "check cache permissions")
         })? {
-            let mut command = crate::git::sandboxed_git_command_at(self.git.store_root(), &root)?;
+            let store_root = self.git.store_root().to_path_buf();
+            let mirror_root = root.clone();
+            let mut command = tokio::task::spawn_blocking(move || {
+                crate::git::sandboxed_git_command_at(&store_root, &mirror_root)
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("mirror git build task failed: {error}"))
+            })??;
             command.args(["fetch", "--prune", "--progress", "origin"]);
             transfer_mirror("update mirror", command, &root).await?;
         } else {
@@ -18292,7 +18338,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             tokio::fs::create_dir_all(&parent).await.map_err(|error| {
                 CowshedError::environment_missing(error.to_string(), "check cache permissions")
             })?;
-            let mut command = std::process::Command::new("git");
+            let mut command = std::process::Command::new(crate::git::resolved_git_program());
             command
                 .args(["clone", "--mirror", "--progress", url.as_str()])
                 .arg(&root);
@@ -22424,15 +22470,37 @@ async fn fence_git(
         Some(Fence::Lock(descriptor)) => Some(*descriptor),
         Some(Fence::Turn(_)) | None => None,
     };
-    let mut command = fence_git_command(store_root, root, fetch_source, args, lock)?;
+    let store_root_owned = store_root.to_path_buf();
+    let root_owned = root.to_path_buf();
+    let fetch_source_owned = fetch_source.map(Path::to_path_buf);
+    let args_owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let mut command = tokio::task::spawn_blocking(move || {
+        let arg_refs: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        fence_git_command(
+            &store_root_owned,
+            &root_owned,
+            fetch_source_owned.as_deref(),
+            &arg_refs,
+            lock,
+        )
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("fence git build task failed: {error}")))??;
     if let Some(Fence::Turn(turn)) = fence.as_deref() {
         turn.bind_at_exec(command.as_std_mut());
     }
-    let mut child = command
+    command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn_locked()
-        .map_err(git_missing)?;
+        .kill_on_drop(true);
+    let handle = tokio::runtime::Handle::current();
+    let mut child = tokio::task::spawn_blocking(move || {
+        let _enter = handle.enter();
+        command.spawn_locked()
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("fence git spawn task failed: {error}")))?
+    .map_err(git_missing)?;
     let Some(Fence::Turn(turn)) = fence else {
         return child.wait_with_output().await.map_err(git_missing);
     };
@@ -22916,13 +22984,38 @@ async fn run_git_fetch<const N: usize>(
     source: &Path,
     args: [&str; N],
 ) -> Result<()> {
-    let mut command = tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(
-        store_root, root, source,
-    )?);
+    let store_root_owned = store_root.to_path_buf();
+    let root_owned = root.to_path_buf();
+    let source_owned = source.to_path_buf();
+    let args_owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
+    let handle = tokio::runtime::Handle::current();
+    let child = tokio::task::spawn_blocking(move || -> Result<tokio::process::Child> {
+        use cowshed_os::fork_lock::Spawn as _;
+
+        let mut command = tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(
+            &store_root_owned,
+            &root_owned,
+            &source_owned,
+        )?);
+        command
+            .args(&args_owned)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let _enter = handle.enter();
+        command.spawn_locked().map_err(|error| {
+            CowshedError::environment_missing(
+                error.to_string(),
+                "restore /usr/bin/git and sandbox-exec",
+            )
+        })
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("git fetch spawn task failed: {error}")))??;
     // WHY unbounded: a sandboxed git fetching from a repository on this host's own disk: it waits
     // on no other process.
     #[allow(clippy::disallowed_methods)]
-    let output = command.args(args).output_locked().await.map_err(|error| {
+    let output = child.wait_with_output().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
             "restore /usr/bin/git and sandbox-exec",
@@ -23000,19 +23093,22 @@ async fn invoke_git(
     root: &Path,
     args: &[&str],
 ) -> Result<std::process::Output> {
-    let mut command = crate::git::sandboxed_git_command_at(store_root, root)?;
-    command.args(args);
-    tokio::task::spawn_blocking(move || {
-        cowshed_os::deadline::output_by_progress(
+    let store_root = std::sync::Arc::clone(store_root);
+    let root = root.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut command = crate::git::sandboxed_git_command_at(&store_root, &root)?;
+        command.args(&args);
+        Ok(cowshed_os::deadline::output_by_progress(
             "git",
             &mut command,
             cowshed_os::deadline::Members::OwnGroup,
             cowshed_os::deadline::HEARTBEAT_SILENCE,
             &mut || None,
-        )
+        ))
     })
     .await
-    .map_err(|error| CowshedError::internal(format!("the git thread failed: {error}")))?
+    .map_err(|error| CowshedError::internal(format!("the git thread failed: {error}")))??
     .map_err(|error| match error {
         cowshed_os::deadline::RunError::Spawn { source, .. } => CowshedError::environment_missing(
             source.to_string(),

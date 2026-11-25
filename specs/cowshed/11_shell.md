@@ -808,20 +808,22 @@ child reports its `exec` before `exec` has closed every close-on-exec descriptor
 highest number down, and the spawn returns on the end of the status pipe it made, so the child still holds its copy of
 any descriptor numbered below that pipe (measured on macOS 26.6: with 20,000 close-on-exec descriptors between a lease
 and the pipe, a probe at the spawn's return found the lease held in 29 of 30 runs, and with the lease numbered above the
-pipe in none of 30). These transient kernel copies reach no command and have no owner: they close moments later on their
-own, so a peer can see a release lag its close by that teardown, and a waiter's grant, never a probe at the spawn's
-return, proves it. An authorized handoff differs: a command handed a held lock's descriptor holds it until it closes it
-(02_workspaces.md, "Held locks"). Every descriptor whose release a peer observes — the supervisor listener and its
-`.sock.lock` lease, the gateway's workspace session and control listeners, the APFS image lease and raw-device pin,
-image lifecycle locks, the intent lease and journal lock, the job records lock, cargo's cache locks — is fenced from the
-moment it is opened: its close takes the lock exclusive, waiting only for spawns in flight. A socket, which Darwin
-cannot create close-on-exec in one system call, is also created exclusive, or a child forked between `socket` and
-`fcntl` would keep it for life. A job's pipe pair is close-on-exec from birth too: `pipe2(O_CLOEXEC)` on Linux; on
-Darwin, which has no `pipe2`, it is created and marked under the exclusive lock (`fork_lock::create`), so no unrelated
-spawn holds a job's end of stream open. cowshed-core's clippy configuration refuses unlocked `spawn`/`output`/`status`.
-This includes test fixture children, such as the pinned Nx cache adapter's version-refusal probe. Gateway listener binds
-and accepted-socket creation use that same exclusive creation step, including close-on-exec publication; asynchronous
-readiness waits hold no fork-lock guard.
+pipe in none of 30). Programs a supervisor, controller, or gateway spawns repeatedly (such as `git`) are therefore
+resolved once per process to an absolute path and spawned by that path, never by a bare name resolved on every spawn, so
+each spawn avoids XNU's per-`PATH`-entry child fork (`cowshed-os/src/fork_lock.rs`). These transient kernel copies reach
+no command and have no owner: they close moments later on their own, so a peer can see a release lag its close by that
+teardown, and a waiter's grant, never a probe at the spawn's return, proves it. An authorized handoff differs: a command
+handed a held lock's descriptor holds it until it closes it (02_workspaces.md, "Held locks"). Every descriptor whose
+release a peer observes — the supervisor listener and its `.sock.lock` lease, the gateway's workspace session and
+control listeners, the APFS image lease and raw-device pin, image lifecycle locks, the intent lease and journal lock,
+the job records lock, cargo's cache locks — is fenced from the moment it is opened: its close takes the lock exclusive,
+waiting only for spawns in flight. A socket, which Darwin cannot create close-on-exec in one system call, is also
+created exclusive, or a child forked between `socket` and `fcntl` would keep it for life. A job's pipe pair is
+close-on-exec from birth too: `pipe2(O_CLOEXEC)` on Linux; on Darwin, which has no `pipe2`, it is created and marked
+under the exclusive lock (`fork_lock::create`), so no unrelated spawn holds a job's end of stream open. cowshed-core's
+clippy configuration refuses unlocked `spawn`/`output`/`status`. This includes test fixture children, such as the pinned
+Nx cache adapter's version-refusal probe. Gateway listener binds and accepted-socket creation use that same exclusive
+creation step, including close-on-exec publication; asynchronous readiness waits hold no fork-lock guard.
 
 The supervisor retains the job's diagnostics stderr before it acquires a warm host. If cloning that descriptor fails,
 the job fails with `EnvironmentMissing`, naming the clone operation and its syscall cause (including `EMFILE` for
@@ -851,13 +853,13 @@ stale, and only a job it does not publish is judged through the actor. Each call
 a read, the kill below) is made in one turn of its actor under the authority it serves then, so a grant advance during
 the hold changes nothing. Measured 2026-11-11: a land gate died when its hold, judged through the actor, waited out the
 5 s bound behind the spawn turn of the job it held, which sat 12 s in one `stat` of the store's main image at load 128
-on 18 cores. No fork-lock acquisition or child spawn runs on a supervisor's or gateway's runtime thread either: the
-runtime stops for as long as one waits, and a client's `wait` reads that silence as `SILENT` (05_gateway.md,
-"Deadlines"; measured 2026-11-25 on `bun-main-pin`'s land: 17 s between a job's admission and its host's spawn, with
-zero heartbeats). It then answers the job's terminal `JobInfo` when the job ends, or `null` again when the client sends
-the demand `release`, which lets the job outlive the connection. A connection that closes before either has left a
-running job with nobody waiting for it: the supervisor kills it under the authority it serves then, and says so on its
-stderr.
+on 18 cores. No fork-lock acquisition, listener bind or accept, descriptor creation under the fork lock, or child spawn
+runs on a supervisor's or gateway's runtime thread either: the runtime stops for as long as one waits, and a client's
+`wait` reads that silence as `SILENT` (05_gateway.md, "Deadlines"; measured 2026-11-25 on `bun-main-pin`'s land: 17 s
+between a job's admission and its host's spawn, with zero heartbeats). It then answers the job's terminal `JobInfo` when
+the job ends, or `null` again when the client sends the demand `release`, which lets the job outlive the connection. A
+connection that closes before either has left a running job with nobody waiting for it: the supervisor kills it under
+the authority it serves then, and says so on its stderr.
 
 - **hello** — the supervisor answers with its build, the authority it serves (repository, workspace, incarnation, grant
   and lifecycle revisions) and its pid. The authority is the one its actor last published (05_gateway.md, "Deadlines"),

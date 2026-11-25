@@ -10,7 +10,6 @@ use cowshed_os::fork_lock::{self, Fenced};
 use http::{Method, StatusCode};
 use thiserror::Error;
 use tokio::{
-    net::{TcpListener, UnixListener},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::timeout,
@@ -371,7 +370,9 @@ impl Gateway {
                         cleanup: Arc::clone(&cleanup),
                     },
                     config.control_tcp.as_ref(),
-                ) {
+                )
+                .await
+                {
                     Ok(control) => Some(control),
                     Err(error) => {
                         let _ = handle.send(Command::ForceStop).await;
@@ -1133,7 +1134,7 @@ struct Actor {
     /// The workspace listeners an install carried across the restart, by address, until a
     /// restored session claims each ([`Actor::bind_endpoint`]). Fenced: a peer observes their
     /// release, since the connections queued on one are reset when it closes.
-    carried: HashMap<std::net::SocketAddr, Fenced<TcpListener>>,
+    carried: HashMap<std::net::SocketAddr, Fenced<std::net::TcpListener>>,
 }
 
 impl Actor {
@@ -1362,11 +1363,11 @@ impl Actor {
             if let Some(current) = previous.as_mut() {
                 current.quiesce().await;
             }
-            match self.bind_endpoint(&session.endpoint) {
+            match self.bind_endpoint(&session.endpoint).await {
                 Ok(listener) => listener,
                 Err(error) => {
                     if let Some(mut current) = previous.take() {
-                        let restored = self.bind_endpoint(&current.endpoint)?;
+                        let restored = self.bind_endpoint(&current.endpoint).await?;
                         self.attach_listener(&workspace_id, &mut current, restored);
                         self.sessions.insert(workspace_id, current);
                     }
@@ -1374,7 +1375,7 @@ impl Actor {
                 }
             }
         } else {
-            match self.bind_endpoint(&session.endpoint) {
+            match self.bind_endpoint(&session.endpoint).await {
                 Ok(listener) => listener,
                 Err(error) => {
                     if let Some(current) = previous.take() {
@@ -1567,7 +1568,7 @@ impl Actor {
     /// A session's listener: the one an install carried across the restart for its address,
     /// when there is one, so the connections queued on it meanwhile are served; else a fresh
     /// bind (05_gateway.md "An install never refuses a client connection").
-    fn bind_endpoint(
+    async fn bind_endpoint(
         &mut self,
         endpoint: &WorkspaceEndpoint,
     ) -> Result<BoundListener, GatewayError> {
@@ -1576,7 +1577,7 @@ impl Actor {
         {
             return Ok(BoundListener::Tcp(carried));
         }
-        bind_endpoint(endpoint)
+        bind_endpoint(endpoint).await
     }
 
     /// As a drain begins, give the install restarting this gateway a duplicate of every TCP
@@ -3175,7 +3176,7 @@ fn audit_unavailable(status: StatusCode) -> AdmissionError {
 /// has closed its copies, so no fresh bind meets them.
 async fn take_carried_listeners(
     config: &GatewayConfig,
-) -> HashMap<std::net::SocketAddr, Fenced<TcpListener>> {
+) -> HashMap<std::net::SocketAddr, Fenced<std::net::TcpListener>> {
     #[cfg(target_os = "macos")]
     if let Some(path) = config.listener_handoff.clone() {
         let taken = tokio::task::spawn_blocking(move || crate::listener_handoff::take(&path))
@@ -3195,11 +3196,8 @@ async fn take_carried_listeners(
         let mut carried = HashMap::new();
         for (address, listener) in taken {
             // Already close-on-exec: the handoff received it under the fork lock.
-            match listener
-                .set_nonblocking(true)
-                .and_then(|()| TcpListener::from_std(listener))
-            {
-                Ok(listener) => {
+            match listener.set_nonblocking(true) {
+                Ok(()) => {
                     carried.insert(address, Fenced::new(listener));
                 }
                 Err(error) => cowshed_os::eprintln!(
@@ -3220,43 +3218,144 @@ async fn take_carried_listeners(
     HashMap::new()
 }
 
-fn bind_tcp(address: std::net::SocketAddr) -> std::io::Result<Fenced<TcpListener>> {
-    Fenced::create(|| {
-        let listener = std::net::TcpListener::bind(address)?;
-        listener.set_nonblocking(true)?;
-        TcpListener::from_std(listener)
-    })
-}
-
-fn bind_unix(path: &Path) -> std::io::Result<Fenced<UnixListener>> {
-    Fenced::create(|| {
-        let listener = std::os::unix::net::UnixListener::bind(path)?;
-        listener.set_nonblocking(true)?;
-        UnixListener::from_std(listener)
-    })
-}
-
-/// Socket accept and close-on-exec publication share the fork lock; waiting holds no guard.
-pub(crate) async fn accept_locked<T>(
-    mut accept: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<T>>,
-) -> std::io::Result<T> {
-    std::future::poll_fn(|context| match fork_lock::create(|| Ok(accept(context))) {
-        Ok(result) => result,
-        Err(error) => std::task::Poll::Ready(Err(error)),
+async fn bind_tcp(address: std::net::SocketAddr) -> std::io::Result<Fenced<std::net::TcpListener>> {
+    tokio::task::spawn_blocking(move || {
+        Fenced::create(|| {
+            let listener = std::net::TcpListener::bind(address)?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        })
     })
     .await
+    .map_err(|error| std::io::Error::other(format!("tcp bind task failed: {error}")))?
+}
+
+async fn bind_unix(path: &Path) -> std::io::Result<Fenced<std::os::unix::net::UnixListener>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        Fenced::create(|| {
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        })
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("unix bind task failed: {error}")))?
+}
+
+struct SharedListener<L>(Arc<Fenced<L>>);
+
+impl<L: std::os::fd::AsRawFd> std::os::fd::AsRawFd for SharedListener<L> {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+pub(crate) trait StdAccept: std::os::fd::AsRawFd + Send + Sync + 'static {
+    type StdStream: Send + 'static;
+    type AsyncStream;
+    type Addr: Send + 'static;
+
+    fn accept_std(&self) -> std::io::Result<(Self::StdStream, Self::Addr)>;
+    fn set_nonblocking(stream: &Self::StdStream) -> std::io::Result<()>;
+    fn into_async(stream: Self::StdStream) -> std::io::Result<Self::AsyncStream>;
+}
+
+impl StdAccept for std::net::TcpListener {
+    type StdStream = std::net::TcpStream;
+    type AsyncStream = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    fn accept_std(&self) -> std::io::Result<(Self::StdStream, Self::Addr)> {
+        self.accept()
+    }
+
+    fn set_nonblocking(stream: &Self::StdStream) -> std::io::Result<()> {
+        stream.set_nonblocking(true)
+    }
+
+    fn into_async(stream: Self::StdStream) -> std::io::Result<Self::AsyncStream> {
+        tokio::net::TcpStream::from_std(stream)
+    }
+}
+
+impl StdAccept for std::os::unix::net::UnixListener {
+    type StdStream = std::os::unix::net::UnixStream;
+    type AsyncStream = tokio::net::UnixStream;
+    type Addr = std::os::unix::net::SocketAddr;
+
+    fn accept_std(&self) -> std::io::Result<(Self::StdStream, Self::Addr)> {
+        self.accept()
+    }
+
+    fn set_nonblocking(stream: &Self::StdStream) -> std::io::Result<()> {
+        stream.set_nonblocking(true)
+    }
+
+    fn into_async(stream: Self::StdStream) -> std::io::Result<Self::AsyncStream> {
+        tokio::net::UnixStream::from_std(stream)
+    }
+}
+
+/// Keeps listener readiness on the runtime thread while running the `accept` syscall and its
+/// close-on-exec marking under `fork_lock::create` on the blocking pool. Retaining the in-flight
+/// `JoinHandle` across `tokio::select!` turns keeps [`Self::accept`] cancel-safe when another
+/// select arm fires mid-accept.
+pub(crate) struct AsyncAccept<L: StdAccept> {
+    listener: tokio::io::unix::AsyncFd<SharedListener<L>>,
+    pending: Option<JoinHandle<std::io::Result<(L::StdStream, L::Addr)>>>,
+}
+
+impl<L: StdAccept> AsyncAccept<L> {
+    pub(crate) fn new(listener: Fenced<L>) -> std::io::Result<Self> {
+        Ok(Self {
+            listener: tokio::io::unix::AsyncFd::with_interest(
+                SharedListener(Arc::new(listener)),
+                tokio::io::Interest::READABLE,
+            )?,
+            pending: None,
+        })
+    }
+
+    pub(crate) async fn accept(&mut self) -> std::io::Result<(L::AsyncStream, L::Addr)> {
+        loop {
+            if self.pending.is_none() {
+                let _ready = self.listener.readable().await?;
+                let shared = Arc::clone(&self.listener.get_ref().0);
+                self.pending = Some(tokio::task::spawn_blocking(move || {
+                    let (stream, addr) = fork_lock::create(|| shared.accept_std())?;
+                    L::set_nonblocking(&stream)?;
+                    Ok((stream, addr))
+                }));
+            }
+            let outcome = self
+                .pending
+                .as_mut()
+                .expect("pending accept task was installed")
+                .await
+                .map_err(|error| std::io::Error::other(format!("accept task failed: {error}")))?;
+            self.pending = None;
+            match outcome {
+                Ok((stream, addr)) => return Ok((L::into_async(stream)?, addr)),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.listener.readable().await?.clear_ready();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 pub(crate) enum BoundListener {
-    Tcp(Fenced<TcpListener>),
-    Unix(Fenced<UnixListener>),
+    Tcp(Fenced<std::net::TcpListener>),
+    Unix(Fenced<std::os::unix::net::UnixListener>),
 }
 
-fn bind_endpoint(endpoint: &WorkspaceEndpoint) -> Result<BoundListener, GatewayError> {
+async fn bind_endpoint(endpoint: &WorkspaceEndpoint) -> Result<BoundListener, GatewayError> {
     match endpoint {
-        WorkspaceEndpoint::Tcp { address, .. } => Ok(BoundListener::Tcp(bind_tcp(*address)?)),
-        WorkspaceEndpoint::Unix(path) => Ok(BoundListener::Unix(bind_data_socket(path).map_err(
-            |error| {
+        WorkspaceEndpoint::Tcp { address, .. } => Ok(BoundListener::Tcp(bind_tcp(*address).await?)),
+        WorkspaceEndpoint::Unix(path) => Ok(BoundListener::Unix(
+            bind_data_socket(path).await.map_err(|error| {
                 std::io::Error::new(
                     error.kind(),
                     format!(
@@ -3264,22 +3363,33 @@ fn bind_endpoint(endpoint: &WorkspaceEndpoint) -> Result<BoundListener, GatewayE
                         path.display()
                     ),
                 )
-            },
-        )?)),
+            })?,
+        )),
     }
 }
 
 /// Bind a workspace's data socket for its owner alone, replacing a stale socket of the user's
 /// at `path`.
-fn bind_data_socket(path: &Path) -> std::io::Result<Fenced<UnixListener>> {
-    remove_stale_socket(path)?;
-    let listener = bind_unix(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(listener)
+async fn bind_data_socket(
+    path: &Path,
+) -> std::io::Result<Fenced<std::os::unix::net::UnixListener>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        remove_stale_socket(&path)?;
+        let listener = Fenced::create(|| {
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(listener)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("data socket bind task failed: {error}")))?
 }
 
 fn remove_stale_socket(path: &Path) -> Result<(), std::io::Error> {
@@ -3319,7 +3429,7 @@ struct ControlRuntime {
 }
 
 impl ControlRuntime {
-    fn start(
+    async fn start(
         path: &Path,
         authorized_uid: u32,
         services: crate::control::ControlServices,
@@ -3361,7 +3471,7 @@ impl ControlRuntime {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let listener = bind_unix(path)?;
+        let listener = bind_unix(path).await?;
         if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             let _ = std::fs::remove_file(path);
             return Err(error.into());
@@ -3375,7 +3485,7 @@ impl ControlRuntime {
                         return Err(GatewayError::Control(error));
                     }
                 };
-            let listener = match bind_tcp(tcp.address) {
+            let listener = match bind_tcp(tcp.address).await {
                 Ok(listener) => listener,
                 Err(error) => {
                     let _ = std::fs::remove_file(path);
@@ -3432,16 +3542,25 @@ impl ControlRuntime {
 }
 
 async fn run_unix_control(
-    listener: Fenced<UnixListener>,
+    listener: Fenced<std::os::unix::net::UnixListener>,
     authorized_uid: u32,
     capacity: usize,
     services: crate::control::ControlServices,
     mut stopped: watch::Receiver<bool>,
 ) {
+    let mut listener = match AsyncAccept::new(listener) {
+        Ok(listener) => listener,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: gateway control socket could not register for readiness: {error}"
+            );
+            return;
+        }
+    };
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-            result = accept_locked(|context| listener.poll_accept(context)) => {
+            result = listener.accept() => {
                 let (stream, _) = match result {
                     Ok(accepted) => accepted,
                     Err(error) => {
@@ -3488,16 +3607,19 @@ async fn run_unix_control(
 }
 
 async fn run_tcp_control(
-    listener: Fenced<TcpListener>,
+    listener: Fenced<std::net::TcpListener>,
     credential: Arc<crate::control::ControllerCredential>,
     capacity: usize,
     services: crate::control::ControlServices,
     mut stopped: watch::Receiver<bool>,
 ) {
+    let Ok(mut listener) = AsyncAccept::new(listener) else {
+        return;
+    };
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-            result = accept_locked(|context| listener.poll_accept(context)) => {
+            result = listener.accept() => {
                 let Ok((stream, peer)) = result else { break };
                 if peer.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
                     || connections.len() >= capacity

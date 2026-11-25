@@ -593,10 +593,8 @@ fn validate_helper_destination(request: &HelperRequest) -> bool {
 }
 
 fn resolve_git_executable() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join("git"))
-        .find(|candidate| candidate.is_file())
+    let path = cowshed_core::git::resolved_git_program();
+    path.is_absolute().then(|| path.to_path_buf())
 }
 
 fn validate_git_executable(path: &Path) -> bool {

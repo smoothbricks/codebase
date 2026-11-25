@@ -5,10 +5,10 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// The Git a confined launch starts, by name: the launcher resolves it on the `PATH` the
-/// controller hands the launch, as the controller's own `git` is resolved.
+/// The Git a confined launch starts, resolved once per process on the controller's `PATH`
+/// ([`super::resolved_git_program`]).
 pub(super) fn git_program() -> PathBuf {
-    PathBuf::from("git")
+    super::resolved_git_program().to_path_buf()
 }
 
 /// The `PATH` a launch of [`git_program`] that inherits no environment is handed: the

@@ -134,6 +134,79 @@ pub(crate) fn start_background_verb(
         .map_err(|error| io(&format!("start {verb}"), program, &error))?;
     Ok(process)
 }
+/// A background verb awaiting adoption by its detached reaper thread: if the calling future is
+/// cancelled across its blocking-pool await before the reaper takes ownership, dropping this guard
+/// ends the unadopted session leader and hands reaping to the detached collector.
+struct UnadoptedVerb {
+    child: Option<Child>,
+}
+
+impl UnadoptedVerb {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn adopt(mut self) -> Child {
+        self.child
+            .take()
+            .expect("an unadopted background verb owns its child")
+    }
+}
+
+impl Drop for UnadoptedVerb {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let pid = i32::try_from(child.id()).expect("an owned child pid fits the kernel pid type");
+        // SAFETY: this is our own unreaped child, started in a session/group of its own via
+        // `setsid` before exec; no other owner can reap it before adoption.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        cowshed_os::deadline::collect_later("unadopted background verb", child);
+    }
+}
+
+/// Start `program <verb> <project_root>` on the blocking pool, guard it against cancellation
+/// across the await with [`UnadoptedVerb`], and hand the adopted child to a detached reaper
+/// thread. Returns the started child's pid.
+pub(crate) async fn start_background_verb_detached(
+    program: PathBuf,
+    verb: &'static str,
+    project_root: PathBuf,
+    reaper_name: &'static str,
+) -> Result<u32> {
+    let program_for_spawn = program.clone();
+    let spawned = tokio::task::spawn_blocking(move || {
+        start_background_verb(&program_for_spawn, verb, &project_root).map(UnadoptedVerb::new)
+    })
+    .await
+    .map_err(|error| {
+        crate::error::CowshedError::internal(format!(
+            "background {verb} spawn task failed: {error}"
+        ))
+    })??;
+    let mut child = spawned.adopt();
+    let pid = child.id();
+    // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
+    #[allow(clippy::disallowed_methods)]
+    let reaper = std::thread::Builder::new()
+        .name(reaper_name.to_owned())
+        .spawn(move || {
+            if let Err(error) = child.wait() {
+                cowshed_os::eprintln!(
+                    "cowshed: the {verb} process {pid} could not be reaped: {error}"
+                );
+            }
+        });
+    if let Err(error) = reaper {
+        cowshed_os::eprintln!(
+            "cowshed: {verb} process {pid} started, but its reaper could not be created: {}",
+            io(&format!("reap {verb}"), &program, &error).message
+        );
+    }
+    Ok(pid)
+}
+
 /// Whether necessary work on main's seed advises a background compaction. The receipt
 /// covers one capture or the actual attach plus mount, never queueing, fsck or metadata.
 pub(crate) fn advised(main: bool, operation_elapsed: Option<Duration>) -> bool {
@@ -237,7 +310,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Foreground advice uses only the operation receipt. No extent provider is reachable here.
     /// Deciding or starting is a value, `Failed` with its error, never a failed fork or land;
     /// nothing is recorded, and the compaction lock alone keeps two from running at once.
-    pub fn advise_compaction(
+    pub async fn advise_compaction(
         &self,
         target: &Owner,
         operation_elapsed: Option<Duration>,
@@ -259,31 +332,25 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         if !advised(true, operation_elapsed) {
             return LandSeedCompaction::NotAdvised;
         }
-        let start = || -> Result<LandSeedCompaction> {
-            let executable = std::env::current_exe().map_err(|error| {
-                io("find this cowshed executable", Path::new("cowshed"), &error)
-            })?;
-            let mut child = start_background_verb(&executable, SEED_COMPACTION_VERB, project_root)?;
-            let pid = child.id();
-            // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
-            #[allow(clippy::disallowed_methods)]
-            let reaper = std::thread::Builder::new()
-                .name("seed-compaction-reaper".to_owned())
-                .spawn(move || {
-                    if let Err(error) = child.wait() {
-                        cowshed_os::eprintln!("cowshed: the seed compaction process {pid} could not be reaped: {error}");
-                    }
-                });
-            if let Err(error) = reaper {
-                cowshed_os::eprintln!(
-                    "cowshed: seed compaction process {pid} started, but its reaper could not be created: {}",
-                    io("reap the seed compaction", &executable, &error).message
-                );
+        let executable = match std::env::current_exe()
+            .map_err(|error| io("find this cowshed executable", Path::new("cowshed"), &error))
+        {
+            Ok(executable) => executable,
+            Err(error) => {
+                return LandSeedCompaction::Failed {
+                    error: error.message,
+                };
             }
-            Ok(LandSeedCompaction::Started { pid })
         };
-        match start() {
-            Ok(report) => report,
+        match start_background_verb_detached(
+            executable,
+            SEED_COMPACTION_VERB,
+            project_root.to_path_buf(),
+            "seed-compaction-reaper",
+        )
+        .await
+        {
+            Ok(pid) => LandSeedCompaction::Started { pid },
             Err(error) => LandSeedCompaction::Failed {
                 error: error.message,
             },
