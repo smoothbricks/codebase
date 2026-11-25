@@ -13530,4 +13530,242 @@ s.recv(16)
             .await
             .unwrap();
     }
+
+    /// A background job that reads no jobserver token and spawns a tree of CPU-burning processes,
+    /// stopped cleanly over a test-owned Unix socket on `stop` or EOF.
+    #[cfg(target_os = "macos")]
+    struct CpuBurner {
+        job_id: JobId,
+        pids: Vec<u32>,
+        writer: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    #[cfg(target_os = "macos")]
+    const CPU_BURNER_PY: &str = r#"
+import os, select, socket, sys
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sys.argv[1])
+count = int(sys.argv[2])
+r_stop, w_stop = os.pipe()
+os.set_blocking(r_stop, False)
+
+children = []
+for _ in range(count - 1):
+    pid = os.fork()
+    if pid == 0:
+        os.close(w_stop)
+        sock.close()
+        x = 1
+        while True:
+            for _ in range(20000):
+                x = (x * 1664525 + 1013904223) & 0xffffffff
+            r, _, _ = select.select([r_stop], [], [], 0)
+            if r:
+                os._exit(0)
+    children.append(pid)
+
+os.close(r_stop)
+pids = [os.getpid()] + children
+sock.sendall(('pids ' + ' '.join(str(p) for p in pids) + '\n').encode())
+sock.setblocking(False)
+x = 1
+while True:
+    for _ in range(20000):
+        x = (x * 1664525 + 1013904223) & 0xffffffff
+    r, _, _ = select.select([sock], [], [], 0)
+    if r:
+        break
+
+os.close(w_stop)
+for pid in children:
+    os.waitpid(pid, 0)
+"#;
+
+    #[cfg(target_os = "macos")]
+    impl CpuBurner {
+        async fn start(
+            handle: &WorkspaceSupervisorHandle,
+            root: &Path,
+            label: &str,
+            processes: usize,
+        ) -> Self {
+            let sock_path = root.join(format!("{label}.sock"));
+            let _ = std::fs::remove_file(&sock_path);
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            let job_id = handle
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            r#"exec python3 -c "$1" "$2" "$3""#.into(),
+                            "cpu-burner".into(),
+                            CPU_BURNER_PY.into(),
+                            CommandArg::from(sock_path.into_os_string()),
+                            processes.to_string().into(),
+                        ]),
+                        cwd: None,
+                        scope: ExecScope::HostGate,
+                        class: ExecClass::Background,
+                        lander: None,
+                        want: Some(NonZeroUsize::new(4).unwrap()),
+                        hold: false,
+                        env: [(
+                            "PATH".into(),
+                            std::env::var("PATH").expect("development shell supplies python3"),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ..request(StdinSource::Empty)
+                    },
+                    AdmissionSource::Coordinator,
+                )
+                .await
+                .unwrap();
+            let (stream, _) = within_silence("cpu burner connect", listener.accept())
+                .await
+                .unwrap();
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            within_silence("cpu burner pids", reader.read_line(&mut line))
+                .await
+                .unwrap();
+            let pids: Vec<u32> = line
+                .trim()
+                .strip_prefix("pids ")
+                .unwrap_or_else(|| panic!("unexpected burner line: {line:?}"))
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            assert_eq!(pids.len(), processes);
+            Self {
+                job_id,
+                pids,
+                writer: write_half,
+            }
+        }
+
+        async fn stop(mut self, handle: &WorkspaceSupervisorHandle) {
+            let _ = self.writer.write_all(b"stop\n").await;
+            let _ = self.writer.shutdown().await;
+            let ended = within_silence("cpu burner exit", handle.wait(self.job_id))
+                .await
+                .unwrap();
+            assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_tree_max_priority(pids: &[u32], expected: i32, context: &str) {
+        for &pid in pids {
+            let priorities = procinfo::thread_max_priorities(pid.cast_signed())
+                .unwrap_or_else(|error| panic!("read thread max priorities for pid {pid}: {error}"))
+                .unwrap_or_else(|| panic!("pid {pid} exited unexpectedly ({context})"));
+            assert!(
+                !priorities.is_empty() && priorities.iter().all(|&p| p == expected),
+                "{context}: pid {pid} expected all threads pth_maxpriority == {expected}, got {priorities:?}"
+            );
+        }
+    }
+
+    /// Red (b): a background job that reads no token and burns > 1.5 cores past its 1 s grace and
+    /// 3 s window gets `PRIO_DARWIN_BG` on every process of its tree (read back via
+    /// `PROC_PIDTHREADINFO` `pth_maxpriority == 4`) and loses it at the gate's end (`== 63`),
+    /// with `job.darwinbg.set` and `job.darwinbg.cleared` span rows.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn land_gate_sets_and_clears_darwinbg_on_token_ignoring_burner() {
+        let mut fixture = start_fixture("gate-darwinbg", false);
+        let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
+        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+
+        let land_gate = GateJob::start(
+            &fixture.handle,
+            &fixture.root,
+            "land-gate",
+            Some(JobLander {
+                pid: std::process::id(),
+                start: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+
+        let expected_pids = burner.pids.clone();
+        within_silence(
+            "darwinbg recorded in group ledger",
+            publication::read_when(fixture.ledger.clone(), move |value| {
+                value
+                    .get("darwinbg")
+                    .and_then(|bg| bg.get("lives"))
+                    .and_then(|lives| lives.as_array())
+                    .is_some_and(|lives| {
+                        expected_pids.iter().all(|&pid| {
+                            lives
+                                .iter()
+                                .any(|life| life["pid"].as_u64() == Some(u64::from(pid)))
+                        })
+                    })
+            }),
+        )
+        .await;
+        // Actor round-trip orders after `setpriority(PRIO_DARWIN_BG)` + readback in the same turn.
+        let _ = fixture.handle.info(burner.job_id).await.unwrap();
+        assert_tree_max_priority(&burner.pids, 4, "during land gate");
+
+        let gate_id = land_gate.job_id;
+        land_gate.finish(&fixture.handle).await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-end").await,
+            GateWatchEvent::GateEnd {
+                job_id: gate_id.get(),
+            }
+        );
+        within_silence(
+            "darwinbg cleared from group ledger",
+            publication::read_when(fixture.ledger.clone(), |value| {
+                value.get("darwinbg").is_none()
+            }),
+        )
+        .await;
+        assert_tree_max_priority(&burner.pids, 63, "after land gate");
+
+        let burner_id = burner.job_id;
+        burner.stop(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let rows = gate_span_rows(&fixture.telemetry, burner_id);
+        let set_row = rows
+            .iter()
+            .find(|row| row.entry_type == "info" && row.message == "job.darwinbg.set")
+            .unwrap_or_else(|| panic!("missing job.darwinbg.set row: {rows:?}"));
+        assert!(
+            set_row.cpu_millicores.is_some_and(|mc| mc > 1500),
+            "expected cpu_millicores > 1500 on job.darwinbg.set: {set_row:?}"
+        );
+        assert_eq!(
+            set_row.tokens,
+            Some(1),
+            "token-ignoring job holds only the implicit token: {set_row:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.entry_type == "info" && row.message == "job.darwinbg.cleared"),
+            "missing job.darwinbg.cleared row: {rows:?}"
+        );
+
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
 }
