@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ts from 'typescript';
@@ -13,8 +13,8 @@ function withTempDir<T>(fn: (dir: string) => Promise<T> | T): Promise<T> {
   return Promise.resolve(fn(dir)).finally(() => rmSync(dir, { recursive: true, force: true }));
 }
 
-function sh(cmd: string, args: string[], cwd: string) {
-  const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 1 << 26 });
+function sh(cmd: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv) {
+  const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 1 << 26, ...(env !== undefined ? { env } : {}) });
   return { code: r.status ?? -1, out: r.stdout ?? '', err: r.error?.message ?? r.stderr ?? '' };
 }
 
@@ -920,4 +920,252 @@ test('a toolchain warning without a source span is no diagnostic of the compiled
 test('a warning that points into the compiled Rust is a diagnostic', () => {
   const stderr = readFileSync(join(import.meta.dir, '../test/testdata/rustc-unused-variable.jsonl'), 'utf8');
   expect(rustcDiagnostics(stderr)).toEqual([expect.stringContaining('unused variable: `x`')]);
+});
+
+test('cross-directory import emits valid identifiers and compiles/passes in TS, Rust and Go', async () => {
+  await withTempDir(async (dir) => {
+    const lawsDir = join(dir, 'laws');
+    const aLawsDir = join(dir, 'a', 'laws');
+    const outDir = join(dir, 'out');
+    mkdirSync(lawsDir, { recursive: true });
+    mkdirSync(aLawsDir, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+
+    writeFileSync(
+      join(lawsDir, 'lemmas.bend'),
+      `import Base
+
+type Found is Data:
+  Hit{v: Nat}
+  Miss{}
+
+def found_if(+ok: Bool, +x: Nat) -> Found:
+  match ok:
+    case True{}:
+      Hit{x}
+    case False{}:
+      Miss{}
+
+def is_hit(+f: Found) -> Bool:
+  match f:
+    case Hit{v}:
+      True{}
+    case Miss{}:
+      False{}
+
+def mem(+x: Nat, +xs: +List<Nat>) -> Bool:
+  match xs:
+    case Nil{}:
+      False{}
+    case Con{+h, +t}:
+      Bool.or(Nat.is_eq(x, h), mem(x, t))
+
+def lookup(+x: Nat, +xs: +List<Nat>) -> Found:
+  found_if(mem(x, xs), x)
+`,
+    );
+
+    const rootPath = join(aLawsDir, 'root.bend');
+    writeFileSync(
+      rootPath,
+      `import Base
+import ../../laws/lemmas.bend as L
+
+law mem_head:
+  for +x: Nat
+  for +xs: +List<Nat>
+  {L.mem(x, Con{x, xs}) == True{} : Bool}
+
+law lookup_head_is_hit:
+  for +x: Nat
+  for +xs: +List<Nat>
+  {L.is_hit(L.lookup(x, Con{x, xs})) == True{} : Bool}
+`,
+    );
+
+    const book = await checkBendFile(rootPath);
+    const laws = ['mem_head', 'lookup_head_is_hit'];
+    const em = book.emit({
+      target: { kind: 'all', stem: 'cross_dir' },
+      laws,
+      cap: 20,
+      listLength: 2,
+      properties: 12,
+    });
+    if (em.kind !== 'all') throw new Error('expected all');
+
+    expect(em.rust).toContain('pub fn ______laws_lemmas_mem(');
+    expect(em.rust).toContain('pub enum ______laws_lemmas_Found');
+    expect(em.rust).toContain('______laws_lemmas_Hit(u64)');
+    expect(em.typescript).toContain('export function ______laws_lemmas_mem(');
+    expect(em.goose).toContain('fn ______laws_lemmas_mem(');
+    expect(em.goose).toContain('enum ______laws_lemmas_Found');
+    expect(em.goose).toContain('______laws_lemmas_Hit { v: i64 }');
+
+    writeFileSync(join(outDir, 'cross_dir.rs'), em.rust);
+    writeFileSync(join(outDir, 'cross_dir.go'), em.go);
+    writeFileSync(join(outDir, 'cross_dir.ts'), em.typescript);
+
+    // TypeScript module strict typecheck + standalone driver run
+    const tsMod = book.emit({
+      target: { kind: 'ts-module', modelName: 'root.bend', flags: [] },
+      laws,
+      cap: 20,
+      listLength: 2,
+      properties: 12,
+    });
+    if (tsMod.kind !== 'module') throw new Error('expected module');
+    const tsModPath = join(outDir, 'cross_dir_mod.ts');
+    writeFileSync(tsModPath, tsMod.source);
+    expect(typeErrors(tsModPath)).toEqual([]);
+
+    expect(rustc(['--edition', '2021', 'cross_dir.rs', '-o', 'cross_dir_rs'], outDir)).toEqual({
+      code: 0,
+      diagnostics: [],
+    });
+    const goBuild = sh('go', ['build', '-o', 'cross_dir_go', 'cross_dir.go'], outDir);
+    expect({ code: goBuild.code, err: goBuild.err }).toEqual({ code: 0, err: '' });
+
+    const rsRun = sh('./cross_dir_rs', [], outDir);
+    const goRun = sh('./cross_dir_go', [], outDir);
+    const tsRun = sh('bun', ['cross_dir.ts'], outDir);
+    expect({ rs: rsRun.code, go: goRun.code, ts: tsRun.code }).toEqual({ rs: 0, go: 0, ts: 0 });
+  });
+});
+
+test('distinct Bend keys colliding after identifier mapping are refused for defs and ADTs', async () => {
+  await withTempDir(async (dir) => {
+    // 1. Def collision: `a/b:f` and `a_b:f` both map to `a_b_f`
+    const fnDir = join(dir, 'fn_collision');
+    mkdirSync(join(fnDir, 'a'), { recursive: true });
+    writeFileSync(
+      join(fnDir, 'a', 'b.bend'),
+      `import Base
+
+def f(+x: Nat) -> Nat:
+  Nat.add(x, 1n)
+`,
+    );
+    writeFileSync(
+      join(fnDir, 'a_b.bend'),
+      `import Base
+
+def f(+x: Nat) -> Nat:
+  Nat.add(x, 2n)
+`,
+    );
+    const fnRoot = join(fnDir, 'root.bend');
+    writeFileSync(
+      fnRoot,
+      `import Base
+import ./a/b.bend as Slash
+import ./a_b.bend as Under
+
+law both_f:
+  for +x: Nat
+  {Nat.add(Slash.f(x), Under.f(x)) == Nat.add(Under.f(x), Slash.f(x)) : Nat}
+`,
+    );
+    const fnBook = await checkBendFile(fnRoot);
+    for (const target of [
+      { kind: 'all', stem: 'collide_fn' } as const,
+      { kind: 'ts-module', modelName: 'root.bend', flags: [] } as const,
+      { kind: 'rust-module', modelName: 'root.bend', flags: [] } as const,
+      { kind: 'go-module', modelName: 'root.bend', flags: [] } as const,
+    ]) {
+      expect(() => fnBook.emit({ target, laws: ['both_f'], cap: 10, properties: 4 })).toThrow(
+        /bend-emit refuses:.*(a\/b:f.*a_b:f|a_b:f.*a\/b:f).*a_b_f/,
+      );
+    }
+
+    // 2. ADT collision: `a/b:Tag` and `a_b:Tag` both map to `a_b_Tag`
+    const adtDir = join(dir, 'adt_collision');
+    mkdirSync(join(adtDir, 'a'), { recursive: true });
+    writeFileSync(
+      join(adtDir, 'a', 'b.bend'),
+      `import Base
+
+type Tag is Data:
+  One{}
+
+def tag_one(+t: Tag) -> Nat:
+  match t:
+    case One{}:
+      1n
+`,
+    );
+    writeFileSync(
+      join(adtDir, 'a_b.bend'),
+      `import Base
+
+type Tag is Data:
+  Two{}
+
+def tag_two(+t: Tag) -> Nat:
+  match t:
+    case Two{}:
+      2n
+`,
+    );
+    const adtRoot = join(adtDir, 'root.bend');
+    writeFileSync(
+      adtRoot,
+      `import Base
+import ./a/b.bend as Slash
+import ./a_b.bend as Under
+
+law both_tags:
+  for +s: Slash.Tag
+  for +u: Under.Tag
+  {Nat.add(Slash.tag_one(s), Under.tag_two(u)) == 3n : Nat}
+`,
+    );
+    const adtBook = await checkBendFile(adtRoot);
+    expect(() =>
+      adtBook.emit({
+        target: { kind: 'all', stem: 'collide_adt' },
+        laws: ['both_tags'],
+        cap: 10,
+        properties: 4,
+      }),
+    ).toThrow(/bend-emit refuses:.*(a\/b:Tag.*a_b:Tag|a_b:Tag.*a\/b:Tag).*a_b_Tag/);
+  });
+});
+
+test('hub 0x-prefixed namespace whose mapped identifier starts with a digit is refused by name', async () => {
+  await withTempDir(async (dir) => {
+    const libDir = join(dir, 'lib');
+    const hubPkgDir = join(libDir, '0xdeadbeef');
+    const outDir = join(dir, 'out');
+    mkdirSync(hubPkgDir, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+
+    writeFileSync(
+      join(hubPkgDir, 'mod.bend'),
+      `import Base
+
+def id_nat(+x: Nat) -> Nat:
+  x
+`,
+    );
+    const rootPath = join(dir, 'root.bend');
+    writeFileSync(
+      rootPath,
+      `import Base
+import 0xdeadbeef/mod.bend as H
+
+law hub_id:
+  for +x: Nat
+  {H.id_nat(x) == x : Nat}
+`,
+    );
+
+    const cli = join(import.meta.dir, '../bin/bend-emit.ts');
+    const r = sh('bun', [cli, rootPath, outDir, '--laws', 'hub_id', '--cap', '4', '--props', '2'], dir, {
+      ...process.env,
+      BEND_LIB: libDir,
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.err).toMatch(/bend-emit refuses:.*0xdeadbeef\/mod:id_nat.*digit/);
+  });
 });

@@ -45,7 +45,40 @@ const NAT: Ty = { k: 'nat' };
 const BOOL: Ty = { k: 'bool' };
 
 function id(k: string): string {
-  return k.replace(/[.:]/g, '_');
+  const out = k.replace(/[^A-Za-z0-9_]/g, '_');
+  if (/^[0-9]/.test(out)) {
+    refuse(`emitted identifier for ${k} (${out}) starts with a digit`);
+  }
+  return out;
+}
+
+function sameTy(a: Ty, b: Ty): boolean {
+  if (a.k !== b.k) return false;
+  if (a.k === 'list' && b.k === 'list') return sameTy(a.el, b.el);
+  if (a.k === 'adt' && b.k === 'adt') {
+    return (
+      a.name === b.name &&
+      a.args.length === b.args.length &&
+      a.args.every((x, i) => {
+        const y = b.args[i];
+        return y !== undefined && sameTy(x, y);
+      })
+    );
+  }
+  return true;
+}
+
+function showRawTy(t: Ty): string {
+  switch (t.k) {
+    case 'nat':
+      return 'Nat';
+    case 'bool':
+      return 'Bool';
+    case 'list':
+      return `List<${showRawTy(t.el)}>`;
+    case 'adt':
+      return t.args.length === 0 ? t.name : `${t.name}<${t.args.map(showRawTy).join(', ')}>`;
+  }
 }
 
 function tyName(t: Ty): string {
@@ -397,7 +430,7 @@ type Law = {
   digest: string;
 };
 
-type SpecEntry = { origKey: string; erasedArgs: Map<number, H>; sig: Sig };
+type SpecEntry = { origKey: string; erasedArgs: Map<number, H>; tyArgs: Ty[]; sig: Sig };
 
 const SIGS = new Map<string, Sig>();
 const SPECIALIZED = new Map<string, SpecEntry>();
@@ -432,6 +465,7 @@ function resolveCall(k: string, all: H[]): { fnKey: string; s: Sig } {
   if (!hasPolyErased) return { fnKey: k, s: sig(k) };
 
   const erasedArgs = new Map<number, H>();
+  const tyArgs: Ty[] = [];
   const suffix: string[] = [];
   let scan = Bend.term_force(t.T);
   let pos = 0;
@@ -441,7 +475,11 @@ function resolveCall(k: string, all: H[]): { fnKey: string; s: Sig } {
       const arg = all[pos];
       if (arg === undefined) refuse(`a partial application of ${k}`);
       erasedArgs.set(pos, arg);
-      if (A.$ === 'Typ') suffix.push(tyName(tyOf(arg)));
+      if (A.$ === 'Typ') {
+        const ty = tyOf(arg);
+        tyArgs.push(ty);
+        suffix.push(tyName(ty));
+      }
       scan = Bend.term_force(scan.B(arg));
     } else {
       scan = Bend.term_force(scan.B(mkVar(scan.k)));
@@ -450,9 +488,27 @@ function resolveCall(k: string, all: H[]): { fnKey: string; s: Sig } {
   }
   const fnKey = suffix.length > 0 ? `${k}__${suffix.join('_')}` : k;
   const existing = SPECIALIZED.get(fnKey);
-  if (existing !== undefined) return { fnKey, s: existing.sig };
+  if (existing !== undefined) {
+    const same =
+      existing.origKey === k &&
+      existing.tyArgs.length === tyArgs.length &&
+      existing.tyArgs.every((prev, i) => {
+        const cur = tyArgs[i];
+        return cur !== undefined && sameTy(prev, cur);
+      });
+    if (!same) {
+      const prevDesc = `${existing.origKey}<${existing.tyArgs.map(showRawTy).join(', ')}>`;
+      const curDesc = `${k}<${tyArgs.map(showRawTy).join(', ')}>`;
+      refuse(`emitted specialization collision: ${prevDesc} and ${curDesc} both map to ${id(fnKey)}`);
+    }
+    return { fnKey, s: existing.sig };
+  }
+  if (suffix.length > 0 && BOOK.tlds[fnKey] !== undefined) {
+    const curDesc = `${k}<${tyArgs.map(showRawTy).join(', ')}>`;
+    refuse(`emitted specialization collision: ${curDesc} and ${fnKey} both map to ${id(fnKey)}`);
+  }
   const s = sigOf(t.T, erasedArgs);
-  SPECIALIZED.set(fnKey, { origKey: k, erasedArgs, sig: s });
+  SPECIALIZED.set(fnKey, { origKey: k, erasedArgs, tyArgs, sig: s });
   return { fnKey, s };
 }
 
@@ -1428,14 +1484,24 @@ function collectTypes(p: Pick<Program, 'fns' | 'laws' | 'cases'>): { adts: AdtTy
   const see = (t: Ty): void => {
     if (t.k === 'adt') {
       const k = tyName(t);
-      if (!adts.has(k)) {
+      const prev = adts.get(k);
+      if (prev !== undefined) {
+        if (!sameTy(prev, t)) {
+          refuse(`emitted type identifier collision: ${showRawTy(prev)} and ${showRawTy(t)} both map to ${k}`);
+        }
+      } else {
         adts.set(k, t);
         for (const c of adtCtors(t)) for (const f of c.fields) see(f.ty);
       }
     }
     if (t.k === 'list') {
       const k = tyName(t);
-      if (!lists.has(k)) {
+      const prev = lists.get(k);
+      if (prev !== undefined) {
+        if (!sameTy(prev, t)) {
+          refuse(`emitted type identifier collision: ${showRawTy(prev)} and ${showRawTy(t)} both map to ${k}`);
+        }
+      } else {
         lists.set(k, t);
         see(t.el);
       }
@@ -1569,7 +1635,8 @@ function rsExpr(e: Expr): string {
       return `Rc::new(List::Con(${rsExpr(e.h)}, ${rsExpr(e.t)}))`;
     case 'ctor': {
       const an = tyName(e.ty);
-      const raw = e.args.length === 0 ? `${an}::${e.ctor}` : `${an}::${e.ctor}(${e.args.map(rsExpr).join(', ')})`;
+      const cn = id(e.ctor);
+      const raw = e.args.length === 0 ? `${an}::${cn}` : `${an}::${cn}(${e.args.map(rsExpr).join(', ')})`;
       return RECURSIVE_ADTS.has(an) ? `Rc::new(${raw})` : raw;
     }
     case 'call':
@@ -1627,7 +1694,7 @@ function rsStmt(s: Stmt, ind: string, tco: TcoCtx | null): string {
       for (const c of ctors) {
         const a = arm(c.name);
         const fs = c.fields.map((_, i) => `f${i}__`);
-        out += `${ind}  ${an}::${c.name}${fs.length ? `(${fs.join(', ')})` : ''} => {\n`;
+        out += `${ind}  ${an}::${id(c.name)}${fs.length ? `(${fs.join(', ')})` : ''} => {\n`;
         a?.binds.forEach((b, i) => {
           out += `${ind}    let ${b.n}: ${rsTy(b.ty)} = f${i}__.clone();\n`;
         });
@@ -1679,7 +1746,7 @@ function emitRust(p: Program, module: string | null = null): string {
     const isRec = RECURSIVE_ADTS.has(an);
     const ctors = adtCtors(a);
     o += `#[derive(Clone, PartialEq)]\npub enum ${an} { ${ctors
-      .map((c) => (c.fields.length ? `${c.name}(${c.fields.map((f) => rsTy(f.ty)).join(', ')})` : c.name))
+      .map((c) => (c.fields.length ? `${id(c.name)}(${c.fields.map((f) => rsTy(f.ty)).join(', ')})` : id(c.name)))
       .join(', ')} }\n`;
     // Each ADT's text is written into one caller buffer (`write_*`), so a show allocates once, never a String per field.
     o += `pub fn write_${an}(x: &${rty}, out: &mut String) {\n  match ${isRec ? '&**x' : 'x'} {\n${ctors
@@ -1688,7 +1755,7 @@ function emitRust(p: Program, module: string | null = null): string {
         const body = fs.length
           ? `{ out.push_str("${c.name}("); ${c.fields.map((f, i) => `${i ? `out.push(','); ` : ''}write_${tyName(f.ty)}(f${i}, out);`).join(' ')} out.push(')'); }`
           : `out.push_str("${c.name}"),`;
-        return `    ${an}::${c.name}${fs.length ? `(${fs.join(', ')})` : ''} => ${body}\n`;
+        return `    ${an}::${id(c.name)}${fs.length ? `(${fs.join(', ')})` : ''} => ${body}\n`;
       })
       .join('')}  }\n}\n`;
     o += `pub fn show_${an}(x: &${rty}) -> String { let mut s = String::new(); write_${an}(x, &mut s); s }\n\n`;
@@ -1746,7 +1813,7 @@ function emitRust(p: Program, module: string | null = null): string {
       const isRec = RECURSIVE_ADTS.has(n);
       const wrap = (body: string): string => (isRec ? `Rc::new(${body})` : body);
       const arm = (c: CtorInfo, dExpr: string): string =>
-        `${c.fields.map((f, j) => `let f${j} = gen_${tyName(f.ty)}(r, ${tyHasRecAdt(f.ty) ? dExpr : '3'}); `).join('')}${wrap(`${n}::${c.name}${c.fields.length ? `(${c.fields.map((_, j) => `f${j}`).join(', ')})` : ''}`)}`;
+        `${c.fields.map((f, j) => `let f${j} = gen_${tyName(f.ty)}(r, ${tyHasRecAdt(f.ty) ? dExpr : '3'}); `).join('')}${wrap(`${n}::${id(c.name)}${c.fields.length ? `(${c.fields.map((_, j) => `f${j}`).join(', ')})` : ''}`)}`;
       if (isRec) {
         const base = baseCtorsOf(t);
         o += `fn gen_${n}(r: &mut Rng, m: u64) -> ${rsTy(t)} {\n  let d = if m > 3 { 3 } else { m };\n  if d == 0 {\n    match r.next() % ${base.length} {\n${base.map((c, i) => `      ${i === base.length - 1 ? '_' : String(i)} => { ${arm(c, '0')} }\n`).join('')}    }\n  } else {\n    match r.next() % ${cs.length} {\n${cs.map((c, i) => `      ${i === cs.length - 1 ? '_' : String(i)} => { ${arm(c, 'd - 1')} }\n`).join('')}    }\n  }\n}\n`;
@@ -1774,7 +1841,7 @@ function emitRustCorpus(p: Program): string {
       const isRec = RECURSIVE_ADTS.has(n);
       const wrap = (body: string): string => (isRec ? `Rc::new(${body})` : body);
       const arm = (c: CtorInfo, dExpr: string): string =>
-        `${c.fields.map((f, j) => `let f${j} = gen_${tyName(f.ty)}(r, ${tyHasRecAdt(f.ty) ? dExpr : '3'}); `).join('')}${wrap(`${n}::${c.name}${c.fields.length ? `(${c.fields.map((_, j) => `f${j}`).join(', ')})` : ''}`)}`;
+        `${c.fields.map((f, j) => `let f${j} = gen_${tyName(f.ty)}(r, ${tyHasRecAdt(f.ty) ? dExpr : '3'}); `).join('')}${wrap(`${n}::${id(c.name)}${c.fields.length ? `(${c.fields.map((_, j) => `f${j}`).join(', ')})` : ''}`)}`;
       if (isRec) {
         const base = baseCtorsOf(t);
         o += `pub fn gen_${n}(r: &mut Rng, m: u64) -> ${rsTy(t)} {\n  let d = if m > 3 { 3 } else { m };\n  if d == 0 {\n    match r.next() % ${base.length} {\n${base.map((c, i) => `      ${i === base.length - 1 ? '_' : String(i)} => { ${arm(c, '0')} }\n`).join('')}    }\n  } else {\n    match r.next() % ${cs.length} {\n${cs.map((c, i) => `      ${i === cs.length - 1 ? '_' : String(i)} => { ${arm(c, 'd - 1')} }\n`).join('')}    }\n  }\n}\n`;
@@ -1849,9 +1916,10 @@ function gsExpr(e: Expr): string {
     case 'ctor': {
       const info = ctorInfoFor(e.ctor, e.ty);
       const an = tyName(e.ty);
+      const cn = id(e.ctor);
       return info.fields.length === 0
-        ? `${an}.${e.ctor}`
-        : `${an}.${e.ctor} { ${info.fields.map((f, i) => `${f.name}: ${gsExpr(e.args[i] ?? refuse('missing field'))}`).join(', ')} }`;
+        ? `${an}.${cn}`
+        : `${an}.${cn} { ${info.fields.map((f, i) => `${f.name}: ${gsExpr(e.args[i] ?? refuse('missing field'))}`).join(', ')} }`;
     }
     case 'call':
       return `${id(e.f)}(${e.args.map(gsExpr).join(', ')})`;
@@ -1890,7 +1958,7 @@ function gsStmt(s: Stmt, ind: string): string {
       let out = `${ind}match ${s.scrut} {\n`;
       for (const c of adtCtors(t)) {
         const a = arm(c.name);
-        out += `${ind}  ${c.name}${c.fields.length ? ' v__' : ''} => {\n`;
+        out += `${ind}  ${id(c.name)}${c.fields.length ? ' v__' : ''} => {\n`;
         a?.binds.forEach((b, i) => {
           out += `${ind}    let ${b.n}: ${gsTy(b.ty)} = v__.${c.fields[i]?.name ?? refuse('field')};\n`;
         });
@@ -1935,7 +2003,9 @@ function emitGoose(p: Program): string {
     const an = tyName(a);
     o += `enum ${an} { ${adtCtors(a)
       .map((c) =>
-        c.fields.length ? `${c.name} { ${c.fields.map((f) => `${f.name}: ${gsTy(f.ty)}`).join(', ')} }` : c.name,
+        c.fields.length
+          ? `${id(c.name)} { ${c.fields.map((f) => `${f.name}: ${gsTy(f.ty)}`).join(', ')} }`
+          : id(c.name),
       )
       .join(', ')} }\n`;
   }
@@ -1953,8 +2023,8 @@ function emitGoose(p: Program): string {
     o += `fn show_${an}(x: ${an}, out: u8[>..]&) {\n  match x {\n${adtCtors(a)
       .map((c) =>
         c.fields.length
-          ? `    ${c.name} v => { format(out, "${c.name}("); ${c.fields.map((f, i) => `${i ? `format(out, ","); ` : ''}show_${tyName(f.ty)}(v.${f.name}, out);`).join(' ')} format(out, ")"); },\n`
-          : `    ${c.name} => { format(out, "${c.name}"); },\n`,
+          ? `    ${id(c.name)} v => { format(out, "${c.name}("); ${c.fields.map((f, i) => `${i ? `format(out, ","); ` : ''}show_${tyName(f.ty)}(v.${f.name}, out);`).join(' ')} format(out, ")"); },\n`
+          : `    ${id(c.name)} => { format(out, "${c.name}"); },\n`,
       )
       .join('')}  }\n}\n`;
   }
@@ -2002,7 +2072,7 @@ function emitGoose(p: Program): string {
       const cs = adtCtors(t);
       const isRec = RECURSIVE_ADTS.has(n);
       const arm = (c: CtorInfo, dExpr: string): string =>
-        `${c.fields.map((f, j) => `let f${j} = gen_${tyName(f.ty)}(r, ${tyHasRecAdt(f.ty) ? dExpr : '3'}); `).join('')}return ${c.fields.length ? `${n}.${c.name} { ${c.fields.map((f, j) => `${f.name}: f${j}`).join(', ')} }` : `${n}.${c.name}`};`;
+        `${c.fields.map((f, j) => `let f${j} = gen_${tyName(f.ty)}(r, ${tyHasRecAdt(f.ty) ? dExpr : '3'}); `).join('')}return ${c.fields.length ? `${n}.${id(c.name)} { ${c.fields.map((f, j) => `${f.name}: f${j}`).join(', ')} }` : `${n}.${id(c.name)}`};`;
       if (isRec) {
         const base = baseCtorsOf(t);
         o += `fn gen_${n}(r: Rng&, m: i64) -> ${n} {\n  var d = m;\n  if d > 3 { d = 3; }\n  if d == 0 {\n    let c = rng_next(r) % ${base.length};\n${base.map((c, i) => `    if c == ${i} { ${arm(c, '0')} }\n`).join('')}    abort("gen");\n  }\n  let c = rng_next(r) % ${cs.length};\n${cs.map((c, i) => `  if c == ${i} { ${arm(c, 'd - 1')} }\n`).join('')}  abort("gen");\n}\n`;
@@ -2737,6 +2807,54 @@ function lawReachedFns(law: Law, fns: ReadonlyMap<string, Fn>): string[] {
   return [...reached].sort();
 }
 
+function checkIdCollisions(
+  fns: readonly Fn[],
+  laws: readonly Law[],
+  adts: readonly AdtTy[],
+  targetKind: Target['kind'],
+): void {
+  const fnIds = new Map<string, string>();
+  for (const f of fns) {
+    const emitted = id(f.name);
+    const prev = fnIds.get(emitted);
+    if (prev !== undefined && prev !== f.name) {
+      refuse(`emitted identifier collision: ${prev} and ${f.name} both map to ${emitted}`);
+    }
+    fnIds.set(emitted, f.name);
+  }
+  const lawIds = new Map<string, string>();
+  const lawUpperIds = new Map<string, string>();
+  const checkUpper = targetKind === 'rust-module' || targetKind === 'ts-module';
+  for (const l of laws) {
+    const emitted = id(l.name);
+    const prev = lawIds.get(emitted);
+    if (prev !== undefined && prev !== l.name) {
+      refuse(`emitted law identifier collision: ${prev} and ${l.name} both map to law_${emitted}`);
+    }
+    lawIds.set(emitted, l.name);
+    if (checkUpper) {
+      const upper = emitted.toUpperCase();
+      const prevUpper = lawUpperIds.get(upper);
+      if (prevUpper !== undefined && prevUpper !== l.name) {
+        refuse(`emitted law constant collision: ${prevUpper} and ${l.name} both map to SEED_${upper}`);
+      }
+      lawUpperIds.set(upper, l.name);
+    }
+  }
+  for (const a of adts) {
+    const an = tyName(a);
+    const ctorIds = new Map<string, string>();
+    for (const c of adtCtors(a)) {
+      const emitted = id(c.name);
+      const prev = ctorIds.get(emitted);
+      if (prev !== undefined && prev !== c.name) {
+        refuse(`emitted constructor identifier collision on ${an}: ${prev} and ${c.name} both map to ${emitted}`);
+      }
+      ctorIds.set(emitted, c.name);
+    }
+  }
+}
+
 function emitBook({
   target,
   modelName,
@@ -2790,6 +2908,7 @@ function emitBook({
   const lowered = lower(order);
   const loweredMap = new Map(lowered.map((f) => [f.name, f]));
   const types = collectTypes({ fns: lowered, laws, cases: new Map() });
+  checkIdCollisions(lowered, laws, types.adts, target.kind);
   RECURSIVE_ADTS = computeRecursiveAdts(types.adts);
   const machines: CompiledMachine[] = machineSpecs.map((m) => {
     const initFn = loweredMap.get(m.init);
