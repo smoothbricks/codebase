@@ -82,6 +82,32 @@ pub const JOB_SPAN_ID: u32 = 1;
 /// the class whose nice its group runs at from then (05_gateway.md "Classes").
 pub const JOB_DECAYED_TO_GATE_MESSAGE: &str = "job.decayed.gate";
 pub const JOB_DECAYED_TO_BACKGROUND_MESSAGE: &str = "job.decayed.background";
+
+/// The messages of a job span's land-gate priority rows (05_gateway.md "A land's gate takes tokens
+/// back"; 13_telemetry.md "Job span segments").
+pub const JOB_TOKENS_WITHDRAWN_MESSAGE: &str = "job.tokens.withdrawn";
+pub const JOB_TOKENS_RESTORED_MESSAGE: &str = "job.tokens.restored";
+pub const JOB_DARWINBG_SET_MESSAGE: &str = "job.darwinbg.set";
+pub const JOB_DARWINBG_CLEARED_MESSAGE: &str = "job.darwinbg.cleared";
+pub const JOB_DARWINBG_UNCONFIRMED_MESSAGE: &str = "job.darwinbg.unconfirmed";
+
+/// One land-gate priority event recorded on a job's span (05_gateway.md "A land's gate takes
+/// tokens back"; 13_telemetry.md "Job span segments").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatePriorityRow {
+    /// `tokens` bytes were drained from the job's jobserver fifo while a land's gate ran.
+    TokensWithdrawn { tokens: u32 },
+    /// `tokens` bytes were written back to the job's jobserver fifo when the span ended.
+    TokensRestored { tokens: u32 },
+    /// `PRIO_DARWIN_BG` was set on the job's process tree after a window of `cpu_millicores` CPU
+    /// while the job held `tokens` tokens (the implicit first token counted).
+    DarwinBgSet { cpu_millicores: u32, tokens: u32 },
+    /// `PRIO_DARWIN_BG` was cleared from the job's process tree.
+    DarwinBgCleared,
+    /// A `PRIO_DARWIN_BG` set or clear on `pid` did not read back as expected from
+    /// `PROC_PIDTHREADINFO`.
+    DarwinBgUnconfirmed { pid: u32 },
+}
 /// Requests waiting for the writer: one job row or one fold batch each. A full queue counts
 /// refused rows rather than delaying the actor.
 const QUEUE_CAPACITY: usize = 256;
@@ -213,12 +239,14 @@ impl JobSpanEdge {
 }
 
 /// What a job's span records: an edge, unattributed terminal usage, a step of interactive
-/// work's decay, or an observed phase before dispatching its first process.
+/// work's decay, a land-gate priority event, or an observed phase before dispatching its first
+/// process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowKind {
     Edge(JobSpanEdge),
     Unattributed(UnattributedUsage),
     Decayed(DecayStep),
+    GatePriority(GatePriorityRow),
     Admission(AdmissionObservation),
 }
 
@@ -226,7 +254,11 @@ impl RowKind {
     fn entry_type(self) -> EntryType {
         match self {
             Self::Edge(edge) => edge.entry_type(),
-            Self::Unattributed(_) | Self::Decayed(_) | Self::Admission(_) => EntryType::Info,
+            Self::GatePriority(GatePriorityRow::DarwinBgUnconfirmed { .. }) => EntryType::Warn,
+            Self::Unattributed(_)
+            | Self::Decayed(_)
+            | Self::GatePriority(_)
+            | Self::Admission(_) => EntryType::Info,
         }
     }
 
@@ -236,6 +268,17 @@ impl RowKind {
             Self::Unattributed(_) => JOB_UNATTRIBUTED_MESSAGE,
             Self::Decayed(DecayStep::ToGate) => JOB_DECAYED_TO_GATE_MESSAGE,
             Self::Decayed(DecayStep::ToBackground) => JOB_DECAYED_TO_BACKGROUND_MESSAGE,
+            Self::GatePriority(GatePriorityRow::TokensWithdrawn { .. }) => {
+                JOB_TOKENS_WITHDRAWN_MESSAGE
+            }
+            Self::GatePriority(GatePriorityRow::TokensRestored { .. }) => {
+                JOB_TOKENS_RESTORED_MESSAGE
+            }
+            Self::GatePriority(GatePriorityRow::DarwinBgSet { .. }) => JOB_DARWINBG_SET_MESSAGE,
+            Self::GatePriority(GatePriorityRow::DarwinBgCleared) => JOB_DARWINBG_CLEARED_MESSAGE,
+            Self::GatePriority(GatePriorityRow::DarwinBgUnconfirmed { .. }) => {
+                JOB_DARWINBG_UNCONFIRMED_MESSAGE
+            }
             Self::Admission(AdmissionObservation::MemoryHeld(pressure)) => match pressure {
                 MemoryPressure::Darwin { level } => match level {
                     DarwinPressureLevel::Normal => "job.admission.memory.darwin.normal",
@@ -259,13 +302,16 @@ impl RowKind {
     fn state(self) -> Option<JobState> {
         match self {
             Self::Edge(edge) => edge.state(),
-            Self::Unattributed(_) | Self::Decayed(_) | Self::Admission(_) => None,
+            Self::Unattributed(_)
+            | Self::Decayed(_)
+            | Self::GatePriority(_)
+            | Self::Admission(_) => None,
         }
     }
 
     fn unattributed(self) -> Option<UnattributedUsage> {
         match self {
-            Self::Edge(_) | Self::Decayed(_) | Self::Admission(_) => None,
+            Self::Edge(_) | Self::Decayed(_) | Self::GatePriority(_) | Self::Admission(_) => None,
             Self::Unattributed(usage) => Some(usage),
         }
     }
@@ -299,6 +345,7 @@ fn charged_memory_at(kind: RowKind, info: &JobInfo) -> Option<ChargedMemoryUsage
         RowKind::Edge(JobSpanEdge::Start { .. })
         | RowKind::Unattributed(_)
         | RowKind::Decayed(_)
+        | RowKind::GatePriority(_)
         | RowKind::Admission(_) => None,
     }
 }
@@ -400,6 +447,11 @@ impl JobSpanPublisher {
         self.enqueue(info, RowKind::Decayed(step));
     }
 
+    /// Queue a land-gate priority row under `info`'s job span, without waiting.
+    pub fn record_gate_priority(&self, info: &JobInfo, row: GatePriorityRow) {
+        self.enqueue(info, RowKind::GatePriority(row));
+    }
+
     /// Queue one admitted phase change under the job's existing span and durable identity.
     pub(crate) fn record_admission(&self, info: &JobInfo, phase: AdmissionObservation) {
         self.enqueue(info, RowKind::Admission(phase));
@@ -412,9 +464,10 @@ impl JobSpanPublisher {
         let facts = match kind {
             RowKind::Edge(JobSpanEdge::Start { host }) => SpanFacts::start(host),
             RowKind::Edge(JobSpanEdge::End { .. }) => SpanFacts::end(info.resources.as_ref()),
-            RowKind::Unattributed(_) | RowKind::Decayed(_) | RowKind::Admission(_) => {
-                SpanFacts::default()
-            }
+            RowKind::Unattributed(_)
+            | RowKind::Decayed(_)
+            | RowKind::GatePriority(_)
+            | RowKind::Admission(_) => SpanFacts::default(),
         };
         permit.send(Request::Job(Box::new(JobSpanRow {
             at: SystemTime::now(),
@@ -769,6 +822,13 @@ trace_columns! {
     admission_pool_priority: Optional<Utf8>,
     /// The known count ahead in the checkout's priority lane, on a pool-pending row.
     admission_pool_ahead: Optional<U64>,
+    /// Token bytes withdrawn or restored on `job.tokens.*`, or tokens held (implicit one counted)
+    /// on `job.darwinbg.set`.
+    tokens: Optional<U32>,
+    /// Window CPU in millicores on `job.darwinbg.set`.
+    cpu_millicores: Optional<U32>,
+    /// Process id whose `PROC_PIDTHREADINFO` readback disagreed on `job.darwinbg.unconfirmed`.
+    pid: Optional<U32>,
 }
 
 /// A gathered job row as the cells its segment holds. The writer encodes each row as it gathers
@@ -822,6 +882,20 @@ impl JobCells {
             ),
             _ => (None, None, None, None),
         };
+        let (tokens, cpu_millicores, pid) = match row.kind {
+            RowKind::GatePriority(GatePriorityRow::TokensWithdrawn { tokens })
+            | RowKind::GatePriority(GatePriorityRow::TokensRestored { tokens }) => {
+                (Some(tokens), None, None)
+            }
+            RowKind::GatePriority(GatePriorityRow::DarwinBgSet {
+                cpu_millicores,
+                tokens,
+            }) => (Some(tokens), Some(cpu_millicores), None),
+            RowKind::GatePriority(GatePriorityRow::DarwinBgUnconfirmed { pid }) => {
+                (None, None, Some(pid))
+            }
+            RowKind::GatePriority(GatePriorityRow::DarwinBgCleared) | _ => (None, None, None),
+        };
         let span = SpanAddress {
             thread_id: job_span_thread(&row.repo_id, &row.workspace_incarnation, row.job_id),
             span_id: JOB_SPAN_ID,
@@ -856,6 +930,9 @@ impl JobCells {
             admission_pool_cpus: cpus,
             admission_pool_priority: priority,
             admission_pool_ahead: ahead,
+            tokens,
+            cpu_millicores,
+            pid,
         };
         Ok(Self {
             timestamp_ns,

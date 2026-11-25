@@ -24,11 +24,14 @@ background verbs' run spans all use that module; none keeps a copy. Nothing in c
 
 **Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
 adopted for it (`JobInfo.trace`): a `span-start` row at admission, the admission notes below, the `job.unattributed` row
-when its terminal sample states unattributed usage, and an `info` row `job.decayed.gate` or `job.decayed.background` at
-each step of an interactive job's decay (05_gateway.md, "Classes"), and a `span-ok`/`span-err` row at its terminal
-state. The supervisor's writer gathers these rows and seals them on the same interval as process rows ("Process
-segments"): the first row of either kind it gathers arms the interval, and when the interval ends, the job rows of every
-job gathered in it seal as one segment `job-<order:020>-<writer>.arrow`, in queue order, under
+when its terminal sample states unattributed usage, an `info` row `job.decayed.gate` or `job.decayed.background` at each
+step of an interactive job's decay (05_gateway.md, "Classes"), the land-gate priority rows (`info` rows
+`job.tokens.withdrawn` and `job.tokens.restored` with `tokens` (`u32`), `job.darwinbg.set` with `cpu_millicores` (`u32`)
+and `tokens` (`u32`), `job.darwinbg.cleared`, and `warn` row `job.darwinbg.unconfirmed` with `pid` (`u32`) when a
+`PROC_PIDTHREADINFO` readback disagrees; 05_gateway.md, "A land's gate takes tokens back"), and a `span-ok`/`span-err`
+row at its terminal state. The supervisor's writer gathers these rows and seals them on the same interval as process
+rows ("Process segments"): the first row of either kind it gathers arms the interval, and when the interval ends, the
+job rows of every job gathered in it seal as one segment `job-<order:020>-<writer>.arrow`, in queue order, under
 `<host-telemetry-root>/<yyyy-mm-dd>/` (the date of its first row), sealed like the gateway's (create-new `0600`
 temporary, rename, no sync: "Unsynced seals"); the writer also seals them before answering a trace-health read, and a
 retiring supervisor has them sealed, and each partition its writer wrote flushed once, before it is answered. One

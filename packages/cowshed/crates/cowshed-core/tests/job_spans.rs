@@ -22,7 +22,7 @@ use cowshed_core::api::{
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{
-    JobSpanEdge, JobSpanPublisher, SEAL_INTERVAL, job_fields, job_span_thread,
+    GatePriorityRow, JobSpanEdge, JobSpanPublisher, SEAL_INTERVAL, job_fields, job_span_thread,
 };
 use cowshed_core::runtime::placement::DecayStep;
 
@@ -70,6 +70,9 @@ fn spec_job_columns() -> Vec<Column> {
         ("admission_pool_cpus", "u64", true),
         ("admission_pool_priority", "utf8", true),
         ("admission_pool_ahead", "u64", true),
+        ("tokens", "u32", true),
+        ("cpu_millicores", "u32", true),
+        ("pid", "u32", true),
     ]
 }
 
@@ -370,6 +373,57 @@ async fn each_step_of_a_job_s_decay_is_one_info_row_of_its_span() {
         assert_eq!(Facts::of((batch, row)), Facts::NONE);
         assert_eq!(text_cell(batch, "job_state", row), None);
     }
+}
+
+/// Every land-gate priority row seals under its job's span with its declared entry type and
+/// columns, and leaves unrelated columns null (05_gateway.md "A land's gate takes tokens back";
+/// 13_telemetry.md "Job span segments").
+#[tokio::test]
+async fn each_land_gate_priority_effect_is_one_row_of_its_span() {
+    let telemetry = TempRoot::new("cowshed-job-span-gate-priority");
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    let only = job(1);
+    publisher.record(&only, JobSpanEdge::Start { host: None });
+    publisher.record_gate_priority(&only, GatePriorityRow::TokensWithdrawn { tokens: 3 });
+    publisher.record_gate_priority(
+        &only,
+        GatePriorityRow::DarwinBgSet {
+            cpu_millicores: 2400,
+            tokens: 1,
+        },
+    );
+    publisher.record_gate_priority(&only, GatePriorityRow::DarwinBgUnconfirmed { pid: 4242 });
+    publisher.record_gate_priority(&only, GatePriorityRow::DarwinBgCleared);
+    publisher.record_gate_priority(&only, GatePriorityRow::TokensRestored { tokens: 3 });
+    let health = publisher.health().await.expect("the writer answers");
+    assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(
+        kinds(&segments),
+        [
+            "span-start cowshed.job",
+            "info job.tokens.withdrawn",
+            "info job.darwinbg.set",
+            "warn job.darwinbg.unconfirmed",
+            "info job.darwinbg.cleared",
+            "info job.tokens.restored",
+        ]
+    );
+    let rows = sealed_rows(&segments);
+    let cells = |idx: usize| {
+        let (batch, row) = rows[idx];
+        (
+            number_cell::<UInt32Type>(batch, "tokens", row),
+            number_cell::<UInt32Type>(batch, "cpu_millicores", row),
+            number_cell::<UInt32Type>(batch, "pid", row),
+        )
+    };
+    assert_eq!(cells(0), (None, None, None));
+    assert_eq!(cells(1), (Some(3), None, None));
+    assert_eq!(cells(2), (Some(1), Some(2400), None));
+    assert_eq!(cells(3), (None, None, Some(4242)));
+    assert_eq!(cells(4), (None, None, None));
+    assert_eq!(cells(5), (Some(3), None, None));
 }
 
 /// `info`'s job, running as job `job_id`.
