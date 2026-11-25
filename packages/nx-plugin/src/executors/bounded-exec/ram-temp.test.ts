@@ -16,6 +16,7 @@ import { createServer, type Socket } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { PassThrough } from 'node:stream';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
 import { whenChanged } from '../../__tests__/path-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -31,6 +32,7 @@ import {
   detachRamDisk,
   diskCommand,
   type HostCommands,
+  hostTaskDirectoryBytes,
   imagesBackedUnder,
   leaseDirectoryBytes,
   mountsBelow,
@@ -46,10 +48,12 @@ import {
   type Result,
   ramDisksIn,
   ramTempPaths,
+  recognizeHostLease,
   testNamespace,
   volumeDisks,
 } from './ram-temp.js';
 import { registryDevice, stepOf } from './ram-temp-fixtures.js';
+import { runScratchProvider } from './scratch-provider.js';
 
 /**
  * The namespace the cases that run fake host commands name their volumes by. They make nothing below it: each case's
@@ -188,6 +192,10 @@ describe('RAM temp volume output parsing', () => {
     expect(leaseDirectoryBytes(worst.mountpoint, pid)).toBe(RAM_TMPDIR_MAX_BYTES);
     expect(Buffer.byteLength(`${worst.mountpoint}/${pid}-aBcDeF`)).toBe(65);
     expect(leaseDirectoryBytes(ramTempPaths({ uid }, PRODUCTION).mountpoint, pid)).toBe(57);
+    // A task directory under a host lease (`<mount>/h<5>/<5>`) spends the same 13 bytes past the mountpoint.
+    expect(hostTaskDirectoryBytes(worst.mountpoint)).toBe(RAM_TMPDIR_MAX_BYTES);
+    expect(Buffer.byteLength(`${worst.mountpoint}/h12345/aBcDe`)).toBe(65);
+    expect(hostTaskDirectoryBytes(ramTempPaths({ uid }, PRODUCTION).mountpoint)).toBe(57);
     expect(RAM_TMPDIR_SOCKET_BUDGET_BYTES).toBe(38);
   });
 
@@ -343,6 +351,40 @@ describe('the RAM temp path budget', () => {
     expect(describeRamTempError(error)).toBe(
       `RAM temp volume: a lease below ${paths.mountpoint} for pid 99999 would be 86 bytes, past the 65 its layout admits, leaving 38 below it for a socket's names within sun_path (specs/cowshed/01_storage.md, "RAM temp path budget")`,
     );
+  });
+
+  it('refuses a host lease whose task directory would exceed the 65-byte budget before touching the host', async () => {
+    const paths = {
+      ...ramTempPaths({ uid: 501 }, NAMESPACE),
+      root: '/private/var/folders/cowshed/501',
+      mountpoint: `/private/var/folders/cowshed/501/${'x'.repeat(21)}`,
+    };
+    const volume = new RamTempVolume(
+      paths,
+      512,
+      {
+        async run(file) {
+          throw new Error(`${file} ran before the host lease path budget was checked`);
+        },
+        async detachRam() {
+          throw new Error('no disk exists');
+        },
+        async attachRam() {
+          throw new Error('a RAM disk was attached before the host lease path budget was checked');
+        },
+      },
+      12_345,
+    );
+    expect(await volume.acquireHostLease(noSubtrees)).toEqual({
+      ok: false,
+      error: {
+        kind: 'lease-path-budget',
+        mountpoint: paths.mountpoint,
+        pid: 12_345,
+        bytes: hostTaskDirectoryBytes(paths.mountpoint),
+        most: 65,
+      },
+    });
   });
 });
 
@@ -2200,6 +2242,164 @@ if (ended !== null) {
       expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
     } finally {
       await fixture.cleanup();
+    }
+  });
+
+  it('accepts host lease names in ledger claims without rejecting the ledger', async () => {
+    const fixture = await detachCustodyFixture();
+    const claim = {
+      name: 'hAb12c',
+      identity: 'owned-host-lease-identity',
+      owner: { pid: process.pid, token: 'live-host-reclaim' },
+    };
+    try {
+      await writeFile(fixture.registry, '');
+      await writeFile(
+        `${fixture.paths.lockFile}.ledger`,
+        JSON.stringify({
+          version: 2,
+          lifecycle: {
+            kind: 'detach',
+            owner: { pid: process.pid, token: 'original-detach' },
+            pending: { physical: '/dev/disk7', registryEntry: fixture.entry, phase: 'reported', facadePid: null },
+          },
+          claims: [claim],
+          held: [],
+        }),
+      );
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain(
+        'owned attach admission reached',
+      );
+      expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [claim], held: [] });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+});
+
+describe('host lease recognition and scratch provider protocol', () => {
+  it('recognizes a host lease by mountpoint parent, h<5> name and matching device without reading marker or lock', async () => {
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'rt-host-recognize-'));
+    const mountpoint = join(root, 'ram3');
+    const lease = join(mountpoint, 'hAb12c');
+    const badName = join(mountpoint, '12345-abcdef');
+    const outside = join(root, 'hAb12c');
+    mkdirSync(lease, { recursive: true, mode: 0o700 });
+    mkdirSync(badName, { mode: 0o700 });
+    mkdirSync(outside, { mode: 0o700 });
+    try {
+      const recognized = await recognizeHostLease(lease, mountpoint);
+      expect(recognized).not.toBeNull();
+      expect(recognized?.directory).toBe(lease);
+      expect(recognized?.mountpoint).toBe(mountpoint);
+      expect(await recognizeHostLease(badName, mountpoint)).toBeNull();
+      expect(await recognizeHostLease(outside, mountpoint)).toBeNull();
+      expect(await recognizeHostLease(join(mountpoint, 'h1234'), mountpoint)).toBeNull();
+      expect(await recognizeHostLease(join(mountpoint, 'h123456'), mountpoint)).toBeNull();
+      expect(await recognizeHostLease(undefined, mountpoint)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('prints {"directory":...} for an acquired host lease and settles on stdin EOF', async () => {
+    const stdin = new PassThrough();
+    const out: string[] = [];
+    const err: string[] = [];
+    const lease = {
+      directory: '/private/var/folders/cowshed/501/ram3/hAb12c',
+      mountpoint: '/private/var/folders/cowshed/501/ram3',
+      attach: 'attach-1',
+      registryEntry: '0x1',
+    };
+    let settled: string | null = null;
+    const provider = runScratchProvider({
+      platform: 'darwin',
+      stdin,
+      stdout: {
+        write(chunk: string) {
+          out.push(chunk);
+          return true;
+        },
+      },
+      stderr: {
+        write(chunk: string) {
+          err.push(chunk);
+          return true;
+        },
+      },
+      workspace: 'job-scratch',
+      subtrees: noSubtrees,
+      volume: {
+        async acquireHostLease() {
+          return {
+            ok: true,
+            value: { kind: 'leased', lease, held: [], reaped: [], gaps: [], retained: [] },
+          };
+        },
+        async settleHostLease(held) {
+          settled = held.directory;
+          return { ok: true, value: [`${held.directory}/t1234 archived at .archive/...`] };
+        },
+      },
+    });
+    // Wait a tick for the directory line to be written before closing stdin.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(out.join('')).toBe(`${JSON.stringify({ directory: lease.directory })}\n`);
+    expect(settled).toBeNull();
+    stdin.end();
+    expect(await provider).toBe(0);
+    expect(settled).toBe(lease.directory);
+    expect(err.join('')).toContain('archived');
+  });
+
+  it('prints {"unavailable":...} and exits 0 when the volume is unavailable or refused', async () => {
+    for (const [label, platform, answer] of [
+      ['non-darwin', 'linux' as const, null],
+      [
+        'unavailable',
+        'darwin' as const,
+        {
+          ok: true as const,
+          value: { kind: 'unavailable' as const, reason: 'gateway-absent' as const, detail: 'no sock' },
+        },
+      ],
+      [
+        'error',
+        'darwin' as const,
+        { ok: false as const, error: { kind: 'root-unready' as const, root: '/r', detail: 'is missing' } },
+      ],
+    ]) {
+      const stdin = new PassThrough();
+      const out: string[] = [];
+      let settled = false;
+      const code = await runScratchProvider({
+        platform,
+        stdin,
+        stdout: {
+          write(chunk: string) {
+            out.push(chunk);
+            return true;
+          },
+        },
+        stderr: { write: () => true },
+        subtrees: noSubtrees,
+        volume: {
+          async acquireHostLease() {
+            if (answer === null) throw new Error(`${label} should not acquire`);
+            return answer;
+          },
+          async settleHostLease() {
+            settled = true;
+            return { ok: true, value: [] };
+          },
+        },
+      });
+      expect(code, label).toBe(0);
+      expect(settled, label).toBe(false);
+      const parsed: unknown = JSON.parse(out.join('').trim());
+      expect(parsed, label).toMatchObject({ unavailable: expect.any(String) });
     }
   });
 });

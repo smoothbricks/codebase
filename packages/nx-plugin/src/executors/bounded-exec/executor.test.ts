@@ -1966,6 +1966,217 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(volume.released).toEqual([]);
   });
 
+  it('uses a per-task <lease>/<5> subdir under a host lease without probing the volume or lock, and deletes it on pass', async () => {
+    const workspace = await createWorkspace();
+    const mountpoint = join(workspace.root, 'ram3');
+    const hostLease = join(mountpoint, 'hAb12c');
+    await mkdir(hostLease, { recursive: true, mode: 0o700 });
+    const previousTmpdir = process.env.TMPDIR;
+    process.env.TMPDIR = hostLease;
+    const volume: TempVolume = {
+      mountpoint,
+      ordinaryParent: workspace.root,
+      acquire() {
+        throw new Error('host lease task must never probe the volume or acquire a lease');
+      },
+      record() {
+        throw new Error('host lease task must never record a volume lease handle');
+      },
+      release() {
+        throw new Error('host lease task must never release a volume lease');
+      },
+      fullness() {
+        throw new Error('host lease task must never probe volume fullness');
+      },
+      space() {
+        throw new Error('host lease task must never probe volume space');
+      },
+    };
+    try {
+      const result = await runBoundedExec(
+        {
+          command:
+            "node -e \"const fs = require('node:fs'); const p = require('node:path'); const d = process.env.TMPDIR; console.log('TMP=' + d); fs.mkdirSync(p.join(d, 'ro'), { mode: 0o500 });\"",
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        volume,
+        null,
+        undefined,
+        await standInOwner(workspace.root),
+      );
+      expect(result.success, result.terminalOutput).toBe(true);
+      const match = /TMP=(\S+)/.exec(result.terminalOutput);
+      expect(match?.[1]).toMatch(new RegExp(`^${hostLease}/[A-Za-z0-9]{5}$`));
+      expect(await readdir(hostLease)).toEqual([]);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpdir;
+    }
+  });
+
+  it.each([
+    ['failed', 'node -e "process.exit(2)"', BOUNDED_TEST_IDLE_TIMEOUT_MS],
+    ['timed-out', 'node -e "process.stdin.resume()"', 50],
+    ['signalled', 'kill -KILL $$', BOUNDED_TEST_IDLE_TIMEOUT_MS],
+  ] as const)(
+    'leaves <lease>/<5> and writes <5>.failed with verdict %s when a host-lease task fails',
+    async (expectedVerdict, command, timeoutMs) => {
+      const workspace = await createWorkspace();
+      const mountpoint = join(workspace.root, 'ram3');
+      const hostLease = join(mountpoint, 'hXy98z');
+      await mkdir(hostLease, { recursive: true, mode: 0o700 });
+      const previousTmpdir = process.env.TMPDIR;
+      process.env.TMPDIR = hostLease;
+      const volume: TempVolume = {
+        mountpoint,
+        ordinaryParent: workspace.root,
+        acquire() {
+          throw new Error('host lease task must never probe the volume or acquire a lease');
+        },
+        record() {
+          throw new Error('host lease task must never record a volume lease handle');
+        },
+        release() {
+          throw new Error('host lease task must never release a volume lease');
+        },
+        fullness() {
+          throw new Error('host lease task must never probe volume fullness');
+        },
+        space() {
+          throw new Error('host lease task must never probe volume space');
+        },
+      };
+      try {
+        const result = await runBoundedExec(
+          { command, timeoutMs, killAfterMs: 0 },
+          workspace.context,
+          createProcessTreeKiller(),
+          volume,
+          null,
+          undefined,
+          await standInOwner(workspace.root),
+        );
+        expect(result.success).toBe(false);
+        const entries = (await readdir(hostLease)).sort();
+        expect(entries).toHaveLength(2);
+        const taskId = entries.find((entry) => /^[A-Za-z0-9]{5}$/.test(entry));
+        expect(taskId).toBeDefined();
+        const markerName = `${taskId}.failed`;
+        expect(entries).toContain(markerName);
+        const marker: unknown = JSON.parse(await readFile(join(hostLease, markerName), 'utf8'));
+        expect(marker).toEqual({ version: 1, verdict: expectedVerdict, at: expect.any(Number) });
+        expect(result.terminalOutput).toContain(join(hostLease, taskId ?? ''));
+      } finally {
+        if (previousTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = previousTmpdir;
+      }
+    },
+  );
+
+  it('writes <5>.failed with verdict unretired when subtree retirement fails in a host lease', async () => {
+    const workspace = await createWorkspace();
+    const mountpoint = join(workspace.root, 'ram3');
+    const hostLease = join(mountpoint, 'hUn12r');
+    await mkdir(hostLease, { recursive: true, mode: 0o700 });
+    const previousTmpdir = process.env.TMPDIR;
+    process.env.TMPDIR = hostLease;
+    const volume: TempVolume = {
+      mountpoint,
+      ordinaryParent: workspace.root,
+      acquire() {
+        throw new Error('host lease task must never probe the volume or acquire a lease');
+      },
+      record() {
+        throw new Error('host lease task must never record a volume lease handle');
+      },
+      release() {
+        throw new Error('host lease task must never release a volume lease');
+      },
+      fullness() {
+        throw new Error('host lease task must never probe volume fullness');
+      },
+      space() {
+        throw new Error('host lease task must never probe volume space');
+      },
+    };
+    try {
+      const result = await runBoundedExec(
+        { command: 'node -e "process.exit(0)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        volume,
+        null,
+        undefined,
+        await standInOwner(workspace.root, { admission: 'admitted', retire: 'fail' }),
+      );
+      expect(result.success).toBe(false);
+      const entries = (await readdir(hostLease)).sort();
+      const taskId = entries.find((entry) => /^[A-Za-z0-9]{5}$/.test(entry));
+      expect(taskId).toBeDefined();
+      const marker: unknown = JSON.parse(await readFile(join(hostLease, `${taskId}.failed`), 'utf8'));
+      expect(marker).toEqual({ version: 1, verdict: 'unretired', at: expect.any(Number) });
+    } finally {
+      if (previousTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpdir;
+    }
+  });
+
+  it('honors a target-provided env.TMPDIR over a host lease without probing or creating a task subdir', async () => {
+    const workspace = await createWorkspace();
+    const mountpoint = join(workspace.root, 'ram3');
+    const hostLease = join(mountpoint, 'hTg12p');
+    const targetTmp = join(workspace.root, 'target-tmp');
+    await mkdir(hostLease, { recursive: true, mode: 0o700 });
+    await mkdir(targetTmp, { recursive: true, mode: 0o700 });
+    await writeFile(join(targetTmp, 'keep'), 'target owned');
+    const previousTmpdir = process.env.TMPDIR;
+    process.env.TMPDIR = hostLease;
+    const volume: TempVolume = {
+      mountpoint,
+      ordinaryParent: workspace.root,
+      acquire() {
+        throw new Error('host lease task must never probe the volume or acquire a lease');
+      },
+      record() {
+        throw new Error('host lease task must never record a volume lease handle');
+      },
+      release() {
+        throw new Error('host lease task must never release a volume lease');
+      },
+      fullness() {
+        throw new Error('host lease task must never probe volume fullness');
+      },
+      space() {
+        throw new Error('host lease task must never probe volume space');
+      },
+    };
+    try {
+      const result = await runBoundedExec(
+        {
+          command: `node -e 'console.log("tmp=" + process.env.TMPDIR)'`,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          env: { TMPDIR: targetTmp },
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        volume,
+        null,
+        undefined,
+        await standInOwner(workspace.root),
+      );
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(result.terminalOutput).toContain(`tmp=${targetTmp}`);
+      expect(result.terminalOutput).toContain(`target-provided TMPDIR ${targetTmp}`);
+      expect(await readdir(hostLease)).toEqual([]);
+      expect(await readFile(join(targetTmp, 'keep'), 'utf8')).toBe('target owned');
+    } finally {
+      if (previousTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpdir;
+    }
+  });
+
   for (const error of [
     { kind: 'provision-failed', step: 'hdiutil attach', detail: 'exit 1: Device not configured' },
     { kind: 'provision-failed', step: 'read marker', detail: 'EIO' },
@@ -3986,10 +4197,12 @@ function scriptedVolume(
   full: RamTempError | null = null,
   space: TempVolumeSpace | null = null,
   ordinaryParent: string | null = null,
+  mountpoint = '/unused-scripted-ram-mount',
 ): TempVolume & { released: string[]; order: string[] } {
   const released: string[] = [];
   const order: string[] = [];
   return {
+    mountpoint,
     released,
     order,
     acquire: () => Promise.resolve(acquisition),

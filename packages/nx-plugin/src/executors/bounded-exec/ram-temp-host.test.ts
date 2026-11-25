@@ -17,6 +17,7 @@ import {
 import { statfs } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
@@ -30,11 +31,13 @@ import {
   archiveDeletions,
   type CommandOutput,
   createHostCommands,
+  HOST_LEASE_NAME,
   type HostCommands,
   mountsBelow,
   operationDisk,
   type RamTempError,
   RamTempVolume,
+  writeHostTaskFailure,
 } from './ram-temp.js';
 import {
   attachedDisks,
@@ -48,6 +51,7 @@ import {
   startFixtureGateway,
   stepOf,
 } from './ram-temp-fixtures.js';
+import { runScratchProvider } from './scratch-provider.js';
 
 const MIB = 1024 * 1024;
 
@@ -825,6 +829,183 @@ async function inheritedTempDirectory(): Promise<void> {
   }
 }
 
+/**
+ * Host leases (`<mount>/h<5>` with `<mount>/h<5>.holder`) share one volume with host task leases:
+ * - a host task's last-lease release must not detach the volume while a live host lease exists;
+ * - a live holder's host lease is never claimed, and a dead holder's is archived whole with its sidecar removed;
+ * - the scratch provider hands out `{"directory":...}` and on stdin EOF archives `<5>` dirs marked `<5>.failed`
+ *   through the volume's existing retention, deletes the rest and its sidecar, and detaches when it was the last lease.
+ */
+async function hostLeaseLifecycle(): Promise<void> {
+  const fixture = scratchVolume(0);
+  const { paths, capacity, owned, gatewaySocket } = fixture;
+  const delegate = createHostCommands(gatewaySocket);
+  const host: HostCommands = {
+    run: delegate.run,
+    detachRam: delegate.detachRam,
+    ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
+    attachRam: recordedRamAttach(delegate.attachRam, delegate.run, owned),
+  };
+  const alive = new Set([101, 202, 303]);
+  const taskVolume = new RamTempVolume(paths, capacity, host, 101, (pid) => alive.has(pid));
+  const holderA = new RamTempVolume(paths, capacity, host, 202, (pid) => alive.has(pid));
+  const holderB = new RamTempVolume(paths, capacity, host, 303, (pid) => alive.has(pid));
+  const stopGateway = await startFixtureGateway(fixture);
+  try {
+    const firstHost = await holderA.acquireHostLease(provisionOnly, 'job-scratch');
+    if (!firstHost.ok) {
+      expectSandboxed(firstHost.error);
+      return;
+    }
+    if (firstHost.value.kind !== 'leased') {
+      throw new Error(`expected host lease: ${JSON.stringify(firstHost)}`);
+    }
+    const leaseA = firstHost.value.lease;
+    const nameA = basename(leaseA.directory);
+    expect(HOST_LEASE_NAME.test(nameA)).toBe(true);
+    expect(statSync(leaseA.directory).mode & 0o777).toBe(0o700);
+    const holderPathA = `${leaseA.directory}.holder`;
+    expect(statSync(holderPathA).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(holderPathA, 'utf8'))).toEqual({
+      version: 1,
+      pid: 202,
+      workspace: 'job-scratch',
+    });
+
+    // A normal host task takes and releases a `<pid>-<6>` lease alongside the live host lease:
+    // its release must NOT detach the volume while `leaseA` is alive.
+    const task = await taskVolume.acquire(provisionOnly);
+    if (!task.ok || task.value.kind !== 'leased') {
+      throw new Error(`expected task lease: ${JSON.stringify(task)}`);
+    }
+    expect(await taskVolume.release(task.value.lease, false, provisionOnly)).toEqual({ ok: true, value: [] });
+    expect(existsSync(leaseA.directory)).toBe(true);
+    expect((await attachedDisks(paths, capacity, gatewaySocket)).map((disk) => disk.mountpoints)).toEqual([
+      [paths.mountpoint],
+    ]);
+
+    // A second host lease whose holder is live is never claimed; once its holder dies, reclaim archives it whole.
+    const secondHost = await holderB.acquireHostLease(provisionOnly, 'dead-ws');
+    if (!secondHost.ok || secondHost.value.kind !== 'leased') {
+      throw new Error(`expected second host lease: ${JSON.stringify(secondHost)}`);
+    }
+    const leaseB = secondHost.value.lease;
+    writeFileSync(join(leaseB.directory, 'evidence'), 'from dead host');
+    // Still alive -> untouched.
+    const probeLive = await taskVolume.acquire(provisionOnly);
+    if (!probeLive.ok || probeLive.value.kind !== 'leased') {
+      throw new Error(`expected probe lease: ${JSON.stringify(probeLive)}`);
+    }
+    expect(existsSync(leaseB.directory)).toBe(true);
+    expect(existsSync(`${leaseB.directory}.holder`)).toBe(true);
+    expect(await taskVolume.release(probeLive.value.lease, false, provisionOnly)).toEqual({ ok: true, value: [] });
+
+    // Holder 303 dies -> next acquire archives leaseB whole and removes its `.holder` sidecar.
+    alive.delete(303);
+    const probeDead = await taskVolume.acquire(provisionOnly);
+    if (!probeDead.ok || probeDead.value.kind !== 'leased') {
+      throw new Error(`expected reclaim lease: ${JSON.stringify(probeDead)}`);
+    }
+    expect(existsSync(leaseB.directory)).toBe(false);
+    expect(existsSync(`${leaseB.directory}.holder`)).toBe(false);
+    const archiveDir = join(paths.mountpoint, '.archive');
+    const deadArchive = readdirSync(archiveDir).find((entry) => entry.endsWith(`-${basename(leaseB.directory)}`));
+    expect(deadArchive).toBeDefined();
+    expect(readFileSync(join(archiveDir, deadArchive ?? '', 'evidence'), 'utf8')).toBe('from dead host');
+    expect(await taskVolume.release(probeDead.value.lease, false, provisionOnly)).toEqual({ ok: true, value: [] });
+
+    // Settle leaseA, then run the real scratch provider as the last lease on the volume.
+    expect(await holderA.settleHostLease(leaseA, provisionOnly)).toEqual({ ok: true, value: [] });
+    expect(existsSync(leaseA.directory)).toBe(false);
+    expect(existsSync(holderPathA)).toBe(false);
+    // leaseA was the last lease -> volume detached.
+    expect(existsSync(paths.mountpoint)).toBe(false);
+    expect(await attachedDisks(paths, capacity, gatewaySocket)).toEqual([]);
+
+    // Now test the provider CLI lifecycle end-to-end on a fresh attach: failed `<5>` dirs archived through retention
+    // (newest ARCHIVES_KEPT kept), passing dir and `.failed` files deleted, volume detached on EOF.
+    const stdin = new PassThrough();
+    const out: string[] = [];
+    const err: string[] = [];
+    const handed = Promise.withResolvers<string>();
+    const provider = runScratchProvider({
+      platform: 'darwin',
+      stdin,
+      stdout: {
+        write(chunk: string) {
+          out.push(chunk);
+          if (out.join('').includes('\n')) handed.resolve(out.join('').trim());
+          return true;
+        },
+      },
+      stderr: {
+        write(chunk: string) {
+          err.push(chunk);
+          return true;
+        },
+      },
+      workspace: 'job-scratch',
+      subtrees: provisionOnly,
+      volume: holderA,
+    });
+    const parsed: unknown = JSON.parse(await handed.promise);
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      !('directory' in parsed) ||
+      typeof parsed.directory !== 'string'
+    ) {
+      throw new Error(`expected {"directory":...} from scratch provider, got ${JSON.stringify(parsed)}`);
+    }
+    const providedDir = parsed.directory;
+    expect(providedDir).toMatch(new RegExp(`^${paths.mountpoint}/h[A-Za-z0-9]{5}$`));
+
+    // Populate a passing task dir (with readonly subtree) and 3 failed task dirs inside the host lease.
+    const passing = join(providedDir, 'pass1');
+    mkdirSync(passing, { mode: 0o700 });
+    readonlyTree(passing);
+    const failedIds = [
+      { id: 'fail1', verdict: 'failed' as const },
+      { id: 'fail2', verdict: 'timed-out' as const },
+      { id: 'fail3', verdict: 'signalled' as const },
+    ];
+    for (const item of failedIds) {
+      const dir = join(providedDir, item.id);
+      mkdirSync(dir, { mode: 0o700 });
+      writeFileSync(join(dir, 'trace'), item.verdict);
+      await writeHostTaskFailure(dir, item.verdict);
+    }
+
+    // Hold a live task lease while provider settles so we can inspect `.archive` before final detach!
+    const observer = await taskVolume.acquire(provisionOnly);
+    if (!observer.ok || observer.value.kind !== 'leased') {
+      throw new Error(`expected observer lease: ${JSON.stringify(observer)}`);
+    }
+    stdin.end();
+    expect(await provider).toBe(0);
+    expect(existsSync(providedDir)).toBe(false);
+    expect(existsSync(`${providedDir}.holder`)).toBe(false);
+    await archiveDeletions();
+    const keptArchives = readdirSync(join(paths.mountpoint, '.archive')).filter((name) => name !== '.deleting');
+    expect(keptArchives).toHaveLength(ARCHIVES_KEPT);
+    expect(err.join('')).toContain('failed');
+    expect(err.join('')).toContain('timed-out');
+    expect(err.join('')).toContain('signalled');
+
+    // Releasing the observer detaches the volume cleanly.
+    expect(await taskVolume.release(observer.value.lease, false, provisionOnly)).toEqual({ ok: true, value: [] });
+    expect(existsSync(paths.mountpoint)).toBe(false);
+    expect(await attachedDisks(paths, capacity, gatewaySocket)).toEqual([]);
+  } finally {
+    try {
+      await detachOwned(owned, paths.uid, gatewaySocket);
+    } finally {
+      await stopGateway();
+    }
+    removeScratchVolume(fixture);
+  }
+}
+
 // Both platforms execute a host proof. APFS leasing is Darwin's contract; other hosts keep
 // their inherited TMPDIR. Running Darwin's fixture there would test a feature the runner never uses.
 describe('temporary-directory policy on this host', () => {
@@ -840,6 +1021,10 @@ describe('temporary-directory policy on this host', () => {
     it(
       'says a lease lost when its volume loses its mount under its task, and detaches the disk the lost mount stranded',
       aLeaseLostUnderItsTask,
+    );
+    it(
+      'keeps the volume alive for a live host lease, reclaims a dead host lease whole, and settles failed task dirs through retention',
+      hostLeaseLifecycle,
     );
   } else {
     it(
