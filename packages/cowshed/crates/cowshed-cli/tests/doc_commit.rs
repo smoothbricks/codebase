@@ -46,6 +46,14 @@ struct Repo {
 
 impl Repo {
     fn new(doc: &str) -> Self {
+        Self::new_with_gateway(doc, TestGateway::start())
+    }
+
+    fn new_with_bounded_deadline(doc: &str, deadline: std::time::Duration) -> Self {
+        Self::new_with_gateway(doc, TestGateway::start_with_bounded_deadline(deadline))
+    }
+
+    fn new_with_gateway(doc: &str, gateway: TestGateway) -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let root =
@@ -53,10 +61,7 @@ impl Repo {
         fs::create_dir_all(root.join("home")).expect("create the test HOME");
         fs::create_dir_all(root.join("bin")).expect("create the test PATH directory");
         let root = fs::canonicalize(&root).expect("canonicalize the test root");
-        let repo = Self {
-            root,
-            gateway: TestGateway::start(),
-        };
+        let repo = Self { root, gateway };
         let main = repo.main();
         fs::create_dir_all(main.join("src")).expect("create main");
         git(&main, &["init", "-q", "-b", "main"]);
@@ -870,4 +875,186 @@ fn a_head_that_moved_under_the_hold_is_not_put_back() {
         "the landed edit stays committed"
     );
     assert_eq!(repo.status(), "");
+}
+
+/// RB1: with a land ticket held and an install waiting (`await-turns`), `cowshed doc-commit` asks
+/// bounded, is numbered at once (not parked), and commits while the install still waits.
+#[test]
+fn doc_commit_completes_behind_a_held_land_while_an_install_waits() {
+    let repo = Repo::new("paths = [\"*.md\"]\n");
+    let before = repo.head();
+
+    // Hold the repository's non-bounded land turn `<TURN>`.
+    let mut land = repo
+        .command(&[
+            "land-turn",
+            TURN,
+            "--gateway-socket",
+            repo.gateway.socket.to_str().unwrap(),
+            "--workspace",
+            "long-land",
+            "--",
+            "sh",
+            "-c",
+            "echo held && exec cat >/dev/null",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn land-turn holder");
+    let land_said = lines(land.stdout.take().expect("land stdout"));
+    assert_eq!(
+        land_said
+            .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
+            .expect("land holds its turn"),
+        "held"
+    );
+
+    // Start a waiting install behind that held land turn.
+    let mut install = repo
+        .command(&[
+            "gateway",
+            "await-turns",
+            "--gateway-socket",
+            repo.gateway.socket.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn await-turns");
+    let install_stderr = lines(install.stderr.take().expect("install stderr"));
+    loop {
+        let line = install_stderr
+            .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
+            .expect("await-turns announces its wait");
+        if line.starts_with("cowshed: await-turns: the install waits for 1 land turn(s)") {
+            break;
+        }
+    }
+
+    // A doc commit asks bounded on `<TURN>.ref` and finishes while the land holds `<TURN>` and the
+    // install still waits.
+    let patch = repo.file("notes.diff", NOTES_PATCH);
+    let output = repo.run(&[
+        "doc-commit",
+        "-m",
+        "docs: under waiting install",
+        "--patch",
+        patch.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "doc-commit should complete behind a held land while an install waits: {}",
+        said(&output)
+    );
+    assert_ne!(repo.head(), before, "doc commit moved HEAD");
+    assert!(
+        install.try_wait().expect("poll waiting install").is_none(),
+        "install must still be waiting on the held land turn"
+    );
+
+    drop(land.stdin.take());
+    assert!(land.wait_bounded().expect("land exits").success());
+    assert!(install.wait_bounded().expect("install exits").success());
+}
+
+/// RB3: when a bounded doc-commit turn stays held past `bounded_turn_deadline`, the gateway ends
+/// it as a lost turn; `cowshed doc-commit` sends SIGTERM to its bound `[doc] check`, reaps it, and
+/// fails naming the bound.
+#[test]
+fn doc_commit_fails_naming_the_bound_and_signals_its_check_past_the_bounded_deadline() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let fifo = std::env::temp_dir().join(format!("cowshed-doc-bound-{}.fifo", std::process::id()));
+    let _ = fs::remove_file(&fifo);
+    let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL");
+    // SAFETY: mkfifo(3) on a test-owned temp path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+    let repo = Repo::new_with_bounded_deadline(
+        &format!(
+            "paths = [\"*.md\"]\ncheck = [\"sh\", \"-c\", \"read x < '{}'\"]\n",
+            fifo.display()
+        ),
+        std::time::Duration::from_millis(250),
+    );
+    let before = repo.head();
+    let patch = repo.file("notes.diff", NOTES_PATCH);
+    let output = repo.run(&[
+        "doc-commit",
+        "-m",
+        "docs: slow check",
+        "--patch",
+        patch.to_str().unwrap(),
+    ]);
+    let _ = fs::remove_file(&fifo);
+
+    assert!(
+        !output.status.success(),
+        "doc-commit past the bounded deadline must fail: {}",
+        said(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("250 ms") && stderr.contains("was sent SIGTERM"),
+        "failure must name the bound and SIGTERM to the check command: {}",
+        said(&output)
+    );
+    assert_eq!(
+        repo.head(),
+        before,
+        "expired doc-commit must not have committed"
+    );
+}
+
+/// RB4: `cowshed doc-commit` asks the gateway for its ref turn with `"class":"bounded"` on the
+/// wire.
+#[test]
+fn doc_commit_asks_for_its_ref_turn_with_class_bounded() {
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+
+    let repo = Repo::new("paths = [\"*.md\"]\n");
+    let stand_in_socket = repo.root.join("stand-in.sock");
+    let listener = UnixListener::bind(&stand_in_socket).expect("bind stand-in control socket");
+    let captured = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept doc-commit ask");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone stream"))
+            .read_line(&mut line)
+            .expect("read doc-commit ask line");
+        let _ = stream.write_all(b"{\"turn\":\"refused\",\"error\":\"captured\"}\n");
+        serde_json::from_str::<serde_json::Value>(&line).expect("parse ask JSON")
+    });
+
+    let patch = repo.file("notes.diff", NOTES_PATCH);
+    let output = repo
+        .command(&[
+            "doc-commit",
+            "-m",
+            "docs: wire class",
+            "--patch",
+            patch.to_str().unwrap(),
+            "--gateway-socket",
+            stand_in_socket.to_str().unwrap(),
+        ])
+        .output_bounded()
+        .expect("run doc-commit against stand-in");
+    assert!(!output.status.success(), "stand-in refused the turn");
+
+    let ask = captured.join().expect("stand-in thread");
+    assert_eq!(
+        (&ask["op"], &ask["repo"], &ask["workspace"], &ask["class"]),
+        (
+            &serde_json::json!(cowshed_core::land_turn::LAND_TURN_OP),
+            &serde_json::json!(format!("{TURN}.ref")),
+            &serde_json::json!("doc-commit"),
+            &serde_json::json!("bounded"),
+        ),
+        "doc-commit must ask its ref turn with class bounded: {ask}"
+    );
 }

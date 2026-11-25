@@ -280,6 +280,8 @@ pub struct GatewayConfig {
     /// there as its drain begins (05_gateway.md "An install never refuses a client connection").
     /// Linux binds no TCP workspace listener, so it has none to carry and never reads this.
     pub listener_handoff: Option<PathBuf>,
+    /// How long a `"class":"bounded"` land or ref turn may stay held once taken.
+    pub bounded_turn_deadline: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -304,6 +306,7 @@ impl Default for GatewayConfig {
             first_launch: None,
             nx_cache: None,
             listener_handoff: None,
+            bounded_turn_deadline: cowshed_core::land_turn::BOUNDED_TURN_DEADLINE,
         }
     }
 }

@@ -45,6 +45,8 @@ pub const LAND_TURNS_OP: &str = "land-turns";
 /// The one-shot gateway control operation that withdraws every install currently waiting for the
 /// land turns (never one already fenced).
 pub const LAND_TURNS_WITHDRAW_OP: &str = "land-turns-withdraw";
+/// How long a `"class":"bounded"` land or ref turn may stay held once taken (05_gateway.md "Deadlines").
+pub const BOUNDED_TURN_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The directory of every repository's land records: a declared land's `lands.log` and its
 /// commands' output (02_workspaces.md "A declared land"), beside the install slot in the host's

@@ -75,6 +75,15 @@ pub struct TestGateway {
 
 impl TestGateway {
     pub fn start() -> Self {
+        Self::start_configured(None)
+    }
+
+    #[allow(dead_code)]
+    pub fn start_with_bounded_deadline(deadline: std::time::Duration) -> Self {
+        Self::start_configured(Some(deadline))
+    }
+
+    fn start_configured(bounded_turn_deadline: Option<std::time::Duration>) -> Self {
         // The socket's root sits under the scratch parent, short enough for a bind path.
         let root = TempRoot::new_in(&temp_parent::scratch_parent(), "csturn");
         let cache = root.join("cache");
@@ -98,15 +107,19 @@ impl TestGateway {
             .enable_all()
             .build()
             .expect("start the test runtime");
+        let mut config = GatewayConfig {
+            control_socket: Some(socket.clone()),
+            mirror_cache: MirrorCacheConfig::new(cache),
+            #[cfg(target_os = "linux")]
+            data_socket_root: Some(data),
+            ..GatewayConfig::default()
+        };
+        if let Some(deadline) = bounded_turn_deadline {
+            config.bounded_turn_deadline = deadline;
+        }
         let gateway = runtime
             .block_on(Gateway::start(
-                GatewayConfig {
-                    control_socket: Some(socket.clone()),
-                    mirror_cache: MirrorCacheConfig::new(cache),
-                    #[cfg(target_os = "linux")]
-                    data_socket_root: Some(data),
-                    ..GatewayConfig::default()
-                },
+                config,
                 Arc::new(NoCredentials),
                 Arc::new(NoConnector),
                 Arc::new(DiscardAudit),

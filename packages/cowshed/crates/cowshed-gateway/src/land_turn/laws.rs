@@ -438,3 +438,21 @@ fn recorded_turns_replay_through_the_model_and_turns() {
     }
     assert_eq!(pairs.len(), 6, "six repositories' queues were recorded");
 }
+
+/// Option B law-driver red (05_gateway.md "The read fences the turns"): while an install waits
+/// behind a non-bounded land ticket, a bounded ask from outside enters the queue (not parked), and
+/// once the land ticket leaves leaving only bounded tickets, a later bounded ask parks.
+#[test]
+fn a_bounded_ask_enters_behind_a_land_while_an_install_waits_and_parks_once_the_land_leaves() {
+    let mut pair = Pair::new("acme");
+    pair.input(&Op::TAsk(1), None).unwrap();
+    pair.input(&Op::TWait, None).unwrap();
+    // Against today's model (which has no bounded class), this ask from outside is parked instead
+    // of numbered behind land 1.
+    pair.input(&Op::TAsk(2), None).unwrap();
+    assert_eq!(
+        (pair.turns.numbered, pair.turns.parked.len()),
+        (2, 0),
+        "bounded ask behind a held land while an install waits must be numbered, not parked"
+    );
+}

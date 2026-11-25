@@ -539,6 +539,203 @@ async fn a_gateway_that_does_not_answer_refuses_the_turn() {
     );
 }
 
+/// A bounded ask (`"class":"bounded"`) from outside every held turn is numbered at once while an
+/// install waits if some queue still holds a non-bounded ticket, takes its turn, and completes
+/// while the install still waits (05_gateway.md "The read fences the turns").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bounded_ask_behind_a_held_land_is_numbered_while_an_install_waits() {
+    let (_gateway, _root, socket) = gateway().await;
+    // Hold the land turn by a bound command alone so later asks from this process are from outside.
+    let mut land = take_free(&socket, "land").await;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped());
+    land.bind_at_exec(&mut command);
+    let mut command = command.spawn().expect("spawn the land's command");
+    awaiting("the command's bind", land.bound(command.id()))
+        .await
+        .expect("bind the land's command");
+    land.end("its command runs on".to_owned());
+
+    let mut install = waiting_fence(&socket).await;
+    let waiting = control_line(&mut install).await;
+    assert_eq!(waiting["fenced"], serde_json::json!(false), "{waiting}");
+
+    // A bounded ask on `<REPO>.ref` arrives while the land holds `<REPO>` and the install waits.
+    let mut doc = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("connect bounded ask");
+    let ask = serde_json::json!({
+        "op": land_turn::LAND_TURN_OP,
+        "repo": format!("{REPO}.ref"),
+        "workspace": "doc-commit",
+        "command": "cowshed doc-commit",
+        "class": "bounded",
+    });
+    doc.write_all(format!("{ask}\n").as_bytes())
+        .await
+        .expect("send bounded ask");
+    let (doc_read, mut doc_write) = doc.into_split();
+    let mut doc_answers = BufReader::new(doc_read).lines();
+    let first = raw_answer(&mut doc_answers).await;
+    assert_eq!(
+        (&first["turn"], &first["ticket"]["workspace"]),
+        (&serde_json::json!("held"), &serde_json::json!("doc-commit")),
+        "bounded ask behind a held land must be numbered immediately, not parked: {first}"
+    );
+    doc_write
+        .write_all(b"{\"step\":\"end\",\"outcome\":\"committed\"}\n")
+        .await
+        .expect("end bounded turn");
+    drop(doc_write);
+    drop(doc_answers);
+
+    // Release the land: now the install is fenced.
+    drop(command.stdin.take());
+    command.wait_bounded().expect("the land's command ends");
+    let fenced = control_line(&mut install).await;
+    assert_eq!(fenced["fenced"], serde_json::json!(true), "{fenced}");
+}
+
+/// Once only bounded tickets remain in the queues while an install waits, a new bounded ask from
+/// outside parks (`{"turn":"fenced"}`) until the install's fence lifts, so the install waits at
+/// most one bound past the last land ticket (05_gateway.md "The read fences the turns").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bounded_ask_parks_once_only_bounded_tickets_remain() {
+    let (_gateway, _root, socket) = gateway().await;
+    // First bounded ticket holds `<REPO>.ref` via its bound command so later asks are from outside.
+    let mut first = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("connect first bounded ask");
+    let first_ask = serde_json::json!({
+        "op": land_turn::LAND_TURN_OP,
+        "repo": format!("{REPO}.ref"),
+        "workspace": "doc-first",
+        "command": "cowshed doc-commit",
+        "class": "bounded",
+    });
+    first
+        .write_all(format!("{first_ask}\n").as_bytes())
+        .await
+        .expect("send first bounded ask");
+    let (first_read, mut first_write) = first.into_split();
+    let mut first_answers = BufReader::new(first_read).lines();
+    let held = raw_answer(&mut first_answers).await;
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped());
+    let mut command = command.spawn().expect("spawn first bounded command");
+    first_write
+        .write_all(format!("{{\"step\":\"bind\",\"pid\":{}}}\n", command.id()).as_bytes())
+        .await
+        .expect("bind first bounded command");
+    let bound = raw_answer(&mut first_answers).await;
+    assert_eq!(bound["turn"], serde_json::json!("bound"), "{bound}");
+    first_write
+        .write_all(b"{\"step\":\"end\",\"outcome\":\"command runs on\"}\n")
+        .await
+        .expect("end first bounded asker");
+    drop(first_write);
+    drop(first_answers);
+
+    // Install waits: only the bounded ticket is in any queue.
+    let mut install = waiting_fence(&socket).await;
+    let waiting = control_line(&mut install).await;
+    assert_eq!(waiting["fenced"], serde_json::json!(false), "{waiting}");
+
+    // Second bounded ask arrives with no non-bounded ticket left: it must park.
+    let mut second = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("connect second bounded ask");
+    let second_ask = serde_json::json!({
+        "op": land_turn::LAND_TURN_OP,
+        "repo": format!("{REPO}.ref"),
+        "workspace": "doc-second",
+        "command": "cowshed doc-commit",
+        "class": "bounded",
+    });
+    second
+        .write_all(format!("{second_ask}\n").as_bytes())
+        .await
+        .expect("send second bounded ask");
+    let mut second_answers = BufReader::new(second).lines();
+    assert_eq!(
+        raw_answer(&mut second_answers).await,
+        serde_json::json!({"turn": "fenced"}),
+        "bounded ask must park once only bounded tickets remain"
+    );
+
+    // First bounded ticket ends -> install is fenced -> install lifts -> second is numbered.
+    drop(command.stdin.take());
+    command.wait_bounded().expect("first bounded command ends");
+    let fenced = control_line(&mut install).await;
+    assert_eq!(fenced["fenced"], serde_json::json!(true), "{fenced}");
+    drop(install);
+    let second_held = raw_answer(&mut second_answers).await;
+    assert_eq!(
+        (&second_held["turn"], &second_held["ticket"]["workspace"]),
+        (&serde_json::json!("held"), &serde_json::json!("doc-second")),
+        "parked bounded ask is numbered once install's fence lifts: {second_held}"
+    );
+}
+
+/// A bounded ticket still held at `bounded_turn_deadline` is ended by the gateway with
+/// `{"turn":"expired","boundMs":...}` and a closed connection (05_gateway.md "Deadlines").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bounded_ticket_past_its_deadline_is_ended_and_names_the_bound() {
+    let id = Uuid::new_v4().simple().to_string();
+    let root = fixture_dir::secure_fixture_dir(&format!("csturn-{}", &id[..8]));
+    let cache = root.path().join("cache");
+    std::fs::create_dir(&cache).expect("cache");
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
+    let socket = root.path().join("gateway.sock");
+    let bound = Duration::from_millis(200);
+    let _gateway = Gateway::start(
+        GatewayConfig {
+            control_socket: Some(socket.clone()),
+            mirror_cache: MirrorCacheConfig::new(cache),
+            bounded_turn_deadline: bound,
+            ..GatewayConfig::default()
+        },
+        Arc::new(NoCredentials),
+        Arc::new(NoConnector),
+        Arc::new(DiscardAudit),
+    )
+    .await
+    .expect("start gateway with short bounded-turn deadline");
+
+    let mut doc = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("connect bounded ask");
+    let ask = serde_json::json!({
+        "op": land_turn::LAND_TURN_OP,
+        "repo": format!("{REPO}.ref"),
+        "workspace": "doc-commit",
+        "command": "cowshed doc-commit",
+        "class": "bounded",
+    });
+    doc.write_all(format!("{ask}\n").as_bytes())
+        .await
+        .expect("send bounded ask");
+    let mut answers = BufReader::new(doc).lines();
+    let held = raw_answer(&mut answers).await;
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+
+    let expired = raw_answer(&mut answers).await;
+    assert_eq!(
+        (&expired["turn"], &expired["boundMs"]),
+        (&serde_json::json!("expired"), &serde_json::json!(200)),
+        "gateway must expire the bounded ticket at the bound: {expired}"
+    );
+    let eof = awaiting("connection close after expiry", answers.next_line())
+        .await
+        .expect("read eof");
+    assert_eq!(eof, None, "gateway closes the expired turn's connection");
+}
+
 /// The install's read of the land turns as `start_service` asks it, with the fence, and the
 /// connection that holds the fence for as long as it is open (05_gateway.md "The read fences the
 /// turns").
@@ -586,7 +783,9 @@ async fn ask_raw(socket: &Path, workspace: &str) -> Lines<BufReader<UnixStream>>
 }
 
 /// The next answer on a raw land-turn connection, as JSON.
-async fn raw_answer(answers: &mut Lines<BufReader<UnixStream>>) -> serde_json::Value {
+async fn raw_answer<R: tokio::io::AsyncBufRead + Unpin>(
+    answers: &mut Lines<R>,
+) -> serde_json::Value {
     let line = awaiting("the gateway's next answer", answers.next_line())
         .await
         .expect("read the gateway's answer")
