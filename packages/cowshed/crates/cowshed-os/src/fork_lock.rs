@@ -261,10 +261,13 @@ pub fn hold_exclusive() -> ExclusiveHold {
 pub mod spawn_count {
     use std::cell::RefCell;
     use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, PoisonError};
 
     thread_local! {
         static SPAWNED: RefCell<Vec<(OsString, usize)>> = const { RefCell::new(Vec::new()) };
     }
+
+    static ALL_SPAWNED: Mutex<Vec<OsString>> = Mutex::new(Vec::new());
 
     pub(super) fn record(program: &OsStr) {
         SPAWNED.with_borrow_mut(|spawned| {
@@ -273,6 +276,10 @@ pub mod spawn_count {
                 None => spawned.push((program.to_owned(), 1)),
             }
         });
+        ALL_SPAWNED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(program.to_owned());
     }
 
     /// How many children this thread has spawned whose command names `program`, as the command
@@ -285,6 +292,29 @@ pub mod spawn_count {
                 .find(|(named, _)| named == program)
                 .map_or(0, |(_, count)| *count)
         })
+    }
+
+    /// Process-wide cursor into every program spelling passed to [`super::Spawn`] across all
+    /// threads (including `spawn_blocking` workers), complementing the thread-local [`spawned`].
+    #[derive(Debug)]
+    pub struct ProcessSpawns {
+        from: usize,
+    }
+
+    impl ProcessSpawns {
+        /// Start observing every subsequent spawn across all threads of this process.
+        pub fn start() -> Self {
+            let from = ALL_SPAWNED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            Self { from }
+        }
+
+        /// The program spellings passed to [`super::Spawn`] on any thread since [`Self::start`].
+        pub fn programs(&self) -> Vec<OsString> {
+            ALL_SPAWNED.lock().unwrap_or_else(PoisonError::into_inner)[self.from..].to_vec()
+        }
     }
 }
 

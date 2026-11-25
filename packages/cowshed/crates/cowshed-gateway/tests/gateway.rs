@@ -475,3 +475,80 @@ fn validation_rejects_ambiguous_policy_and_platform_endpoints() {
         .is_err()
     );
 }
+
+/// Holding the process-wide fork lock exclusive while a client connects to the gateway's control
+/// socket must not stop the gateway's `current_thread` runtime from serving other actor work, and
+/// the control listener must answer again once the hold ends (`actor.rs`, `accept_locked`).
+#[tokio::test(flavor = "current_thread")]
+async fn gateway_control_accept_does_not_block_runtime_while_fork_lock_is_held() {
+    use cowshed_os::test_backstop::UnixStreamBackstop as _;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::sync::atomic::AtomicBool;
+
+    let control_dir = secure_fixture_dir(&format!("cowshed-gw-accept-{}", std::process::id()));
+    let control_socket = control_dir.path().join("control.sock");
+    let (mut config, _cache) = test_config();
+    config.control_socket = Some(control_socket.clone());
+    let gw = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let client =
+        cowshed_gateway::GatewayControlClient::new(control_socket.clone()).expect("control client");
+    client
+        .status()
+        .await
+        .expect("baseline status before fork-lock hold");
+
+    let hold_active = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let socket_for_thread = control_socket.clone();
+    let active_for_thread = Arc::clone(&hold_active);
+    let holder = std::thread::spawn(move || {
+        let hold = cowshed_os::fork_lock::hold_exclusive();
+        active_for_thread.store(true, Ordering::Release);
+        // Connect without taking `fork_lock` so the kernel marks the control listener readable
+        // while the exclusive hold is active.
+        let _pending = StdUnixStream::connect_bounded(&socket_for_thread)
+            .expect("connect to control socket while fork lock is held");
+        let _ = ready_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        active_for_thread.store(false, Ordering::Release);
+        drop(hold);
+    });
+
+    ready_rx
+        .await
+        .expect("holder acquired fork lock and connected");
+    // Give the current_thread reactor a turn to poll the control listener's accept arm. While
+    // `accept_locked` takes `FORK_LOCK` exclusive synchronously on the runtime thread, this
+    // sleep is frozen for the whole 2 s hold and zero actor work runs during the hold.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut served_during_hold = 0usize;
+    while hold_active.load(Ordering::Acquire) && served_during_hold < 5 {
+        gw.handle()
+            .status()
+            .await
+            .expect("gateway actor answers status while accept waits on the fork lock");
+        served_during_hold += 1;
+    }
+    let _ = release_tx.send(());
+    holder.join().expect("holder thread");
+
+    assert!(
+        served_during_hold > 0,
+        "gateway runtime served no work while control accept waited on the fork lock"
+    );
+    client
+        .status()
+        .await
+        .expect("control listener still answers once the fork-lock hold ends");
+    gw.drain().await.expect("drain gateway");
+}

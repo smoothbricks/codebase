@@ -451,3 +451,44 @@ async fn controller_git_writes_its_profile_into_the_store_it_serves() {
         "one profile for one plain checkout: {profiles:?}"
     );
 }
+
+/// Repeated `git` spawns through the process-wide fork-lock recorder use a single resolved
+/// absolute program path instead of a bare `"git"` that walks `PATH` on every spawn
+/// (`fork_lock.rs`, `11_shell.md`).
+#[test]
+fn repeated_git_spawns_record_absolute_program_paths() {
+    let root = repository();
+    let recorded = cowshed_os::fork_lock::spawn_count::ProcessSpawns::start();
+    for _ in 0..2 {
+        let output = crate::git::git_command_at(&root)
+            .args(["rev-parse", "HEAD"])
+            .output_bounded()
+            .expect("run git rev-parse");
+        assert!(
+            output.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let programs = recorded.programs();
+    assert!(
+        programs.len() >= 2,
+        "expected at least two recorded git spawns, got {programs:?}"
+    );
+    for program in &programs {
+        assert!(
+            Path::new(program).is_absolute(),
+            "repeated git spawn used bare program name instead of resolved absolute path: {programs:?}"
+        );
+    }
+    assert!(
+        programs.windows(2).all(|pair| pair[0] == pair[1]),
+        "repeated git spawns resolved differently: {programs:?}"
+    );
+    let sandboxed = crate::git::sandboxed_git();
+    assert!(
+        sandboxed.program.is_absolute(),
+        "sandboxed_git program is not an absolute path: {:?}",
+        sandboxed.program
+    );
+}
