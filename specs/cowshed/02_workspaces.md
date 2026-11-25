@@ -1295,13 +1295,17 @@ unchanged.
 
 1. **Refuse early.** The land runs `land --preflight`'s fences first, so a land that would refuse after its gate (a
    dirty tree, a retired binding) refuses before it asks for a turn.
-2. **The land turn.** It takes its repository's turn, the queue `[land] turn` (05_gateway.md "Land turns"), in this
-   process, and holds it through step 5 and its retire: its wait reports, ticket and the gateway's log lines are
-   `land-turn`'s, with `<ws>` as the ticket's workspace. The gate (step 4) binds itself to the turn as `land-turn`'s
-   command does, from its start, so the gateway keeps the turn until the gate has ended too, however this process ends:
-   a land killed alone leaves its gate holding the turn, never a second land beside it. That gate does not run on for
-   nobody: its foreground `cowshed exec`s end with the land (05_gateway.md "A job lives with its requester"), so the
-   gate ends by itself and the turn passes on.
+2. **The land turn.** It takes its repository's turn, the queue `[land] turn` (05_gateway.md "Land turns"), as a
+   resumable turn (`resumable: true`) in this process, and holds it through step 5 and its retire: its wait reports,
+   ticket and the gateway's log lines are `land-turn`'s, with `<ws>` as the ticket's workspace. The gate (step 4) binds
+   itself to the turn as `land-turn`'s command does, from its start, so the gateway keeps the turn until the gate has
+   ended too, however this process ends: a land killed alone leaves its gate holding the turn, never a second land
+   beside it. That gate does not run on for nobody: its foreground `cowshed exec`s end with the land (05_gateway.md "A
+   job lives with its requester"), so the gate ends by itself and the turn passes on. When an install asks the gateway
+   to fence turns for a restart (05_gateway.md "The read fences the turns"), the land acknowledges `{"step":"fenced"}`
+   within one heartbeat (`HEARTBEAT`, 5 s) while its running rebase or gate continues untouched; once the replacing
+   gateway serves, it reconnects within `HANDSHAKE` (10 s) and resumes with its token (`land-turn-resume`). Any new
+   `bind` or `end` waits until the turn has resumed (or unfenced, if the install lifted its fence without restarting).
 3. **Rebase.** It first brings main to the head of `[land] push`'s branch: a writer that pushes main without landing it
    (a release workflow's version commits, dispatched under the land turn: 05_gateway.md "A publish holds the land turn")
    can leave the remote ahead, and a land onto the main it left behind would gate, land and run its after commands on a
@@ -1313,25 +1317,33 @@ unchanged.
    commit. It rebases `<ws>` onto main's head as `cowshed rebase <ws> --expected-onto-head <head>` does, and again onto
    the newer head when main moved before the rebase began (`OntoMoved`). A conflict stops the land with the rebase's own
    refusal and the workspace as it was: the land aborts the replay the rebase stopped (`--abort`), and the conflict is
-   resolved through `cowshed rebase <ws>` and `--continue` before landing again. A turn lost while the rebase runs stops
-   the land once the rebase has ended, and one found lost before the fast-forward (step 5) stops it before main moves.
+   resolved through `cowshed rebase <ws>` and `--continue` before landing again. A fenced gateway restart is not a lost
+   turn; a genuine turn loss (an unfenced close, silence while fenced, or a failed or refused resume: 05_gateway.md
+   "Land turns") while the rebase runs stops the land once the rebase has ended, and one found lost before the
+   fast-forward (step 5) stops it before main moves.
 4. **The declared gate.** It runs `[land] gate`, `{workspace}` replaced by `<ws>`, on the host in main's pure
-   environment (below), its stdout and stderr on the land's stderr. A nonzero exit stops the land (exit 4, naming the
-   gate and how it ended) and keeps the workspace. The gate checks the tree; it moves neither main nor the workspace,
-   and a workspace head that moved during the gate is step 5's `SourceMoved`.
+   environment (below), its stdout and stderr on the land's stderr. A fenced gateway restart leaves the bound gate
+   running untouched while the land resumes its turn on the replacing gateway. A nonzero exit stops the land (exit 4,
+   naming the gate and how it ended) and keeps the workspace. The gate checks the tree; it moves neither main nor the
+   workspace, and a workspace head that moved during the gate is step 5's `SourceMoved`.
 5. **Fast-forward under the ref turn.** It lands exactly the gated head onto exactly the head it rebased onto (the
    primitive above with `--expected-source-head` and `--expected-target-head` pinned), and its ref fence is the
    repository's **ref turn**, the queue `<turn>.ref` a doc commit holds ("`cowshed doc-commit`" below), taken only from
-   the head re-read through the fast-forward. The primitive's retire is the route's: the workspace is retired as
-   `cowshed land` retires the unit it landed, however young, with whatever that retire takes with it (`--no-retire`
-   keeps it, and the land collects build volumes instead). A main that moved since the rebase (`TargetMoved`: a doc
-   commit landed while the gate ran) sends the land back to step 3: it rebases onto the new head and runs the gate
-   again, whose Nx cache replays every task the commits main gained do not reach; stderr counts the re-gates. A refusal
-   no fence made, with main holding the gated head and that head not the one it rebased onto, came after the
-   fast-forward, from the retire: main has moved, so the land goes on to step 6 and answers that refusal last. Any other
-   refusal stops the land. Lock order is always the land turn, then the ref turn; nothing holds a ref turn and then asks
-   for a land turn, so the two never deadlock; and an install that waits for the land turn never parks the ref turn
-   asked inside it (05_gateway.md "The read fences the turns").
+   the head re-read through the fast-forward. If the land's turn resumed across a gateway build change during the gate
+   (05_gateway.md "A land step waits for an install in progress"), the land does not re-run the gate: it runs the
+   installed cowshed's step 5 as a **bound child of its held turn** (`bind_at_exec`), passing the land's recorded proof
+   (the gated head and its verdict) explicitly; that child never re-derives the proof. If the installed build refuses
+   that proof's format, it refuses by name and the land fails closed through the lost-turn path — never silently
+   re-gating. The primitive's retire is the route's: the workspace is retired as `cowshed land` retires the unit it
+   landed, however young, with whatever that retire takes with it (`--no-retire` keeps it, and the land collects build
+   volumes instead). A main that moved since the rebase (`TargetMoved`: a doc commit landed while the gate ran) sends
+   the land back to step 3: it rebases onto the new head and runs the gate again, whose Nx cache replays every task the
+   commits main gained do not reach; stderr counts the re-gates. A refusal no fence made, with main holding the gated
+   head and that head not the one it rebased onto, came after the fast-forward, from the retire: main has moved, so the
+   land goes on to step 6 and answers that refusal last. Any other refusal stops the land. Lock order is always the land
+   turn, then the ref turn; nothing holds a ref turn and then asks for a land turn, so the two never deadlock; and an
+   install that waits for the land turn never parks the ref turn asked inside an unfenced held turn (05_gateway.md "The
+   read fences the turns").
 6. **After the turn.** The turn ends once the fast-forward's retire has. Then, outside it: the landed head is recorded
    in `lands.log` in the turn's records directory (`{atUnixMs, event, head, before?, detail?}`, `event` one of `landed`,
    `unpushed`, `pushed`, `push-failed`, `after-exited`, `installed`; appended, never rewritten), and the land submits

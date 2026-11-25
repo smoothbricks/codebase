@@ -1,24 +1,26 @@
 # Restart safety across an install and a land (specs/cowshed/05_gateway.md "An
-# install refuses while a land runs", "A land step waits for an install in
-# progress", "The install slot", "Land turns"): every interleaving of one
-# install and any number of lands, with the gateway's land-turn queue, the
-# install slot and the workspace supervisors' admitted gate jobs.
+# install refuses while an unfenced land runs", "A land step waits for an
+# install in progress", "The install slot", "Land turns"): every interleaving
+# of one install and any number of lands, with the gateway's land-turn queue,
+# the install slot and the workspace supervisors' admitted gate jobs.
 #
 # The install (tooling/land-install.sh, then cowshed-cli gateway_service.rs
 # `start_service` or setup's refresh):
 #   InstallBuild  land-install builds the release CLI. Today's design
-#                 (turn=False): readiness, no held turn, is judged first and
-#                 the build runs in a shed forked at the head, asking no turn
-#                                                     IRUnbuilt -> IRFree | IRRefused
+#                 (turn=False): readiness, no unfenced turn, is judged first
+#                 and the build runs in a shed forked at the head, asking no
+#                 turn                                IRUnbuilt -> IRFree | IRRefused
 #                 The old design (turn=True): the build asks a land turn of
-#                 its own, holds it, then ends it  IRUnbuilt -> IRBuilding -> IRFree
+#                 its own, holds it, then ends it     IRUnbuilt -> IRBuilding -> IRFree
 #   TakeSlot      exclusive flock on install.lock     IRFree -> IRHeld
 #   ReadBlockers  agent_cycle `read_judged` over the gateway's fenced
-#                 `land-turns` read: refused while a queue has a holder, and
-#                 with `fenced` the read fences the turns otherwise
-#                                                     IRHeld -> IRRefused | IRClear
-#   Restart       activation: the old gateway drains, its control socket and
-#                 every land-turn connection close    IRClear -> IRRestarted
+#                 `land-turns` read: refused while any queue holds an unfenced
+#                 ticket; with `fenced` the read fences the turns once every
+#                 ticket is fenced (including empty)  IRHeld -> IRRefused | IRClear
+#   Restart       activation: the old gateway snapshots every fenced ticket and
+#                 drains; fenced tickets survive into the replacing gateway
+#                 (their lands enter LRResuming*), while unfenced tickets are
+#                 dropped (LRDropped/LROrphan)        IRClear -> IRRestarted
 #   ReleaseSlot   the new gateway serves              IRRestarted -> IRDone
 # A land (run.rs `is_land_step`, declared_land.rs `land`, land_turn.rs):
 #   WaitSlot  install_basis `wait_for_install`: waits while an install holds
@@ -27,16 +29,27 @@
 #             gateway serving the ask fails the land  LRReady -> LRAsked | LRLost
 #   BindGate  the holder (first ticket) binds its gate, which a workspace
 #             supervisor admits                      LRAsked -> LRGate
+#   Fence     ROFence{id}: under `fenced=True`, a land in LRAsked or LRGate
+#             acknowledges `{"turn":"fence"}` within one heartbeat, marking its
+#             ticket fenced while its gate keeps running
+#                                                    LRAsked -> LRFencedAsked
+#                                                    LRGate  -> LRFencedGate
+#   Resume    once the replacing gateway serves (IRDone), a fenced land resumes
+#             with its token (land-turn-resume)      LRResuming* -> LRAsked | LRGate
+#             if the install lifted its fence without restarting, it unfences
+#             in place                               LRFenced*   -> LRAsked | LRGate
 #   End       the gate ends and the land ends its hold  LRGate -> LRDone
-#   a land whose turn's connection closed fails; one with a bound gate sends
-#   it SIGTERM (declared_land.rs `gate`)            LRDropped|LROrphan -> LRLost
+#   a land whose unfenced turn connection closed fails; one with a bound gate
+#   sends it SIGTERM (declared_land.rs `gate`)       LRDropped|LROrphan -> LRLost
 #
 # `fenced` is the repair the code implements (05_gateway.md "The read fences
-# the turns"): the read of the blockers fences the gateway's turns, and an ask
-# the fence meets waits for the install slot and asks again (the land goes back
-# to WaitSlot). fenced=False is the code before it, whose races
-# install_restart_open.bend states. One repository's queue is the model: an
-# install is refused by any queue's holder, so other queues only add refusals.
+# the turns", "Land turns"): resumable tickets fence within one heartbeat and
+# survive the restart in the handoff snapshot; the read fences once every
+# ticket is fenced, and outside asks meeting the fence wait for the install
+# slot and ask again (back to WaitSlot). fenced=False is the code before it,
+# whose races install_restart_open.bend states. One repository's queue is the
+# model: an install is refused by any queue's unfenced ticket, so other queues
+# only add refusals.
 #
 # Check: bun bend2/main.ts install_restart.bend --verdict
 # Bound to the code by cowshed-cli src/agent_cycle/laws.rs (`restart_blockers`,
@@ -59,6 +72,10 @@ type LR is Data:
   LRReady{}
   LRAsked{}
   LRGate{}
+  LRFencedAsked{}
+  LRFencedGate{}
+  LRResumingAsked{}
+  LRResumingGate{}
   LRDone{}
   LRDropped{}
   LROrphan{}
@@ -67,22 +84,28 @@ type LR is Data:
 type Ld is Data:
   Ld{id: Nat, ph: LR}
 
-# a ticket: the land that asked, and whether it asked before the blockers were read
+# a ticket: the land that asked, whether it asked before the blockers were read,
+# and whether its asker has fenced for a restart
 type Tk is Data:
-  Tk{id: Nat, early: Bool}
+  Tk{id: Nat, early: Bool, fenced: Bool}
   TkI{}
 
 type RO is Data:
   ROInstall{}
   ROLand{id: Nat}
+  ROFence{id: Nat}
 
-# one repository's queue as `land-turns` lists it: its ticket numbers in order
+# one ticket as `land-turns` lists it: its number and whether it has fenced
+type RT is Data:
+  RT{num: Nat, fenced: Bool}
+
+# one repository's queue as `land-turns` lists it: its tickets in order
 type RQ is Data:
-  RQ{repo: Nat, tickets: +List<Nat>}
+  RQ{repo: Nat, tickets: +List<RT>}
 
-# cuts: restarts that closed a held turn; early: those whose queue held a ticket
-# asked before the read; kills: admitted gates sent SIGTERM for a lost turn;
-# refused: asks that met no gateway
+# cuts: restarts that closed an unfenced turn; early: those whose queue held an
+# unfenced ticket asked before the read; kills: admitted gates sent SIGTERM for
+# a lost turn; refused: asks that met no gateway
 type Ty is Data:
   Ty{cuts: Nat, early: Nat, kills: Nat, refused: Nat}
 
@@ -160,14 +183,22 @@ def remove_n(+x: Nat, xs: +List<Nat>) -> +List<Nat>:
 
 # --- the blocker judgement (agent_cycle.rs `restart_blockers`, `refusal`) --------
 
-def blockers.q(ts: +List<Nat>, rest: +List<Nat>) -> +List<Nat>:
+def blockers.if(n: Nat, f: Bool, rest: +List<Nat>) -> +List<Nat>:
+  match f:
+    case True{}:
+      rest
+    case False{}:
+      n <> rest
+
+# every unfenced ticket of one queue, in order (a fenced ticket survives restart)
+def blockers.q(ts: +List<RT>, rest: +List<Nat>) -> +List<Nat>:
   match ts:
     case Nil{}:
       rest
-    case Con{n, u}:
-      n <> rest
+    case Con{RT{n, f}, u}:
+      blockers.if(n, f, blockers.q(u, rest))
 
-# the holder of each repository's turn: the first ticket of each queue
+# the unfenced tickets across all queues: each blocks a restart
 def blockers(qs: +List<RQ>) -> +List<Nat>:
   match qs:
     case Nil{}:
@@ -175,58 +206,78 @@ def blockers(qs: +List<RQ>) -> +List<Nat>:
     case Con{RQ{r, ts}, t}:
       blockers.q(ts, blockers(t))
 
-# an install refuses while anything blocks it
+# an install refuses while any unfenced ticket blocks it
 def refuses(+qs: +List<RQ>) -> Bool:
   not(is_nil(blockers(qs)))
 
 # --- the queue --------------------------------------------------------------------
 
-# a ticket's number as `land-turns` lists it; the install build's own ticket is
-# listed like any other
-def tk_id(t: Tk) -> Nat:
+# a ticket as `land-turns` lists it; the old install build's ticket is unfenced
+def rt_of(t: Tk) -> RT:
   match t:
-    case Tk{i, e}:
-      i
+    case Tk{i, e, f}:
+      RT{i, f}
     case TkI{}:
-      0n
+      RT{0n, False{}}
 
-# the ticket is land x's (never the install build's)
-def names(+x: Nat, t: Tk) -> Bool:
-  match t:
-    case Tk{i, e}:
-      same(x, i)
-    case TkI{}:
-      False{}
-
-def ids(q: +List<Tk>) -> +List<Nat>:
+def rts(q: +List<Tk>) -> +List<RT>:
   match q:
     case Nil{}:
       []
     case Con{h, t}:
-      tk_id(h) <> ids(t)
+      rt_of(h) <> rts(t)
 
-def is_nil_t(q: +List<Tk>) -> Bool:
+# the ticket is land x's (never the install build's)
+def names(+x: Nat, t: Tk) -> Bool:
+  match t:
+    case Tk{i, e, f}:
+      same(x, i)
+    case TkI{}:
+      False{}
+
+def any_unfenced(q: +List<Tk>) -> Bool:
   match q:
     case Nil{}:
+      False{}
+    case Con{Tk{i, e, True{}}, t}:
+      any_unfenced(t)
+    case Con{Tk{i, e, False{}}, t}:
       True{}
-    case Con{h, t}:
-      False{}
-
-def any_early(q: +List<Tk>) -> Bool:
-  match q:
-    case Nil{}:
-      False{}
-    case Con{Tk{i, e}, t}:
-      or(e, any_early(t))
     case Con{TkI{}, t}:
-      any_early(t)
+      True{}
 
-def mem_t(+x: Nat, q: +List<Tk>) -> Bool:
+def any_early_unfenced(q: +List<Tk>) -> Bool:
   match q:
     case Nil{}:
       False{}
-    case Con{h, t}:
-      or(names(x, h), mem_t(x, t))
+    case Con{Tk{i, e, True{}}, t}:
+      any_early_unfenced(t)
+    case Con{Tk{i, e, False{}}, t}:
+      or(e, any_early_unfenced(t))
+    case Con{TkI{}, t}:
+      any_early_unfenced(t)
+
+def mem_unfenced(+x: Nat, q: +List<Tk>) -> Bool:
+  match q:
+    case Nil{}:
+      False{}
+    case Con{Tk{i, e, False{}}, t}:
+      or(same(x, i), mem_unfenced(x, t))
+    case Con{Tk{i, e, True{}}, t}:
+      mem_unfenced(x, t)
+    case Con{TkI{}, t}:
+      mem_unfenced(x, t)
+
+def mem_fenced(+x: Nat, q: +List<Tk>) -> Bool:
+  match q:
+    case Nil{}:
+      False{}
+    case Con{Tk{i, e, True{}}, t}:
+      or(same(x, i), mem_fenced(x, t))
+    case Con{Tk{i, e, False{}}, t}:
+      mem_fenced(x, t)
+    case Con{TkI{}, t}:
+      mem_fenced(x, t)
 
 def snoc_t(q: +List<Tk>, +x: Tk) -> +List<Tk>:
   match q:
@@ -249,6 +300,35 @@ def remove_t(+x: Nat, q: +List<Tk>) -> +List<Tk>:
     case Con{+h, t}:
       remove_t.if(h, remove_t(x, t), names(x, h))
 
+# mark land x's ticket fenced or unfenced
+def set_fenced.if(i: Nat, e: Bool, f: Bool, nf: Bool, t: +List<Tk>, r: +List<Tk>, b: Bool) -> +List<Tk>:
+  match b:
+    case True{}:
+      Tk{i, e, nf} <> t
+    case False{}:
+      Tk{i, e, f} <> r
+
+def set_fenced(+x: Nat, +nf: Bool, q: +List<Tk>) -> +List<Tk>:
+  match q:
+    case Nil{}:
+      []
+    case Con{Tk{+i, +e, +f}, +t}:
+      set_fenced.if(i, e, f, nf, t, set_fenced(x, nf, t), same(x, i))
+    case Con{TkI{}, t}:
+      TkI{} <> set_fenced(x, nf, t)
+
+# a restart preserves every fenced ticket in order and drops every unfenced one
+def keep_fenced(q: +List<Tk>) -> +List<Tk>:
+  match q:
+    case Nil{}:
+      []
+    case Con{Tk{i, e, True{}}, t}:
+      Tk{i, e, True{}} <> keep_fenced(t)
+    case Con{Tk{i, e, False{}}, t}:
+      keep_fenced(t)
+    case Con{TkI{}, t}:
+      keep_fenced(t)
+
 # the first ticket holds the turn (land_turn.bend `one_holder`)
 def first_is(+x: Nat, q: +List<Tk>) -> Bool:
   match q:
@@ -259,7 +339,7 @@ def first_is(+x: Nat, q: +List<Tk>) -> Bool:
 
 def is_tki(t: Tk) -> Bool:
   match t:
-    case Tk{i, e}:
+    case Tk{i, e, f}:
       False{}
     case TkI{}:
       True{}
@@ -276,8 +356,8 @@ def remove_i(q: +List<Tk>) -> +List<Tk>:
   match q:
     case Nil{}:
       []
-    case Con{Tk{i, e}, t}:
-      Tk{i, e} <> remove_i(t)
+    case Con{Tk{i, e, f}, t}:
+      Tk{i, e, f} <> remove_i(t)
     case Con{TkI{}, t}:
       remove_i(t)
 
@@ -285,7 +365,7 @@ def has_land(q: +List<Tk>) -> Bool:
   match q:
     case Nil{}:
       False{}
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, f}, t}:
       True{}
     case Con{TkI{}, t}:
       has_land(t)
@@ -295,7 +375,7 @@ def waits_on_install(q: +List<Tk>) -> Bool:
   match q:
     case Nil{}:
       False{}
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, f}, t}:
       waits_on_install(t)
     case Con{TkI{}, t}:
       has_land(t)
@@ -305,7 +385,7 @@ def lands_only(q: +List<Tk>) -> Bool:
   match q:
     case Nil{}:
       True{}
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, f}, t}:
       lands_only(t)
     case Con{TkI{}, t}:
       False{}
@@ -351,17 +431,40 @@ def put(+x: Nat, +p: LR, ls: +List<Ld>) -> +List<Ld>:
     case Con{+h, +t}:
       put.if(x, p, h, t, put(x, p, t), same(x, ld_id(h)))
 
-# what a closed turn connection leaves of a land
-def lose.ph(p: LR) -> LR:
+# what a restart leaves of one land: a fenced ticket's land transitions to
+# resuming; an unfenced ticket's land is cut (dropped/orphan)
+def lose.unfenced(b: Bool, p: LR, cut: LR) -> LR:
+  match b:
+    case True{}:
+      cut
+    case False{}:
+      p
+
+def lose.fenced(b: Bool, p: LR, res: LR) -> LR:
+  match b:
+    case True{}:
+      res
+    case False{}:
+      p
+
+def lose.one(p: LR, unf: Bool, fen: Bool) -> LR:
   match p:
     case LRAbsent{}:
       LRAbsent{}
     case LRReady{}:
       LRReady{}
     case LRAsked{}:
-      LRDropped{}
+      lose.unfenced(unf, LRAsked{}, LRDropped{})
     case LRGate{}:
-      LROrphan{}
+      lose.unfenced(unf, LRGate{}, LROrphan{})
+    case LRFencedAsked{}:
+      lose.fenced(fen, LRFencedAsked{}, LRResumingAsked{})
+    case LRFencedGate{}:
+      lose.fenced(fen, LRFencedGate{}, LRResumingGate{})
+    case LRResumingAsked{}:
+      LRResumingAsked{}
+    case LRResumingGate{}:
+      LRResumingGate{}
     case LRDone{}:
       LRDone{}
     case LRDropped{}:
@@ -371,20 +474,12 @@ def lose.ph(p: LR) -> LR:
     case LRLost{}:
       LRLost{}
 
-def lose.if(b: Bool, p: LR) -> LR:
-  match b:
-    case True{}:
-      lose.ph(p)
-    case False{}:
-      p
-
-# a restart closes the connection of every land with a ticket
 def lose(ls: +List<Ld>, +q: +List<Tk>) -> +List<Ld>:
   match ls:
     case Nil{}:
       []
     case Con{Ld{+i, p}, t}:
-      Ld{i, lose.if(mem_t(i, q), p)} <> lose(t, q)
+      Ld{i, lose.one(p, mem_unfenced(i, q), mem_fenced(i, q))} <> lose(t, q)
 
 # --- the install ------------------------------------------------------------------
 
@@ -427,7 +522,8 @@ def before_read(p: IR) -> Bool:
     case IRRefused{}:
       False{}
 
-# a gateway answers a turn ask (the restarted one serves once the slot is released)
+# a gateway answers a turn ask or resume (the restarted one serves once the
+# slot is released)
 def serving(p: IR) -> Bool:
   match p:
     case IRUnbuilt{b}:
@@ -469,7 +565,7 @@ def fenced_now(p: IR, f: Bool) -> Bool:
 def ty_cut(+q: +List<Tk>, y: Ty) -> Ty:
   match y:
     case Ty{c, e, k, r}:
-      Ty{addb(not(is_nil_t(q)), c), addb(any_early(q), e), k, r}
+      Ty{addb(any_unfenced(q), c), addb(any_early_unfenced(q), e), k, r}
 
 def ty_kill(y: Ty) -> Ty:
   match y:
@@ -481,11 +577,12 @@ def ty_refuse(y: Ty) -> Ty:
     case Ty{c, e, k, r}:
       Ty{c, e, k, 1n+r}
 
-# Restart: the queue is gone with the gateway; supervisors keep their jobs
+# Restart: fenced tickets survive in the handoff snapshot; unfenced tickets are
+# cut; supervisors keep their admitted jobs
 def restart(s: RS) -> RS:
   match s:
     case RS{p, +q, ls, js, y, f}:
-      RS{IRRestarted{}, [], lose(ls, q), js, ty_cut(q, y), f}
+      RS{IRRestarted{}, keep_fenced(q), lose(ls, q), js, ty_cut(q, y), f}
 
 def read.if(b: Bool, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>, y: Ty, f: Bool) -> RS:
   match b:
@@ -514,7 +611,7 @@ def turn_built.if(b: Bool, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>, y: Ty, f
 def istep(s: RS) -> RS:
   match s:
     case RS{IRUnbuilt{False{}}, +q, ls, js, y, f}:
-      built.if(refuses([RQ{0n, ids(q)}]), q, ls, js, y, f)
+      built.if(refuses([RQ{0n, rts(q)}]), q, ls, js, y, f)
     case RS{IRUnbuilt{True{}}, q, ls, js, y, f}:
       RS{IRBuilding{}, snoc_t(q, TkI{}), ls, js, y, f}
     case RS{IRBuilding{}, +q, ls, js, y, f}:
@@ -522,7 +619,7 @@ def istep(s: RS) -> RS:
     case RS{IRFree{}, q, ls, js, y, f}:
       RS{IRHeld{}, q, ls, js, y, f}
     case RS{IRHeld{}, +q, ls, js, y, f}:
-      read.if(refuses([RQ{0n, ids(q)}]), q, ls, js, y, f)
+      read.if(refuses([RQ{0n, rts(q)}]), q, ls, js, y, f)
     case RS{IRClear{}, q, ls, js, y, f}:
       restart(RS{IRClear{}, q, ls, js, y, f})
     case RS{IRRestarted{}, q, ls, js, y, f}:
@@ -544,7 +641,7 @@ def wait.if(+x: Nat, b: Bool, p: IR, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>
 def ask.b(+x: Nat, b: Bool, +p: IR, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>, y: Ty, f: Bool) -> RS:
   match b:
     case True{}:
-      RS{p, snoc_t(q, Tk{x, before_read(p)}), put(x, LRAsked{}, ls), js, y, f}
+      RS{p, snoc_t(q, Tk{x, before_read(p), False{}}), put(x, LRAsked{}, ls), js, y, f}
     case False{}:
       RS{p, q, put(x, LRLost{}, ls), js, ty_refuse(y), f}
 
@@ -562,6 +659,35 @@ def bind.if(+x: Nat, b: Bool, p: IR, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>
     case False{}:
       RS{p, q, ls, js, y, f}
 
+# neither IRClear nor IRRestarted: no fence or restart is actively underway
+def not_in_restart(p: IR) -> Bool:
+  match p:
+    case IRUnbuilt{b}:
+      True{}
+    case IRBuilding{}:
+      True{}
+    case IRFree{}:
+      True{}
+    case IRHeld{}:
+      True{}
+    case IRClear{}:
+      False{}
+    case IRRestarted{}:
+      False{}
+    case IRDone{}:
+      True{}
+    case IRRefused{}:
+      True{}
+
+# a fenced land unfences in place only outside a fence/restart; a resuming land
+# resumes once the replacing gateway serves
+def resume.if(+x: Nat, can: Bool, target: LR, p: IR, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>, y: Ty, f: Bool) -> RS:
+  match can:
+    case True{}:
+      RS{p, set_fenced(x, False{}, q), put(x, target, ls), js, y, f}
+    case False{}:
+      RS{p, q, ls, js, y, f}
+
 def lact(+x: Nat, lp: LR, s: RS) -> RS:
   match lp s:
     case LRAbsent{} RS{+p, q, ls, js, y, f}:
@@ -572,6 +698,14 @@ def lact(+x: Nat, lp: LR, s: RS) -> RS:
       bind.if(x, first_is(x, q), p, q, ls, js, y, f)
     case LRGate{} RS{p, q, ls, js, y, f}:
       RS{p, remove_t(x, q), put(x, LRDone{}, ls), remove_n(x, js), y, f}
+    case LRFencedAsked{} RS{+p, q, ls, js, y, f}:
+      resume.if(x, not_in_restart(p), LRAsked{}, p, q, ls, js, y, f)
+    case LRFencedGate{} RS{+p, q, ls, js, y, f}:
+      resume.if(x, not_in_restart(p), LRGate{}, p, q, ls, js, y, f)
+    case LRResumingAsked{} RS{+p, q, ls, js, y, f}:
+      resume.if(x, not_in_restart(p), LRAsked{}, p, q, ls, js, y, f)
+    case LRResumingGate{} RS{+p, q, ls, js, y, f}:
+      resume.if(x, not_in_restart(p), LRGate{}, p, q, ls, js, y, f)
     case LRDone{} RS{p, q, ls, js, y, f}:
       RS{p, q, ls, js, y, f}
     case LRDropped{} RS{p, q, ls, js, y, f}:
@@ -580,6 +714,49 @@ def lact(+x: Nat, lp: LR, s: RS) -> RS:
       RS{p, q, put(x, LRLost{}, ls), remove_n(x, js), ty_kill(y), f}
     case LRLost{} RS{p, q, ls, js, y, f}:
       RS{p, q, ls, js, y, f}
+
+# a land acknowledges `{"turn":"fence"}` under fenced=True while the gateway
+# serves; under fenced=False (the code before fencing) this is a no-op
+def fstep.on(+x: Nat, lp: LR, +p: IR, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>, y: Ty) -> RS:
+  match lp:
+    case LRAsked{}:
+      RS{p, set_fenced(x, True{}, q), put(x, LRFencedAsked{}, ls), js, y, True{}}
+    case LRGate{}:
+      RS{p, set_fenced(x, True{}, q), put(x, LRFencedGate{}, ls), js, y, True{}}
+    case LRAbsent{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRReady{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRFencedAsked{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRFencedGate{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRResumingAsked{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRResumingGate{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRDone{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRDropped{}:
+      RS{p, q, ls, js, y, True{}}
+    case LROrphan{}:
+      RS{p, q, ls, js, y, True{}}
+    case LRLost{}:
+      RS{p, q, ls, js, y, True{}}
+
+def fstep.srv(+x: Nat, lp: LR, srv: Bool, +p: IR, q: +List<Tk>, ls: +List<Ld>, js: +List<Nat>, y: Ty) -> RS:
+  match srv:
+    case True{}:
+      fstep.on(x, lp, p, q, ls, js, y)
+    case False{}:
+      RS{p, q, ls, js, y, True{}}
+
+def fstep(+x: Nat, lp: LR, s: RS) -> RS:
+  match s:
+    case RS{+p, q, ls, js, y, True{}}:
+      fstep.srv(x, lp, serving(p), p, q, ls, js, y)
+    case RS{p, q, ls, js, y, False{}}:
+      RS{p, q, ls, js, y, False{}}
 
 def lands_of(s: RS) -> +List<Ld>:
   match s:
@@ -592,6 +769,8 @@ def step(o: RO, +s: RS) -> RS:
       istep(s)
     case ROLand{+x}:
       lact(x, look(x, lands_of(s)), s)
+    case ROFence{+x}:
+      fstep(x, look(x, lands_of(s)), s)
 
 def run(os: +List<RO>, s: RS) -> RS:
   match os:
@@ -672,17 +851,58 @@ def z_eq(+n: Nat, z: IsZ(n)) -> {n == 0n : Nat}:
     case 1n+p:
       match z:
 
-# every ticket asked after the read
+def t_not_f(h: {True{} == False{} : Bool}) -> Empty:
+  %h : IsT(_)
+  Unit{}
+
+# every ticket in q is a land's fenced ticket (no unfenced ticket, no TkI)
+def AllFencedT(q: +List<Tk>) -> Data:
+  match q:
+    case Nil{}:
+      Unit
+    case Con{Tk{i, e, True{}}, t}:
+      AllFencedT(t)
+    case Con{Tk{i, e, False{}}, t}:
+      Empty
+    case Con{TkI{}, t}:
+      Empty
+
+# refuses == False on a queue proves every ticket in it is fenced
+def refuses_false_all_fenced(+q: +List<Tk>, h: {refuses([RQ{0n, rts(q)}]) == False{} : Bool}) -> AllFencedT(q):
+  match q:
+    case Nil{}:
+      Unit{}
+    case Con{Tk{i, e, True{}}, t}:
+      refuses_false_all_fenced(t, h)
+    case Con{Tk{i, e, False{}}, t}:
+      t_not_f(h)
+    case Con{TkI{}, t}:
+      t_not_f(h)
+
+# every unfenced ticket was asked after the read
 def AllLate(q: +List<Tk>) -> Data:
   match q:
     case Nil{}:
       Unit
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, True{}}, t}:
+      AllLate(t)
+    case Con{Tk{i, e, False{}}, t}:
       Sigma<&2, &2, IsF(e), u => AllLate(t)>
     case Con{TkI{}, t}:
       AllLate(t)
 
-# between a clear read and the restart, no ticket was asked before the read
+def all_fenced_late(+q: +List<Tk>, af: AllFencedT(q)) -> AllLate(q):
+  match q:
+    case Nil{}:
+      Unit{}
+    case Con{Tk{i, e, True{}}, t}:
+      all_fenced_late(t, af)
+    case Con{Tk{i, e, False{}}, t}:
+      match af:
+    case Con{TkI{}, t}:
+      match af:
+
+# between a clear read and the restart, no unfenced ticket was asked before the read
 def Safe(p: IR, q: +List<Tk>) -> Data:
   match p:
     case IRUnbuilt{b}:
@@ -707,49 +927,74 @@ def Inv(s: RS) -> Data:
     case RS{p, +q, ls, js, Ty{c, e, k, r}, f}:
       Sigma<&2, &2, IsZ(e), u => Safe(p, q)>
 
-# --- tickets asked after the read stay so --------------------------------------------
+# --- unfenced tickets asked after the read stay so ----------------------------------
 
-def late_snoc(+q: +List<Tk>, +x: Nat, l: AllLate(q)) -> AllLate(snoc_t(q, Tk{x, False{}})):
+def late_snoc(+q: +List<Tk>, +x: Nat, l: AllLate(q)) -> AllLate(snoc_t(q, Tk{x, False{}, False{}})):
   match q:
     case Nil{}:
       (Unit{}, Unit{})
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, True{}}, t}:
+      late_snoc(t, x, l)
+    case Con{Tk{i, e, False{}}, t}:
       (u, r) = l
       (u, late_snoc(t, x, r))
     case Con{TkI{}, t}:
       late_snoc(t, x, l)
 
-def late_rm.if(+i: Nat, +e: Bool, +r: +List<Tk>, b: Bool, u: IsF(e), lr: AllLate(r)) -> AllLate(remove_t.if(Tk{i, e}, r, b)):
+def late_rm.if(+i: Nat, +e: Bool, +f: Bool, +r: +List<Tk>, b: Bool, u: AllLate(Tk{i, e, f} <> r), lr: AllLate(r)) -> AllLate(remove_t.if(Tk{i, e, f}, r, b)):
   match b:
     case True{}:
       lr
     case False{}:
-      (u, lr)
+      u
 
-def late_remove(+q: +List<Tk>, +x: Nat, l: AllLate(q)) -> AllLate(remove_t(x, q)):
+def late_remove(+q: +List<Tk>, +x: Nat, +l: AllLate(q)) -> AllLate(remove_t(x, q)):
   match q:
     case Nil{}:
       Unit{}
-    case Con{Tk{i, e}, t}:
-      (u, r) = l
-      late_rm.if(i, e, remove_t(x, t), same(x, i), u, late_remove(t, x, r))
+    case Con{Tk{i, e, True{}}, t}:
+      late_rm.if(i, e, True{}, remove_t(x, t), same(x, i), late_remove(t, x, l), late_remove(t, x, l))
+    case Con{Tk{i, e, False{}}, t}:
+      (u, +r) = l
+      late_rm.if(i, e, False{}, remove_t(x, t), same(x, i), (u, late_remove(t, x, r)), late_remove(t, x, r))
     case Con{TkI{}, t}:
       late_remove(t, x, l)
 
-def z_late(+q: +List<Tk>, +e: Nat, l: AllLate(q), z: IsZ(e)) -> IsZ(addb(any_early(q), e)):
+def late_fence.if(+i: Nat, +e: Bool, +f: Bool, +t: +List<Tk>, +r: +List<Tk>, b: Bool, lt: AllLate(t), lhead: AllLate(Tk{i, e, f} <> r)) -> AllLate(set_fenced.if(i, e, f, True{}, t, r, b)):
+  match b:
+    case True{}:
+      lt
+    case False{}:
+      lhead
+
+def late_fence(+q: +List<Tk>, +x: Nat, +l: AllLate(q)) -> AllLate(set_fenced(x, True{}, q)):
+  match q:
+    case Nil{}:
+      Unit{}
+    case Con{Tk{i, e, True{}}, t}:
+      late_fence.if(i, e, True{}, t, set_fenced(x, True{}, t), same(x, i), l, late_fence(t, x, l))
+    case Con{Tk{i, e, False{}}, t}:
+      (u, +r) = l
+      late_fence.if(i, e, False{}, t, set_fenced(x, True{}, t), same(x, i), r, (u, late_fence(t, x, r)))
+    case Con{TkI{}, t}:
+      late_fence(t, x, l)
+
+def z_late(+q: +List<Tk>, +e: Nat, l: AllLate(q), z: IsZ(e)) -> IsZ(addb(any_early_unfenced(q), e)):
   match q:
     case Nil{}:
       z
-    case Con{Tk{i, True{}}, t}:
+    case Con{Tk{i, ee, True{}}, t}:
+      z_late(t, e, l, z)
+    case Con{Tk{i, True{}, False{}}, t}:
       (u, r) = l
       match u:
-    case Con{Tk{i, False{}}, t}:
+    case Con{Tk{i, False{}, False{}}, t}:
       (u, r) = l
       z_late(t, e, r, z)
     case Con{TkI{}, t}:
       z_late(t, e, l, z)
 
-def safe_snoc(+p: IR, +q: +List<Tk>, +x: Nat, sq: Safe(p, q)) -> Safe(p, snoc_t(q, Tk{x, before_read(p)})):
+def safe_snoc(+p: IR, +q: +List<Tk>, +x: Nat, sq: Safe(p, q)) -> Safe(p, snoc_t(q, Tk{x, before_read(p), False{}})):
   match p:
     case IRUnbuilt{b}:
       Unit{}
@@ -787,7 +1032,26 @@ def safe_remove(+p: IR, +q: +List<Tk>, +x: Nat, sq: Safe(p, q)) -> Safe(p, remov
     case IRRefused{}:
       Unit{}
 
-# --- every step keeps the invariant ---------------------------------------------------
+def safe_fence(+p: IR, +q: +List<Tk>, +x: Nat, sq: Safe(p, q)) -> Safe(p, set_fenced(x, True{}, q)):
+  match p:
+    case IRUnbuilt{b}:
+      Unit{}
+    case IRBuilding{}:
+      Unit{}
+    case IRFree{}:
+      Unit{}
+    case IRHeld{}:
+      Unit{}
+    case IRClear{}:
+      late_fence(q, x, sq)
+    case IRRestarted{}:
+      Unit{}
+    case IRDone{}:
+      Unit{}
+    case IRRefused{}:
+      Unit{}
+
+# --- every step keeps Inv -----------------------------------------------------------
 
 def inv_tb(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, z: IsZ(e)) -> Inv(turn_built.if(b, q, ls, js, Ty{c, e, k, r}, f)):
   match b:
@@ -796,14 +1060,25 @@ def inv_tb(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e
     case False{}:
       (z, Unit{})
 
+def inv_read_if(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, z: IsZ(e), hb: {refuses([RQ{0n, rts(q)}]) == b : Bool}) -> Inv(read.if(b, q, ls, js, Ty{c, e, k, r}, f)):
+  match b:
+    case True{}:
+      (z, Unit{})
+    case False{}:
+      (z, all_fenced_late(q, refuses_false_all_fenced(q, hb)))
+
+def inv_built_if(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, z: IsZ(e)) -> Inv(built.if(b, q, ls, js, Ty{c, e, k, r}, f)):
+  match b:
+    case True{}:
+      (z, Unit{})
+    case False{}:
+      (z, Unit{})
+
 def inv_istep(+s: RS, i: Inv(s)) -> Inv(istep(s)):
   match s:
-    case RS{IRUnbuilt{False{}}, Nil{}, ls, js, Ty{c, e, k, r}, f}:
+    case RS{IRUnbuilt{False{}}, q, ls, js, Ty{c, e, k, r}, f}:
       (z, sq) = i
-      (z, Unit{})
-    case RS{IRUnbuilt{False{}}, Con{h, t}, ls, js, Ty{c, e, k, r}, f}:
-      (z, sq) = i
-      (z, Unit{})
+      inv_built_if(refuses([RQ{0n, rts(q)}]), q, ls, js, c, e, k, r, f, z)
     case RS{IRUnbuilt{True{}}, q, ls, js, Ty{c, e, k, r}, f}:
       (z, sq) = i
       (z, Unit{})
@@ -813,12 +1088,9 @@ def inv_istep(+s: RS, i: Inv(s)) -> Inv(istep(s)):
     case RS{IRFree{}, q, ls, js, Ty{c, e, k, r}, f}:
       (z, sq) = i
       (z, Unit{})
-    case RS{IRHeld{}, Nil{}, ls, js, Ty{c, e, k, r}, f}:
+    case RS{IRHeld{}, q, ls, js, Ty{c, e, k, r}, f}:
       (z, sq) = i
-      (z, Unit{})
-    case RS{IRHeld{}, Con{h, t}, ls, js, Ty{c, e, k, r}, f}:
-      (z, sq) = i
-      (z, Unit{})
+      inv_read_if(refuses([RQ{0n, rts(q)}]), q, ls, js, c, e, k, r, f, z, {==})
     case RS{IRClear{}, q, ls, js, Ty{c, e, k, r}, f}:
       (z, sq) = i
       (z_late(q, e, sq, z), Unit{})
@@ -859,6 +1131,31 @@ def inv_bind(+x: Nat, +b: Bool, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +Lis
     case False{}:
       i
 
+def safe_resume_clear(+x: Nat, +target: LR, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, i: Inv(RS{p, q, ls, js, Ty{c, e, k, r}, f})) -> Inv(resume.if(x, not_in_restart(p), target, p, q, ls, js, Ty{c, e, k, r}, f)):
+  match p:
+    case IRUnbuilt{b}:
+      (z, sq) = i
+      (z, Unit{})
+    case IRBuilding{}:
+      (z, sq) = i
+      (z, Unit{})
+    case IRFree{}:
+      (z, sq) = i
+      (z, Unit{})
+    case IRHeld{}:
+      (z, sq) = i
+      (z, Unit{})
+    case IRClear{}:
+      i
+    case IRRestarted{}:
+      i
+    case IRDone{}:
+      (z, sq) = i
+      (z, Unit{})
+    case IRRefused{}:
+      (z, sq) = i
+      (z, Unit{})
+
 def inv_lact(+x: Nat, +lp: LR, +s: RS, i: Inv(s)) -> Inv(lact(x, lp, s)):
   match lp s:
     case LRAbsent{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
@@ -870,6 +1167,14 @@ def inv_lact(+x: Nat, +lp: LR, +s: RS, i: Inv(s)) -> Inv(lact(x, lp, s)):
     case LRGate{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
       (z, sq) = i
       (z, safe_remove(p, q, x, sq))
+    case LRFencedAsked{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      safe_resume_clear(x, LRAsked{}, p, q, ls, js, c, e, k, r, f, i)
+    case LRFencedGate{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      safe_resume_clear(x, LRGate{}, p, q, ls, js, c, e, k, r, f, i)
+    case LRResumingAsked{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      safe_resume_clear(x, LRAsked{}, p, q, ls, js, c, e, k, r, f, i)
+    case LRResumingGate{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      safe_resume_clear(x, LRGate{}, p, q, ls, js, c, e, k, r, f, i)
     case LRDone{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
       i
     case LRDropped{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
@@ -879,12 +1184,57 @@ def inv_lact(+x: Nat, +lp: LR, +s: RS, i: Inv(s)) -> Inv(lact(x, lp, s)):
     case LRLost{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
       i
 
+def inv_fstep_on(+x: Nat, +lp: LR, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, i: Inv(RS{p, q, ls, js, Ty{c, e, k, r}, True{}})) -> Inv(fstep.on(x, lp, p, q, ls, js, Ty{c, e, k, r})):
+  match lp:
+    case LRAsked{}:
+      (z, sq) = i
+      (z, safe_fence(p, q, x, sq))
+    case LRGate{}:
+      (z, sq) = i
+      (z, safe_fence(p, q, x, sq))
+    case LRAbsent{}:
+      i
+    case LRReady{}:
+      i
+    case LRFencedAsked{}:
+      i
+    case LRFencedGate{}:
+      i
+    case LRResumingAsked{}:
+      i
+    case LRResumingGate{}:
+      i
+    case LRDone{}:
+      i
+    case LRDropped{}:
+      i
+    case LROrphan{}:
+      i
+    case LRLost{}:
+      i
+
+def inv_fstep_srv(+x: Nat, +lp: LR, +srv: Bool, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, i: Inv(RS{p, q, ls, js, Ty{c, e, k, r}, True{}})) -> Inv(fstep.srv(x, lp, srv, p, q, ls, js, Ty{c, e, k, r})):
+  match srv:
+    case True{}:
+      inv_fstep_on(x, lp, p, q, ls, js, c, e, k, r, i)
+    case False{}:
+      i
+
+def inv_fstep(+x: Nat, +lp: LR, +s: RS, i: Inv(s)) -> Inv(fstep(x, lp, s)):
+  match s:
+    case RS{p, q, ls, js, Ty{c, e, k, r}, True{}}:
+      inv_fstep_srv(x, lp, serving(p), p, q, ls, js, c, e, k, r, i)
+    case RS{p, q, ls, js, Ty{c, e, k, r}, False{}}:
+      i
+
 def inv_step(+o: RO, +s: RS, i: Inv(s)) -> Inv(step(o, s)):
   match o:
     case ROInstall{}:
       inv_istep(s, i)
     case ROLand{x}:
       inv_lact(x, look(x, lands_of(s)), s, i)
+    case ROFence{x}:
+      inv_fstep(x, look(x, lands_of(s)), s, i)
 
 def inv_run(+os: +List<RO>, +s: RS, i: Inv(s)) -> Inv(run(os, s)):
   match os:
@@ -902,16 +1252,9 @@ def early_of(+s: RS, i: Inv(s)) -> IsZ(n_early(s)):
       (z, sq) = i
       z
 
-# --- the fenced repair: the read fences the turns until the restarted gateway serves --
+# --- the fenced repair: fenced tickets survive restart and resume --------------------
 
-def IsNilT(q: +List<Tk>) -> Data:
-  match q:
-    case Nil{}:
-      Unit
-    case Con{h, t}:
-      Empty
-
-# between a clear read and the restart the queue is empty
+# between a clear read and the restart every ticket in q is fenced
 def Clear(p: IR, q: +List<Tk>) -> Data:
   match p:
     case IRUnbuilt{b}:
@@ -923,7 +1266,7 @@ def Clear(p: IR, q: +List<Tk>) -> Data:
     case IRHeld{}:
       Unit
     case IRClear{}:
-      IsNilT(q)
+      AllFencedT(q)
     case IRRestarted{}:
       Unit
     case IRDone{}:
@@ -940,6 +1283,14 @@ def NotOrph(p: LR) -> Data:
     case LRAsked{}:
       Unit
     case LRGate{}:
+      Unit
+    case LRFencedAsked{}:
+      Unit
+    case LRFencedGate{}:
+      Unit
+    case LRResumingAsked{}:
+      Unit
+    case LRResumingGate{}:
       Unit
     case LRDone{}:
       Unit
@@ -996,33 +1347,147 @@ def no_put(+x: Nat, +p: LR, +ls: +List<Ld>, +np: NotOrph(p), n: NoOrph(ls)) -> N
       (ni, +nt) = n
       no_put.if(x, p, i, pi, t, put(x, p, t), same(x, i), np, ni, nt, no_put(x, p, t, np, nt))
 
-def no_lose_nil(+ls: +List<Ld>, n: NoOrph(ls)) -> NoOrph(lose(ls, [])):
+def af_no_any_unfenced(+q: +List<Tk>, af: AllFencedT(q)) -> {any_unfenced(q) == False{} : Bool}:
+  match q:
+    case Nil{}:
+      {==}
+    case Con{Tk{i, e, True{}}, t}:
+      af_no_any_unfenced(t, af)
+    case Con{Tk{i, e, False{}}, t}:
+      match af:
+    case Con{TkI{}, t}:
+      match af:
+
+def af_no_mem_unfenced(+x: Nat, +q: +List<Tk>, af: AllFencedT(q)) -> {mem_unfenced(x, q) == False{} : Bool}:
+  match q:
+    case Nil{}:
+      {==}
+    case Con{Tk{i, e, True{}}, t}:
+      af_no_mem_unfenced(x, t, af)
+    case Con{Tk{i, e, False{}}, t}:
+      match af:
+    case Con{TkI{}, t}:
+      match af:
+
+def no_lose_fenced_one(+p: LR, +fen: Bool, np: NotOrph(p)) -> NotOrph(lose.one(p, False{}, fen)):
+  match p fen:
+    case LRAbsent{} b:
+      Unit{}
+    case LRReady{} b:
+      Unit{}
+    case LRAsked{} b:
+      Unit{}
+    case LRGate{} b:
+      Unit{}
+    case LRFencedAsked{} True{}:
+      Unit{}
+    case LRFencedAsked{} False{}:
+      Unit{}
+    case LRFencedGate{} True{}:
+      Unit{}
+    case LRFencedGate{} False{}:
+      Unit{}
+    case LRResumingAsked{} b:
+      Unit{}
+    case LRResumingGate{} b:
+      Unit{}
+    case LRDone{} b:
+      Unit{}
+    case LRDropped{} b:
+      Unit{}
+    case LROrphan{} b:
+      match np:
+    case LRLost{} b:
+      Unit{}
+
+def no_lose_fenced_head(+i: Nat, +p: LR, +q: +List<Tk>, af: AllFencedT(q), np: NotOrph(p)) -> NotOrph(lose.one(p, mem_unfenced(i, q), mem_fenced(i, q))):
+  %Equal.sym(Bool, mem_unfenced(i, q), False{}, af_no_mem_unfenced(i, q, af)) : NotOrph(lose.one(p, _, mem_fenced(i, q)))
+  no_lose_fenced_one(p, mem_fenced(i, q), np)
+
+def no_lose_fenced(+ls: +List<Ld>, +q: +List<Tk>, +af: AllFencedT(q), n: NoOrph(ls)) -> NoOrph(lose(ls, q)):
   match ls:
     case Nil{}:
       Unit{}
-    case Con{Ld{i, p}, t}:
+    case Con{Ld{+i, +p}, t}:
       (np, nt) = n
-      (np, no_lose_nil(t, nt))
+      (no_lose_fenced_head(i, p, q, af, np), no_lose_fenced(t, q, af, nt))
+
+def z_cuts_fenced(+q: +List<Tk>, +c: Nat, af: AllFencedT(q), zc: IsZ(c)) -> IsZ(addb(any_unfenced(q), c)):
+  %Equal.sym(Bool, any_unfenced(q), False{}, af_no_any_unfenced(q, af)) : IsZ(addb(_, c))
+  zc
+
+def af_rm.if(+i: Nat, +e: Bool, +r: +List<Tk>, b: Bool, ar: AllFencedT(r)) -> AllFencedT(remove_t.if(Tk{i, e, True{}}, r, b)):
+  match b:
+    case True{}:
+      ar
+    case False{}:
+      ar
+
+def af_remove(+q: +List<Tk>, +x: Nat, af: AllFencedT(q)) -> AllFencedT(remove_t(x, q)):
+  match q:
+    case Nil{}:
+      Unit{}
+    case Con{Tk{i, e, True{}}, t}:
+      af_rm.if(i, e, remove_t(x, t), same(x, i), af_remove(t, x, af))
+    case Con{Tk{i, e, False{}}, t}:
+      match af:
+    case Con{TkI{}, t}:
+      match af:
+
+def af_fence.if(+i: Nat, +e: Bool, +t: +List<Tk>, +r: +List<Tk>, b: Bool, at: AllFencedT(t), ar: AllFencedT(r)) -> AllFencedT(set_fenced.if(i, e, True{}, True{}, t, r, b)):
+  match b:
+    case True{}:
+      at
+    case False{}:
+      ar
+
+def af_fence(+q: +List<Tk>, +x: Nat, +af: AllFencedT(q)) -> AllFencedT(set_fenced(x, True{}, q)):
+  match q:
+    case Nil{}:
+      Unit{}
+    case Con{Tk{i, e, True{}}, t}:
+      af_fence.if(i, e, t, set_fenced(x, True{}, t), same(x, i), af, af_fence(t, x, af))
+    case Con{Tk{i, e, False{}}, t}:
+      match af:
+    case Con{TkI{}, t}:
+      match af:
 
 def clear_remove(+p: IR, +q: +List<Tk>, +x: Nat, cl: Clear(p, q)) -> Clear(p, remove_t(x, q)):
-  match p q:
-    case IRUnbuilt{b} q0:
+  match p:
+    case IRUnbuilt{b}:
       Unit{}
-    case IRBuilding{} q0:
+    case IRBuilding{}:
       Unit{}
-    case IRFree{} q0:
+    case IRFree{}:
       Unit{}
-    case IRHeld{} q0:
+    case IRHeld{}:
       Unit{}
-    case IRClear{} Nil{}:
+    case IRClear{}:
+      af_remove(q, x, cl)
+    case IRRestarted{}:
       Unit{}
-    case IRClear{} Con{h, t}:
-      match cl:
-    case IRRestarted{} q0:
+    case IRDone{}:
       Unit{}
-    case IRDone{} q0:
+    case IRRefused{}:
       Unit{}
-    case IRRefused{} q0:
+
+def clear_fence(+p: IR, +q: +List<Tk>, +x: Nat, cl: Clear(p, q)) -> Clear(p, set_fenced(x, True{}, q)):
+  match p:
+    case IRUnbuilt{b}:
+      Unit{}
+    case IRBuilding{}:
+      Unit{}
+    case IRFree{}:
+      Unit{}
+    case IRHeld{}:
+      Unit{}
+    case IRClear{}:
+      af_fence(q, x, cl)
+    case IRRestarted{}:
+      Unit{}
+    case IRDone{}:
+      Unit{}
+    case IRRefused{}:
       Unit{}
 
 def inv2_tb(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, i: Inv2(RS{IRBuilding{}, q, ls, js, Ty{c, e, k, r}, f})) -> Inv2(turn_built.if(b, q, ls, js, Ty{c, e, k, r}, f)):
@@ -1035,18 +1500,27 @@ def inv2_tb(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +
     case False{}:
       i
 
+def inv2_built_if(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, ft: IsT(f), zs: Zs(c, k, r), no: NoOrph(ls)) -> Inv2(built.if(b, q, ls, js, Ty{c, e, k, r}, f)):
+  match b:
+    case True{}:
+      (ft, (zs, (Unit{}, no)))
+    case False{}:
+      (ft, (zs, (Unit{}, no)))
+
+def inv2_read_if(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, ft: IsT(f), zs: Zs(c, k, r), no: NoOrph(ls), hb: {refuses([RQ{0n, rts(q)}]) == b : Bool}) -> Inv2(read.if(b, q, ls, js, Ty{c, e, k, r}, f)):
+  match b:
+    case True{}:
+      (ft, (zs, (Unit{}, no)))
+    case False{}:
+      (ft, (zs, (refuses_false_all_fenced(q, hb), no)))
+
 def inv2_istep(+s: RS, i: Inv2(s)) -> Inv2(istep(s)):
   match s:
-    case RS{IRUnbuilt{False{}}, Nil{}, ls, js, Ty{c, e, k, r}, f}:
+    case RS{IRUnbuilt{False{}}, q, ls, js, Ty{c, e, k, r}, f}:
       (ft, i1) = i
       (zs, i2) = i1
       (cl, no) = i2
-      (ft, (zs, (Unit{}, no)))
-    case RS{IRUnbuilt{False{}}, Con{h, t}, ls, js, Ty{c, e, k, r}, f}:
-      (ft, i1) = i
-      (zs, i2) = i1
-      (cl, no) = i2
-      (ft, (zs, (Unit{}, no)))
+      inv2_built_if(refuses([RQ{0n, rts(q)}]), q, ls, js, c, e, k, r, f, ft, zs, no)
     case RS{IRUnbuilt{True{}}, q, ls, js, Ty{c, e, k, r}, f}:
       (ft, i1) = i
       (zs, i2) = i1
@@ -1059,26 +1533,17 @@ def inv2_istep(+s: RS, i: Inv2(s)) -> Inv2(istep(s)):
       (zs, i2) = i1
       (cl, no) = i2
       (ft, (zs, (Unit{}, no)))
-    case RS{IRHeld{}, Nil{}, ls, js, Ty{c, e, k, r}, f}:
+    case RS{IRHeld{}, q, ls, js, Ty{c, e, k, r}, f}:
       (ft, i1) = i
       (zs, i2) = i1
       (cl, no) = i2
-      (ft, (zs, (Unit{}, no)))
-    case RS{IRHeld{}, Con{h, t}, ls, js, Ty{c, e, k, r}, f}:
+      inv2_read_if(refuses([RQ{0n, rts(q)}]), q, ls, js, c, e, k, r, f, ft, zs, no, {==})
+    case RS{IRClear{}, q, ls, js, Ty{c, e, k, r}, f}:
       (ft, i1) = i
       (zs, i2) = i1
-      (cl, no) = i2
-      (ft, (zs, (Unit{}, no)))
-    case RS{IRClear{}, Nil{}, ls, js, Ty{c, e, k, r}, f}:
-      (ft, i1) = i
-      (zs, i2) = i1
-      (cl, no) = i2
-      (ft, (zs, (Unit{}, no_lose_nil(ls, no))))
-    case RS{IRClear{}, Con{h, t}, ls, js, Ty{c, e, k, r}, f}:
-      (ft, i1) = i
-      (zs, i2) = i1
-      (cl, no) = i2
-      match cl:
+      (zc, zk_zr) = zs
+      (+cl, no) = i2
+      (ft, ((z_cuts_fenced(q, c, cl, zc), zk_zr), (Unit{}, no_lose_fenced(ls, q, cl, no))))
     case RS{IRRestarted{}, q, ls, js, Ty{c, e, k, r}, f}:
       (ft, i1) = i
       (zs, i2) = i1
@@ -1108,6 +1573,43 @@ def inv2_bind(+x: Nat, +b: Bool, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +Li
       (ft, (zs, (cl, no_put(x, LRGate{}, ls, Unit{}, no))))
     case False{}:
       i
+
+def inv2_resume(+x: Nat, +target: LR, +nt: NotOrph(target), +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, +f: Bool, i: Inv2(RS{p, q, ls, js, Ty{c, e, k, r}, f})) -> Inv2(resume.if(x, not_in_restart(p), target, p, q, ls, js, Ty{c, e, k, r}, f)):
+  match p:
+    case IRUnbuilt{b}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (Unit{}, no_put(x, target, ls, nt, no))))
+    case IRBuilding{}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (Unit{}, no_put(x, target, ls, nt, no))))
+    case IRFree{}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (Unit{}, no_put(x, target, ls, nt, no))))
+    case IRHeld{}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (Unit{}, no_put(x, target, ls, nt, no))))
+    case IRClear{}:
+      i
+    case IRRestarted{}:
+      i
+    case IRDone{}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (Unit{}, no_put(x, target, ls, nt, no))))
+    case IRRefused{}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (Unit{}, no_put(x, target, ls, nt, no))))
 
 # an ask enters a queue only while no read is fenced; one the fence meets waits for the slot
 def inv2_ready(+x: Nat, +s: RS, i: Inv2(s)) -> Inv2(lact(x, LRReady{}, s)):
@@ -1172,6 +1674,14 @@ def inv2_lact(+x: Nat, +lp: LR, +s: RS, nl: NotOrph(lp), i: Inv2(s)) -> Inv2(lac
       (zs, i2) = i1
       (cl, no) = i2
       (ft, (zs, (clear_remove(p, q, x, cl), no_put(x, LRDone{}, ls, Unit{}, no))))
+    case LRFencedAsked{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      inv2_resume(x, LRAsked{}, Unit{}, p, q, ls, js, c, e, k, r, f, i)
+    case LRFencedGate{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      inv2_resume(x, LRGate{}, Unit{}, p, q, ls, js, c, e, k, r, f, i)
+    case LRResumingAsked{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      inv2_resume(x, LRAsked{}, Unit{}, p, q, ls, js, c, e, k, r, f, i)
+    case LRResumingGate{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      inv2_resume(x, LRGate{}, Unit{}, p, q, ls, js, c, e, k, r, f, i)
     case LRDone{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
       i
     case LRDropped{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
@@ -1182,6 +1692,53 @@ def inv2_lact(+x: Nat, +lp: LR, +s: RS, nl: NotOrph(lp), i: Inv2(s)) -> Inv2(lac
     case LROrphan{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
       match nl:
     case LRLost{} RS{p, q, ls, js, Ty{c, e, k, r}, f}:
+      i
+
+def inv2_fstep_on(+x: Nat, +lp: LR, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, i: Inv2(RS{p, q, ls, js, Ty{c, e, k, r}, True{}})) -> Inv2(fstep.on(x, lp, p, q, ls, js, Ty{c, e, k, r})):
+  match lp:
+    case LRAsked{}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (clear_fence(p, q, x, cl), no_put(x, LRFencedAsked{}, ls, Unit{}, no))))
+    case LRGate{}:
+      (ft, i1) = i
+      (zs, i2) = i1
+      (cl, no) = i2
+      (ft, (zs, (clear_fence(p, q, x, cl), no_put(x, LRFencedGate{}, ls, Unit{}, no))))
+    case LRAbsent{}:
+      i
+    case LRReady{}:
+      i
+    case LRFencedAsked{}:
+      i
+    case LRFencedGate{}:
+      i
+    case LRResumingAsked{}:
+      i
+    case LRResumingGate{}:
+      i
+    case LRDone{}:
+      i
+    case LRDropped{}:
+      i
+    case LROrphan{}:
+      i
+    case LRLost{}:
+      i
+
+def inv2_fstep_srv(+x: Nat, +lp: LR, +srv: Bool, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +c: Nat, +e: Nat, +k: Nat, +r: Nat, i: Inv2(RS{p, q, ls, js, Ty{c, e, k, r}, True{}})) -> Inv2(fstep.srv(x, lp, srv, p, q, ls, js, Ty{c, e, k, r})):
+  match srv:
+    case True{}:
+      inv2_fstep_on(x, lp, p, q, ls, js, c, e, k, r, i)
+    case False{}:
+      i
+
+def inv2_fstep(+x: Nat, +lp: LR, +s: RS, i: Inv2(s)) -> Inv2(fstep(x, lp, s)):
+  match s:
+    case RS{p, q, ls, js, Ty{c, e, k, r}, True{}}:
+      inv2_fstep_srv(x, lp, serving(p), p, q, ls, js, c, e, k, r, i)
+    case RS{p, q, ls, js, Ty{c, e, k, r}, False{}}:
       i
 
 def noorph_of(+s: RS, i: Inv2(s)) -> NoOrph(lands_of(s)):
@@ -1198,6 +1755,8 @@ def inv2_step(+o: RO, +s: RS, +i: Inv2(s)) -> Inv2(step(o, s)):
       inv2_istep(s, i)
     case ROLand{x}:
       inv2_lact(x, look(x, lands_of(s)), s, no_look(x, lands_of(s), noorph_of(s, i)), i)
+    case ROFence{x}:
+      inv2_fstep(x, look(x, lands_of(s)), s, i)
 
 def inv2_run(+os: +List<RO>, +s: RS, i: Inv2(s)) -> Inv2(run(os, s)):
   match os:
@@ -1222,7 +1781,7 @@ def LandsOnly(q: +List<Tk>) -> Data:
   match q:
     case Nil{}:
       Unit
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, f}, t}:
       LandsOnly(t)
     case Con{TkI{}, t}:
       Empty
@@ -1252,16 +1811,16 @@ def Inv3(s: RS) -> Data:
     case RS{+p, +q, ls, js, y, f}:
       Sigma<&2, &2, LandsOnly(q), u => NotTurnBuild(p)>
 
-def lo_snoc(+q: +List<Tk>, +x: Nat, +e: Bool, lo: LandsOnly(q)) -> LandsOnly(snoc_t(q, Tk{x, e})):
+def lo_snoc(+q: +List<Tk>, +x: Nat, +e: Bool, +f: Bool, lo: LandsOnly(q)) -> LandsOnly(snoc_t(q, Tk{x, e, f})):
   match q:
     case Nil{}:
       Unit{}
-    case Con{Tk{i, d}, t}:
-      lo_snoc(t, x, e, lo)
+    case Con{Tk{i, d, g}, t}:
+      lo_snoc(t, x, e, f, lo)
     case Con{TkI{}, t}:
       match lo:
 
-def lo_rm.if(+i: Nat, +e: Bool, +r: +List<Tk>, b: Bool, lr: LandsOnly(r)) -> LandsOnly(remove_t.if(Tk{i, e}, r, b)):
+def lo_rm.if(+i: Nat, +e: Bool, +f: Bool, +r: +List<Tk>, b: Bool, lr: LandsOnly(r)) -> LandsOnly(remove_t.if(Tk{i, e, f}, r, b)):
   match b:
     case True{}:
       lr
@@ -1272,18 +1831,57 @@ def lo_remove(+q: +List<Tk>, +x: Nat, lo: LandsOnly(q)) -> LandsOnly(remove_t(x,
   match q:
     case Nil{}:
       Unit{}
-    case Con{Tk{i, e}, t}:
-      lo_rm.if(i, e, remove_t(x, t), same(x, i), lo_remove(t, x, lo))
+    case Con{Tk{i, e, f}, t}:
+      lo_rm.if(i, e, f, remove_t(x, t), same(x, i), lo_remove(t, x, lo))
     case Con{TkI{}, t}:
       match lo:
 
+def lo_set_fenced.if(+i: Nat, +e: Bool, +f: Bool, +nf: Bool, +t: +List<Tk>, +r: +List<Tk>, b: Bool, lt: LandsOnly(t), lr: LandsOnly(r)) -> LandsOnly(set_fenced.if(i, e, f, nf, t, r, b)):
+  match b:
+    case True{}:
+      lt
+    case False{}:
+      lr
+
+def lo_set_fenced(+q: +List<Tk>, +x: Nat, +nf: Bool, +lo: LandsOnly(q)) -> LandsOnly(set_fenced(x, nf, q)):
+  match q:
+    case Nil{}:
+      Unit{}
+    case Con{Tk{i, e, f}, t}:
+      lo_set_fenced.if(i, e, f, nf, t, set_fenced(x, nf, t), same(x, i), lo, lo_set_fenced(t, x, nf, lo))
+    case Con{TkI{}, t}:
+      match lo:
+
+def lo_keep_fenced(+q: +List<Tk>) -> LandsOnly(keep_fenced(q)):
+  match q:
+    case Nil{}:
+      Unit{}
+    case Con{Tk{i, e, True{}}, t}:
+      lo_keep_fenced(t)
+    case Con{Tk{i, e, False{}}, t}:
+      lo_keep_fenced(t)
+    case Con{TkI{}, t}:
+      lo_keep_fenced(t)
+
+def inv3_built_if(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +y: Ty, +f: Bool, lo: LandsOnly(q)) -> Inv3(built.if(b, q, ls, js, y, f)):
+  match b:
+    case True{}:
+      (lo, Unit{})
+    case False{}:
+      (lo, Unit{})
+
+def inv3_read_if(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +y: Ty, +f: Bool, lo: LandsOnly(q)) -> Inv3(read.if(b, q, ls, js, y, f)):
+  match b:
+    case True{}:
+      (lo, Unit{})
+    case False{}:
+      (lo, Unit{})
+
 def inv3_istep(+s: RS, i: Inv3(s)) -> Inv3(istep(s)):
   match s:
-    case RS{IRUnbuilt{False{}}, Nil{}, ls, js, y, f}:
-      (Unit{}, Unit{})
-    case RS{IRUnbuilt{False{}}, Con{h, t}, ls, js, y, f}:
+    case RS{IRUnbuilt{False{}}, q, ls, js, y, f}:
       (lo, nb) = i
-      (lo, Unit{})
+      inv3_built_if(refuses([RQ{0n, rts(q)}]), q, ls, js, y, f, lo)
     case RS{IRUnbuilt{True{}}, q, ls, js, y, f}:
       (lo, nb) = i
       match nb:
@@ -1293,13 +1891,12 @@ def inv3_istep(+s: RS, i: Inv3(s)) -> Inv3(istep(s)):
     case RS{IRFree{}, q, ls, js, y, f}:
       (lo, nb) = i
       (lo, Unit{})
-    case RS{IRHeld{}, Nil{}, ls, js, y, f}:
-      (Unit{}, Unit{})
-    case RS{IRHeld{}, Con{h, t}, ls, js, y, f}:
+    case RS{IRHeld{}, q, ls, js, y, f}:
       (lo, nb) = i
-      (lo, Unit{})
+      inv3_read_if(refuses([RQ{0n, rts(q)}]), q, ls, js, y, f, lo)
     case RS{IRClear{}, q, ls, js, y, f}:
-      (Unit{}, Unit{})
+      (lo, nb) = i
+      (lo_keep_fenced(q), Unit{})
     case RS{IRRestarted{}, q, ls, js, y, f}:
       (lo, nb) = i
       (lo, Unit{})
@@ -1319,7 +1916,7 @@ def inv3_ask_b(+x: Nat, +b: Bool, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +L
   match b:
     case True{}:
       (lo, nb) = i
-      (lo_snoc(q, x, before_read(p), lo), nb)
+      (lo_snoc(q, x, before_read(p), False{}, lo), nb)
     case False{}:
       i
 
@@ -1337,6 +1934,14 @@ def inv3_bind(+x: Nat, +b: Bool, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +Li
     case False{}:
       i
 
+def inv3_resume(+x: Nat, +can: Bool, +target: LR, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +y: Ty, +f: Bool, i: Inv3(RS{p, q, ls, js, y, f})) -> Inv3(resume.if(x, can, target, p, q, ls, js, y, f)):
+  match can:
+    case True{}:
+      (lo, nb) = i
+      (lo_set_fenced(q, x, False{}, lo), nb)
+    case False{}:
+      i
+
 def inv3_lact(+x: Nat, +lp: LR, +s: RS, i: Inv3(s)) -> Inv3(lact(x, lp, s)):
   match lp s:
     case LRAbsent{} RS{p, q, ls, js, y, f}:
@@ -1348,6 +1953,14 @@ def inv3_lact(+x: Nat, +lp: LR, +s: RS, i: Inv3(s)) -> Inv3(lact(x, lp, s)):
     case LRGate{} RS{p, q, ls, js, y, f}:
       (lo, nb) = i
       (lo_remove(q, x, lo), nb)
+    case LRFencedAsked{} RS{p, q, ls, js, y, f}:
+      inv3_resume(x, not_in_restart(p), LRAsked{}, p, q, ls, js, y, f, i)
+    case LRFencedGate{} RS{p, q, ls, js, y, f}:
+      inv3_resume(x, not_in_restart(p), LRGate{}, p, q, ls, js, y, f, i)
+    case LRResumingAsked{} RS{p, q, ls, js, y, f}:
+      inv3_resume(x, not_in_restart(p), LRAsked{}, p, q, ls, js, y, f, i)
+    case LRResumingGate{} RS{p, q, ls, js, y, f}:
+      inv3_resume(x, not_in_restart(p), LRGate{}, p, q, ls, js, y, f, i)
     case LRDone{} RS{p, q, ls, js, y, f}:
       i
     case LRDropped{} RS{p, q, ls, js, y, f}:
@@ -1357,12 +1970,57 @@ def inv3_lact(+x: Nat, +lp: LR, +s: RS, i: Inv3(s)) -> Inv3(lact(x, lp, s)):
     case LRLost{} RS{p, q, ls, js, y, f}:
       i
 
+def inv3_fstep_on(+x: Nat, +lp: LR, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +y: Ty, i: Inv3(RS{p, q, ls, js, y, True{}})) -> Inv3(fstep.on(x, lp, p, q, ls, js, y)):
+  match lp:
+    case LRAsked{}:
+      (lo, nb) = i
+      (lo_set_fenced(q, x, True{}, lo), nb)
+    case LRGate{}:
+      (lo, nb) = i
+      (lo_set_fenced(q, x, True{}, lo), nb)
+    case LRAbsent{}:
+      i
+    case LRReady{}:
+      i
+    case LRFencedAsked{}:
+      i
+    case LRFencedGate{}:
+      i
+    case LRResumingAsked{}:
+      i
+    case LRResumingGate{}:
+      i
+    case LRDone{}:
+      i
+    case LRDropped{}:
+      i
+    case LROrphan{}:
+      i
+    case LRLost{}:
+      i
+
+def inv3_fstep_srv(+x: Nat, +lp: LR, +srv: Bool, +p: IR, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +y: Ty, i: Inv3(RS{p, q, ls, js, y, True{}})) -> Inv3(fstep.srv(x, lp, srv, p, q, ls, js, y)):
+  match srv:
+    case True{}:
+      inv3_fstep_on(x, lp, p, q, ls, js, y, i)
+    case False{}:
+      i
+
+def inv3_fstep(+x: Nat, +lp: LR, +s: RS, i: Inv3(s)) -> Inv3(fstep(x, lp, s)):
+  match s:
+    case RS{p, q, ls, js, y, True{}}:
+      inv3_fstep_srv(x, lp, serving(p), p, q, ls, js, y, i)
+    case RS{p, q, ls, js, y, False{}}:
+      i
+
 def inv3_step(+o: RO, +s: RS, i: Inv3(s)) -> Inv3(step(o, s)):
   match o:
     case ROInstall{}:
       inv3_istep(s, i)
     case ROLand{x}:
       inv3_lact(x, look(x, lands_of(s)), s, i)
+    case ROFence{x}:
+      inv3_fstep(x, look(x, lands_of(s)), s, i)
 
 def inv3_run(+os: +List<RO>, +s: RS, i: Inv3(s)) -> Inv3(run(os, s)):
   match os:
@@ -1384,7 +2042,7 @@ def lo_refl(+q: +List<Tk>, lo: LandsOnly(q)) -> {lands_only(q) == True{} : Bool}
   match q:
     case Nil{}:
       {==}
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, f}, t}:
       lo_refl(t, lo)
     case Con{TkI{}, t}:
       match lo:
@@ -1393,31 +2051,33 @@ def lo_waits(+q: +List<Tk>, lo: LandsOnly(q)) -> {waits_on_install(q) == False{}
   match q:
     case Nil{}:
       {==}
-    case Con{Tk{i, e}, t}:
+    case Con{Tk{i, e, f}, t}:
       lo_waits(t, lo)
     case Con{TkI{}, t}:
       match lo:
 
 # --- laws -------------------------------------------------------------------------
 
-# A restart never closes a turn whose land asked before the blockers were read:
-# such a ticket is still queued at the read, and the read refuses the install.
+# A restart never closes an unfenced turn whose land asked before the blockers
+# were read: such a ticket is still unfenced at the read, and the read refuses
+# the install.
 law restart_spares_turns_asked_before_the_read:
   for +f: Bool
   for +turn: Bool
   for +os: +List<RO>
   {n_early(run(os, empty(f, turn))) == 0n : Nat}
 
-# The supervisors' admitted jobs survive a restart: it closes the gateway's
-# queue and connections and touches no job.
+# The supervisors' admitted jobs survive a restart: it snapshots fenced tickets,
+# drops unfenced ones and touches no job.
 law restart_keeps_admitted_jobs:
   for +s: RS
   {jobs(restart(s)) == jobs(s) : +List<Nat>}
 
-# Definedness: a restart does happen, and loses every queue.
-law restart_loses_the_queue:
+# Definedness: a restart preserves every fenced ticket in order and drops only
+# unfenced ones.
+law restart_keeps_fenced_tickets:
   for +s: RS
-  {queue(restart(s)) == [] : +List<Tk>}
+  {queue(restart(s)) == keep_fenced(queue(s)) : +List<Tk>}
 
 # Definedness: an install that reads no blockers restarts the gateway.
 law a_clear_read_restarts:
@@ -1427,21 +2087,37 @@ law a_clear_read_restarts:
   for +f: Bool
   {phase(istep(istep(RS{IRHeld{}, [], ls, js, y, f}))) == IRRestarted{} : IR}
 
-# Definedness: a held turn refuses the install, the holder named first.
+# Definedness: an install that reads only fenced tickets restarts the gateway
+# while keeping them in the queue.
+law a_fenced_read_restarts_keeping_the_queue:
+  for +ls: +List<Ld>
+  for +js: +List<Nat>
+  for +y: Ty
+  {queue(istep(istep(RS{IRHeld{}, [Tk{0n, True{}, True{}}], ls, js, y, True{}}))) == [Tk{0n, True{}, True{}}] : +List<Tk>}
+
+# Definedness: an unfenced held turn refuses the install, named first.
 law a_held_turn_refuses:
   for +r: Nat
   for +n: Nat
-  for +t: +List<Nat>
+  for +t: +List<RT>
   for +qs: +List<RQ>
-  {blockers(RQ{r, n <> t} <> qs) == n <> blockers(qs) : +List<Nat>}
+  {blockers(RQ{r, RT{n, False{}} <> t} <> qs) == n <> blockers(RQ{r, t} <> qs) : +List<Nat>}
+
+# Definedness: a fenced turn does not block the install.
+law a_fenced_turn_does_not_refuse:
+  for +r: Nat
+  for +n: Nat
+  for +t: +List<RT>
+  for +qs: +List<RQ>
+  {blockers(RQ{r, RT{n, True{}} <> t} <> qs) == blockers(RQ{r, t} <> qs) : +List<Nat>}
 
 # Definedness: with no install running, a land's ask enters the queue.
 law an_ask_enters:
   for +f: Bool
-  {queue(run([ROLand{0n}, ROLand{0n}], empty(f, False{}))) == [Tk{0n, True{}}] : +List<Tk>}
+  {queue(run([ROLand{0n}, ROLand{0n}], empty(f, False{}))) == [Tk{0n, True{}, False{}}] : +List<Tk>}
 
-# The fenced repair, proven: no restart cuts a turn, kills an admitted gate or
-# refuses an ask, in every interleaving.
+# The fenced repair, proven over non-empty fenced queues too: no restart cuts a
+# turn, kills an admitted gate or refuses an ask, in every interleaving.
 law fenced_restart_never_cuts_a_turn:
   for +os: +List<RO>
   {n_cuts(run(os, empty(True{}, False{}))) == 0n : Nat}
@@ -1453,6 +2129,14 @@ law fenced_restart_never_kills_an_admitted_gate:
 law fenced_restart_never_refuses_an_ask:
   for +os: +List<RO>
   {n_refused(run(os, empty(True{}, False{}))) == 0n : Nat}
+
+# Definedness of Option A: a land holds its turn mid-gate, fences on the
+# install's wait, the install restarts the gateway while the queue retains the
+# ticket and the supervisor retains the gate, and the land resumes and finishes
+# with zero cuts, zero kills, and zero refusals.
+law a_fenced_gate_survives_restart_and_resumes:
+  for +b: Bool
+  {run([ROLand{0n}, ROLand{0n}, ROLand{0n}, ROFence{0n}, ROInstall{}, ROInstall{}, ROInstall{}, ROInstall{}, ROInstall{}, ROLand{0n}, ROLand{0n}], empty(True{}, False{})) == RS{IRDone{}, [], [Ld{0n, LRDone{}}], [], Ty{0n, 0n, 0n, 0n}, True{}} : RS}
 
 # The install build takes no land turn (the new land-install builds in a shed
 # of its own): in every interleaving the queue's tickets are lands' only, so no
@@ -1505,7 +2189,7 @@ def restart_keeps_admitted_jobs(s):
     case RS{p, q, ls, js, y, f}:
       {==}
 
-def restart_loses_the_queue(s):
+def restart_keeps_fenced_tickets(s):
   match s:
     case RS{p, q, ls, js, y, f}:
       {==}
@@ -1513,7 +2197,13 @@ def restart_loses_the_queue(s):
 def a_clear_read_restarts(ls, js, y, f):
   {==}
 
+def a_fenced_read_restarts_keeping_the_queue(ls, js, y):
+  {==}
+
 def a_held_turn_refuses(r, n, t, qs):
+  {==}
+
+def a_fenced_turn_does_not_refuse(r, n, t, qs):
   {==}
 
 def an_ask_enters(f):
@@ -1544,6 +2234,9 @@ def fenced_restart_never_kills_an_admitted_gate(os):
 
 def fenced_restart_never_refuses_an_ask(os):
   z_eq(n_refused(run(os, empty(True{}, False{}))), z_r(n_cuts(run(os, empty(True{}, False{}))), n_kills(run(os, empty(True{}, False{}))), n_refused(run(os, empty(True{}, False{}))), fenced_zs(os)))
+
+def a_fenced_gate_survives_restart_and_resumes(b):
+  {==}
 
 def no_land_waits_on_install_build(f, os):
   lo_refl(queue(run(os, empty(f, False{}))), lo_of(run(os, empty(f, False{})), inv3_run(os, empty(f, False{}), inv3_empty(f))))
@@ -1597,7 +2290,8 @@ law the_fenced_read_is_the_read_step:
   for +ls: +List<Ld>
   for +js: +List<Nat>
   for +y: Ty
-  {fenced_now(phase(istep(RS{IRHeld{}, q, ls, js, y, True{}})), True{}) == read_fences([RQ{0n, ids(q)}]) : Bool}
+  {fenced_now(phase(istep(RS{IRHeld{}, q, ls, js, y, True{}})), True{}) == read_fences([RQ{0n, rts(q)}]) : Bool}
 
 def the_fenced_read_is_the_read_step(q, ls, js, y):
-  read_step(refuses([RQ{0n, ids(q)}]), q, ls, js, y)
+  read_step(refuses([RQ{0n, rts(q)}]), q, ls, js, y)
+

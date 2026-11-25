@@ -44,11 +44,11 @@ fn list_append<T: Clone>(a: &Rc<List<T>>, b: Rc<List<T>>) -> Rc<List<T>> {
 
 #[derive(Clone, PartialEq)]
 pub enum E {
-    E(u64, u64, bool, Rc<List<u64>>, bool, bool),
+    E(u64, u64, bool, Rc<List<u64>>, bool, bool, bool),
 }
 pub fn write_E(x: &E, out: &mut String) {
     match x {
-        E::E(f0, f1, f2, f3, f4, f5) => {
+        E::E(f0, f1, f2, f3, f4, f5, f6) => {
             out.push_str("E(");
             write_Nat(f0, out);
             out.push(',');
@@ -61,6 +61,8 @@ pub fn write_E(x: &E, out: &mut String) {
             write_Bool(f4, out);
             out.push(',');
             write_Bool(f5, out);
+            out.push(',');
+            write_Bool(f6, out);
             out.push(')');
         }
     }
@@ -124,6 +126,8 @@ pub enum Edit {
     AddPid(u64),
     DropPid(u64),
     Depart,
+    MarkFenced,
+    UnfenceOne,
 }
 pub fn write_Edit(x: &Edit, out: &mut String) {
     match x {
@@ -138,6 +142,8 @@ pub fn write_Edit(x: &Edit, out: &mut String) {
             out.push(')');
         }
         Edit::Depart => out.push_str("Depart"),
+        Edit::MarkFenced => out.push_str("MarkFenced"),
+        Edit::UnfenceOne => out.push_str("UnfenceOne"),
     }
 }
 pub fn show_Edit(x: &Edit) -> String {
@@ -151,12 +157,14 @@ pub enum Bound {
     BGranted,
     BGone,
     BWaiting,
+    BFenced,
 }
 pub fn write_Bound(x: &Bound, out: &mut String) {
     match x {
         Bound::BGranted => out.push_str("BGranted"),
         Bound::BGone => out.push_str("BGone"),
         Bound::BWaiting => out.push_str("BWaiting"),
+        Bound::BFenced => out.push_str("BFenced"),
     }
 }
 pub fn show_Bound(x: &Bound) -> String {
@@ -175,6 +183,8 @@ pub enum Op {
     TUnfence,
     TWait,
     TWaitLeave,
+    TFenced(u64),
+    TResume(u64),
 }
 pub fn write_Op(x: &Op, out: &mut String) {
     match x {
@@ -208,6 +218,16 @@ pub fn write_Op(x: &Op, out: &mut String) {
         Op::TUnfence => out.push_str("TUnfence"),
         Op::TWait => out.push_str("TWait"),
         Op::TWaitLeave => out.push_str("TWaitLeave"),
+        Op::TFenced(f0) => {
+            out.push_str("TFenced(");
+            write_Nat(f0, out);
+            out.push(')');
+        }
+        Op::TResume(f0) => {
+            out.push_str("TResume(");
+            write_Nat(f0, out);
+            out.push(')');
+        }
     }
 }
 pub fn show_Op(x: &Op) -> String {
@@ -323,14 +343,15 @@ pub fn and(a_31: bool, b_32: bool) -> bool {
 
 pub fn num(e_36: E) -> u64 {
     match &e_36 {
-        E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-            let num_88: u64 = f0__.clone();
-            let pid_89: u64 = f1__.clone();
-            let asker_90: bool = f2__.clone();
-            let bound_91: Rc<List<u64>> = f3__.clone();
-            let held_92: bool = f4__.clone();
-            let bounded_93: bool = f5__.clone();
-            return num_88;
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_89: u64 = f0__.clone();
+            let pid_90: u64 = f1__.clone();
+            let asker_91: bool = f2__.clone();
+            let bound_92: Rc<List<u64>> = f3__.clone();
+            let held_93: bool = f4__.clone();
+            let bounded_94: bool = f5__.clone();
+            let fenced_95: bool = f6__.clone();
+            return num_89;
         }
     }
 }
@@ -367,49 +388,51 @@ pub fn counter(s_20: St) -> u64 {
 
 pub fn held(e_56: E) -> bool {
     match &e_56 {
-        E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-            let num_111: u64 = f0__.clone();
-            let pid_112: u64 = f1__.clone();
-            let asker_113: bool = f2__.clone();
-            let bound_114: Rc<List<u64>> = f3__.clone();
-            let held_115: bool = f4__.clone();
-            let bounded_116: bool = f5__.clone();
-            return held_115;
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_114: u64 = f0__.clone();
+            let pid_115: u64 = f1__.clone();
+            let asker_116: bool = f2__.clone();
+            let bound_117: Rc<List<u64>> = f3__.clone();
+            let held_118: bool = f4__.clone();
+            let bounded_119: bool = f5__.clone();
+            let fenced_120: bool = f6__.clone();
+            return held_118;
         }
     }
 }
 
-pub fn not(a_331: bool) -> bool {
-    if a_331 {
+pub fn not(a_377: bool) -> bool {
+    if a_377 {
         return false;
     } else {
         return true;
     }
 }
 
-pub fn is_nil(xs_333: Rc<List<u64>>) -> bool {
-    match &*xs_333 {
+pub fn is_nil(xs_379: Rc<List<u64>>) -> bool {
+    match &*xs_379 {
         List::Nil => {
             return true;
         }
         List::Con(h__, t__) => {
-            let head_465: u64 = h__.clone();
-            let tail_466: Rc<List<u64>> = t__.clone();
+            let head_514: u64 = h__.clone();
+            let tail_515: Rc<List<u64>> = t__.clone();
             return false;
         }
     }
 }
 
-pub fn idle_b(e_103: E) -> bool {
-    match &e_103 {
-        E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-            let num_322: u64 = f0__.clone();
-            let pid_323: u64 = f1__.clone();
-            let asker_324: bool = f2__.clone();
-            let bound_325: Rc<List<u64>> = f3__.clone();
-            let held_326: bool = f4__.clone();
-            let bounded_327: bool = f5__.clone();
-            return and(not(held_326), is_nil(bound_325.clone()));
+pub fn idle_b(e_105: E) -> bool {
+    match &e_105 {
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_367: u64 = f0__.clone();
+            let pid_368: u64 = f1__.clone();
+            let asker_369: bool = f2__.clone();
+            let bound_370: Rc<List<u64>> = f3__.clone();
+            let held_371: bool = f4__.clone();
+            let bounded_372: bool = f5__.clone();
+            let fenced_373: bool = f6__.clone();
+            return and(not(held_371), is_nil(bound_370.clone()));
         }
     }
 }
@@ -420,9 +443,9 @@ pub fn waiters_b(q_58: Rc<List<E>>) -> bool {
             return true;
         }
         List::Con(h__, t__) => {
-            let head_98: E = h__.clone();
-            let tail_99: Rc<List<E>> = t__.clone();
-            return and(idle_b(head_98.clone()), waiters_b(tail_99.clone()));
+            let head_100: E = h__.clone();
+            let tail_101: Rc<List<E>> = t__.clone();
+            return and(idle_b(head_100.clone()), waiters_b(tail_101.clone()));
         }
     }
 }
@@ -453,32 +476,34 @@ pub fn queue(s_4: St) -> Rc<List<E>> {
     }
 }
 
-pub fn tell(q_380: Rc<List<E>>) -> Rc<List<E>> {
-    match &*q_380 {
+pub fn tell(q_428: Rc<List<E>>) -> Rc<List<E>> {
+    match &*q_428 {
         List::Nil => {
             return Rc::new(List::Nil);
         }
         List::Con(h__, t__) => {
-            let head_528: E = h__.clone();
-            let tail_529: Rc<List<E>> = t__.clone();
-            match &head_528 {
-                E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-                    let num_536: u64 = f0__.clone();
-                    let pid_537: u64 = f1__.clone();
-                    let asker_538: bool = f2__.clone();
-                    let bound_539: Rc<List<u64>> = f3__.clone();
-                    let held_540: bool = f4__.clone();
-                    let bounded_541: bool = f5__.clone();
+            let head_611: E = h__.clone();
+            let tail_612: Rc<List<E>> = t__.clone();
+            match &head_611 {
+                E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+                    let num_620: u64 = f0__.clone();
+                    let pid_621: u64 = f1__.clone();
+                    let asker_622: bool = f2__.clone();
+                    let bound_623: Rc<List<u64>> = f3__.clone();
+                    let held_624: bool = f4__.clone();
+                    let bounded_625: bool = f5__.clone();
+                    let fenced_626: bool = f6__.clone();
                     return Rc::new(List::Con(
                         E::E(
-                            num_536,
-                            pid_537,
-                            asker_538,
-                            bound_539.clone(),
+                            num_620,
+                            pid_621,
+                            asker_622,
+                            bound_623.clone(),
                             true,
-                            bounded_541,
+                            bounded_625,
+                            fenced_626,
                         ),
-                        tail_529.clone(),
+                        tail_612.clone(),
                     ));
                 }
             }
@@ -486,401 +511,456 @@ pub fn tell(q_380: Rc<List<E>>) -> Rc<List<E>> {
     }
 }
 
-pub fn snoc(q_431: Rc<List<E>>, e_432: E) -> Rc<List<E>> {
-    match &*q_431 {
+pub fn snoc(q_479: Rc<List<E>>, e_480: E) -> Rc<List<E>> {
+    match &*q_479 {
         List::Nil => {
-            return Rc::new(List::Con(e_432.clone(), Rc::new(List::Nil)));
+            return Rc::new(List::Con(e_480.clone(), Rc::new(List::Nil)));
         }
         List::Con(h__, t__) => {
-            let head_548: E = h__.clone();
-            let tail_549: Rc<List<E>> = t__.clone();
+            let head_634: E = h__.clone();
+            let tail_635: Rc<List<E>> = t__.clone();
             return Rc::new(List::Con(
-                head_548.clone(),
-                snoc(tail_549.clone(), e_432.clone()),
+                head_634.clone(),
+                snoc(tail_635.clone(), e_480.clone()),
             ));
         }
     }
 }
 
-pub fn push_p(xs_524: Rc<List<P>>, x_525: P) -> Rc<List<P>> {
-    match &*xs_524 {
+pub fn push_p(xs_607: Rc<List<P>>, x_608: P) -> Rc<List<P>> {
+    match &*xs_607 {
         List::Nil => {
-            return Rc::new(List::Con(x_525.clone(), Rc::new(List::Nil)));
+            return Rc::new(List::Con(x_608.clone(), Rc::new(List::Nil)));
         }
         List::Con(h__, t__) => {
-            let head_675: P = h__.clone();
-            let tail_676: Rc<List<P>> = t__.clone();
+            let head_870: P = h__.clone();
+            let tail_871: Rc<List<P>> = t__.clone();
             return Rc::new(List::Con(
-                head_675.clone(),
-                push_p(tail_676.clone(), x_525.clone()),
+                head_870.clone(),
+                push_p(tail_871.clone(), x_608.clone()),
             ));
         }
     }
 }
 
 pub fn ask_wb(
-    q_709: Rc<List<E>>,
-    c_710: u64,
-    v_711: u64,
-    p_712: Rc<List<P>>,
-    x_713: u64,
-    u_714: bool,
+    q_905: Rc<List<E>>,
+    c_906: u64,
+    v_907: u64,
+    p_908: Rc<List<P>>,
+    x_909: u64,
+    u_910: bool,
 ) -> St {
-    if u_714 {
+    if u_910 {
         return St::St(
             tell(snoc(
-                q_709.clone(),
+                q_905.clone(),
                 E::E(
-                    nat_add(c_710, 1u64),
-                    x_713,
+                    nat_add(c_906, 1u64),
+                    x_909,
                     true,
                     Rc::new(List::Nil),
                     false,
                     true,
+                    false,
                 ),
             )),
-            nat_add(c_710, 1u64),
+            nat_add(c_906, 1u64),
             0u64,
-            nat_add(v_711, 1u64),
-            p_712.clone(),
+            nat_add(v_907, 1u64),
+            p_908.clone(),
         );
     } else {
         return St::St(
-            q_709.clone(),
-            c_710,
+            q_905.clone(),
+            c_906,
             0u64,
-            nat_add(v_711, 1u64),
-            push_p(p_712.clone(), P::P(x_713, true)),
+            nat_add(v_907, 1u64),
+            push_p(p_908.clone(), P::P(x_909, true)),
         );
     }
 }
 
-pub fn or(a_457: bool, b_458: bool) -> bool {
-    if a_457 {
+pub fn or(a_506: bool, b_507: bool) -> bool {
+    if a_506 {
         return true;
     } else {
-        return b_458;
+        return b_507;
     }
 }
 
-pub fn bounded(e_796: E) -> bool {
-    match &e_796 {
-        E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-            let num_808: u64 = f0__.clone();
-            let pid_809: u64 = f1__.clone();
-            let asker_810: bool = f2__.clone();
-            let bound_811: Rc<List<u64>> = f3__.clone();
-            let held_812: bool = f4__.clone();
-            let bounded_813: bool = f5__.clone();
-            return bounded_813;
+pub fn bounded(e_995: E) -> bool {
+    match &e_995 {
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_1008: u64 = f0__.clone();
+            let pid_1009: u64 = f1__.clone();
+            let asker_1010: bool = f2__.clone();
+            let bound_1011: Rc<List<u64>> = f3__.clone();
+            let held_1012: bool = f4__.clone();
+            let bounded_1013: bool = f5__.clone();
+            let fenced_1014: bool = f6__.clone();
+            return bounded_1013;
         }
     }
 }
 
-pub fn has_unbounded(q_716: Rc<List<E>>) -> bool {
-    match &*q_716 {
+pub fn has_unbounded(q_912: Rc<List<E>>) -> bool {
+    match &*q_912 {
         List::Nil => {
             return false;
         }
         List::Con(h__, t__) => {
-            let head_790: E = h__.clone();
-            let tail_791: Rc<List<E>> = t__.clone();
+            let head_989: E = h__.clone();
+            let tail_990: Rc<List<E>> = t__.clone();
             return or(
-                not(bounded(head_790.clone())),
-                has_unbounded(tail_791.clone()),
+                not(bounded(head_989.clone())),
+                has_unbounded(tail_990.clone()),
             );
         }
     }
 }
 
 pub fn ask_w(
-    q_510: Rc<List<E>>,
-    c_511: u64,
-    w_512: u64,
-    p_513: Rc<List<P>>,
-    x_514: u64,
-    d_515: bool,
+    q_593: Rc<List<E>>,
+    c_594: u64,
+    w_595: u64,
+    p_596: Rc<List<P>>,
+    x_597: u64,
+    d_598: bool,
 ) -> St {
-    if w_512 == 0 {
+    if w_595 == 0 {
         return St::St(
             tell(snoc(
-                q_510.clone(),
+                q_593.clone(),
                 E::E(
-                    nat_add(c_511, 1u64),
-                    x_514,
+                    nat_add(c_594, 1u64),
+                    x_597,
                     true,
                     Rc::new(List::Nil),
                     false,
-                    d_515,
+                    d_598,
+                    false,
                 ),
             )),
-            nat_add(c_511, 1u64),
+            nat_add(c_594, 1u64),
             0u64,
             0u64,
-            p_513.clone(),
+            p_596.clone(),
         );
     } else {
-        let pred_693: u64 = w_512 - 1;
-        if d_515 {
+        let pred_889: u64 = w_595 - 1;
+        if d_598 {
             return ask_wb(
-                q_510.clone(),
-                c_511,
-                pred_693,
-                p_513.clone(),
-                x_514,
-                has_unbounded(q_510.clone()),
+                q_593.clone(),
+                c_594,
+                pred_889,
+                p_596.clone(),
+                x_597,
+                has_unbounded(q_593.clone()),
             );
         } else {
             return St::St(
-                q_510.clone(),
-                c_511,
+                q_593.clone(),
+                c_594,
                 0u64,
-                nat_add(pred_693, 1u64),
-                push_p(p_513.clone(), P::P(x_514, false)),
+                nat_add(pred_889, 1u64),
+                push_p(p_596.clone(), P::P(x_597, false)),
             );
         }
     }
 }
 
 pub fn ask(
-    q_446: Rc<List<E>>,
-    c_447: u64,
-    f_448: u64,
-    w_449: u64,
-    p_450: Rc<List<P>>,
-    x_451: u64,
-    d_452: bool,
+    q_495: Rc<List<E>>,
+    c_496: u64,
+    f_497: u64,
+    w_498: u64,
+    p_499: Rc<List<P>>,
+    x_500: u64,
+    d_501: bool,
 ) -> St {
-    if f_448 == 0 {
-        return ask_w(q_446.clone(), c_447, w_449, p_450.clone(), x_451, d_452);
+    if f_497 == 0 {
+        return ask_w(q_495.clone(), c_496, w_498, p_499.clone(), x_500, d_501);
     } else {
-        let pred_516: u64 = f_448 - 1;
+        let pred_599: u64 = f_497 - 1;
         return St::St(
-            q_446.clone(),
-            c_447,
-            nat_add(pred_516, 1u64),
-            w_449,
-            push_p(p_450.clone(), P::P(x_451, d_452)),
+            q_495.clone(),
+            c_496,
+            nat_add(pred_599, 1u64),
+            w_498,
+            push_p(p_499.clone(), P::P(x_500, d_501)),
         );
     }
 }
 
 pub fn ask_in(
-    q_139: Rc<List<E>>,
-    c_140: u64,
-    f_141: u64,
-    w_142: u64,
-    p_143: Rc<List<P>>,
-    x_144: u64,
-    d_145: bool,
-    i_146: bool,
+    q_143: Rc<List<E>>,
+    c_144: u64,
+    f_145: u64,
+    w_146: u64,
+    p_147: Rc<List<P>>,
+    x_148: u64,
+    d_149: bool,
+    i_150: bool,
 ) -> St {
-    if i_146 {
+    if i_150 {
         return St::St(
             tell(snoc(
-                q_139.clone(),
+                q_143.clone(),
                 E::E(
-                    nat_add(c_140, 1u64),
-                    x_144,
+                    nat_add(c_144, 1u64),
+                    x_148,
                     true,
                     Rc::new(List::Nil),
                     false,
-                    d_145,
+                    d_149,
+                    false,
                 ),
             )),
-            nat_add(c_140, 1u64),
-            f_141,
-            w_142,
-            p_143.clone(),
+            nat_add(c_144, 1u64),
+            f_145,
+            w_146,
+            p_147.clone(),
         );
     } else {
         return ask(
-            q_139.clone(),
-            c_140,
-            f_141,
-            w_142,
-            p_143.clone(),
-            x_144,
-            d_145,
+            q_143.clone(),
+            c_144,
+            f_145,
+            w_146,
+            p_147.clone(),
+            x_148,
+            d_149,
         );
     }
 }
 
-pub fn same(a_402: u64, b_403: u64) -> bool {
-    return (a_402 == b_403);
+pub fn same(a_450: u64, b_451: u64) -> bool {
+    return (a_450 == b_451);
 }
 
-pub fn mem(x_568: u64, xs_569: Rc<List<u64>>) -> bool {
-    match &*xs_569 {
+pub fn mem(x_656: u64, xs_657: Rc<List<u64>>) -> bool {
+    match &*xs_657 {
         List::Nil => {
             return false;
         }
         List::Con(h__, t__) => {
-            let head_726: u64 = h__.clone();
-            let tail_727: Rc<List<u64>> = t__.clone();
-            return or(same(x_568, head_726), mem(x_568, tail_727.clone()));
+            let head_922: u64 = h__.clone();
+            let tail_923: Rc<List<u64>> = t__.clone();
+            return or(same(x_656, head_922), mem(x_656, tail_923.clone()));
         }
     }
 }
 
-pub fn asking(a_719: bool, h_720: bool) -> bool {
-    if h_720 {
-        return a_719;
+pub fn asking(a_915: bool, h_916: bool) -> bool {
+    if h_916 {
+        return a_915;
     } else {
         return false;
     }
 }
 
-pub fn mine_if(a_573: bool, h_574: bool, s_575: bool) -> bool {
-    if s_575 {
-        return asking(a_573, h_574);
+pub fn mine_if(a_661: bool, h_662: bool, s_663: bool) -> bool {
+    if s_663 {
+        return asking(a_661, h_662);
     } else {
         return false;
     }
 }
 
-pub fn within(x_461: u64, e_462: E) -> bool {
-    match &e_462 {
-        E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-            let num_558: u64 = f0__.clone();
-            let pid_559: u64 = f1__.clone();
-            let asker_560: bool = f2__.clone();
-            let bound_561: Rc<List<u64>> = f3__.clone();
-            let held_562: bool = f4__.clone();
-            let bounded_563: bool = f5__.clone();
-            return or(
-                mem(x_461, bound_561.clone()),
-                mine_if(asker_560, held_562, same(x_461, pid_559)),
-            );
+pub fn within(x_510: u64, e_511: E) -> bool {
+    match &e_511 {
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_645: u64 = f0__.clone();
+            let pid_646: u64 = f1__.clone();
+            let asker_647: bool = f2__.clone();
+            let bound_648: Rc<List<u64>> = f3__.clone();
+            let held_649: bool = f4__.clone();
+            let bounded_650: bool = f5__.clone();
+            let fenced_651: bool = f6__.clone();
+            if fenced_651 {
+                return false;
+            } else {
+                return or(
+                    mem(x_510, bound_648.clone()),
+                    mine_if(asker_647, held_649, same(x_510, pid_646)),
+                );
+            }
         }
     }
 }
 
-pub fn inside(x_149: u64, q_150: Rc<List<E>>) -> bool {
-    match &*q_150 {
+pub fn inside(x_153: u64, q_154: Rc<List<E>>) -> bool {
+    match &*q_154 {
         List::Nil => {
             return false;
         }
         List::Con(h__, t__) => {
-            let head_453: E = h__.clone();
-            let tail_454: Rc<List<E>> = t__.clone();
+            let head_502: E = h__.clone();
+            let tail_503: Rc<List<E>> = t__.clone();
             return or(
-                within(x_149, head_453.clone()),
-                inside(x_149, tail_454.clone()),
+                within(x_153, head_502.clone()),
+                inside(x_153, tail_503.clone()),
             );
         }
     }
 }
 
-pub fn push(xs_800: Rc<List<u64>>, x_801: u64) -> Rc<List<u64>> {
-    match &*xs_800 {
+pub fn push(xs_999: Rc<List<u64>>, x_1000: u64) -> Rc<List<u64>> {
+    match &*xs_999 {
         List::Nil => {
-            return Rc::new(List::Con(x_801, Rc::new(List::Nil)));
+            return Rc::new(List::Con(x_1000, Rc::new(List::Nil)));
         }
         List::Con(h__, t__) => {
-            let head_814: u64 = h__.clone();
-            let tail_815: Rc<List<u64>> = t__.clone();
-            return Rc::new(List::Con(head_814, push(tail_815.clone(), x_801)));
+            let head_1015: u64 = h__.clone();
+            let tail_1016: Rc<List<u64>> = t__.clone();
+            return Rc::new(List::Con(head_1015, push(tail_1016.clone(), x_1000)));
         }
     }
 }
 
-pub fn add_if(x_762: u64, xs_763: Rc<List<u64>>, b_764: bool) -> Rc<List<u64>> {
-    if b_764 {
-        return xs_763.clone();
+pub fn add_if(x_960: u64, xs_961: Rc<List<u64>>, b_962: bool) -> Rc<List<u64>> {
+    if b_962 {
+        return xs_961.clone();
     } else {
-        return push(xs_763.clone(), x_762);
+        return push(xs_961.clone(), x_960);
     }
 }
 
-pub fn add(x_631: u64, xs_632: Rc<List<u64>>) -> Rc<List<u64>> {
-    return add_if(x_631, xs_632.clone(), mem(x_631, xs_632.clone()));
+pub fn add(x_764: u64, xs_765: Rc<List<u64>>) -> Rc<List<u64>> {
+    return add_if(x_764, xs_765.clone(), mem(x_764, xs_765.clone()));
 }
 
-pub fn remove_if(h_752: u64, r_753: Rc<List<u64>>, b_754: bool) -> Rc<List<u64>> {
-    if b_754 {
-        return r_753.clone();
+pub fn remove_if(h_950: u64, r_951: Rc<List<u64>>, b_952: bool) -> Rc<List<u64>> {
+    if b_952 {
+        return r_951.clone();
     } else {
-        return Rc::new(List::Con(h_752, r_753.clone()));
+        return Rc::new(List::Con(h_950, r_951.clone()));
     }
 }
 
-pub fn remove(x_655: u64, xs_656: Rc<List<u64>>) -> Rc<List<u64>> {
-    match &*xs_656 {
+pub fn remove(x_791: u64, xs_792: Rc<List<u64>>) -> Rc<List<u64>> {
+    match &*xs_792 {
         List::Nil => {
             return Rc::new(List::Nil);
         }
         List::Con(h__, t__) => {
-            let head_747: u64 = h__.clone();
-            let tail_748: Rc<List<u64>> = t__.clone();
+            let head_945: u64 = h__.clone();
+            let tail_946: Rc<List<u64>> = t__.clone();
             return remove_if(
-                head_747,
-                remove(x_655, tail_748.clone()),
-                same(x_655, head_747),
+                head_945,
+                remove(x_791, tail_946.clone()),
+                same(x_791, head_945),
             );
         }
     }
 }
 
-pub fn apply(k_499: Edit, e_500: E) -> E {
-    match &k_499 {
+pub fn apply(k_578: Edit, e_579: E) -> E {
+    match &k_578 {
         Edit::AddPid(f0__) => {
-            let pid_610: u64 = f0__.clone();
-            match &e_500 {
-                E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-                    let num_617: u64 = f0__.clone();
-                    let pid_618: u64 = f1__.clone();
-                    let asker_619: bool = f2__.clone();
-                    let bound_620: Rc<List<u64>> = f3__.clone();
-                    let held_621: bool = f4__.clone();
-                    let bounded_622: bool = f5__.clone();
+            let pid_740: u64 = f0__.clone();
+            match &e_579 {
+                E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+                    let num_748: u64 = f0__.clone();
+                    let pid_749: u64 = f1__.clone();
+                    let asker_750: bool = f2__.clone();
+                    let bound_751: Rc<List<u64>> = f3__.clone();
+                    let held_752: bool = f4__.clone();
+                    let bounded_753: bool = f5__.clone();
+                    let fenced_754: bool = f6__.clone();
                     return E::E(
-                        num_617,
-                        pid_618,
-                        asker_619,
-                        add(pid_610, bound_620.clone()),
-                        held_621,
-                        bounded_622,
+                        num_748,
+                        pid_749,
+                        asker_750,
+                        add(pid_740, bound_751.clone()),
+                        held_752,
+                        bounded_753,
+                        fenced_754,
                     );
                 }
             }
         }
         Edit::DropPid(f0__) => {
-            let pid_634: u64 = f0__.clone();
-            match &e_500 {
-                E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-                    let num_641: u64 = f0__.clone();
-                    let pid_642: u64 = f1__.clone();
-                    let asker_643: bool = f2__.clone();
-                    let bound_644: Rc<List<u64>> = f3__.clone();
-                    let held_645: bool = f4__.clone();
-                    let bounded_646: bool = f5__.clone();
+            let pid_767: u64 = f0__.clone();
+            match &e_579 {
+                E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+                    let num_775: u64 = f0__.clone();
+                    let pid_776: u64 = f1__.clone();
+                    let asker_777: bool = f2__.clone();
+                    let bound_778: Rc<List<u64>> = f3__.clone();
+                    let held_779: bool = f4__.clone();
+                    let bounded_780: bool = f5__.clone();
+                    let fenced_781: bool = f6__.clone();
                     return E::E(
-                        num_641,
-                        pid_642,
-                        asker_643,
-                        remove(pid_634, bound_644.clone()),
-                        held_645,
-                        bounded_646,
+                        num_775,
+                        pid_776,
+                        asker_777,
+                        remove(pid_767, bound_778.clone()),
+                        held_779,
+                        bounded_780,
+                        fenced_781,
                     );
                 }
             }
         }
-        Edit::Depart => match &e_500 {
-            E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-                let num_663: u64 = f0__.clone();
-                let pid_664: u64 = f1__.clone();
-                let asker_665: bool = f2__.clone();
-                let bound_666: Rc<List<u64>> = f3__.clone();
-                let held_667: bool = f4__.clone();
-                let bounded_668: bool = f5__.clone();
+        Edit::Depart => match &e_579 {
+            E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+                let num_800: u64 = f0__.clone();
+                let pid_801: u64 = f1__.clone();
+                let asker_802: bool = f2__.clone();
+                let bound_803: Rc<List<u64>> = f3__.clone();
+                let held_804: bool = f4__.clone();
+                let bounded_805: bool = f5__.clone();
+                let fenced_806: bool = f6__.clone();
                 return E::E(
-                    num_663,
-                    pid_664,
+                    num_800,
+                    pid_801,
                     false,
-                    bound_666.clone(),
-                    held_667,
-                    bounded_668,
+                    bound_803.clone(),
+                    held_804,
+                    bounded_805,
+                    fenced_806,
+                );
+            }
+        },
+        Edit::MarkFenced => match &e_579 {
+            E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+                let num_821: u64 = f0__.clone();
+                let pid_822: u64 = f1__.clone();
+                let asker_823: bool = f2__.clone();
+                let bound_824: Rc<List<u64>> = f3__.clone();
+                let held_825: bool = f4__.clone();
+                let bounded_826: bool = f5__.clone();
+                let fenced_827: bool = f6__.clone();
+                return E::E(
+                    num_821,
+                    pid_822,
+                    asker_823,
+                    bound_824.clone(),
+                    held_825,
+                    bounded_826,
+                    true,
+                );
+            }
+        },
+        Edit::UnfenceOne => match &e_579 {
+            E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+                let num_842: u64 = f0__.clone();
+                let pid_843: u64 = f1__.clone();
+                let asker_844: bool = f2__.clone();
+                let bound_845: Rc<List<u64>> = f3__.clone();
+                let held_846: bool = f4__.clone();
+                let bounded_847: bool = f5__.clone();
+                let fenced_848: bool = f6__.clone();
+                return E::E(
+                    num_842,
+                    pid_843,
+                    asker_844,
+                    bound_845.clone(),
+                    held_846,
+                    bounded_847,
+                    false,
                 );
             }
         },
@@ -888,220 +968,285 @@ pub fn apply(k_499: Edit, e_500: E) -> E {
 }
 
 pub fn edit_if(
-    k_392: Edit,
-    e_393: E,
-    t_394: Rc<List<E>>,
-    r_395: Rc<List<E>>,
-    b_396: bool,
+    k_440: Edit,
+    e_441: E,
+    t_442: Rc<List<E>>,
+    r_443: Rc<List<E>>,
+    b_444: bool,
 ) -> Rc<List<E>> {
-    if b_396 {
+    if b_444 {
         return Rc::new(List::Con(
-            apply(k_392.clone(), e_393.clone()),
-            t_394.clone(),
+            apply(k_440.clone(), e_441.clone()),
+            t_442.clone(),
         ));
     } else {
-        return Rc::new(List::Con(e_393.clone(), r_395.clone()));
+        return Rc::new(List::Con(e_441.clone(), r_443.clone()));
     }
 }
 
-pub fn edit(n_213: u64, k_214: Edit, q_215: Rc<List<E>>) -> Rc<List<E>> {
-    match &*q_215 {
+pub fn edit(n_217: u64, k_218: Edit, q_219: Rc<List<E>>) -> Rc<List<E>> {
+    match &*q_219 {
         List::Nil => {
             return Rc::new(List::Nil);
         }
         List::Con(h__, t__) => {
-            let head_385: E = h__.clone();
-            let tail_386: Rc<List<E>> = t__.clone();
+            let head_433: E = h__.clone();
+            let tail_434: Rc<List<E>> = t__.clone();
             return edit_if(
-                k_214.clone(),
-                head_385.clone(),
-                tail_386.clone(),
-                edit(n_213, k_214.clone(), tail_386.clone()),
-                same(n_213, num(head_385.clone())),
+                k_218.clone(),
+                head_433.clone(),
+                tail_434.clone(),
+                edit(n_217, k_218.clone(), tail_434.clone()),
+                same(n_217, num(head_433.clone())),
             );
         }
     }
 }
 
-pub fn bind_if(n_174: u64, p_175: u64, q_176: Rc<List<E>>, v_177: Bound) -> Rc<List<E>> {
-    match &v_177 {
+pub fn bind_if(n_178: u64, p_179: u64, q_180: Rc<List<E>>, v_181: Bound) -> Rc<List<E>> {
+    match &v_181 {
         Bound::BGranted => {
-            return tell(edit(n_174, Edit::AddPid(p_175), q_176.clone()));
+            return tell(edit(n_178, Edit::AddPid(p_179), q_180.clone()));
         }
         Bound::BGone => {
-            return q_176.clone();
+            return q_180.clone();
         }
         Bound::BWaiting => {
-            return q_176.clone();
+            return q_180.clone();
+        }
+        Bound::BFenced => {
+            return q_180.clone();
         }
     }
 }
 
-pub fn find_held(h_502: bool) -> Bound {
-    if h_502 {
-        return Bound::BGranted;
+pub fn find_held(h_582: bool, f_583: bool) -> Bound {
+    if h_582 {
+        if f_583 {
+            return Bound::BFenced;
+        } else {
+            return Bound::BGranted;
+        }
     } else {
         return Bound::BWaiting;
     }
 }
 
-pub fn find_if(e_415: E, r_416: Bound, b_417: bool) -> Bound {
-    if b_417 {
-        return find_held(held(e_415.clone()));
-    } else {
-        return r_416.clone();
+pub fn is_fenced(e_586: E) -> bool {
+    match &e_586 {
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_863: u64 = f0__.clone();
+            let pid_864: u64 = f1__.clone();
+            let asker_865: bool = f2__.clone();
+            let bound_866: Rc<List<u64>> = f3__.clone();
+            let held_867: bool = f4__.clone();
+            let bounded_868: bool = f5__.clone();
+            let fenced_869: bool = f6__.clone();
+            return fenced_869;
+        }
     }
 }
 
-pub fn find(n_180: u64, q_181: Rc<List<E>>) -> Bound {
-    match &*q_181 {
+pub fn find_if(e_463: E, r_464: Bound, b_465: bool) -> Bound {
+    if b_465 {
+        return find_held(held(e_463.clone()), is_fenced(e_463.clone()));
+    } else {
+        return r_464.clone();
+    }
+}
+
+pub fn find(n_184: u64, q_185: Rc<List<E>>) -> Bound {
+    match &*q_185 {
         List::Nil => {
             return Bound::BGone;
         }
         List::Con(h__, t__) => {
-            let head_410: E = h__.clone();
-            let tail_411: Rc<List<E>> = t__.clone();
+            let head_458: E = h__.clone();
+            let tail_459: Rc<List<E>> = t__.clone();
             return find_if(
-                head_410.clone(),
-                find(n_180, tail_411.clone()),
-                same(n_180, num(head_410.clone())),
+                head_458.clone(),
+                find(n_184, tail_459.clone()),
+                same(n_184, num(head_458.clone())),
             );
         }
     }
 }
 
-pub fn plus(a_370: u64, b_371: u64) -> u64 {
-    if a_370 == 0 {
-        return b_371;
+pub fn plus(a_547: u64, b_548: u64) -> u64 {
+    if a_547 == 0 {
+        return b_548;
     } else {
-        let pred_479: u64 = a_370 - 1;
-        return nat_add(plus(pred_479, b_371), 1u64);
+        let pred_714: u64 = a_547 - 1;
+        return nat_add(plus(pred_714, b_548), 1u64);
     }
 }
 
-pub fn wake(q_201: Rc<List<E>>, c_202: u64, f_203: u64, w_204: u64, p_205: Rc<List<P>>) -> St {
-    match &*q_201 {
-        List::Nil => {
-            return St::St(
-                Rc::new(List::Nil),
-                c_202,
-                plus(w_204, f_203),
-                0u64,
-                p_205.clone(),
-            );
-        }
-        List::Con(h__, t__) => {
-            let head_372: E = h__.clone();
-            let tail_373: Rc<List<E>> = t__.clone();
-            return St::St(
-                Rc::new(List::Con(head_372.clone(), tail_373.clone())),
-                c_202,
-                f_203,
-                w_204,
-                p_205.clone(),
-            );
-        }
-    }
-}
-
-pub fn drop_if(e_604: E, t_605: Rc<List<E>>, b_606: bool) -> Rc<List<E>> {
-    if b_606 {
-        return t_605.clone();
+pub fn wake_if(
+    q_420: Rc<List<E>>,
+    c_421: u64,
+    f_422: u64,
+    w_423: u64,
+    p_424: Rc<List<P>>,
+    ready_425: bool,
+) -> St {
+    if ready_425 {
+        return St::St(
+            q_420.clone(),
+            c_421,
+            plus(w_423, f_422),
+            0u64,
+            p_424.clone(),
+        );
     } else {
-        return Rc::new(List::Con(e_604.clone(), t_605.clone()));
+        return St::St(q_420.clone(), c_421, f_422, w_423, p_424.clone());
     }
 }
 
-pub fn done(e_608: E) -> bool {
-    match &e_608 {
-        E::E(f0__, f1__, f2__, f3__, f4__, f5__) => {
-            let num_740: u64 = f0__.clone();
-            let pid_741: u64 = f1__.clone();
-            let asker_742: bool = f2__.clone();
-            let bound_743: Rc<List<u64>> = f3__.clone();
-            let held_744: bool = f4__.clone();
-            let bounded_745: bool = f5__.clone();
-            if asker_742 {
-                return false;
+pub fn ticket_fenced(e_559: E) -> bool {
+    match &e_559 {
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_724: u64 = f0__.clone();
+            let pid_725: u64 = f1__.clone();
+            let asker_726: bool = f2__.clone();
+            let bound_727: Rc<List<u64>> = f3__.clone();
+            let held_728: bool = f4__.clone();
+            let bounded_729: bool = f5__.clone();
+            let fenced_730: bool = f6__.clone();
+            if asker_726 {
+                return fenced_730;
             } else {
-                return is_nil(bound_743.clone());
+                return true;
             }
         }
     }
 }
 
-pub fn sweep_if(e_488: E, t_489: Rc<List<E>>, r_490: Rc<List<E>>, b_491: bool) -> Rc<List<E>> {
-    if b_491 {
-        return drop_if(e_488.clone(), t_489.clone(), done(e_488.clone()));
-    } else {
-        return Rc::new(List::Con(e_488.clone(), r_490.clone()));
+pub fn all_fenced(q_393: Rc<List<E>>) -> bool {
+    match &*q_393 {
+        List::Nil => {
+            return true;
+        }
+        List::Con(h__, t__) => {
+            let head_554: E = h__.clone();
+            let tail_555: Rc<List<E>> = t__.clone();
+            return and(
+                ticket_fenced(head_554.clone()),
+                all_fenced(tail_555.clone()),
+            );
+        }
     }
 }
 
-pub fn sweep(n_383: u64, q_384: Rc<List<E>>) -> Rc<List<E>> {
-    match &*q_384 {
+pub fn wake(q_205: Rc<List<E>>, c_206: u64, f_207: u64, w_208: u64, p_209: Rc<List<P>>) -> St {
+    return wake_if(
+        q_205.clone(),
+        c_206,
+        f_207,
+        w_208,
+        p_209.clone(),
+        all_fenced(q_205.clone()),
+    );
+}
+
+pub fn drop_if(e_734: E, t_735: Rc<List<E>>, b_736: bool) -> Rc<List<E>> {
+    if b_736 {
+        return t_735.clone();
+    } else {
+        return Rc::new(List::Con(e_734.clone(), t_735.clone()));
+    }
+}
+
+pub fn done(e_738: E) -> bool {
+    match &e_738 {
+        E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+            let num_937: u64 = f0__.clone();
+            let pid_938: u64 = f1__.clone();
+            let asker_939: bool = f2__.clone();
+            let bound_940: Rc<List<u64>> = f3__.clone();
+            let held_941: bool = f4__.clone();
+            let bounded_942: bool = f5__.clone();
+            let fenced_943: bool = f6__.clone();
+            if asker_939 {
+                return false;
+            } else {
+                return is_nil(bound_940.clone());
+            }
+        }
+    }
+}
+
+pub fn sweep_if(e_567: E, t_568: Rc<List<E>>, r_569: Rc<List<E>>, b_570: bool) -> Rc<List<E>> {
+    if b_570 {
+        return drop_if(e_567.clone(), t_568.clone(), done(e_567.clone()));
+    } else {
+        return Rc::new(List::Con(e_567.clone(), r_569.clone()));
+    }
+}
+
+pub fn sweep(n_431: u64, q_432: Rc<List<E>>) -> Rc<List<E>> {
+    match &*q_432 {
         List::Nil => {
             return Rc::new(List::Nil);
         }
         List::Con(h__, t__) => {
-            let head_482: E = h__.clone();
-            let tail_483: Rc<List<E>> = t__.clone();
+            let head_561: E = h__.clone();
+            let tail_562: Rc<List<E>> = t__.clone();
             return sweep_if(
-                head_482.clone(),
-                tail_483.clone(),
-                sweep(n_383, tail_483.clone()),
-                same(n_383, num(head_482.clone())),
+                head_561.clone(),
+                tail_562.clone(),
+                sweep(n_431, tail_562.clone()),
+                same(n_431, num(head_561.clone())),
             );
         }
     }
 }
 
-pub fn settle(n_208: u64, q_209: Rc<List<E>>) -> Rc<List<E>> {
-    return tell(sweep(n_208, q_209.clone()));
+pub fn settle(n_212: u64, q_213: Rc<List<E>>) -> Rc<List<E>> {
+    return tell(sweep(n_212, q_213.clone()));
 }
 
-pub fn fence(q_256: Rc<List<E>>, f_257: u64) -> u64 {
-    match &*q_256 {
-        List::Nil => {
-            return nat_add(f_257, 1u64);
-        }
-        List::Con(h__, t__) => {
-            let head_361: E = h__.clone();
-            let tail_362: Rc<List<E>> = t__.clone();
-            return f_257;
-        }
+pub fn fence_if(f_411: u64, ready_412: bool) -> u64 {
+    if ready_412 {
+        return nat_add(f_411, 1u64);
+    } else {
+        return f_411;
     }
 }
 
-pub fn admit(mut p_470: Rc<List<P>>, mut q_471: Rc<List<E>>, mut c_472: u64) -> St {
+pub fn fence(q_260: Rc<List<E>>, f_261: u64) -> u64 {
+    return fence_if(f_261, all_fenced(q_260.clone()));
+}
+
+pub fn admit(mut p_529: Rc<List<P>>, mut q_530: Rc<List<E>>, mut c_531: u64) -> St {
     loop {
-        match &*p_470.clone() {
+        match &*p_529.clone() {
             List::Nil => {
-                return St::St(q_471.clone(), c_472, 0u64, 0u64, Rc::new(List::Nil));
+                return St::St(q_530.clone(), c_531, 0u64, 0u64, Rc::new(List::Nil));
             }
             List::Con(h__, t__) => {
-                let head_583: P = h__.clone();
-                let tail_584: Rc<List<P>> = t__.clone();
-                match &head_583.clone() {
+                let head_671: P = h__.clone();
+                let tail_672: Rc<List<P>> = t__.clone();
+                match &head_671.clone() {
                     P::P(f0__, f1__) => {
-                        let pid_587: u64 = f0__.clone();
-                        let bounded_588: bool = f1__.clone();
-                        let __t0 = tail_584.clone();
+                        let pid_675: u64 = f0__.clone();
+                        let bounded_676: bool = f1__.clone();
+                        let __t0 = tail_672.clone();
                         let __t1 = tell(snoc(
-                            q_471.clone(),
+                            q_530.clone(),
                             E::E(
-                                nat_add(c_472, 1u64),
-                                pid_587,
+                                nat_add(c_531, 1u64),
+                                pid_675,
                                 true,
                                 Rc::new(List::Nil),
                                 false,
-                                bounded_588,
+                                bounded_676,
+                                false,
                             ),
                         ));
-                        let __t2 = nat_add(c_472, 1u64);
-                        p_470 = __t0;
-                        q_471 = __t1;
-                        c_472 = __t2;
+                        let __t2 = nat_add(c_531, 1u64);
+                        p_529 = __t0;
+                        q_530 = __t1;
+                        c_531 = __t2;
                         continue;
                     }
                 }
@@ -1110,226 +1255,312 @@ pub fn admit(mut p_470: Rc<List<P>>, mut q_471: Rc<List<E>>, mut c_472: u64) -> 
     }
 }
 
-pub fn lift_w(q_350: Rc<List<E>>, c_351: u64, w_352: u64, p_353: Rc<List<P>>) -> St {
-    if w_352 == 0 {
-        return admit(p_353.clone(), q_350.clone(), c_351);
-    } else {
-        let pred_473: u64 = w_352 - 1;
-        return St::St(
-            q_350.clone(),
-            c_351,
-            0u64,
-            nat_add(pred_473, 1u64),
-            p_353.clone(),
-        );
-    }
-}
-
-pub fn lift(q_273: Rc<List<E>>, c_274: u64, f_275: u64, w_276: u64, p_277: Rc<List<P>>) -> St {
-    if f_275 == 0 {
-        return lift_w(q_273.clone(), c_274, w_276, p_277.clone());
-    } else {
-        let pred_354: u64 = f_275 - 1;
-        return St::St(
-            q_273.clone(),
-            c_274,
-            nat_add(pred_354, 1u64),
-            w_276,
-            p_277.clone(),
-        );
-    }
-}
-
-pub fn less(f_279: u64) -> u64 {
-    if f_279 == 0 {
-        return 0u64;
-    } else {
-        let pred_360: u64 = f_279 - 1;
-        return pred_360;
-    }
-}
-
-pub fn wait(q_295: Rc<List<E>>, c_296: u64, f_297: u64, w_298: u64, p_299: Rc<List<P>>) -> St {
-    match &*q_295 {
+pub fn unfence_all(q_533: Rc<List<E>>) -> Rc<List<E>> {
+    match &*q_533 {
         List::Nil => {
-            return St::St(
-                Rc::new(List::Nil),
-                c_296,
-                nat_add(f_297, 1u64),
-                w_298,
-                p_299.clone(),
-            );
+            return Rc::new(List::Nil);
         }
         List::Con(h__, t__) => {
-            let head_339: E = h__.clone();
-            let tail_340: Rc<List<E>> = t__.clone();
-            return St::St(
-                Rc::new(List::Con(head_339.clone(), tail_340.clone())),
-                c_296,
-                f_297,
-                nat_add(w_298, 1u64),
-                p_299.clone(),
-            );
+            let head_690: E = h__.clone();
+            let tail_691: Rc<List<E>> = t__.clone();
+            match &head_690 {
+                E::E(f0__, f1__, f2__, f3__, f4__, f5__, f6__) => {
+                    let num_699: u64 = f0__.clone();
+                    let pid_700: u64 = f1__.clone();
+                    let asker_701: bool = f2__.clone();
+                    let bound_702: Rc<List<u64>> = f3__.clone();
+                    let held_703: bool = f4__.clone();
+                    let bounded_704: bool = f5__.clone();
+                    let fenced_705: bool = f6__.clone();
+                    return Rc::new(List::Con(
+                        E::E(
+                            num_699,
+                            pid_700,
+                            asker_701,
+                            bound_702.clone(),
+                            held_703,
+                            bounded_704,
+                            false,
+                        ),
+                        unfence_all(tail_691.clone()),
+                    ));
+                }
+            }
         }
     }
+}
+
+pub fn lift_w(q_398: Rc<List<E>>, c_399: u64, w_400: u64, p_401: Rc<List<P>>) -> St {
+    if w_400 == 0 {
+        return admit(p_401.clone(), unfence_all(q_398.clone()), c_399);
+    } else {
+        let pred_534: u64 = w_400 - 1;
+        return St::St(
+            q_398.clone(),
+            c_399,
+            0u64,
+            nat_add(pred_534, 1u64),
+            p_401.clone(),
+        );
+    }
+}
+
+pub fn lift(q_277: Rc<List<E>>, c_278: u64, f_279: u64, w_280: u64, p_281: Rc<List<P>>) -> St {
+    if f_279 == 0 {
+        return lift_w(q_277.clone(), c_278, w_280, p_281.clone());
+    } else {
+        let pred_402: u64 = f_279 - 1;
+        return St::St(
+            q_277.clone(),
+            c_278,
+            nat_add(pred_402, 1u64),
+            w_280,
+            p_281.clone(),
+        );
+    }
+}
+
+pub fn less(f_283: u64) -> u64 {
+    if f_283 == 0 {
+        return 0u64;
+    } else {
+        let pred_408: u64 = f_283 - 1;
+        return pred_408;
+    }
+}
+
+pub fn wait_if(
+    q_386: Rc<List<E>>,
+    c_387: u64,
+    f_388: u64,
+    w_389: u64,
+    p_390: Rc<List<P>>,
+    ready_391: bool,
+) -> St {
+    if ready_391 {
+        return St::St(
+            q_386.clone(),
+            c_387,
+            nat_add(f_388, 1u64),
+            w_389,
+            p_390.clone(),
+        );
+    } else {
+        return St::St(
+            q_386.clone(),
+            c_387,
+            f_388,
+            nat_add(w_389, 1u64),
+            p_390.clone(),
+        );
+    }
+}
+
+pub fn wait(q_299: Rc<List<E>>, c_300: u64, f_301: u64, w_302: u64, p_303: Rc<List<P>>) -> St {
+    return wait_if(
+        q_299.clone(),
+        c_300,
+        f_301,
+        w_302,
+        p_303.clone(),
+        all_fenced(q_299.clone()),
+    );
 }
 
 pub fn step(o_75: Op, s_76: St) -> St {
     match &o_75 {
         Op::TAsk(f0__, f1__) => {
-            let pid_119: u64 = f0__.clone();
-            let bounded_120: bool = f1__.clone();
+            let pid_123: u64 = f0__.clone();
+            let bounded_124: bool = f1__.clone();
             match &s_76 {
                 St::St(f0__, f1__, f2__, f3__, f4__) => {
-                    let q_126: Rc<List<E>> = f0__.clone();
-                    let numbered_127: u64 = f1__.clone();
-                    let fences_128: u64 = f2__.clone();
-                    let waiting_129: u64 = f3__.clone();
-                    let parked_130: Rc<List<P>> = f4__.clone();
+                    let q_130: Rc<List<E>> = f0__.clone();
+                    let numbered_131: u64 = f1__.clone();
+                    let fences_132: u64 = f2__.clone();
+                    let waiting_133: u64 = f3__.clone();
+                    let parked_134: Rc<List<P>> = f4__.clone();
                     return ask_in(
-                        q_126.clone(),
-                        numbered_127,
-                        fences_128,
-                        waiting_129,
-                        parked_130.clone(),
-                        pid_119,
-                        bounded_120,
-                        inside(pid_119, q_126.clone()),
+                        q_130.clone(),
+                        numbered_131,
+                        fences_132,
+                        waiting_133,
+                        parked_134.clone(),
+                        pid_123,
+                        bounded_124,
+                        inside(pid_123, q_130.clone()),
                     );
                 }
             }
         }
         Op::TBind(f0__, f1__) => {
-            let num_153: u64 = f0__.clone();
-            let pid_154: u64 = f1__.clone();
+            let num_157: u64 = f0__.clone();
+            let pid_158: u64 = f1__.clone();
             match &s_76 {
                 St::St(f0__, f1__, f2__, f3__, f4__) => {
-                    let q_160: Rc<List<E>> = f0__.clone();
-                    let numbered_161: u64 = f1__.clone();
-                    let fences_162: u64 = f2__.clone();
-                    let waiting_163: u64 = f3__.clone();
-                    let parked_164: Rc<List<P>> = f4__.clone();
+                    let q_164: Rc<List<E>> = f0__.clone();
+                    let numbered_165: u64 = f1__.clone();
+                    let fences_166: u64 = f2__.clone();
+                    let waiting_167: u64 = f3__.clone();
+                    let parked_168: Rc<List<P>> = f4__.clone();
                     return St::St(
                         bind_if(
-                            num_153,
-                            pid_154,
-                            q_160.clone(),
-                            find(num_153, q_160.clone()),
+                            num_157,
+                            pid_158,
+                            q_164.clone(),
+                            find(num_157, q_164.clone()),
                         ),
-                        numbered_161,
-                        fences_162,
-                        waiting_163,
-                        parked_164.clone(),
+                        numbered_165,
+                        fences_166,
+                        waiting_167,
+                        parked_168.clone(),
                     );
                 }
             }
         }
         Op::TExit(f0__, f1__) => {
-            let num_184: u64 = f0__.clone();
-            let pid_185: u64 = f1__.clone();
+            let num_188: u64 = f0__.clone();
+            let pid_189: u64 = f1__.clone();
             match &s_76 {
                 St::St(f0__, f1__, f2__, f3__, f4__) => {
-                    let q_191: Rc<List<E>> = f0__.clone();
-                    let numbered_192: u64 = f1__.clone();
-                    let fences_193: u64 = f2__.clone();
-                    let waiting_194: u64 = f3__.clone();
-                    let parked_195: Rc<List<P>> = f4__.clone();
+                    let q_195: Rc<List<E>> = f0__.clone();
+                    let numbered_196: u64 = f1__.clone();
+                    let fences_197: u64 = f2__.clone();
+                    let waiting_198: u64 = f3__.clone();
+                    let parked_199: Rc<List<P>> = f4__.clone();
                     return wake(
                         settle(
-                            num_184,
-                            edit(num_184, Edit::DropPid(pid_185), q_191.clone()),
+                            num_188,
+                            edit(num_188, Edit::DropPid(pid_189), q_195.clone()),
                         ),
-                        numbered_192,
-                        fences_193,
-                        waiting_194,
-                        parked_195.clone(),
+                        numbered_196,
+                        fences_197,
+                        waiting_198,
+                        parked_199.clone(),
                     );
                 }
             }
         }
         Op::TLeave(f0__) => {
-            let num_218: u64 = f0__.clone();
+            let num_222: u64 = f0__.clone();
             match &s_76 {
                 St::St(f0__, f1__, f2__, f3__, f4__) => {
-                    let q_224: Rc<List<E>> = f0__.clone();
-                    let numbered_225: u64 = f1__.clone();
-                    let fences_226: u64 = f2__.clone();
-                    let waiting_227: u64 = f3__.clone();
-                    let parked_228: Rc<List<P>> = f4__.clone();
+                    let q_228: Rc<List<E>> = f0__.clone();
+                    let numbered_229: u64 = f1__.clone();
+                    let fences_230: u64 = f2__.clone();
+                    let waiting_231: u64 = f3__.clone();
+                    let parked_232: Rc<List<P>> = f4__.clone();
                     return wake(
-                        settle(num_218, edit(num_218, Edit::Depart, q_224.clone())),
-                        numbered_225,
-                        fences_226,
-                        waiting_227,
-                        parked_228.clone(),
+                        settle(num_222, edit(num_222, Edit::Depart, q_228.clone())),
+                        numbered_229,
+                        fences_230,
+                        waiting_231,
+                        parked_232.clone(),
                     );
                 }
             }
         }
         Op::TFence => match &s_76 {
             St::St(f0__, f1__, f2__, f3__, f4__) => {
-                let q_244: Rc<List<E>> = f0__.clone();
-                let numbered_245: u64 = f1__.clone();
-                let fences_246: u64 = f2__.clone();
-                let waiting_247: u64 = f3__.clone();
-                let parked_248: Rc<List<P>> = f4__.clone();
+                let q_248: Rc<List<E>> = f0__.clone();
+                let numbered_249: u64 = f1__.clone();
+                let fences_250: u64 = f2__.clone();
+                let waiting_251: u64 = f3__.clone();
+                let parked_252: Rc<List<P>> = f4__.clone();
                 return St::St(
-                    q_244.clone(),
-                    numbered_245,
-                    fence(q_244.clone(), fences_246),
-                    waiting_247,
-                    parked_248.clone(),
+                    q_248.clone(),
+                    numbered_249,
+                    fence(q_248.clone(), fences_250),
+                    waiting_251,
+                    parked_252.clone(),
                 );
             }
         },
         Op::TUnfence => match &s_76 {
             St::St(f0__, f1__, f2__, f3__, f4__) => {
-                let q_263: Rc<List<E>> = f0__.clone();
-                let numbered_264: u64 = f1__.clone();
-                let fences_265: u64 = f2__.clone();
-                let waiting_266: u64 = f3__.clone();
-                let parked_267: Rc<List<P>> = f4__.clone();
+                let q_267: Rc<List<E>> = f0__.clone();
+                let numbered_268: u64 = f1__.clone();
+                let fences_269: u64 = f2__.clone();
+                let waiting_270: u64 = f3__.clone();
+                let parked_271: Rc<List<P>> = f4__.clone();
                 return lift(
-                    q_263.clone(),
-                    numbered_264,
-                    less(fences_265),
-                    waiting_266,
-                    parked_267.clone(),
+                    q_267.clone(),
+                    numbered_268,
+                    less(fences_269),
+                    waiting_270,
+                    parked_271.clone(),
                 );
             }
         },
         Op::TWait => match &s_76 {
             St::St(f0__, f1__, f2__, f3__, f4__) => {
-                let q_285: Rc<List<E>> = f0__.clone();
-                let numbered_286: u64 = f1__.clone();
-                let fences_287: u64 = f2__.clone();
-                let waiting_288: u64 = f3__.clone();
-                let parked_289: Rc<List<P>> = f4__.clone();
+                let q_289: Rc<List<E>> = f0__.clone();
+                let numbered_290: u64 = f1__.clone();
+                let fences_291: u64 = f2__.clone();
+                let waiting_292: u64 = f3__.clone();
+                let parked_293: Rc<List<P>> = f4__.clone();
                 return wait(
-                    q_285.clone(),
-                    numbered_286,
-                    fences_287,
-                    waiting_288,
-                    parked_289.clone(),
+                    q_289.clone(),
+                    numbered_290,
+                    fences_291,
+                    waiting_292,
+                    parked_293.clone(),
                 );
             }
         },
         Op::TWaitLeave => match &s_76 {
             St::St(f0__, f1__, f2__, f3__, f4__) => {
-                let q_305: Rc<List<E>> = f0__.clone();
-                let numbered_306: u64 = f1__.clone();
-                let fences_307: u64 = f2__.clone();
-                let waiting_308: u64 = f3__.clone();
-                let parked_309: Rc<List<P>> = f4__.clone();
+                let q_309: Rc<List<E>> = f0__.clone();
+                let numbered_310: u64 = f1__.clone();
+                let fences_311: u64 = f2__.clone();
+                let waiting_312: u64 = f3__.clone();
+                let parked_313: Rc<List<P>> = f4__.clone();
                 return lift(
-                    q_305.clone(),
-                    numbered_306,
-                    fences_307,
-                    less(waiting_308),
-                    parked_309.clone(),
+                    q_309.clone(),
+                    numbered_310,
+                    fences_311,
+                    less(waiting_312),
+                    parked_313.clone(),
                 );
             }
         },
+        Op::TFenced(f0__) => {
+            let num_321: u64 = f0__.clone();
+            match &s_76 {
+                St::St(f0__, f1__, f2__, f3__, f4__) => {
+                    let q_327: Rc<List<E>> = f0__.clone();
+                    let numbered_328: u64 = f1__.clone();
+                    let fences_329: u64 = f2__.clone();
+                    let waiting_330: u64 = f3__.clone();
+                    let parked_331: Rc<List<P>> = f4__.clone();
+                    return wake(
+                        edit(num_321, Edit::MarkFenced, q_327.clone()),
+                        numbered_328,
+                        fences_329,
+                        waiting_330,
+                        parked_331.clone(),
+                    );
+                }
+            }
+        }
+        Op::TResume(f0__) => {
+            let num_341: u64 = f0__.clone();
+            match &s_76 {
+                St::St(f0__, f1__, f2__, f3__, f4__) => {
+                    let q_347: Rc<List<E>> = f0__.clone();
+                    let numbered_348: u64 = f1__.clone();
+                    let fences_349: u64 = f2__.clone();
+                    let waiting_350: u64 = f3__.clone();
+                    let parked_351: Rc<List<P>> = f4__.clone();
+                    return St::St(
+                        edit(num_341, Edit::UnfenceOne, q_347.clone()),
+                        numbered_348,
+                        fences_349,
+                        waiting_350,
+                        parked_351.clone(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1356,41 +1587,41 @@ pub fn empty() -> St {
     return St::St(Rc::new(List::Nil), 0u64, 0u64, 0u64, Rc::new(List::Nil));
 }
 
-pub fn parked(s_818: St) -> Rc<List<P>> {
-    match &s_818 {
+pub fn parked(s_1019: St) -> Rc<List<P>> {
+    match &s_1019 {
         St::St(f0__, f1__, f2__, f3__, f4__) => {
-            let q_824: Rc<List<E>> = f0__.clone();
-            let numbered_825: u64 = f1__.clone();
-            let fences_826: u64 = f2__.clone();
-            let waiting_827: u64 = f3__.clone();
-            let parked_828: Rc<List<P>> = f4__.clone();
-            return parked_828.clone();
+            let q_1025: Rc<List<E>> = f0__.clone();
+            let numbered_1026: u64 = f1__.clone();
+            let fences_1027: u64 = f2__.clone();
+            let waiting_1028: u64 = f3__.clone();
+            let parked_1029: Rc<List<P>> = f4__.clone();
+            return parked_1029.clone();
         }
     }
 }
 
-pub fn waiting(s_829: St) -> u64 {
-    match &s_829 {
+pub fn waiting(s_1030: St) -> u64 {
+    match &s_1030 {
         St::St(f0__, f1__, f2__, f3__, f4__) => {
-            let q_835: Rc<List<E>> = f0__.clone();
-            let numbered_836: u64 = f1__.clone();
-            let fences_837: u64 = f2__.clone();
-            let waiting_838: u64 = f3__.clone();
-            let parked_839: Rc<List<P>> = f4__.clone();
-            return waiting_838;
+            let q_1036: Rc<List<E>> = f0__.clone();
+            let numbered_1037: u64 = f1__.clone();
+            let fences_1038: u64 = f2__.clone();
+            let waiting_1039: u64 = f3__.clone();
+            let parked_1040: Rc<List<P>> = f4__.clone();
+            return waiting_1039;
         }
     }
 }
 
-pub fn fences(s_840: St) -> u64 {
-    match &s_840 {
+pub fn fences(s_1041: St) -> u64 {
+    match &s_1041 {
         St::St(f0__, f1__, f2__, f3__, f4__) => {
-            let q_846: Rc<List<E>> = f0__.clone();
-            let numbered_847: u64 = f1__.clone();
-            let fences_848: u64 = f2__.clone();
-            let waiting_849: u64 = f3__.clone();
-            let parked_850: Rc<List<P>> = f4__.clone();
-            return fences_848;
+            let q_1047: Rc<List<E>> = f0__.clone();
+            let numbered_1048: u64 = f1__.clone();
+            let fences_1049: u64 = f2__.clone();
+            let waiting_1050: u64 = f3__.clone();
+            let parked_1051: Rc<List<P>> = f4__.clone();
+            return fences_1049;
         }
     }
 }
@@ -1486,7 +1717,8 @@ pub fn gen_E(r: &mut Rng, _m: u64) -> E {
             let f3 = gen_ListNat(r, 3);
             let f4 = gen_Bool(r, 3);
             let f5 = gen_Bool(r, 3);
-            E::E(f0, f1, f2, f3, f4, f5)
+            let f6 = gen_Bool(r, 3);
+            E::E(f0, f1, f2, f3, f4, f5, f6)
         }
     }
 }
@@ -1512,7 +1744,7 @@ pub fn gen_P(r: &mut Rng, _m: u64) -> P {
     }
 }
 pub fn gen_Edit(r: &mut Rng, _m: u64) -> Edit {
-    match r.next() % 3 {
+    match r.next() % 5 {
         0 => {
             let f0 = gen_Nat(r, 3);
             Edit::AddPid(f0)
@@ -1521,18 +1753,21 @@ pub fn gen_Edit(r: &mut Rng, _m: u64) -> Edit {
             let f0 = gen_Nat(r, 3);
             Edit::DropPid(f0)
         }
-        _ => Edit::Depart,
+        2 => Edit::Depart,
+        3 => Edit::MarkFenced,
+        _ => Edit::UnfenceOne,
     }
 }
 pub fn gen_Bound(r: &mut Rng, _m: u64) -> Bound {
-    match r.next() % 3 {
+    match r.next() % 4 {
         0 => Bound::BGranted,
         1 => Bound::BGone,
-        _ => Bound::BWaiting,
+        2 => Bound::BWaiting,
+        _ => Bound::BFenced,
     }
 }
 pub fn gen_Op(r: &mut Rng, _m: u64) -> Op {
-    match r.next() % 8 {
+    match r.next() % 10 {
         0 => {
             let f0 = gen_Nat(r, 3);
             let f1 = gen_Bool(r, 3);
@@ -1555,7 +1790,15 @@ pub fn gen_Op(r: &mut Rng, _m: u64) -> Op {
         4 => Op::TFence,
         5 => Op::TUnfence,
         6 => Op::TWait,
-        _ => Op::TWaitLeave,
+        7 => Op::TWaitLeave,
+        8 => {
+            let f0 = gen_Nat(r, 3);
+            Op::TFenced(f0)
+        }
+        _ => {
+            let f0 = gen_Nat(r, 3);
+            Op::TResume(f0)
+        }
     }
 }
 
