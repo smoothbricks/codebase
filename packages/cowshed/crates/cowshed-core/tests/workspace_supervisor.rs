@@ -12651,7 +12651,7 @@ mod land_gate_priority {
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     use tokio::net::UnixListener;
-    use tokio::sync::{Mutex, Notify, mpsc, watch};
+    use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
     /// Await `fut` bounded only by the spec's heartbeat silence bound (`deadline::HEARTBEAT_SILENCE`).
     async fn within_silence<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
@@ -13159,23 +13159,23 @@ for line in f_in:
             );
         }
 
-        async fn wait_tokens_backstop(&mut self, n: usize) {
+        async fn wait_tokens_within(&mut self, n: usize, bound: Duration) {
             self.writer
                 .write_all(format!("wait_tokens {n}\n").as_bytes())
                 .await
                 .unwrap();
             self.writer.flush().await.unwrap();
             let mut line = String::new();
-            match tokio::time::timeout(
-                cowshed_os::test_backstop::NO_PROGRESS,
-                self.reader.read_line(&mut line),
-            )
-            .await
-            {
+            match tokio::time::timeout(bound, self.reader.read_line(&mut line)).await {
                 Ok(Ok(_)) => assert_eq!(line.trim(), format!("restored {n}")),
-                Ok(Err(error)) => panic!("wait_tokens_backstop read error: {error}"),
-                Err(_) => panic!("wait_tokens({n}) did not complete before NO_PROGRESS"),
+                Ok(Err(error)) => panic!("wait_tokens_within read error: {error}"),
+                Err(_) => panic!("wait_tokens({n}) did not complete within {bound:?}"),
             }
+        }
+
+        async fn wait_tokens_backstop(&mut self, n: usize) {
+            self.wait_tokens_within(n, cowshed_os::test_backstop::NO_PROGRESS)
+                .await;
         }
 
         async fn exit(mut self, handle: &WorkspaceSupervisorHandle) {
@@ -14493,22 +14493,13 @@ os.read(0, 1)
 
         // Concurrently send local `gate-start`/`gate-end` commands driven purely by real job
         // start/exit events while awaiting the real silence bound (`HEARTBEAT_SILENCE` +
-        // `HEARTBEAT` slack for delivery). On buggy code where each command resets the silence
-        // timer, the span never ends and this wait expires.
+        // `HEARTBEAT` slack for delivery). The span-off observable is the bg fifo getting its 3
+        // tokens back (not actor-published liveness, which lags behind a stalled turn by design).
         let handle_ref = &fixture.handle;
         let root_ref = &fixture.root;
         let bg_id = bg.job_id;
-        let wait_span_off = wait_for_liveness(
-            handle_ref,
-            "span off past silence despite local gate commands",
-            deadline::HEARTBEAT_SILENCE + deadline::HEARTBEAT,
-            |liveness| {
-                !liveness.gate_active()
-                    && liveness
-                        .job_gate_priority(bg_id)
-                        .is_some_and(|state| state.tokens_withdrawn == 0)
-            },
-        );
+        let wait_tokens_back =
+            bg.wait_tokens_within(3, deadline::HEARTBEAT_SILENCE + deadline::HEARTBEAT);
         let local_commands = async {
             let mut n = 0_u64;
             loop {
@@ -14520,12 +14511,23 @@ os.read(0, 1)
         };
         tokio::select! {
             biased;
-            () = wait_span_off => {}
+            () = wait_tokens_back => {}
             () = local_commands => unreachable!("local gate command stream is endless"),
         }
 
-        bg.wait_tokens(3).await;
         land_gate.finish(&fixture.handle).await;
+        wait_for_liveness(
+            &fixture.handle,
+            "liveness reflects span off after jobs finish",
+            deadline::HEARTBEAT_SILENCE,
+            |liveness| {
+                !liveness.gate_active()
+                    && liveness
+                        .job_gate_priority(bg_id)
+                        .is_some_and(|state| state.tokens_withdrawn == 0)
+            },
+        )
+        .await;
         bg.exit(&fixture.handle).await;
         let _ = fixture.handle.trace_health().await.unwrap();
         let bg_rows = gate_span_rows(&fixture.telemetry, bg_id);
@@ -14647,6 +14649,429 @@ os.read(0, 1)
         bg.exit(&fixture.handle).await;
         gateway_2.close().await;
         serve_task.abort();
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
+    const STALL_SPAWN_ENV: &str = "COWSHED_TEST_STALL_SPAWN";
+
+    /// Drops/sends the stall release even if an assertion panics, so a stalled spawn turn always
+    /// finishes cleanly during test teardown.
+    struct StallReleaseGuard(Option<oneshot::Sender<()>>);
+
+    impl StallReleaseGuard {
+        fn release(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    impl Drop for StallReleaseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    /// Typed `SpawnSink` wrapper that stalls one marked request (`STALL_SPAWN_ENV`) inside the
+    /// actor's spawn turn after reporting entry on `entered` and until `release` completes.
+    struct StallingSpawnSink<S> {
+        inner: S,
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+    }
+
+    #[async_trait]
+    impl<S: SpawnSink> SpawnSink for StallingSpawnSink<S> {
+        async fn admit_membership(
+            &mut self,
+            authority: &WorkspaceAuthoritySnapshot,
+            job_id: JobId,
+            class: ExecClass,
+        ) -> Result<Option<cowshed_core::runtime::supervisor::JobMembership>> {
+            self.inner.admit_membership(authority, job_id, class).await
+        }
+
+        async fn spawn(
+            &mut self,
+            request: ProcessSpawnRequest,
+            events: mpsc::Sender<ProcessEvent>,
+        ) -> Result<Box<dyn RunningProcess>> {
+            if request.env.contains_key(STALL_SPAWN_ENV) {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = self.release.take() {
+                    let _ = release.await;
+                }
+            }
+            self.inner.spawn(request, events).await
+        }
+
+        fn shell_pool(&self) -> Option<cowshed_core::runtime::shell_pool::PoolCounts> {
+            self.inner.shell_pool()
+        }
+    }
+
+    fn start_stalling_fixture<S: SpawnSink + 'static>(
+        name: &str,
+        inner: S,
+        use_fake_artifacts: bool,
+    ) -> (GateFixture, oneshot::Receiver<()>, StallReleaseGuard) {
+        let (mut config, root) = isolated_config(&temp_parent::canonical_parent(), name);
+        config.default_cwd = None;
+        config.term_grace = Duration::from_secs(1);
+        std::fs::create_dir_all(&config.sandbox.home).unwrap();
+        std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    config
+                        .workspace_root
+                        .join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH),
+                )
+                .unwrap()
+                .write_all(
+                    cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                        .encode()
+                        .as_bytes(),
+                )
+                .unwrap();
+        }
+        let telemetry = root.join("telemetry");
+        std::fs::create_dir_all(&telemetry).unwrap();
+        let ledger = root.join("supervisor.groups");
+        config.telemetry_root = Some(telemetry.clone());
+        config.group_ledger = Some(ledger.clone());
+        let store_root = config.sandbox.store_root.clone();
+        let gateway = StandInGateway::start(&store_root);
+        let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+            Box::new(cowshed_core::storage::audit::NullAuditSink),
+            8,
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let spawner = StallingSpawnSink {
+            inner,
+            entered: Some(entered_tx),
+            release: Some(release_rx),
+        };
+        type SinkReceivers = (
+            mpsc::UnboundedReceiver<ArtifactObservation>,
+            mpsc::UnboundedReceiver<OrderObservation>,
+        );
+        let (artifacts, sink_receivers): (Box<dyn ArtifactSink>, Option<SinkReceivers>) =
+            if use_fake_artifacts {
+                let (artifact_tx, artifacts_rx) = mpsc::unbounded_channel();
+                let (order_tx, order_rx) = mpsc::unbounded_channel();
+                (
+                    Box::new(FakeArtifactSink {
+                        sealed_stdout: None,
+                        refused: None,
+                        next: JobId::new(1).unwrap(),
+                        quota: 1024,
+                        jobs: BTreeMap::new(),
+                        terminals: BTreeMap::new(),
+                        authority: config.authority.clone(),
+                        observations: artifact_tx,
+                        order: order_tx,
+                    }),
+                    Some((artifacts_rx, order_rx)),
+                )
+            } else {
+                let store = cowshed_core::runtime::supervisor::ArtifactStoreSink::open(
+                    config.workspace_root.clone(),
+                    &config.owned_repo_ids,
+                    &config.authority,
+                    config.artifacts.clone(),
+                    config.census.clone(),
+                )
+                .unwrap();
+                (Box::new(store), None)
+            };
+        let handle = WorkspaceSupervisor::start_with_sinks(
+            config,
+            Box::new(spawner),
+            artifacts,
+            Box::new(commitments),
+        )
+        .unwrap();
+        handle.gateway_hello();
+        (
+            GateFixture {
+                handle,
+                gateway,
+                store_root,
+                telemetry,
+                ledger,
+                mbx: None,
+                _sink_receivers: sink_receivers,
+                root,
+            },
+            entered_rx,
+            StallReleaseGuard(Some(release_tx)),
+        )
+    }
+
+    /// Red: span-off on gateway silence must restore withdrawn jobserver tokens without waiting
+    /// behind an actor turn stalled inside `SpawnSink::spawn`.
+    #[tokio::test]
+    async fn land_gate_span_off_does_not_wait_behind_a_stalled_spawn() {
+        let (mut fixture, entered_rx, mut release_guard) = start_stalling_fixture(
+            "gate-stall-tok",
+            cowshed_core::runtime::supervisor::SystemSpawnSink::default(),
+            false,
+        );
+        let mut bg = JobserverClient::start(
+            &fixture.handle,
+            &fixture.root,
+            "bg",
+            ExecClass::Background,
+            4,
+        )
+        .await;
+        let lander = Some(JobLander {
+            pid: std::process::id(),
+            start: 1,
+        });
+        let land_gate = GateJob::start(&fixture.handle, &fixture.root, "land-gate", lander).await;
+        assert_eq!(
+            fixture.gateway.recv_event("initial gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+        wait_for_withdrawn(&fixture.handle, bg.job_id, 3).await;
+        assert_eq!(bg.fionread().await, 0);
+
+        // Start a marked gate job whose spawn stalls inside the actor's admission turn. Await
+        // `entered_rx` BEFORE `go_silent()` so the actor is proven inside the stalled turn before
+        // the silence bound starts counting.
+        let stall_handle = fixture.handle.clone();
+        let stalled_exec = tokio::spawn(async move {
+            stall_handle
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            "true".into(),
+                        ]),
+                        cwd: None,
+                        scope: ExecScope::HostGate,
+                        class: ExecClass::Gate,
+                        lander,
+                        want: None,
+                        hold: false,
+                        env: [
+                            (STALL_SPAWN_ENV.into(), "1".into()),
+                            ("PATH".into(), std::env::var("PATH").expect("PATH supplied")),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        ..request(StdinSource::Empty)
+                    },
+                    AdmissionSource::Coordinator,
+                )
+                .await
+        });
+        within_silence("stalled spawn entered", entered_rx)
+            .await
+            .expect("stalled spawn entered channel closed");
+
+        // Gateway goes silent while the actor is stalled inside `spawn`. Tokens must come back
+        // within the silence bound without waiting for the stalled turn to end.
+        fixture.gateway.go_silent();
+        bg.wait_tokens_within(3, deadline::HEARTBEAT_SILENCE + deadline::HEARTBEAT)
+            .await;
+
+        // Release the stall, finish all jobs, and verify the actor records `job.tokens.restored`.
+        release_guard.release();
+        let stalled_job_id = within_silence("stalled exec admission", stalled_exec)
+            .await
+            .expect("stalled exec task")
+            .expect("stalled exec succeeded");
+        let stalled_ended = within_silence("stalled job exit", fixture.handle.wait(stalled_job_id))
+            .await
+            .unwrap();
+        assert_eq!(stalled_ended.exit, Some(ExitStatus::Exited { code: 0 }));
+        land_gate.finish(&fixture.handle).await;
+        let bg_id = bg.job_id;
+        bg.exit(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let bg_rows = gate_span_rows(&fixture.telemetry, bg_id);
+        assert!(
+            bg_rows.iter().any(|row| {
+                row.entry_type == "info"
+                    && row.message == "job.tokens.restored"
+                    && row.tokens == Some(3)
+            }),
+            "missing job.tokens.restored(3) after stalled-spawn silence: {bg_rows:?}"
+        );
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
+    /// Red (macOS): span-off on gateway silence must also clear `PRIO_DARWIN_BG` on every live
+    /// process of a backgrounded job without waiting behind a stalled actor spawn turn; once the
+    /// stall releases, the actor flushes `.groups` and records `job.darwinbg.cleared`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn land_gate_darwinbg_clear_does_not_wait_behind_a_stalled_spawn() {
+        let (mut fixture, entered_rx, mut release_guard) =
+            start_stalling_fixture("gate-stall-bg", BurnerSpawnSink, true);
+        let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
+        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+
+        let lander = Some(JobLander {
+            pid: std::process::id(),
+            start: 1,
+        });
+        let land_gate = GateJob::start(&fixture.handle, &fixture.root, "land-gate", lander).await;
+        assert_eq!(
+            fixture.gateway.recv_event("initial gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg active before stalled spawn",
+            deadline::HEARTBEAT_SILENCE,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| state.darwinbg_active)
+            },
+        )
+        .await;
+        assert_tree_max_priority(&burner.pids, 4, "before stalled spawn");
+
+        // Enter the stalled spawn turn BEFORE `go_silent()`.
+        let stall_handle = fixture.handle.clone();
+        let stalled_exec = tokio::spawn(async move {
+            stall_handle
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            "true".into(),
+                        ]),
+                        cwd: None,
+                        scope: ExecScope::HostGate,
+                        class: ExecClass::Gate,
+                        lander,
+                        want: None,
+                        hold: false,
+                        env: [
+                            (STALL_SPAWN_ENV.into(), "1".into()),
+                            ("PATH".into(), std::env::var("PATH").expect("PATH supplied")),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        ..request(StdinSource::Empty)
+                    },
+                    AdmissionSource::Coordinator,
+                )
+                .await
+        });
+        within_silence("stalled spawn entered", entered_rx)
+            .await
+            .expect("stalled spawn entered channel closed");
+
+        // Gateway goes silent while the actor is stalled. Every process of `burner`'s tree must
+        // read back `pth_maxpriority == 63` within the silence bound, BEFORE releasing the stall.
+        fixture.gateway.go_silent();
+        let bound = deadline::HEARTBEAT_SILENCE + deadline::HEARTBEAT;
+        let pids = burner.pids.clone();
+        match tokio::time::timeout(bound, async {
+            loop {
+                let all_cleared = pids.iter().all(|&pid| {
+                    procinfo::thread_max_priorities(pid.cast_signed())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|prios| !prios.is_empty() && prios.iter().all(|&p| p == 63))
+                });
+                if all_cleared {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => {
+                let current: Vec<_> = burner
+                    .pids
+                    .iter()
+                    .map(|&pid| (pid, procinfo::thread_max_priorities(pid.cast_signed())))
+                    .collect();
+                panic!(
+                    "PRIO_DARWIN_BG was not cleared while actor spawn was stalled within {bound:?}: {current:?}"
+                );
+            }
+        }
+        assert_tree_max_priority(&burner.pids, 63, "cleared while actor spawn still stalled");
+
+        // Release the stall; the actor finishes the turn, flushes `.groups`, and records the row.
+        release_guard.release();
+        let stalled_job_id = within_silence("stalled exec admission", stalled_exec)
+            .await
+            .expect("stalled exec task")
+            .expect("stalled exec succeeded");
+        let stalled_ended = within_silence("stalled job exit", fixture.handle.wait(stalled_job_id))
+            .await
+            .unwrap();
+        assert_eq!(stalled_ended.exit, Some(ExitStatus::Exited { code: 0 }));
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg cleared on liveness after stall release",
+            deadline::HEARTBEAT_SILENCE,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| !state.darwinbg_active && state.darwinbg_cleared >= 1)
+            },
+        )
+        .await;
+        let cleared_ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.ledger).expect("read group ledger"))
+                .expect("parse group ledger");
+        assert!(
+            cleared_ledger.get("darwinbg").is_none(),
+            "darwinbg must be absent from ledger after stall release: {cleared_ledger}"
+        );
+
+        land_gate.finish(&fixture.handle).await;
+        let burner_id = burner.job_id;
+        burner.stop(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let burner_rows = gate_span_rows(&fixture.telemetry, burner_id);
+        assert!(
+            burner_rows
+                .iter()
+                .any(|row| row.entry_type == "info" && row.message == "job.darwinbg.cleared"),
+            "missing job.darwinbg.cleared after stalled-spawn silence: {burner_rows:?}"
+        );
         fixture
             .handle
             .retire(NxDaemonRetirement::Recorded)
