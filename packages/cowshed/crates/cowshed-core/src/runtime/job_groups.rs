@@ -1840,6 +1840,61 @@ os._exit(0)
         let _ = job.wait_bounded();
     }
 
+    /// A byte-identical cut skips the temp+rename rewrite (keeping the same inode), while a cut
+    /// with distinct serialized bytes writes a fresh file. A failed write never poisons the last
+    /// published bytes, so retrying the same cut once the fault clears still writes.
+    #[test]
+    fn recorder_skips_byte_identical_cuts_and_writes_on_change_or_after_failure() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (_scratch, ledger) = scratch();
+        let recorder = super::Recorder::new(ledger.clone());
+        let first = GroupLeader::from_parts(42, 1, 100).unwrap();
+        let second = GroupLeader::from_parts(43, 2, 200).unwrap();
+
+        recorder
+            .record([super::JobGroupClaim::group(1, first)].into_iter(), &[])
+            .unwrap();
+        let first_inode = std::fs::symlink_metadata(&ledger).unwrap().ino();
+
+        recorder
+            .record([super::JobGroupClaim::group(1, first)].into_iter(), &[])
+            .unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&ledger).unwrap().ino(),
+            first_inode,
+            "a byte-identical cut skips temp+rename and keeps the existing inode"
+        );
+
+        recorder
+            .record([super::JobGroupClaim::group(2, second)].into_iter(), &[])
+            .unwrap();
+        let second_inode = std::fs::symlink_metadata(&ledger).unwrap().ino();
+        assert_ne!(
+            second_inode, first_inode,
+            "a changed cut publishes a new file"
+        );
+
+        // Block the temporary publication path with a directory so the next distinct cut fails,
+        // then clear the fault and verify the same cut is not falsely skipped.
+        let temporary = ledger.with_extension(format!("groups.{}", std::process::id()));
+        std::fs::create_dir(&temporary).unwrap();
+        let third = GroupLeader::from_parts(44, 3, 300).unwrap();
+        recorder
+            .record([super::JobGroupClaim::group(3, third)].into_iter(), &[])
+            .expect_err("a directory at the temporary path fails publication");
+        std::fs::remove_dir(&temporary).unwrap();
+
+        recorder
+            .record([super::JobGroupClaim::group(3, third)].into_iter(), &[])
+            .unwrap();
+        assert_ne!(
+            std::fs::symlink_metadata(&ledger).unwrap().ino(),
+            second_inode,
+            "a failed write does not cache its bytes; retrying the same cut publishes"
+        );
+    }
+
     /// A ledger rewrite carries the identity a group's leader had when the job started. Here
     /// the job's pid now names another live group leader -- what a pid reuse looks like from the
     /// ledger -- and recording it again must not adopt that stranger as the job's group, nor may

@@ -691,4 +691,95 @@ mod tests {
             (Step::Next, Seen::Idle),
         ]);
     }
+
+    #[test]
+    fn cuts_within_the_rate_bound_wait_and_coalesce_until_the_interval_elapses() {
+        let origin = std::time::Instant::now();
+        let at = |ms| origin + Duration::from_millis(ms);
+        let mut slot = Table::with_interval(MIN_PUBLISH_INTERVAL);
+
+        assert_eq!(slot.publish("a"), Ok(None));
+        assert!(matches!(slot.next(at(0)), Next::Work(Work::Write("a"))));
+        slot.written(Ok(true), at(0));
+        assert!(matches!(slot.next(at(50)), Next::Wait));
+
+        assert_eq!(slot.publish("b"), Ok(None));
+        assert_eq!(slot.publish("c"), Ok(Some("b")));
+        assert!(matches!(
+            slot.next(at(500)),
+            Next::WaitUntil(deadline) if deadline == at(1000)
+        ));
+        assert_eq!(slot.publish("d"), Ok(Some("c")));
+        assert!(matches!(
+            slot.next(at(800)),
+            Next::WaitUntil(deadline) if deadline == at(1000)
+        ));
+        assert!(matches!(slot.next(at(1000)), Next::Work(Work::Write("d"))));
+        slot.written(Ok(true), at(1000));
+        assert!(matches!(slot.next(at(1000)), Next::Wait));
+
+        // A skipped byte-identical cut (`Ok(false)`) did not publish and does not start a new
+        // rate-limit window for a genuinely changed cut right after it.
+        assert_eq!(slot.publish("e"), Ok(None));
+        assert!(matches!(slot.next(at(2000)), Next::Work(Work::Write("e"))));
+        slot.written(Ok(false), at(2000));
+        assert_eq!(slot.publish("f"), Ok(None));
+        assert!(matches!(slot.next(at(2050)), Next::Work(Work::Write("f"))));
+    }
+
+    #[test]
+    fn finish_and_teardown_bypass_the_rate_bound_immediately() {
+        let origin = std::time::Instant::now();
+        let at = |ms| origin + Duration::from_millis(ms);
+
+        let mut finishing = Table::with_interval(MIN_PUBLISH_INTERVAL);
+        assert_eq!(finishing.publish("a"), Ok(None));
+        assert!(matches!(
+            finishing.next(at(0)),
+            Next::Work(Work::Write("a"))
+        ));
+        finishing.written(Ok(true), at(0));
+        assert_eq!(finishing.publish("b"), Ok(None));
+        assert!(matches!(
+            finishing.next(at(100)),
+            Next::WaitUntil(deadline) if deadline == at(1000)
+        ));
+        assert_eq!(finishing.finish("final"), Ok(()));
+        assert!(matches!(
+            finishing.next(at(200)),
+            Next::Work(Work::Write("b"))
+        ));
+        finishing.written(Ok(true), at(200));
+        assert!(matches!(
+            finishing.next(at(200)),
+            Next::Work(Work::Finish {
+                reply: "final",
+                result: Ok(())
+            })
+        ));
+
+        let mut tearing_down = Table::with_interval(MIN_PUBLISH_INTERVAL);
+        assert_eq!(tearing_down.publish("a"), Ok(None));
+        assert!(matches!(
+            tearing_down.next(at(0)),
+            Next::Work(Work::Write("a"))
+        ));
+        tearing_down.written(Ok(true), at(0));
+        assert_eq!(tearing_down.publish("b"), Ok(None));
+        assert!(matches!(
+            tearing_down.next(at(100)),
+            Next::WaitUntil(deadline) if deadline == at(1000)
+        ));
+        assert!(matches!(
+            tearing_down.teardown("jobs", false),
+            Handoff::Queued(Some("b"))
+        ));
+        assert!(matches!(
+            tearing_down.next(at(200)),
+            Next::Work(Work::Retire {
+                custody: "jobs",
+                finish: None
+            })
+        ));
+    }
 }
