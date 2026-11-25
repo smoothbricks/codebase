@@ -196,7 +196,7 @@ index 0000000..97d1522
 +	}
 +}
 diff --git a/driver/plugins.go b/driver/plugins.go
-index 3224cea..b749d2f 100644
+index 3224cea..122e0cb 100644
 --- a/driver/plugins.go
 +++ b/driver/plugins.go
 @@ -9,6 +9,8 @@ import (
@@ -283,7 +283,29 @@ index 3224cea..b749d2f 100644
    tsconfig     string
  }
  
-@@ -895,6 +939,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+@@ -885,28 +929,37 @@ func RegisterPlugin(plugin any) {
+   pluginRegistry = append(pluginRegistry, plugin)
+ }
+ 
+-// loadLinkedPluginState reads the linked-plugin manifest from the environment
+-// and returns the hydrated state. Returns a zero-entry state (not an error)
+-// when the environment variable is absent or empty.
+-func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error) {
+-  input := strings.TrimSpace(os.Getenv(LinkedPluginsEnv))
++// loadLinkedPluginState reads the linked-plugin manifest from overrideJSON
++// when non-empty, or from the environment variable otherwise, and returns the
++// hydrated state. Returns a zero-entry state (not an error) when both are
++// empty.
++func loadLinkedPluginState(cwd, tsconfigPath, overrideJSON string) (linkedPluginState, error) {
++  source := LinkedPluginsEnv
++  input := strings.TrimSpace(overrideJSON)
++  if input != "" {
++    source = "LoadProgramOptions.LinkedPluginsJSON"
++  } else {
++    input = strings.TrimSpace(os.Getenv(LinkedPluginsEnv))
++  }
+   if input == "" {
+     return linkedPluginState{
        cwd:          cwd,
        declarations: newPluginFileDeclarations(),
        inputs:       newPluginHostInputScopes(),
@@ -291,7 +313,13 @@ index 3224cea..b749d2f 100644
        tsconfig:     tsconfigPath,
      }, nil
    }
-@@ -907,6 +952,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+   var entries []PluginEntry
+   if err := json.Unmarshal([]byte(input), &entries); err != nil {
+-    return linkedPluginState{}, fmt.Errorf("ttsc driver: invalid %s: %w", LinkedPluginsEnv, err)
++    return linkedPluginState{}, fmt.Errorf("ttsc driver: invalid %s: %w", source, err)
+   }
+   return linkedPluginState{
+     cwd:          cwd,
      declarations: newPluginFileDeclarations(),
      entries:      entries,
      inputs:       newPluginHostInputScopes(),
@@ -299,7 +327,7 @@ index 3224cea..b749d2f 100644
      tsconfig:     tsconfigPath,
    }, nil
  }
-@@ -925,7 +971,7 @@ func (state linkedPluginState) sourcePreamble() (string, error) {
+@@ -925,7 +978,7 @@ func (state linkedPluginState) sourcePreamble() (string, error) {
      if !ok {
        continue
      }
@@ -308,7 +336,7 @@ index 3224cea..b749d2f 100644
      if err != nil {
        return "", err
      }
-@@ -946,7 +992,7 @@ func (state linkedPluginState) apply(prog *Program) error {
+@@ -946,7 +999,7 @@ func (state linkedPluginState) apply(prog *Program) error {
      if !ok {
        continue
      }
@@ -317,7 +345,7 @@ index 3224cea..b749d2f 100644
        return err
      }
    }
-@@ -969,7 +1015,7 @@ func (state linkedPluginState) hasProgramPlugins() bool {
+@@ -969,7 +1022,7 @@ func (state linkedPluginState) hasProgramPlugins() bool {
  // emitTransforms collects an emit-phase PluginTransform from every registered
  // EmitTransformPlugin, in registration order. Entries that do not implement
  // EmitTransformPlugin, or whose transform is nil, are skipped.
@@ -326,7 +354,7 @@ index 3224cea..b749d2f 100644
    var out []PluginTransform
    for index, entry := range state.entries {
      plugin, ok := registeredPlugin(index)
-@@ -980,7 +1026,7 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+@@ -980,7 +1033,7 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
      if !ok {
        continue
      }
@@ -335,7 +363,7 @@ index 3224cea..b749d2f 100644
      if err != nil {
        return nil, err
      }
-@@ -991,6 +1037,46 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+@@ -991,6 +1044,46 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
    return out, nil
  }
  
@@ -382,7 +410,7 @@ index 3224cea..b749d2f 100644
  // registeredPlugin returns the plugin registered at position index, or
  // (nil, false) when the index is out of range. Registration order matches
  // the order of linked Go init() calls.
-@@ -1010,12 +1096,19 @@ func registeredPlugin(index int) (any, bool) {
+@@ -1010,12 +1103,19 @@ func registeredPlugin(index int) (any, bool) {
  // and program hooks are the same plugin's claim and must not be attributed
  // separately. Environment reads go to the generation ledger, which fixes one
  // value per name for every hook.
@@ -403,7 +431,7 @@ index 3224cea..b749d2f 100644
      Tsconfig:                       state.tsconfig,
      reportHostInput:                inputs.add,
      reportHostInputHash:            inputs.addHash,
-@@ -1028,7 +1121,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
+@@ -1028,7 +1128,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
      reportFileComplete:             declaration.addComplete,
      reportEveryFileComplete:        declaration.completeEveryFile,
      readEnvironment:                state.inputs.readEnvironment,
@@ -448,10 +476,31 @@ index 3224cea..b749d2f 100644
  
  // hostInputs returns the exact native configuration inputs reported in this
 diff --git a/driver/program.go b/driver/program.go
-index 8dc486a..e49a37a 100644
+index 8dc486a..a338703 100644
 --- a/driver/program.go
 +++ b/driver/program.go
-@@ -801,6 +801,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
+@@ -401,6 +401,11 @@ type LoadProgramOptions struct {
+   // visible to the program and to incremental UpdateProgram calls.
+   FS vfs.FS
+ 
++  // LinkedPluginsJSON overrides the TTSC_LINKED_PLUGINS_JSON environment
++  // variable for this program load when non-empty. Empty preserves the
++  // default environment-variable lookup unchanged for existing callers.
++  LinkedPluginsJSON string
++
+   // OnFailureInputs receives the actual CLI/config input observations if this
+   // load exits after observation starts but before a Program is acquired. It
+   // runs synchronously once; it does not report a completed source population.
+@@ -622,7 +627,7 @@ func LoadProgram(cwd, tsconfigPath string, options LoadProgramOptions) (program
+   if err != nil {
+     return nil, nil, err
+   }
+-  pluginState, err := loadLinkedPluginState(cwd, tsconfigPath)
++  pluginState, err := loadLinkedPluginState(cwd, tsconfigPath, options.LinkedPluginsJSON)
+   if err != nil {
+     return nil, nil, err
+   }
+@@ -801,6 +806,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
    options := parsed.ParsedConfig.CompilerOptions
    options.NoEmit = core.TSFalse
    options.EmitDeclarationOnly = core.TSFalse
@@ -464,7 +513,7 @@ index 8dc486a..e49a37a 100644
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
-@@ -1019,6 +1025,18 @@ func (p *Program) HasLinkedProgramPlugins() bool {
+@@ -1019,6 +1030,18 @@ func (p *Program) HasLinkedProgramPlugins() bool {
    return p != nil && p.plugins.hasProgramPlugins()
  }
  
@@ -483,7 +532,7 @@ index 8dc486a..e49a37a 100644
  // PluginHostInputs returns the union of native file paths reported by linked
  // hooks while this Program was loaded or transformed. Each scope is copied
  // separately; this is not an atomic snapshot across concurrently reporting hooks
-@@ -1246,6 +1264,13 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
+@@ -1246,6 +1269,13 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
      }
    }
    raw = filterDiagnostics(raw)
@@ -631,10 +680,10 @@ index 6d4b492..b7128ae 100644
    return reused
 diff --git a/driver/session_linked_plugins_test.go b/driver/session_linked_plugins_test.go
 new file mode 100644
-index 0000000..d9afae2
+index 0000000..fabd2d2
 --- /dev/null
 +++ b/driver/session_linked_plugins_test.go
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,260 @@
 +package driver
 +
 +import (
@@ -819,6 +868,80 @@ index 0000000..d9afae2
 +	}
 +	if strings.Contains(emitted["main.js"], "for await") {
 +		t.Fatalf("expected emit transform to lower for await:\n%s", emitted["main.js"])
++	}
++}
++
++func TestLoadProgramOptionsLinkedPluginsJSONOverridesEnv(t *testing.T) {
++	savedRegistry := append([]any(nil), pluginRegistry...)
++	t.Cleanup(func() { pluginRegistry = savedRegistry })
++
++	plugin := &sessionTestPlugin{}
++	pluginRegistry = []any{plugin}
++	payload, _ := json.Marshal([]PluginEntry{{Name: "session-test", Stage: "transform", Config: map[string]any{}}})
++
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	mainPath := filepath.Join(root, "main.ts")
++	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"compilerOptions":{"target":"ES2022","module":"ESNext","strict":true,"outDir":"out"},"files":["main.ts"]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(mainPath, []byte(`export const label = "before-emit";`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// Empty LinkedPluginsJSON falls back to env (unset here -> 0 transforms).
++	t.Setenv(LinkedPluginsEnv, "")
++	progDefault, diags, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{})
++	if err != nil || CountErrors(diags) != 0 {
++		t.Fatalf("LoadProgram default failed: err=%v diags=%v", err, diags)
++	}
++	transformsDefault, err := progDefault.LinkedEmitTransforms()
++	progDefault.Close()
++	if err != nil || len(transformsDefault) != 0 {
++		t.Fatalf("expected 0 transforms with empty env and empty option, got len=%d err=%v", len(transformsDefault), err)
++	}
++
++	// Non-empty LinkedPluginsJSON activates the plugin even when env is unset,
++	// and survives Session.Apply generations.
++	session, diags, err := NewSession(root, "tsconfig.json", LoadProgramOptions{LinkedPluginsJSON: string(payload)})
++	if err != nil || CountErrors(diags) != 0 {
++		t.Fatalf("NewSession with LinkedPluginsJSON failed: err=%v diags=%v", err, diags)
++	}
++	defer session.Close()
++
++	transforms, err := session.Program().LinkedEmitTransforms()
++	if err != nil || len(transforms) != 1 {
++		t.Fatalf("expected 1 transform from LinkedPluginsJSON, got len=%d err=%v", len(transforms), err)
++	}
++	session.Apply(mainPath, `export const label = "before-emit"; // gen 2`)
++	emitted := map[string]string{}
++	if _, err := session.Program().EmitWithPluginTransformers(nil, func(name shimtspath.RootedFilePath, text string, _ *shimcompiler.WriteFileData) error {
++		emitted[filepath.Base(string(name))] = text
++		return nil
++	}); err != nil {
++		t.Fatalf("EmitWithPluginTransformers failed: %v", err)
++	}
++	if !strings.Contains(emitted["main.js"], `"after-emit"`) {
++		t.Fatalf("emitted JS lacks transform from LinkedPluginsJSON:\n%s", emitted["main.js"])
++	}
++
++	// Explicit "[]" overrides a non-empty env variable.
++	t.Setenv(LinkedPluginsEnv, string(payload))
++	progOverrideEmpty, diags, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{LinkedPluginsJSON: "[]"})
++	if err != nil || CountErrors(diags) != 0 {
++		t.Fatalf("LoadProgram with LinkedPluginsJSON=[] failed: err=%v diags=%v", err, diags)
++	}
++	transformsEmpty, err := progOverrideEmpty.LinkedEmitTransforms()
++	progOverrideEmpty.Close()
++	if err != nil || len(transformsEmpty) != 0 {
++		t.Fatalf("expected 0 transforms when LinkedPluginsJSON overrides env with [], got len=%d err=%v", len(transformsEmpty), err)
++	}
++
++	// Malformed LinkedPluginsJSON reports LoadProgramOptions.LinkedPluginsJSON in its error.
++	if _, _, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{LinkedPluginsJSON: "{bad"}); err == nil || !strings.Contains(err.Error(), "LoadProgramOptions.LinkedPluginsJSON") {
++		t.Fatalf("expected error naming LoadProgramOptions.LinkedPluginsJSON, got %v", err)
 +	}
 +}
 diff --git a/driver/withdrawn_diagnostics.go b/driver/withdrawn_diagnostics.go
@@ -1188,6 +1311,30 @@ index b347a08..cae5f80 100644
          };
      }
      finally {
+diff --git a/lib/index.d.ts b/lib/index.d.ts
+index d1ff216..f34457f 100644
+--- a/lib/index.d.ts
++++ b/lib/index.d.ts
+@@ -10,6 +10,7 @@
+ export * from "./plugin/ITtscCapabilityPlugin";
+ export * from "./plugin/CapabilityPluginResolver";
+ export * from "./plugin/resolveCapabilityPlugins";
++export * from "./plugin/resolveLinkedTransformPlugins";
+ export * from "./TtscCompiler";
+ export { resolveCompilerEnvironment } from "./compiler/resolveCompilerEnvironment";
+ export * from "./TtscServiceRequestOptions";
+diff --git a/lib/index.js b/lib/index.js
+index d69b165..55c582c 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -27,6 +27,7 @@ exports.serializeCompilerError = exports.resolveCompilerEnvironment = void 0;
+ __exportStar(require("./plugin/ITtscCapabilityPlugin"), exports);
+ __exportStar(require("./plugin/CapabilityPluginResolver"), exports);
+ __exportStar(require("./plugin/resolveCapabilityPlugins"), exports);
++__exportStar(require("./plugin/resolveLinkedTransformPlugins"), exports);
+ __exportStar(require("./TtscCompiler"), exports);
+ var resolveCompilerEnvironment_1 = require("./compiler/resolveCompilerEnvironment");
+ Object.defineProperty(exports, "resolveCompilerEnvironment", { enumerable: true, get: function () { return resolveCompilerEnvironment_1.resolveCompilerEnvironment; } });
 diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javascriptRuntimeCapabilities.js
 index 53dc81d..d6ad694 100644
 --- a/lib/internal/javascriptRuntimeCapabilities.js
@@ -1752,6 +1899,96 @@ index 191b99e..a741af5 100644
          if (clock - startedAt >= opts.timeoutMs) {
              throw new Error(`ttsc: timed out after ${(0, formatDuration_1.formatDuration)(clock - startedAt)} waiting for ` +
                  `${opts.lockInfo.label} "${opts.lockInfo.pluginName}" at ${opts.lockDir}; ` +
+diff --git a/lib/plugin/resolveLinkedTransformPlugins.d.ts b/lib/plugin/resolveLinkedTransformPlugins.d.ts
+new file mode 100644
+index 0000000..4f1bb74
+--- /dev/null
++++ b/lib/plugin/resolveLinkedTransformPlugins.d.ts
+@@ -0,0 +1,27 @@
++/**
++ * Resolve a project's configured linked transform plugins and return the
++ * serialized JSON manifest that ttsc's transform path passes to a native host
++ * via `TTSC_LINKED_PLUGINS_JSON`.
++ *
++ * Returns an empty string when the project configures no linked transform
++ * plugins.
++ *
++ * @param options.cacheDir - Override the plugin binary cache directory.
++ * @param options.cwd - Project root. Defaults to the current directory.
++ * @param options.env - Effective environment for plugin discovery and loading.
++ * @param options.pluginConfigDir - Caller-declared consumer directory for
++ *   plugin packages and config-file discovery.
++ * @param options.plugins - Explicit plugin entries; `false` disables plugins.
++ * @param options.projectRoot - Override the project source root.
++ * @param options.tsconfig - Project tsconfig path, relative to `cwd`.
++ * @returns Compact JSON manifest for linked transform plugins, or `""` if none.
++ */
++export declare function resolveLinkedTransformPlugins(options?: {
++    cacheDir?: string;
++    cwd?: string;
++    env?: NodeJS.ProcessEnv;
++    pluginConfigDir?: string;
++    plugins?: false | readonly Record<string, unknown>[];
++    projectRoot?: string;
++    tsconfig?: string;
++}): string;
+diff --git a/lib/plugin/resolveLinkedTransformPlugins.js b/lib/plugin/resolveLinkedTransformPlugins.js
+new file mode 100644
+index 0000000..9d95790
+--- /dev/null
++++ b/lib/plugin/resolveLinkedTransformPlugins.js
+@@ -0,0 +1,51 @@
++"use strict";
++var __importDefault = (this && this.__importDefault) || function (mod) {
++    return (mod && mod.__esModule) ? mod : { "default": mod };
++};
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.resolveLinkedTransformPlugins = resolveLinkedTransformPlugins;
++const node_path_1 = __importDefault(require("node:path"));
++const NativePluginArguments_1 = require("../compiler/internal/build/NativePluginArguments");
++const resolveBinary_1 = require("../compiler/internal/resolveBinary");
++const SidecarEnvironment_1 = require("../compiler/internal/sharedHost/SidecarEnvironment");
++const inheritedSidecarEnv_1 = require("../compiler/internal/sharedHost/inheritedSidecarEnv");
++const linkedTransformPlugins_1 = require("../compiler/internal/sharedHost/linkedTransformPlugins");
++const loadProjectPlugins_1 = require("./internal/load/loadProjectPlugins");
++/**
++ * Resolve a project's configured linked transform plugins and return the
++ * serialized JSON manifest that ttsc's transform path passes to a native host
++ * via `TTSC_LINKED_PLUGINS_JSON`.
++ *
++ * Returns an empty string when the project configures no linked transform
++ * plugins.
++ *
++ * @param options.cacheDir - Override the plugin binary cache directory.
++ * @param options.cwd - Project root. Defaults to the current directory.
++ * @param options.env - Effective environment for plugin discovery and loading.
++ * @param options.pluginConfigDir - Caller-declared consumer directory for
++ *   plugin packages and config-file discovery.
++ * @param options.plugins - Explicit plugin entries; `false` disables plugins.
++ * @param options.projectRoot - Override the project source root.
++ * @param options.tsconfig - Project tsconfig path, relative to `cwd`.
++ * @returns Compact JSON manifest for linked transform plugins, or `""` if none.
++ */
++function resolveLinkedTransformPlugins(options = {}) {
++    const cwd = node_path_1.default.resolve(options.cwd ?? process.cwd());
++    const loaded = (0, loadProjectPlugins_1.loadProjectPlugins)({
++        binary: (0, resolveBinary_1.resolveBinary)({
++            env: SidecarEnvironment_1.SidecarEnvironment.merge(process.env, options.env),
++        }) ?? "",
++        cacheDir: options.cacheDir ??
++            SidecarEnvironment_1.SidecarEnvironment.read(options.env, "TTSC_CACHE_DIR"),
++        cwd,
++        entries: options.plugins,
++        env: (0, inheritedSidecarEnv_1.inheritedSidecarEnv)(options.env, undefined),
++        pluginConfigDir: options.pluginConfigDir,
++        projectRoot: options.projectRoot,
++        tsconfig: options.tsconfig,
++    });
++    const linked = (0, linkedTransformPlugins_1.linkedTransformPlugins)(loaded.nativePlugins);
++    if (linked.length === 0)
++        return "";
++    return NativePluginArguments_1.NativePluginArguments.serializeNativePlugins(linked);
++}
 diff --git a/utility/emit_transform_test.go b/utility/emit_transform_test.go
 new file mode 100644
 index 0000000..73ebec9

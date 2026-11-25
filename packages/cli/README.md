@@ -475,6 +475,15 @@ withdrawn under `noEmitOnError`, declaration emit (`EmitOnlyDts`) temporarily cl
 `emitProgram` (restoring it on return) so both JavaScript and `.d.ts` outputs emit while any unwithdrawn error still
 blocks emit ([samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)).
 
+`resolveLinkedTransformPlugins` (`lib/plugin/resolveLinkedTransformPlugins.js`, re-exported from `lib/index.js` and
+`lib/index.d.ts`) exposes ttsc's own `loadProjectPlugins` and `serializeNativePlugins(linkedTransformPlugins(...))`
+resolution, returning `""` when a project configures no linked transform plugins; on the Go side,
+`driver.LoadProgramOptions.LinkedPluginsJSON` (`driver/program.go`, `driver/plugins.go` `loadLinkedPluginState`) lets a
+caller supply that manifest per `LoadProgram` or `NewSession` call instead of mutating process-wide
+`TTSC_LINKED_PLUGINS_JSON` ([samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)): an empty value preserves
+the existing environment lookup, while a non-empty value overrides it (including `"[]"` to disable linked plugins for
+one session) and names `LoadProgramOptions.LinkedPluginsJSON` on invalid JSON.
+
 The packaged managed asset is the source, so clean managed installs receive the same repairs without a compiler fork or
 edits to the dependency cache. The registration applies only to that exact compiler version; the repository's lockfile
 continues to own its compiler pin.
