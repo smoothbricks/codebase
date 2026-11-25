@@ -657,8 +657,12 @@ fn launchctl_missing(op: &'static str) -> RunError {
     }
 }
 
+/// The temporary file the fake filesystem creates beside the gateway's service definition: in
+/// LaunchAgents on macOS, in the systemd user unit directory on Linux.
 fn temp_path() -> PathBuf {
-    PathBuf::from("/Users/cowshed-test/Library/LaunchAgents/.exclusive-no-follow-temp")
+    gateway()
+        .launch_agents_directory()
+        .join(".exclusive-no-follow-temp")
 }
 
 #[cfg(target_os = "macos")]
