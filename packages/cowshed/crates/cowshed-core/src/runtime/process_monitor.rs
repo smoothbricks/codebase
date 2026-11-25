@@ -260,7 +260,7 @@ impl ProcessMonitor {
 
     /// [`ProcessMonitor::prepare`] over `reads`, the kernel's per-process reads, which a test
     /// replaces to make the kernel fail the way it does under load.
-    pub(crate) fn prepare_with<P: ProcessReads + Send + 'static>(
+    pub fn prepare_with<P: ProcessReads + Send + 'static>(
         job_id: TreeOwner,
         reads: P,
     ) -> Result<Self> {

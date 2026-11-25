@@ -12862,6 +12862,11 @@ mod land_gate_priority {
         #[allow(dead_code)]
         ledger: PathBuf,
         mbx: Option<TestMbx>,
+        #[allow(dead_code)]
+        _sink_receivers: Option<(
+            mpsc::UnboundedReceiver<ArtifactObservation>,
+            mpsc::UnboundedReceiver<OrderObservation>,
+        )>,
         root: TempRoot,
     }
 
@@ -12910,6 +12915,7 @@ mod land_gate_priority {
             telemetry,
             ledger,
             mbx,
+            _sink_receivers: None,
             root,
         }
     }
@@ -13582,6 +13588,313 @@ s.recv(16)
         writer: tokio::net::unix::OwnedWriteHalf,
     }
 
+    /// Real macOS `ProcessReads` wrapper for the token-ignoring burner job: delegates every
+    /// kernel read, process-tree fork adoption, group read, and signal to real [`Darwin`], and
+    /// reports deterministic 1.0 core/s CPU growth per live process (3.0 cores/s across the 3 real
+    /// OS processes) so the 1.5-core `PRIO_DARWIN_BG` threshold does not depend on host load
+    /// average or runner nice (`AGENTS.md` Rule 5: no test drives core logic through a load
+    /// generator).
+    #[cfg(target_os = "macos")]
+    struct BurnerReads {
+        origin: Instant,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl BurnerReads {
+        fn new() -> Self {
+            Self {
+                origin: Instant::now(),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl cowshed_core::runtime::process_events::ProcessReads for BurnerReads {
+        fn record(
+            &self,
+            pid: u32,
+        ) -> std::io::Result<Option<cowshed_core::runtime::job_groups::ProcessRecord>> {
+            cowshed_core::runtime::process_events::Darwin.record(pid)
+        }
+
+        fn image(
+            &self,
+            pid: u32,
+        ) -> std::io::Result<cowshed_core::runtime::process_tree::ProcessImage> {
+            cowshed_core::runtime::process_events::Darwin.image(pid)
+        }
+
+        fn children(&self, pid: u32) -> std::io::Result<Vec<u32>> {
+            cowshed_core::runtime::process_events::Darwin.children(pid)
+        }
+
+        fn reader_uid(&self) -> u32 {
+            cowshed_core::runtime::process_events::Darwin.reader_uid()
+        }
+
+        fn usage(
+            &self,
+            process: cowshed_core::runtime::process_tree::ProcessIdentity,
+            held: Option<std::os::fd::BorrowedFd<'_>>,
+            start: Option<cowshed_core::runtime::process_usage::StartStamp>,
+            at: Instant,
+        ) -> std::result::Result<
+            cowshed_core::runtime::process_usage::Sampled,
+            cowshed_core::runtime::process_usage::SampleError,
+        > {
+            match cowshed_core::runtime::process_events::Darwin.usage(process, held, start, at)? {
+                cowshed_core::runtime::process_usage::Sampled::Read(mut reading) => {
+                    let elapsed_us =
+                        u64::try_from(at.saturating_duration_since(self.origin).as_micros())
+                            .unwrap_or(u64::MAX);
+                    reading.cpu_user = cowshed_core::api::resources::CpuMicros::new(
+                        reading.cpu_user.get().max(elapsed_us),
+                    )
+                    .expect("elapsed micros fit CpuMicros");
+                    Ok(cowshed_core::runtime::process_usage::Sampled::Read(reading))
+                }
+                other => Ok(other),
+            }
+        }
+
+        fn group(
+            &self,
+            leader: &Birth,
+        ) -> std::io::Result<Vec<cowshed_core::runtime::job_groups::ProcessRecord>> {
+            cowshed_core::runtime::process_events::Darwin.group(leader)
+        }
+
+        fn signal(
+            &self,
+            process: cowshed_core::runtime::process_tree::ProcessIdentity,
+            signal: libc::c_int,
+        ) -> std::io::Result<bool> {
+            cowshed_core::runtime::process_events::Darwin.signal(process, signal)
+        }
+    }
+
+    /// Typed `SpawnSink` for macOS `PRIO_DARWIN_BG` tests: spawns real OS processes under
+    /// [`ProcessMonitor`], using [`BurnerReads`] for `cpu-burner` jobs and real [`Darwin`] for
+    /// all other jobs (jobserver clients and land gates).
+    #[cfg(target_os = "macos")]
+    struct BurnerSpawnSink;
+
+    #[cfg(target_os = "macos")]
+    struct BurnerRunningProcess {
+        process: OwnedProcess,
+        monitor: cowshed_core::runtime::process_monitor::ProcessMonitor,
+        pgid: i32,
+        reaped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RunningProcess for BurnerRunningProcess {
+        fn process(&self) -> Option<&OwnedProcess> {
+            Some(&self.process)
+        }
+
+        fn nice(&self) -> Option<i32> {
+            None
+        }
+
+        fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
+            Some(&self.monitor)
+        }
+
+        fn try_write_stdin(&mut self, _: Bytes) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn close_stdin(&mut self) -> bool {
+            true
+        }
+
+        fn end_stdin(&mut self) {}
+
+        fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
+            if !self.reaped.load(std::sync::atomic::Ordering::Acquire) {
+                let sig = match signal {
+                    ProcessSignal::Term => libc::SIGTERM,
+                    ProcessSignal::Kill => libc::SIGKILL,
+                };
+                // SAFETY: `self.pgid` is our live child's process group, held unreaped.
+                let _ = unsafe { libc::kill(-self.pgid, sig) };
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for BurnerRunningProcess {
+        fn drop(&mut self) {
+            if !self.reaped.load(std::sync::atomic::Ordering::Acquire) {
+                // SAFETY: best-effort cleanup on test panic/drop of our owned process group.
+                let _ = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[async_trait]
+    impl SpawnSink for BurnerSpawnSink {
+        async fn spawn(
+            &mut self,
+            request: ProcessSpawnRequest,
+            events: mpsc::Sender<ProcessEvent>,
+        ) -> Result<Box<dyn RunningProcess>> {
+            use std::os::unix::process::CommandExt as _;
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let SpawnCommand::Argv(argv) = &request.command else {
+                return Err(CowshedError::internal("BurnerSpawnSink expects Argv"));
+            };
+            let is_burner = argv
+                .get(3)
+                .is_some_and(|arg| arg.as_os_str() == "cpu-burner");
+            let monitor = if is_burner {
+                cowshed_core::runtime::process_monitor::ProcessMonitor::prepare_with(
+                    cowshed_core::runtime::process_tree::TreeOwner::Job(request.job_id),
+                    BurnerReads::new(),
+                )?
+            } else {
+                cowshed_core::runtime::process_monitor::ProcessMonitor::prepare(
+                    cowshed_core::runtime::process_tree::TreeOwner::Job(request.job_id),
+                )?
+            };
+            let mut command = std::process::Command::new(&argv[0]);
+            command
+                .args(&argv[1..])
+                .env_clear()
+                .envs(&request.env)
+                .env(
+                    "CARGO_MAKEFLAGS",
+                    format!("--jobserver-auth=fifo:{}", request.cpu.fifo.display()),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0);
+            let (mut child, _) = monitor
+                .spawn_root(command)
+                .map_err(|error| CowshedError::internal(format!("spawn failed: {error}")))?;
+            let pid = child.id();
+            let pgid = i32::try_from(pid).expect("pid fits i32");
+            let birth = Birth::of(pid);
+            let reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reaped_wait = Arc::clone(&reaped);
+            let job_id = request.job_id;
+            tokio::task::spawn_blocking(move || {
+                let exit = match child.wait() {
+                    Ok(status) => {
+                        reaped_wait.store(true, std::sync::atomic::Ordering::Release);
+                        if let Some(code) = status.code() {
+                            ExitStatus::Exited { code }
+                        } else if let Some(signal) = status.signal() {
+                            ExitStatus::Signaled {
+                                signal,
+                                core_dumped: false,
+                            }
+                        } else {
+                            ExitStatus::Exited { code: 1 }
+                        }
+                    }
+                    Err(_) => {
+                        reaped_wait.store(true, std::sync::atomic::Ordering::Release);
+                        ExitStatus::Exited { code: 1 }
+                    }
+                };
+                let _ = events.blocking_send(ProcessEvent::OutputEof {
+                    job_id,
+                    stream: StreamKind::Stdout,
+                });
+                let _ = events.blocking_send(ProcessEvent::OutputEof {
+                    job_id,
+                    stream: StreamKind::Stderr,
+                });
+                let _ = events.blocking_send(ProcessEvent::Exited { job_id, exit });
+            });
+            Ok(Box::new(BurnerRunningProcess {
+                process: OwnedProcess {
+                    birth,
+                    spawned: Instant::now(),
+                    host: cowshed_core::host_load::read_host_load(),
+                },
+                monitor,
+                pgid,
+                reaped,
+            }))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_burner_fixture(name: &str) -> GateFixture {
+        let (mut config, root) = isolated_config(&temp_parent::canonical_parent(), name);
+        config.default_cwd = None;
+        config.term_grace = Duration::from_secs(1);
+        std::fs::create_dir_all(&config.sandbox.home).unwrap();
+        std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    config
+                        .workspace_root
+                        .join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH),
+                )
+                .unwrap()
+                .write_all(
+                    cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                        .encode()
+                        .as_bytes(),
+                )
+                .unwrap();
+        }
+        let telemetry = root.join("telemetry");
+        std::fs::create_dir_all(&telemetry).unwrap();
+        let ledger = root.join("supervisor.groups");
+        config.telemetry_root = Some(telemetry.clone());
+        config.group_ledger = Some(ledger.clone());
+        let gateway = StandInGateway::start(&config.sandbox.store_root);
+        let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+            Box::new(cowshed_core::storage::audit::NullAuditSink),
+            8,
+        )
+        .unwrap();
+        let (artifact_tx, artifacts_rx) = mpsc::unbounded_channel();
+        let (order_tx, order_rx) = mpsc::unbounded_channel();
+        let artifact_authority = config.authority.clone();
+        let handle = WorkspaceSupervisor::start_with_sinks(
+            config,
+            Box::new(BurnerSpawnSink),
+            Box::new(FakeArtifactSink {
+                sealed_stdout: None,
+                refused: None,
+                next: JobId::new(1).unwrap(),
+                quota: 1024,
+                jobs: BTreeMap::new(),
+                terminals: BTreeMap::new(),
+                authority: artifact_authority,
+                observations: artifact_tx,
+                order: order_tx,
+            }),
+            Box::new(commitments),
+        )
+        .unwrap();
+        GateFixture {
+            handle,
+            gateway,
+            telemetry,
+            ledger,
+            mbx: None,
+            _sink_receivers: Some((artifacts_rx, order_rx)),
+            root,
+        }
+    }
+
     #[cfg(target_os = "macos")]
     const CPU_BURNER_PY: &str = r#"
 import os, select, socket, sys
@@ -13590,7 +13903,6 @@ sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(sys.argv[1])
 count = int(sys.argv[2])
 r_stop, w_stop = os.pipe()
-os.set_blocking(r_stop, False)
 
 children = []
 for _ in range(count - 1):
@@ -13598,26 +13910,14 @@ for _ in range(count - 1):
     if pid == 0:
         os.close(w_stop)
         sock.close()
-        x = 1
-        while True:
-            for _ in range(20000):
-                x = (x * 1664525 + 1013904223) & 0xffffffff
-            r, _, _ = select.select([r_stop], [], [], 0)
-            if r:
-                os._exit(0)
+        select.select([r_stop], [], [])
+        os._exit(0)
     children.append(pid)
 
 os.close(r_stop)
 pids = [os.getpid()] + children
 sock.sendall(('pids ' + ' '.join(str(p) for p in pids) + '\n').encode())
-sock.setblocking(False)
-x = 1
-while True:
-    for _ in range(20000):
-        x = (x * 1664525 + 1013904223) & 0xffffffff
-    r, _, _ = select.select([sock], [], [], 0)
-    if r:
-        break
+select.select([sock], [], [])
 
 os.close(w_stop)
 for pid in children:
@@ -13721,7 +14021,7 @@ for pid in children:
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn land_gate_sets_and_clears_darwinbg_on_token_ignoring_burner() {
-        let mut fixture = start_fixture("gate-darwinbg", false);
+        let mut fixture = start_burner_fixture("gate-darwinbg");
         let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
         assert_tree_max_priority(&burner.pids, 63, "before land gate");
 
@@ -14001,6 +14301,9 @@ os.read(0, 1)
     /// on macOS clears `PRIO_DARWIN_BG` (`pth_maxpriority == 63`, `job.darwinbg.cleared`).
     #[tokio::test]
     async fn gateway_silence_restores_tokens_and_clears_darwinbg_within_silence_bound() {
+        #[cfg(target_os = "macos")]
+        let mut fixture = start_burner_fixture("gate-silence");
+        #[cfg(not(target_os = "macos"))]
         let mut fixture = start_fixture("gate-silence", false);
         let mut bg = JobserverClient::start(
             &fixture.handle,
