@@ -1030,7 +1030,10 @@ fn doc_commit_asks_for_its_ref_turn_with_class_bounded() {
     use std::os::unix::net::UnixListener;
 
     let repo = Repo::new("paths = [\"*.md\"]\n");
-    let stand_in_socket = repo.root.join("stand-in.sock");
+    // Under the scratch parent, as the test gateway's socket is: the repo root under a shed's TMPDIR
+    // can leave no room for a socket name within SUN_LEN.
+    let stand_in_root = temp_root::TempRoot::new_in(&temp_parent::scratch_parent(), "csdoc");
+    let stand_in_socket = stand_in_root.join("stand-in.sock");
     let listener = UnixListener::bind(&stand_in_socket).expect("bind stand-in control socket");
     let captured = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept doc-commit ask");
