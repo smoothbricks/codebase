@@ -1,31 +1,32 @@
 //! A real JSON publication, awaited by native directory writes rather than elapsed time.
+//!
+//! The watch runs on Tokio's reactor through [`tokio::io::unix::AsyncFd`] (a non-blocking
+//! `kqueue` on macOS, a non-blocking `inotify` descriptor on Linux) rather than a blocking
+//! `spawn_blocking` thread, so cancelling or bounding [`read_when`] with `tokio::time::timeout`
+//! drops the watch immediately and never hangs runtime teardown.
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub async fn read_when(path: PathBuf, ready: impl Fn(&Value) -> bool + Send + 'static) -> Value {
-    tokio::task::spawn_blocking(move || {
-        let watch = DirectoryWatch::arm(path.parent().expect("the publication's directory"));
-        loop {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let value = serde_json::from_slice(&bytes).expect("a JSON publication");
-                    if ready(&value) {
-                        return value;
-                    }
+    let watch = DirectoryWatch::arm(path.parent().expect("the publication's directory"));
+    loop {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let value = serde_json::from_slice(&bytes).expect("a JSON publication");
+                if ready(&value) {
+                    return value;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("read publication {}: {error}", path.display()),
             }
-            watch.wait();
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read publication {}: {error}", path.display()),
         }
-    })
-    .await
-    .expect("the publication watcher")
+        watch.wait().await;
+    }
 }
 
 #[cfg(target_os = "macos")]
 struct DirectoryWatch {
-    queue: std::os::fd::OwnedFd,
+    queue: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
     _directory: std::fs::File,
 }
 
@@ -66,39 +67,51 @@ impl DirectoryWatch {
             path.display(),
             std::io::Error::last_os_error()
         );
+        // macOS kqueue descriptors support `EVFILT_READ` only (registering `EVFILT_WRITE`
+        // returns `EINVAL`), so request readable interest alone.
+        let queue = tokio::io::unix::AsyncFd::with_interest(queue, tokio::io::Interest::READABLE)
+            .expect("register kqueue on tokio reactor");
         Self {
             queue,
             _directory: directory,
         }
     }
 
-    fn wait(&self) {
+    async fn wait(&self) {
         use std::os::fd::AsRawFd as _;
-        let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         loop {
-            // SAFETY: a live queue and room for one event. The null timeout waits for
-            // the kernel's event; the target owns any no-progress bound.
+            let mut guard = self
+                .queue
+                .readable()
+                .await
+                .expect("wait for publication readiness");
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            // SAFETY: non-blocking drain of one pending kevent from our live queue.
             let received = unsafe {
                 libc::kevent(
-                    self.queue.as_raw_fd(),
+                    self.queue.get_ref().as_raw_fd(),
                     std::ptr::null(),
                     0,
                     event.as_mut_ptr(),
                     1,
-                    std::ptr::null(),
+                    &zero,
                 )
             };
-            if received < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
+            if received < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("wait for publication: {error}");
+            }
+            if received == 0 {
+                guard.clear_ready();
                 continue;
             }
-            assert_eq!(
-                received,
-                1,
-                "wait for publication: {}",
-                std::io::Error::last_os_error()
-            );
             // SAFETY: kevent returned exactly one initialized event.
             let event = unsafe { event.assume_init() };
             assert_eq!(
@@ -107,6 +120,7 @@ impl DirectoryWatch {
                 "publication watch: errno {}",
                 { event.data }
             );
+            guard.clear_ready();
             return;
         }
     }
@@ -114,7 +128,7 @@ impl DirectoryWatch {
 
 #[cfg(target_os = "linux")]
 struct DirectoryWatch {
-    events: std::fs::File,
+    events: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -123,14 +137,14 @@ impl DirectoryWatch {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::ffi::OsStrExt as _;
         // SAFETY: flags only; a negative answer is checked before taking custody.
-        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         assert!(
             raw >= 0,
             "inotify_init1: {}",
             std::io::Error::last_os_error()
         );
         // SAFETY: this value alone owns the newly returned descriptor.
-        let events = unsafe { std::fs::File::from_raw_fd(raw) };
+        let events = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a directory path");
         // SAFETY: the path is NUL-terminated, live for the call and the descriptor is owned.
         let added = unsafe {
@@ -146,19 +160,58 @@ impl DirectoryWatch {
             path.display(),
             std::io::Error::last_os_error()
         );
+        let events = tokio::io::unix::AsyncFd::with_interest(events, tokio::io::Interest::READABLE)
+            .expect("register inotify on tokio reactor");
         Self { events }
     }
 
-    fn wait(&self) {
-        use std::io::Read as _;
+    async fn wait(&self) {
+        use std::os::fd::AsRawFd as _;
         let mut buffer = [0_u8; 4096];
         loop {
-            match (&self.events).read(&mut buffer) {
-                Ok(0) => panic!("publication watch ended"),
-                Ok(_) => return,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => panic!("wait for publication: {error}"),
+            let mut guard = self
+                .events
+                .readable()
+                .await
+                .expect("wait for publication readiness");
+            // SAFETY: reading from our live non-blocking inotify fd into a valid buffer.
+            let n = unsafe {
+                libc::read(
+                    self.events.get_ref().as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if n > 0 {
+                // Drain any further queued events before returning.
+                loop {
+                    // SAFETY: same live non-blocking inotify fd.
+                    let more = unsafe {
+                        libc::read(
+                            self.events.get_ref().as_raw_fd(),
+                            buffer.as_mut_ptr().cast(),
+                            buffer.len(),
+                        )
+                    };
+                    if more <= 0 {
+                        break;
+                    }
+                }
+                guard.clear_ready();
+                return;
             }
+            if n == 0 {
+                panic!("publication watch ended");
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                guard.clear_ready();
+                continue;
+            }
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("wait for publication: {error}");
         }
     }
 }
