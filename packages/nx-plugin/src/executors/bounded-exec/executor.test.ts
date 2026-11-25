@@ -2315,6 +2315,59 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   });
   //#endregion smoo/cowshed!n/a-minimum-for-a-whole-suite
 
+  it('sends job_id beside job_started_ms only for an interactive leaf with MBX_SCHEDULER_JOB_ID set', async () => {
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-bin');
+    await mkdir(bin);
+    await writeFile(join(bin, 'stryker'), '#!/bin/sh\necho ok\n', { mode: 0o755 });
+    const endpoint = await standInReservations(() => 2);
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+      MBX_SCHEDULER_PRIORITY: process.env.MBX_SCHEDULER_PRIORITY,
+      MBX_SCHEDULER_JOB_STARTED_MS: process.env.MBX_SCHEDULER_JOB_STARTED_MS,
+      MBX_SCHEDULER_JOB_ID: process.env.MBX_SCHEDULER_JOB_ID,
+      [RESERVATIONS_ENV]: process.env[RESERVATIONS_ENV],
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    process.env[RESERVATIONS_ENV] = endpoint.socket;
+    const jobId = 'job-0198f2c0b7e34dc795f17b238b331c80-7';
+    try {
+      for (const leaf of [
+        { priority: 'interactive', started: '1700000000000', jobId },
+        { priority: 'interactive', started: '1700000000000', jobId: '' },
+        { priority: 'normal', started: '1700000000000', jobId },
+      ]) {
+        process.env.MBX_SCHEDULER_PRIORITY = leaf.priority;
+        process.env.MBX_SCHEDULER_JOB_STARTED_MS = leaf.started;
+        process.env.MBX_SCHEDULER_JOB_ID = leaf.jobId;
+        const result = await runBoundedExec(
+          { command: 'stryker run --concurrency=4', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+        );
+        expect(result.success, result.terminalOutput).toBe(true);
+      }
+      await endpoint.released(3);
+      expect(
+        endpoint.reserves.map(({ priority, job_started_ms, job_id }) => ({ priority, job_started_ms, job_id })),
+      ).toEqual([
+        { priority: 'interactive', job_started_ms: 1_700_000_000_000, job_id: jobId },
+        { priority: 'interactive', job_started_ms: 1_700_000_000_000, job_id: null },
+        { priority: 'normal', job_started_ms: null, job_id: null },
+      ]);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await endpoint.close();
+    }
+  });
   //#region smoo/cowshed!n/a-case-starts-on-a-core
   /**
    * A prebuilt nextest leaf that asks for six cores and is granted one. Its stand-in runner prints its thread count

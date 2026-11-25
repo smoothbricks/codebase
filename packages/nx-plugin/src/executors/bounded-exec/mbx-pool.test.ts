@@ -34,15 +34,30 @@ describe("mbx's one pool at the leaf", () => {
     });
   });
 
-  it("carries an interactive job's start, which its leaves' requests decay by, and no start for another class", () => {
-    const named = { MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHEDULER_JOB_STARTED_MS: '1700000000000' };
+  it("carries an interactive job's start and id, which mbx's first-admission decay keys on, and neither for another class", () => {
+    const jobId = 'job-0198f2c0b7e34dc795f17b238b331c80-7';
+    const named = {
+      MBX_SCHEDULER: '1',
+      MBX_CACHE_DIR: '/bc/mbx',
+      MBX_SCHEDULER_JOB_STARTED_MS: '1700000000000',
+      MBX_SCHEDULER_JOB_ID: jobId,
+    };
     const interactive = mbxPool({ ...named, MBX_SCHEDULER_PRIORITY: 'interactive' });
-    expect(interactive).toEqual({ priority: 'interactive', jobStartedMs: 1_700_000_000_000 });
-    // cowshed exports the start empty for every job that is not interactive: a request of it names none.
-    expect(mbxPool({ ...named, MBX_SCHEDULER_PRIORITY: 'interactive', MBX_SCHEDULER_JOB_STARTED_MS: '' })).toEqual({
+    expect(interactive).toEqual({ priority: 'interactive', jobStartedMs: 1_700_000_000_000, jobId });
+    // cowshed exports start and id empty for every job that is not interactive: a request of it names neither.
+    expect(
+      mbxPool({
+        ...named,
+        MBX_SCHEDULER_PRIORITY: 'interactive',
+        MBX_SCHEDULER_JOB_STARTED_MS: '',
+        MBX_SCHEDULER_JOB_ID: '',
+      }),
+    ).toEqual({ priority: 'interactive' });
+    expect(mbxPool({ ...named, MBX_SCHEDULER_PRIORITY: 'interactive', MBX_SCHEDULER_JOB_ID: '' })).toEqual({
       priority: 'interactive',
+      jobStartedMs: 1_700_000_000_000,
     });
-    // Only an interactive request decays, so no other band's request names a start it happens to inherit.
+    // Only an interactive request decays, so no other band's request names a start or id it happens to inherit.
     expect(mbxPool({ ...named, MBX_SCHEDULER_PRIORITY: 'normal' })).toEqual({ priority: 'normal' });
     expect(mbxPool({ ...named })).toEqual({ priority: 'low' });
     if (interactive === null) throw new Error('the canonical environment names a pool');
@@ -50,6 +65,7 @@ describe("mbx's one pool at the leaf", () => {
       kind: 'reserve',
       priority: 'interactive',
       jobStartedMs: 1_700_000_000_000,
+      jobId,
     });
   });
 

@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import { rm } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
-import typia from 'typia';
+import typia, { type tags } from 'typia';
 import type { MbxPriority } from '../executors/bounded-exec/mbx-pool.js';
 import { ownedSocketDirectory } from '../testing.js';
 
@@ -11,7 +11,16 @@ import { ownedSocketDirectory } from '../testing.js';
  * exactly these fields, as the host's installed mbx accepts them.
  */
 type HeardLine =
-  | { type: 'reserve'; id: number; cpus: number; priority: MbxPriority; min?: number; name?: string }
+  | {
+      type: 'reserve';
+      id: number;
+      cpus: number;
+      priority: MbxPriority;
+      min?: number;
+      name?: string;
+      job_started_ms?: number & tags.Type<'uint64'>;
+      job_id?: string & tags.MinLength<1>;
+    }
   | { type: 'release'; id: number };
 
 const validLine = typia.createValidateEquals<HeardLine>();
@@ -43,6 +52,10 @@ export interface HeardReserve {
   readonly min: number | null;
   /** The class the request named; null for a request that named none. */
   readonly name: string | null;
+  /** The job start the request named; null for a request that named none. */
+  readonly job_started_ms: number | null;
+  /** The job id the request named; null for a request that named none. */
+  readonly job_id: string | null;
   readonly connection: number;
 }
 
@@ -125,6 +138,8 @@ export async function standInReservations(
           priority: line.priority,
           min: line.min ?? null,
           name: line.name ?? null,
+          job_started_ms: line.job_started_ms ?? null,
+          job_id: line.job_id ?? null,
           connection,
         };
         reserves.push(heard);
