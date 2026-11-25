@@ -423,19 +423,8 @@ fn registered_worktree_git_dir(root: &Path) -> Result<Option<PathBuf>> {
     if !metadata.file_type().is_file() {
         return Ok(None);
     }
-    let content = fs::read_to_string(&pointer).map_err(|error| {
-        CowshedError::integrity(
-            format!(
-                "cannot read Git worktree pointer {}: {error}",
-                pointer.display()
-            ),
-            "repair the Git worktree",
-        )
-    })?;
-    let admin = content.trim_end().strip_prefix("gitdir: ").ok_or_else(|| {
-        CowshedError::integrity("invalid Git worktree pointer", "repair the Git worktree")
-    })?;
-    let admin = fs::canonicalize(admin).map_err(|error| {
+    let admin = super::read_worktree_pointer(&pointer)?;
+    let admin = fs::canonicalize(&admin).map_err(|error| {
         CowshedError::integrity(
             format!("cannot resolve Git worktree administration: {error}"),
             "repair the Git worktree",
@@ -459,13 +448,9 @@ fn registered_worktree_git_dir(root: &Path) -> Result<Option<PathBuf>> {
             "repair the Git worktree",
         )
     })?;
-    let reverse = fs::read_to_string(admin.join("gitdir")).map_err(|error| {
-        CowshedError::integrity(
-            format!("cannot read reverse Git worktree registration: {error}"),
-            "repair the Git worktree",
-        )
-    })?;
-    if fs::canonicalize(reverse.trim_end()).ok().as_deref() != Some(pointer.as_path()) {
+    let reverse =
+        super::read_gitdir_file(&admin.join("gitdir"), "reverse Git worktree registration")?;
+    if fs::canonicalize(&reverse).ok().as_deref() != Some(pointer.as_path()) {
         return Err(CowshedError::integrity(
             "Git worktree registration does not point back to this workspace",
             "repair the Git worktree",

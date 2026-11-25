@@ -4174,16 +4174,7 @@ impl GitRepository {
             }
         }
         let gitdir_file = admin.join("gitdir");
-        let registered = fs::read(&gitdir_file).map_err(|error| {
-            CowshedError::integrity(
-                format!(
-                    "read linked-worktree registration {name} at {}: {error}",
-                    gitdir_file.display()
-                ),
-                "cowshed doctor --json",
-            )
-        })?;
-        let registered = parse_one_path(&registered, "linked worktree gitdir")?;
+        let registered = read_gitdir_file(&gitdir_file, "linked worktree gitdir")?;
         if registered != dot_git && registered != staged_dot_git {
             return Err(CowshedError::integrity(
                 format!(
@@ -4251,22 +4242,37 @@ impl GitRepository {
 
     /// Point this repository's registration for `mount` back at the mount, both directions.
     ///
-    /// The primitive git provides for exactly this two-way pointer fixup, and the one `cowshed mv`
-    /// runs after moving either end.
+    /// Reconciles only the named worktree's two pointer files (`<mount>/.git` and
+    /// `<main>/.git/worktrees/<id>/gitdir`). `git worktree repair` walks every registered sibling
+    /// in `main/.git/worktrees/*`; under Linux Landlock, `stat` succeeds on siblings while `open`
+    /// is refused, so Git treats untouched siblings as broken and dies trying to rewrite them
+    /// (02_workspaces.md, "Git-worktree workspaces").
     pub async fn repair_linked_worktree(&self, mount: &Path) -> Result<()> {
-        let output = run_git_at_with_objects(
-            &self.store_root,
-            &self.root,
-            self.alternate_objects.as_deref(),
-            Some(mount),
-            [
-                OsStr::new("worktree"),
-                OsStr::new("repair"),
-                mount.as_os_str(),
-            ],
-        )
-        .await?;
-        ensure_git_success("repair linked worktree registration", output)
+        let worktrees_dir = self.worktrees_dir().await?;
+        let mount = mount.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            reconcile_linked_worktree_pointers(&worktrees_dir, &mount)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("repair linked worktree registration: {error}"))
+        })?
+    }
+
+    /// Where this repository keeps linked worktree administration directories (`worktrees`).
+    async fn worktrees_dir(&self) -> Result<PathBuf> {
+        let output = self
+            .run([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "worktrees",
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("resolve linked worktree state", &output));
+        }
+        parse_one_path(&output.stdout, "linked worktree state")
     }
 
     /// Drop `workspace`'s linked-worktree registration from this repository, which is main's.
@@ -5873,6 +5879,232 @@ fn changes_path(changes: &std::collections::BTreeSet<&[u8]>, path: &[u8]) -> boo
 fn parse_one_path(bytes: &[u8], description: &str) -> Result<PathBuf> {
     let value = parse_one_line(bytes, description)?;
     Ok(PathBuf::from(OsString::from_vec(value.to_vec())))
+}
+
+/// Read a regular file without following a final symlink (`O_NOFOLLOW`), refusing non-regular
+/// entries.
+fn read_regular_file_nofollow(path: &Path, operation: &str, hint: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            CowshedError::integrity(format!("{operation} at {}: {error}", path.display()), hint)
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        CowshedError::integrity(format!("{operation} at {}: {error}", path.display()), hint)
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(CowshedError::integrity(
+            format!("{operation} at {} is not a regular file", path.display()),
+            hint,
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        CowshedError::integrity(format!("{operation} at {}: {error}", path.display()), hint)
+    })?;
+    Ok(bytes)
+}
+
+/// Read and parse a linked-worktree `gitdir` administration file (one path line, no symlinks).
+pub(super) fn read_gitdir_file(path: &Path, description: &str) -> Result<PathBuf> {
+    let bytes = read_regular_file_nofollow(path, description, "cowshed doctor --json")?;
+    parse_one_path(&bytes, description)
+}
+
+/// Read and parse a linked-worktree `.git` pointer file (`gitdir: <path>`, no symlinks).
+pub(super) fn read_worktree_pointer(pointer: &Path) -> Result<PathBuf> {
+    let bytes = read_regular_file_nofollow(
+        pointer,
+        "read Git worktree pointer",
+        "repair the Git worktree",
+    )?;
+    let line = parse_one_line(&bytes, "Git worktree pointer")?;
+    let target = line.strip_prefix(b"gitdir: ").ok_or_else(|| {
+        CowshedError::integrity("invalid Git worktree pointer", "repair the Git worktree")
+    })?;
+    if target.is_empty() {
+        return Err(CowshedError::integrity(
+            "invalid Git worktree pointer",
+            "repair the Git worktree",
+        ));
+    }
+    Ok(PathBuf::from(OsString::from_vec(target.to_vec())))
+}
+
+/// Replace an existing regular pointer file atomically if its bytes differ, refusing symlinks.
+fn write_pointer_file_if_changed(path: &Path, expected: &[u8], operation: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let current = read_regular_file_nofollow(path, operation, "repair the Git worktree")?;
+    if current == expected {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        CowshedError::internal(format!("{operation}: {} has no parent", path.display()))
+    })?;
+    let temp = parent.join(format!(
+        ".cowshed-pointer-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
+        .map_err(|error| io_failure(operation, &temp, error))?;
+    if let Err(error) = file.write_all(expected) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(io_failure(operation, &temp, error));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(io_failure(operation, path, error));
+    }
+    Ok(())
+}
+
+/// Reconcile the two pointer files of one linked worktree (`<mount>/.git` and
+/// `<worktrees>/<id>/gitdir`) without touching any sibling worktree.
+fn reconcile_linked_worktree_pointers(worktrees_dir: &Path, mount: &Path) -> Result<()> {
+    let canonical_mount = fs::canonicalize(mount)
+        .map_err(|error| io_failure("canonicalize linked worktree mount", mount, error))?;
+    let dot_git = canonical_mount.join(".git");
+    let pointed_admin = read_worktree_pointer(&dot_git)?;
+
+    let canonical_worktrees = fs::canonicalize(worktrees_dir).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot resolve linked-worktree administration root {}: {error}",
+                worktrees_dir.display()
+            ),
+            "repair the Git worktree",
+        )
+    })?;
+    let worktrees_meta = inspect_path(&canonical_worktrees, "inspect worktrees directory")?;
+    if !worktrees_meta.is_some_and(|meta| meta.file_type().is_dir()) {
+        return Err(CowshedError::integrity(
+            format!(
+                "linked-worktree administration root {} is not a real directory",
+                canonical_worktrees.display()
+            ),
+            "repair the Git worktree",
+        ));
+    }
+
+    let forward_match = fs::canonicalize(&pointed_admin).ok().filter(|candidate| {
+        candidate.parent() == Some(canonical_worktrees.as_path())
+            && inspect_path(candidate, "inspect linked-worktree administration")
+                .ok()
+                .flatten()
+                .is_some_and(|meta| meta.file_type().is_dir())
+    });
+
+    let mut reverse_matches = Vec::new();
+    let entries = fs::read_dir(&canonical_worktrees).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot read linked-worktree administration root {}: {error}",
+                canonical_worktrees.display()
+            ),
+            "repair the Git worktree",
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "cannot read linked-worktree administration entry in {}: {error}",
+                    canonical_worktrees.display()
+                ),
+                "repair the Git worktree",
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "cannot inspect linked-worktree administration entry {}: {error}",
+                    entry.path().display()
+                ),
+                "repair the Git worktree",
+            )
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let gitdir_file = entry.path().join("gitdir");
+        if inspect_path(&gitdir_file, "inspect linked-worktree gitdir")?.is_none() {
+            continue;
+        }
+        let recorded = read_gitdir_file(&gitdir_file, "linked worktree gitdir")?;
+        if recorded == dot_git
+            || fs::canonicalize(&recorded).ok().as_deref() == Some(dot_git.as_path())
+        {
+            reverse_matches.push(entry.path());
+        }
+    }
+
+    if reverse_matches.len() > 1 {
+        return Err(CowshedError::integrity(
+            format!(
+                "multiple linked-worktree registrations point to {}",
+                dot_git.display()
+            ),
+            "cowshed doctor --json",
+        ));
+    }
+    let reverse_match = reverse_matches.into_iter().next();
+    let admin = match (forward_match, reverse_match) {
+        (Some(forward), Some(reverse)) if forward != reverse => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "linked-worktree pointer {} names {} while registration {} points back to it",
+                    dot_git.display(),
+                    forward.display(),
+                    reverse.display()
+                ),
+                "cowshed doctor --json",
+            ));
+        }
+        (Some(admin), _) | (None, Some(admin)) => admin,
+        (None, None) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "no linked-worktree registration in {} matches {}",
+                    canonical_worktrees.display(),
+                    dot_git.display()
+                ),
+                "repair the Git worktree",
+            ));
+        }
+    };
+
+    let mut expected_pointer = b"gitdir: ".to_vec();
+    expected_pointer.extend_from_slice(admin.as_os_str().as_bytes());
+    expected_pointer.push(b'\n');
+    write_pointer_file_if_changed(
+        &dot_git,
+        &expected_pointer,
+        "repair linked worktree pointer",
+    )?;
+
+    let mut expected_gitdir = dot_git.as_os_str().as_bytes().to_vec();
+    expected_gitdir.push(b'\n');
+    write_pointer_file_if_changed(
+        &admin.join("gitdir"),
+        &expected_gitdir,
+        "repair linked worktree gitdir",
+    )?;
+    Ok(())
 }
 
 /// A registration-step filesystem failure, named by the operation that failed.
@@ -8830,6 +9062,52 @@ mod tests {
             .head_oid()
             .await
             .expect("workspace git works again");
+    }
+
+    /// Repairing one linked worktree touches only that worktree's pointer pair and leaves sibling
+    /// worktrees' `.git` files untouched.
+    #[tokio::test]
+    async fn repair_reconciles_only_the_named_worktree_without_touching_siblings() {
+        let store = crate::sandbox::tests::fixture_store();
+        let main = repository();
+        let raven = clone_image(&main);
+        let heron = main.with_extension("heron");
+        copy_tree(&main, &heron);
+        GitRepository::from_root(store.shared(), &raven)
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect("adopt raven");
+        GitRepository::from_root(store.shared(), &heron)
+            .adopt_as_linked_worktree("heron", &main, None)
+            .await
+            .expect("adopt heron");
+
+        let moved = main.with_extension("moved-multi");
+        fs::rename(&main, &moved).expect("move main");
+        let heron_before = fs::read(heron.join(".git")).expect("heron pointer before");
+
+        GitRepository::from_root(store.shared(), &moved)
+            .repair_linked_worktree(&raven)
+            .await
+            .expect("repair raven alone");
+        assert_eq!(
+            fs::read(heron.join(".git")).expect("heron pointer unchanged"),
+            heron_before,
+            "repairing raven must not rewrite sibling heron's pointer"
+        );
+        GitRepository::from_root(store.shared(), &raven)
+            .head_oid()
+            .await
+            .expect("raven git works after repair");
+
+        GitRepository::from_root(store.shared(), &moved)
+            .repair_linked_worktree(&heron)
+            .await
+            .expect("repair heron");
+        GitRepository::from_root(store.shared(), &heron)
+            .head_oid()
+            .await
+            .expect("heron git works after repair");
     }
 
     /// A branch main already holds is main's, and the registration id is the workspace name, so

@@ -798,8 +798,11 @@ gains three steps between attach and publication:
    the same reason the `main` remote does — a registration recorded through an alias breaks when it moves, and
    `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already present
    from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto the mount
-   root, and reconciles both directions with `git -C <main-canonical-mount> worktree repair <mount>`, which is the
-   primitive git provides for exactly this two-way pointer fixup. `git worktree add` insists on creating the path it
+   root, and reconciles both directions of the named worktree's pointers (`<mount>/.git` and
+   `<main-canonical-mount>/.git/worktrees/<ws>/gitdir`) directly without following symlinks. Git's own `worktree repair`
+   walks every registered sibling in `main/.git/worktrees/*`, and a confined controller cannot open sibling worktrees
+   (under Linux Landlock, `stat` succeeds on siblings while `open` is refused, causing `git worktree repair` to treat
+   untouched siblings as broken and fail trying to rewrite them). `git worktree add` insists on creating the path it
    registers, so the registration is taken out through a staging directory inside the image and the pointer file is
    moved up to the mount root afterwards; the staging directory's name is the worktree id git derives from it, which is
    why it is the workspace name and not anything mount-derived — a `--slot` mount does not carry the name, and
