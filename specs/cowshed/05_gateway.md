@@ -1869,7 +1869,10 @@ mbx's machine-wide pool is the CPU and measured-memory ledger; without it, cowsh
 per-job jobservers and the Nx/bounded-exec cpu-pool, not a host token ledger. Class placement still tells the kernel
 whose runnable threads take precedence ("Classes"). The owner's ruling, 2026-10-27, selects this boundary. A job that
 declares its parallelism is admitted against that same pool as one hold for its life ("Held jobs"); that is no second
-ledger.
+ledger. Nor is what a land's gate takes while it runs ("A land's gate takes tokens back"): the supervisors read back the
+jobserver tokens of running jobs and give them back when the gate ends. That decides no admission, since mbx still
+admits every compile, lease and hold, and it keeps no count of its own, since a fifo's token bytes are the count (the
+owner's ruling, 2026-11-25).
 
 ### Pool selection and revision
 
@@ -2048,10 +2051,14 @@ Two readbacks do not report what the kernel applies, so neither verifies a lever
 backgrounded, and `getiopolicy_np` reports the requested disk policy, not the tier a QoS clamp imposes. A thread's
 priority and ceiling from `PROC_PIDTHREADINFO` show both.
 
-**On macOS nothing cowshed starts is throttled for I/O.** No process cowshed spawns that opens a path under the store or
-a workspace runs under `PRIO_DARWIN_BG`, a QoS clamp (`taskpolicy -b`, `taskpolicy -c utility|background`) or a disk I/O
-policy below IMPORTANT, and every cowshed launchd agent is `ProcessType=Interactive`. Those mechanisms throttle the
-process's disk I/O along with its CPU, and a throttled thread sleeps while it holds work other writers wait behind:
+**On macOS nothing cowshed starts is throttled for I/O, but for one case.** No process cowshed spawns that opens a path
+under the store or a workspace runs under `PRIO_DARWIN_BG`, a QoS clamp (`taskpolicy -b`,
+`taskpolicy -c utility|background`) or a disk I/O policy below IMPORTANT, and every cowshed launchd agent is
+`ProcessType=Interactive`, except a job that runs on past the tokens a land's gate left it, which is set
+`PRIO_DARWIN_BG` until that gate ends ("A land's gate takes tokens back"; the owner's ruling, 2026-11-25). Its disk I/O
+is throttled for that span, 79 to 105 times its unlink wall per file as measured above, and no other job's is: the cost
+falls on the job that would not give the gate its cores. Those mechanisms throttle a process's disk I/O along with its
+CPU, and a throttled thread sleeps while it holds work other writers wait behind:
 
 - 2026-10-22 (57b1c81bc0): the image-freeing thread under `IOPOL_THROTTLE` slept on 1,213 of 1,963 metadata reads at a
   20.1 ms median; an unlink took 53.1 s against 7.6 s at normal policy, and a probe writer's p50 rose from 0.2 ms to
@@ -2069,6 +2076,75 @@ process's disk I/O along with its CPU, and a throttled thread sleeps while it ho
   its barriers: its `F_FULLFSYNC`s took 1.8 s alone and 3.9 to 4.7 s beside the writers at every tier, because each one
   flushes the whole device. [laws/io_tier.bend](laws/io_tier.bend) models the tiers: under `Tier`, a low request holding
   a lock a gate waits on does not move while the window runs (`throttled_holder_stalls_the_gate`).
+
+<a id="smoo/cowshed!n/a-lands-gate-takes-tokens-back"></a>**A land's gate takes tokens back.** While a land's gate runs,
+every supervisor takes the jobserver tokens of the jobs it withdraws from back out of their fifos, and gives them back
+when the gate ends. A job that runs on past what it was left is set `PRIO_DARWIN_BG` on macOS for the same span. Every
+other job keeps running on what it has: none waits, is held back, stops or loses its class, and every mbx lease and hold
+stays as admitted ("Landing gets priority, never exclusivity"). The owner's ruling, 2026-11-25: a land's gate is
+prioritised by jobserver tokens taken from the other jobs, and by `PRIO_DARWIN_BG` only for a job whose tool does not
+respect tokens, both reset when the land ends. Class placement alone does not give the gate the host on macOS ("On macOS
+the order between classes is admission, not OS priority"), and the pool admits but never takes back what it admitted.
+
+- **A land's gate, and only a land's.** The span is a gate-class job named by its lander (`COWSHED_LANDER`, which only
+  `cowshed land` sets, "Gates and lands"), from its admission to its end, whatever its verdict; a land whose gate runs
+  several such jobs has one span while any of them runs. A train's proof, an operator's gate-class run and a land's
+  `--check` command carry no lander and start nothing. The supervisor that admits such a job tells the gateway, which
+  owns the land turns, at its admission and at its end; the gateway holds the span while any registered job lives, and a
+  supervisor whose connection ends drops its registrations with it.
+- **Every supervisor hears it.** Each served supervisor holds one watch on the gateway's gate state, a long answer under
+  the heartbeats of "A long wait has no total ceiling": a state change is written when it happens, and the state again
+  every 5 s. A supervisor that hears no state for the silence bound (15 s), or whose watch ends, takes the state to be
+  off. So a gate's end, or the gateway's, gives every token back within one heartbeat of it.
+- **Whom it withdraws from.** Every job that is not gate-class: `background` and `resident`, and an `interactive` or
+  `interactive-resident` job once its asks have left the `interactive` band. That is the decay's own clock, 120 s from
+  the job's first admitted ask (above), read from mbx's record of that admission through its published inspection
+  (`mbx stats --scheduler --json` names each job key's first admission); a job mbx has not yet admitted is still inside
+  it. An interactive job inside its first band is above the gate in §Classes' order and keeps its tokens; one that has
+  decayed is crowding the gate, as the decay itself says, and is withdrawn from like background. A gate-class job is
+  never withdrawn from, a train's proof included.
+- **The fifo drained by its server, no count beside it.** The supervisor already holds each job's fifo open read-write
+  ("The fifo is the job's free count"). To withdraw, it reads every token byte the fifo holds and every one a holder
+  returns, and keeps them; at the span's end it writes them all back. Only the implicit first token cannot be taken, so
+  a job that respects tokens runs on one core. A count the server checks before refilling would stop only refills: a
+  tool gives its tokens back at its own pace either way, and the drain takes each one the moment it comes back, with no
+  state but the bytes it holds. Measured 2026-11-24 (1ba9b6448a, a rustc-shaped client of 18 tokens and 36 workers on an
+  18-core host): the fifo drained in 84 to 430 ms; with all tokens taken the gate got CPU 162 to 207 : 1 over it, and 1
+  : 1 before; given back, the client recovered within 0.52 s; and its unlink phase took at most 1.2 times its time
+  untouched (8a11a9bbb4), so the drain throttles no I/O. A nested exec shares its parent's fifo and is withdrawn from
+  with it. With mbx, a Cargo leaf reads its job's fifo, so the drain bounds its compiler fan-out too.
+- **A job that does not respect tokens, by what it does.** A tool's use of the jobserver is its behaviour, not its name,
+  so it is measured. After a grace of 1 s from the drain's start, over each window of 3 s, the job's CPU is the rusage
+  its process tree gained between the supervisor's process-tree samples at the window's ends (07_api.md, "Process-tree
+  observations"), never one sample. A job whose CPU over a window exceeds 1.5 cores per token it still holds, the
+  implicit one counted, is set `PRIO_DARWIN_BG`. A job that never read a token, its fifo never below `g − 1` bytes since
+  it started (the server's own descriptor answers how many it holds), holds only the implicit one and is judged by the
+  same rule from the span's start. A non-Cargo leaf under an mbx reservation, whose runner reads no jobserver, is such a
+  job: its job is set `PRIO_DARWIN_BG` if it runs on its grant, and its lease is untouched. The grace and the window are
+  the measured drain (at most 0.52 s in five of six runs, 1.5 s in the sixth) with room.
+- **`PRIO_DARWIN_BG` on the whole tree, and off again.** The supervisor sets it on each live process of the job's tree,
+  and on each process its observer sees start while it holds, since a process spawned before keeps its own policy. It
+  clears it on each process of the tree at the span's end, when the job ends, and when the supervisor stops hearing the
+  gate state: a process spawned while it was set inherits it and keeps it after its parent's is cleared, so no clear is
+  of one process. On Linux a job's class cgroup weight is unchanged and nothing is set; whether a cgroup's `cpu.idle`
+  should serve there is open with the Linux question above.
+- **What a crash leaves.** `PRIO_DARWIN_BG` outlives the process that set it. Before setting it on a process, the
+  supervisor appends that life (its pid and `p_uniqueid` under `kern.bootsessionuuid`) to its group ledger (11_shell.md,
+  "Supervisor recovery"). A supervisor's start clears it on every recorded life still running before it serves anything,
+  as it reads the same ledger to end a dead supervisor's groups; and the gateway, which sees a dead supervisor's watch
+  end, clears that ledger's recorded lives at once, so no job of a supervisor that is not started again stays
+  backgrounded until it ends. The taken tokens need no recovery: they are bytes the dead supervisor held, its jobs'
+  fifos go with it, and its next start ends those jobs.
+- **Read back, never assumed.** A set or a clear is checked on each process by its threads' priority ceiling from
+  `PROC_PIDTHREADINFO` (`pth_maxpriority` 4 while set, 63 after clearing); `getpriority(PRIO_DARWIN_PROCESS)` and
+  `getiopolicy_np` misreport it (above). One that does not read back is a `warn` row of the job's span. The job's span
+  records the span's effects as `info` rows: `job.tokens.withdrawn` and `job.tokens.restored` with the bytes taken and
+  given back, `job.darwinbg.set` with the window's CPU and the tokens it held, and `job.darwinbg.cleared`
+  (13_telemetry.md, "Job span segments").
+- **Enforced by** reds of a background jobserver client whose CPU falls while a land's gate runs and recovers within a
+  heartbeat of its end; of a job that reads no token, set `PRIO_DARWIN_BG` after its window and cleared at the gate's
+  end, both read back; of a supervisor killed while a gate runs, whose successor clears every recorded life; and of a
+  gateway gone silent while a gate runs, after which every supervisor gives the tokens back and clears.
 
 ### Memory pressure
 
@@ -2361,18 +2437,19 @@ the job's `--want`, or `cores` when absent; every class uses the same rule and a
 **With mbx, Cargo and non-Cargo leaves enter the same pool once.** A Cargo leaf that builds runs through mbx under its
 job's priority, with `CARGO_BUILD_JOBS=g` as that build's CPU ceiling, not an enclosing resource reservation. It takes
 no cowshed host grant; mbx admits the actual compiler and supported test work. It keeps its job's jobserver fifo: the
-fifo bounds one build tree's own fan-out at the same `g`, never host capacity, so it is no second ledger, and Cargo
-reads `MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf reserves at
-most `g` cores at its job's priority from its Nx run's mbx reservation endpoint, `g` being the job's own count from its
-`--want`, never a host figure. The grant is the leaf's admission: its command stays queued until mbx grants it, as soon
-as one core is free, as many of the `g` cores as are free then, and bounded-exec sizes the leaf's runner flags and
-thread variables to that count as the command starts, so the runner runs on what it holds; a nextest leaf whose cases
-each start on a core ("A case starts on a core") is told its ask instead. The memory request is the same task identity's
-last recorded resource peak from existing LMAO job/process spans (13_telemetry.md, "Job resource peaks"), passed as the
-request's `memory`; no cowshed peak ledger or prediction table exists. [INFERENCE] The task-identity key needed to
-select that span is not verified for Nx leaves; until the span carries it, or when no prior peak exists, `memory` is
-omitted. mbx defines an omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open
-keying question does not authorize a second store (AGENTS.md, rule 8).
+fifo bounds one build tree's own fan-out at the same `g`, never host capacity, so it is no second ledger, and its bytes
+are what a land's gate takes back ("A land's gate takes tokens back"); Cargo reads `MAKEFLAGS` as well as
+`CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf reserves at most `g` cores at its job's
+priority from its Nx run's mbx reservation endpoint, `g` being the job's own count from its `--want`, never a host
+figure. The grant is the leaf's admission: its command stays queued until mbx grants it, as soon as one core is free, as
+many of the `g` cores as are free then, and bounded-exec sizes the leaf's runner flags and thread variables to that
+count as the command starts, so the runner runs on what it holds; a nextest leaf whose cases each start on a core ("A
+case starts on a core") is told its ask instead. The memory request is the same task identity's last recorded resource
+peak from existing LMAO job/process spans (13_telemetry.md, "Job resource peaks"), passed as the request's `memory`; no
+cowshed peak ledger or prediction table exists. [INFERENCE] The task-identity key needed to select that span is not
+verified for Nx leaves; until the span carries it, or when no prior peak exists, `memory` is omitted. mbx defines an
+omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open keying question does
+not authorize a second store (AGENTS.md, rule 8).
 
 <a id="smoo/cowshed!n/an-nx-run-serves-its-leaves-one-reservation-endpoint"></a> **An Nx run serves its leaves one
 reservation endpoint.** The admission is `mbx reserve`'s: the same pool, priority and order, and each grant held until
@@ -2558,11 +2635,11 @@ test-runner boundaries" and "Open questions"). The external-work interface belon
 [mbx reserve](https://mr-boxington.jdx.dev/scheduling#reserve-capacity-for-external-work) for one command,
 [mbx reservations](https://mr-boxington.jdx.dev/scheduling#serve-reservations-to-many-commands) for many.
 
-**Without mbx, every job receives its own GNU make jobserver fifo**, served by its supervisor at the constant count `g`.
-The fifo bounds the compiler and test threads one build tree starts, not host-wide capacity. Two jobs may each hold
-`cores` tokens, and the kernel weighs their runnable threads by class. This non-mbx mechanism remains unchanged. The
-remaining bullets specify that mechanism and the local sizing inside an external reservation; they do not add another
-host grant around mbx Cargo work.
+**Without mbx, every job receives its own GNU make jobserver fifo**, served by its supervisor at the count `g`, which
+only a land's gate lowers, for its span ("A land's gate takes tokens back"). The fifo bounds the compiler and test
+threads one build tree starts, not host-wide capacity. Two jobs may each hold `cores` tokens, and the kernel weighs
+their runnable threads by class. This non-mbx mechanism remains unchanged. The remaining bullets specify that mechanism
+and the local sizing inside an external reservation; they do not add another host grant around mbx Cargo work.
 
 Measured 2026-10-21 under a default of one token: an `nx run-many` under `cowshed exec` handed that one token to its
 runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 21m19s against 5m54s on the host route.
@@ -2584,11 +2661,13 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   `<store>/run/cpu/<base64url-incarnation>/job-<id>.fifo`, mode `0600`, in the workspace's pool directory, which the
   sandbox opens for reading and writing fifos and nothing else (04_sandbox.md). It opens it `O_RDWR`, keeps that
   descriptor for the job's life, so the bytes survive while no reader has it open, and writes `g − 1` token bytes: the
-  command holds the implicit first token, as make's protocol has it. At the job's end it closes and unlinks the fifo,
-  and a supervisor's start removes every fifo left in its pool directory. A Cargo that outlives the fifo keeps its open
-  descriptor and runs on unbounded until it ends; one started after finds no fifo and runs unconfigured. The incarnation
-  component is the unpadded 22-byte base64url encoding of all 128 bits of the validated workspace incarnation, never a
-  digest or prefix; the sandbox builder and the supervisor derive this one layout through the same helper.
+  command holds the implicit first token, as make's protocol has it. While a land's gate runs it reads back the token
+  bytes the fifo holds and those returned to it, and writes them back when the gate ends ("A land's gate takes tokens
+  back"). At the job's end it closes and unlinks the fifo, and a supervisor's start removes every fifo left in its pool
+  directory. A Cargo that outlives the fifo keeps its open descriptor and runs on unbounded until it ends; one started
+  after finds no fifo and runs unconfigured. The incarnation component is the unpadded 22-byte base64url encoding of all
+  128 bits of the validated workspace incarnation, never a digest or prefix; the sandbox builder and the supervisor
+  derive this one layout through the same helper.
 - **A nested exec shares its parent's fifo.** A `cowshed exec` from inside a job whose inherited `CARGO_MAKEFLAGS` fifo
   lies in the new job's own workspace pool directory reuses that fifo and its `BOUNDED_EXEC_CPU_TOKENS` count, so a
   test's child build reads the test run's tokens and waits only for a sibling's thread, which is the jobserver's
@@ -2806,7 +2885,10 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   waits or runs: every permit that frees goes to waiting interactive work first, then to waiting gate work, and to low
   work whenever both need none ("Held jobs", Order; the laws `lanes_in_order` and `work_conserving`). The admission
   policy belongs to mbx and never preempts an admitted reservation or hold. Without mbx, the existing class placement
-  applies. A gate has no quiet window and creates no additional hold.
+  applies. A gate has no quiet window and creates no additional hold. What a land's gate does take, for its span, is CPU
+  from work already running: the jobserver tokens of every job it withdraws from, and `PRIO_DARWIN_BG` on macOS for a
+  job that runs on past them ("A land's gate takes tokens back"; the owner's ruling, 2026-11-25). No job waits for it,
+  and every lease and hold stays as admitted.
 - **A job lives with its requester.** A foreground job's only consumer is the process that asked for it, so when that
   process is gone the job stops. A gate job's verdict moves main only through the `cowshed land` its lander runs next,
   so a gate whose lander is gone authorizes nothing and only loads the host. Measured 2026-10-18: a land of another
