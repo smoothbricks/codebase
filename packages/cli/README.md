@@ -473,7 +473,9 @@ filter diagnostics, drop the checker refusals a linked `DiagnosticPlugin` withdr
 those withdrawals (`recordWithdrawnDiagnostics`) at the pre-emit and JavaScript-emit gates: when every pre-emit error is
 withdrawn under `noEmitOnError`, declaration emit (`EmitOnlyDts`) temporarily clears `NoEmitOnError` around
 `emitProgram` (restoring it on return) so both JavaScript and `.d.ts` outputs emit while any unwithdrawn error still
-blocks emit ([samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)).
+blocks emit; `EmitWithPluginTransformers` also flushes reported `ReportHostOutput` files (`writeHostOutputs`) on both
+the JS-only early return (when declarations and build info are off) and the declaration emit path so a linked plugin's
+side outputs survive JS-only emits too ([samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)).
 
 `resolveLinkedTransformPlugins` (`lib/plugin/resolveLinkedTransformPlugins.js`, re-exported from `lib/index.js` and
 `lib/index.d.ts`) exposes ttsc's own `loadProjectPlugins` and `serializeNativePlugins(linkedTransformPlugins(...))`

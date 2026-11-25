@@ -1,5 +1,5 @@
 diff --git a/driver/emit_plugin.go b/driver/emit_plugin.go
-index 3793b3a..4d34807 100644
+index 3793b3a..c81b1d0 100644
 --- a/driver/emit_plugin.go
 +++ b/driver/emit_plugin.go
 @@ -228,7 +228,7 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
@@ -26,7 +26,7 @@ index 3793b3a..4d34807 100644
    }
    hasTransform := false
    for _, transform := range transforms {
-@@ -379,7 +384,10 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+@@ -379,9 +384,16 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
    // that has no declarations to write at all.
    if !options.GetEmitDeclarations() && !p.emitsBuildInfo() {
      if result := handleNoEmit(context.Background(), p.TSProgram); result != nil {
@@ -35,10 +35,17 @@ index 3793b3a..4d34807 100644
 +      if err != nil || len(diagnostics) != 0 {
 +        return diagnostics, err
 +      }
++    }
++    if err := output.flush(); err != nil {
++      return nil, err
      }
-     return nil, output.flush()
+-    return nil, output.flush()
++    _, err := p.writeHostOutputs(writeFile)
++    return nil, err
    }
-@@ -400,25 +408,32 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+ 
+   // What the build information this pass writes does and does not claim.
+@@ -400,25 +412,32 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
    // `shimcompiler.EmitFreshWithBuildInfo`), so this asymmetry costs a ttsc
    // rebuild nothing.
    var wfMu sync.Mutex
@@ -89,7 +96,7 @@ index 3793b3a..4d34807 100644
    var diagnostics []Diagnostic
    if result != nil && len(result.Diagnostics) != 0 {
      var err error
-@@ -427,7 +442,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+@@ -427,7 +446,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
        return diagnostics, err
      }
    }
@@ -680,10 +687,10 @@ index 6d4b492..b7128ae 100644
    return reused
 diff --git a/driver/session_linked_plugins_test.go b/driver/session_linked_plugins_test.go
 new file mode 100644
-index 0000000..fabd2d2
+index 0000000..e0c2f19
 --- /dev/null
 +++ b/driver/session_linked_plugins_test.go
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,318 @@
 +package driver
 +
 +import (
@@ -942,6 +949,64 @@ index 0000000..fabd2d2
 +	// Malformed LinkedPluginsJSON reports LoadProgramOptions.LinkedPluginsJSON in its error.
 +	if _, _, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{LinkedPluginsJSON: "{bad"}); err == nil || !strings.Contains(err.Error(), "LoadProgramOptions.LinkedPluginsJSON") {
 +		t.Fatalf("expected error naming LoadProgramOptions.LinkedPluginsJSON, got %v", err)
++	}
++}
++
++type hostOutputEmitPlugin struct{}
++
++func (hostOutputEmitPlugin) ApplyProgram(_ *Program, ctx PluginContext) error {
++	outDir := filepath.Join(ctx.Cwd, "out")
++	if err := os.MkdirAll(outDir, 0o755); err != nil {
++		return err
++	}
++	sidePath := filepath.Join(outDir, "side-output.json")
++	if err := os.WriteFile(sidePath, []byte(`{"ok":true}`), 0o644); err != nil {
++		return err
++	}
++	ctx.ReportHostOutput(sidePath)
++	return nil
++}
++
++func (hostOutputEmitPlugin) EmitTransform(_ PluginContext) (PluginTransform, error) {
++	return func(_ *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
++		return sf
++	}, nil
++}
++
++func TestEmitWithPluginTransformersWritesHostOutputsWithoutDeclarations(t *testing.T) {
++	savedRegistry := append([]any(nil), pluginRegistry...)
++	t.Cleanup(func() { pluginRegistry = savedRegistry })
++
++	pluginRegistry = []any{hostOutputEmitPlugin{}}
++	payload, _ := json.Marshal([]PluginEntry{{Name: "host-output-emit", Stage: "transform", Config: map[string]any{}}})
++
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"compilerOptions":{"target":"ES2022","module":"ESNext","strict":true,"outDir":"out"},"files":["main.ts"]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "main.ts"), []byte("export const value = 1;\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	prog, diags, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{LinkedPluginsJSON: string(payload)})
++	if err != nil || CountErrors(diags) != 0 {
++		t.Fatalf("LoadProgram failed: err=%v diags=%v", err, diags)
++	}
++	defer prog.Close()
++
++	emitted := map[string]string{}
++	emitDiags, err := prog.EmitWithPluginTransformers(nil, func(name shimtspath.RootedFilePath, text string, _ *shimcompiler.WriteFileData) error {
++		emitted[filepath.Base(string(name))] = text
++		return nil
++	})
++	if err != nil || CountErrors(emitDiags) != 0 {
++		t.Fatalf("EmitWithPluginTransformers failed: err=%v diags=%v", err, emitDiags)
++	}
++	if emitted["side-output.json"] != `{"ok":true}` {
++		t.Fatalf("expected side-output.json via writeHostOutputs on JS-only emit, got %+v", emitted)
 +	}
 +}
 diff --git a/driver/withdrawn_diagnostics.go b/driver/withdrawn_diagnostics.go
