@@ -29,6 +29,10 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 
+#[cfg(target_os = "linux")]
+#[path = "support/sandbox_launcher.rs"]
+mod sandbox_launcher;
+
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 
 /// A relocated project: main at its new path, one session workspace, and a dead old checkout path
@@ -47,6 +51,8 @@ struct Relocated {
 
 impl Relocated {
     fn new(label: &str) -> Self {
+        #[cfg(target_os = "linux")]
+        sandbox_launcher::name(cowshed_core::sandbox::name_launcher);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
