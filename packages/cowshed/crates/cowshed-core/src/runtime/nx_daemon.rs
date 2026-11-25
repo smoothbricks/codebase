@@ -2566,7 +2566,7 @@ mod lifecycle_authority_tests {
     /// beside it in the fixture's scratch. Without `NX_SOCKET_DIR` the daemon binds under the
     /// host's shared `/tmp/.nx/<uid>/sockets`, which any other Nx on the host may clear while the
     /// fixture's daemon lives (sb-batch-6 gate 1).
-    fn nx_environment(root: &Path) -> [(&'static str, PathBuf); 3] {
+    fn nx_environment(root: &Path) -> [(&'static str, PathBuf); 4] {
         [
             ("NX_WORKSPACE_ROOT_PATH", root.to_owned()),
             (
@@ -2574,6 +2574,7 @@ mod lifecycle_authority_tests {
                 root.join(".nx/workspace-data"),
             ),
             ("NX_CACHE_DIRECTORY", root.join(".nx/cache")),
+            ("NX_SOCKET_DIR", nx_sockets(root)),
         ]
     }
 
