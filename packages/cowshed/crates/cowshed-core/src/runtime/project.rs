@@ -30062,21 +30062,32 @@ mod port_reservation_tests {
             .expect("a block no claimant on the host holds");
         let block = reservation.grants.port_block.expect("reserved block");
         let claim = block.base() + 1;
-        // The store takes the claim from the reservation's own listener: no unbound interval.
-        let service = reservation
-            .listeners
-            .iter()
-            .position(|listener| listener.local_addr().expect("listener address").port() == claim)
-            .expect("the reservation listens on every port of its block");
+        // The store takes every port of its block from the reservation's own listeners, so no
+        // unbound interval opens on any of them: a store that held one port and let the rest go
+        // lost them to whichever allocator bound the lowest free port next (sb-batch-4 gate 2,
+        // 2026-11-25).
+        assert!(
+            reservation.listeners.iter().any(|listener| listener
+                .local_addr()
+                .expect("listener address")
+                .port()
+                == claim),
+            "the reservation listens on every port of its block"
+        );
         let claims = owner
             .fixture_port_claims()
             .expect("a fixture store holds claims");
-        claims.hold(claim, reservation.listeners.remove(service));
+        let held = reservation.listeners.len();
+        for listener in reservation.listeners.drain(..) {
+            let port = listener.local_addr().expect("listener address").port();
+            claims.hold(port, listener);
+        }
         drop(reservation);
         // A concurrent allocator binds the lowest free port it finds, as the gate's other tests
-        // and live workspaces do (sb-batch-4 gate 2, 2026-11-25): a port of this block the store
-        // let go of is one.
-        let _intruder = TcpListener::bind((Ipv4Addr::LOCALHOST, block.base())).ok();
+        // and live workspaces do: none of this block's ports is free to it.
+        let intruder = TcpListener::bind((Ipv4Addr::LOCALHOST, block.base()))
+            .expect_err("the store holds every port of its block");
+        assert_eq!(intruder.kind(), ErrorKind::AddrInUse);
 
         let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, claim))
             .expect_err("the store holds its detached block's claim");
@@ -30106,8 +30117,8 @@ mod port_reservation_tests {
             .expect("the claiming store reserves its own block");
         assert_eq!(
             reused.claims.len(),
-            1,
-            "the reservation took the store's claim"
+            held,
+            "the reservation took every claim the store held"
         );
         drop(reused);
         let reset = queued
