@@ -261,16 +261,17 @@ async fn turns_pass_in_the_order_asked_and_a_waiter_is_told_who_holds_the_turn()
     };
     assert_eq!(ahead, 2);
     assert_eq!(tickets(&socket).await, ["first", "second", "third"]);
-    first.end("exited 0".to_owned());
+    first.end("exited 0".to_owned()).expect("end first");
     let second = awaiting("second's turn", second)
         .await
         .expect("second's turn");
     assert!(!third.is_finished(), "third took the turn ahead of second");
-    second.end("exited 0".to_owned());
+    second.end("exited 0".to_owned()).expect("end second");
     awaiting("third's turn", third)
         .await
         .expect("third's turn")
-        .end("exited 0".to_owned());
+        .end("exited 0".to_owned())
+        .expect("end third");
     let probe = take_after(&socket, "probe").await;
     let listed = queue(&socket).await.expect("the probe's queue is listed");
     assert!(
@@ -278,7 +279,7 @@ async fn turns_pass_in_the_order_asked_and_a_waiter_is_told_who_holds_the_turn()
         "an ended turn is no abandonment: {:?}",
         listed.abandoned
     );
-    probe.end("exited 0".to_owned());
+    probe.end("exited 0".to_owned()).expect("end probe");
 }
 
 /// Measured on the installed cowshed 2026-10-26: a second land waited 19 s for a `sleep 20` the
@@ -307,7 +308,7 @@ async fn a_process_the_bound_command_leaves_running_holds_no_turn() {
         .trim()
         .parse()
         .expect("a pid");
-    first.end("exited 0".to_owned());
+    first.end("exited 0".to_owned()).expect("end first");
     // Second holds the turn once first's departure is processed, the descendant still running.
     let second = take_after(&socket, "second").await;
     // SAFETY: kill(2) with signal 0 only checks that the process exists.
@@ -316,7 +317,7 @@ async fn a_process_the_bound_command_leaves_running_holds_no_turn() {
         0,
         "the descendant still runs"
     );
-    second.end("exited 0".to_owned());
+    second.end("exited 0".to_owned()).expect("end second");
     // SAFETY: kill(2) of the descendant this test started.
     assert_eq!(unsafe { libc::kill(descendant, libc::SIGKILL) }, 0);
 }
@@ -336,7 +337,9 @@ async fn a_bound_command_holds_the_turn_after_its_asker_ends_its_hold() {
     awaiting("the command's bind", first.bound(command.id()))
         .await
         .expect("bind the command");
-    first.end("its command runs on".to_owned());
+    first
+        .end("its command runs on".to_owned())
+        .expect("end first");
     let (second, mut told) = waiting(&socket, "second");
     let Wait::Queued { holder, .. } = awaiting("second's first wait", told.recv())
         .await
@@ -354,7 +357,8 @@ async fn a_bound_command_holds_the_turn_after_its_asker_ends_its_hold() {
     awaiting("second's turn", second)
         .await
         .expect("second's turn")
-        .end("exited 0".to_owned());
+        .end("exited 0".to_owned())
+        .expect("end second");
 }
 
 /// Measured 2026-10-26 in review: a land killed between spawning its gate and binding it left the
@@ -401,7 +405,8 @@ async fn a_command_holds_the_turn_from_its_start_whatever_its_asker_does_next() 
     awaiting("second's turn", second)
         .await
         .expect("second's turn")
-        .end("exited 0".to_owned());
+        .end("exited 0".to_owned())
+        .expect("end second");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -426,11 +431,12 @@ async fn a_waiter_that_leaves_blocks_nobody_and_is_listed_abandoned() {
     };
     assert_eq!(ahead, 1);
     assert_eq!(tickets(&socket).await, ["first", "third"]);
-    first.end("exited 0".to_owned());
+    first.end("exited 0".to_owned()).expect("end first");
     awaiting("third's turn", third)
         .await
         .expect("third's turn")
-        .end("exited 0".to_owned());
+        .end("exited 0".to_owned())
+        .expect("end third");
     let probe = take_after(&socket, "probe").await;
     let abandoned = queue(&socket)
         .await
@@ -443,7 +449,7 @@ async fn a_waiter_that_leaves_blocks_nobody_and_is_listed_abandoned() {
             .collect::<Vec<_>>(),
         [("second", "it left the queue before its turn")]
     );
-    probe.end("exited 0".to_owned());
+    probe.end("exited 0".to_owned()).expect("end probe");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -513,12 +519,13 @@ async fn a_land_that_asks_for_a_held_ref_turn_holds_it_once_the_writer_ends() {
     assert!(!land.is_finished(), "the land took a held ref turn");
     // The probe leaves the queue: the land waits for the writer alone.
     drop(answers);
-    writer.end("committed".to_owned());
+    writer.end("committed".to_owned()).expect("end writer");
     awaiting("the land's ref turn", land)
         .await
         .expect("the land task")
         .expect("the land takes the released ref turn")
-        .end("delivered".to_owned());
+        .end("delivered".to_owned())
+        .expect("end land ref turn");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -557,7 +564,8 @@ async fn a_bounded_ask_behind_a_held_land_is_numbered_while_an_install_waits() {
     awaiting("the command's bind", land.bound(command.id()))
         .await
         .expect("bind the land's command");
-    land.end("its command runs on".to_owned());
+    land.end("its command runs on".to_owned())
+        .expect("end land");
 
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
@@ -852,7 +860,7 @@ async fn a_fenced_read_that_finds_a_holder_sets_no_fence() {
     assert_eq!(read["fenced"], serde_json::json!(false), "{read}");
     let mut second = ask_raw(&socket, "second").await;
     assert_eq!(raw_answer(&mut second).await["turn"], "queued");
-    first.end("exited 0".to_owned());
+    first.end("exited 0".to_owned()).expect("end first");
     assert_eq!(raw_answer(&mut second).await["turn"], "held");
 }
 
@@ -911,7 +919,9 @@ async fn a_land_that_asks_after_a_waiting_install_runs_after_it() {
     awaiting("the command's bind", first.bound(command.id()))
         .await
         .expect("bind the first land's command");
-    first.end("its command runs on".to_owned());
+    first
+        .end("its command runs on".to_owned())
+        .expect("end first");
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
     assert_eq!(
@@ -1003,8 +1013,8 @@ async fn a_land_takes_its_ref_turn_inside_its_turn_though_an_install_waits_for_t
         },
     )
     .await;
-    fence.end("delivered".to_owned());
-    land.end("exited 0".to_owned());
+    fence.end("delivered".to_owned()).expect("end fence");
+    land.end("exited 0".to_owned()).expect("end land");
     let fenced = control_line(&mut install).await;
     assert_eq!(
         (&fenced["ok"], &fenced["fenced"], &fenced["landTurns"]),
@@ -1035,7 +1045,9 @@ async fn a_waiting_install_withdrawn_leaves_the_wait_and_admits_parked_asks_in_o
     awaiting("the command's bind", first.bound(command.id()))
         .await
         .expect("bind the first land's command");
-    first.end("its command runs on".to_owned());
+    first
+        .end("its command runs on".to_owned())
+        .expect("end first");
 
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
@@ -1164,7 +1176,9 @@ async fn land_turns_lists_waiting_installs_and_parked_asks_without_fencing() {
     awaiting("the command's bind", holder.bound(command.id()))
         .await
         .expect("bind the holder's command");
-    holder.end("its command runs on".to_owned());
+    holder
+        .end("its command runs on".to_owned())
+        .expect("end holder");
 
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
@@ -1537,5 +1551,5 @@ async fn the_recorded_install_restart_never_cuts_a_turn_asked_after_its_read() {
         ),
         ended = gate.wait_bounded() => assert!(ended.expect("the gate ends").success()),
     }
-    turn.end("exited 0".to_owned());
+    turn.end("exited 0".to_owned()).expect("end turn");
 }

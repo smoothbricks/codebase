@@ -108,11 +108,36 @@ where
         state: &state,
     };
     let held = hold.run(&edit, icm.as_deref(), doc, output).await;
-    match &held {
+    let ended = match &held {
         Ok(report) => turn.end(format!("committed {}", report.commit.as_str())),
         Err(error) => turn.end(format!("refused: {}", error.message)),
+    };
+    match (held, ended) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Ok(report), Err(loss)) => {
+            output
+                .warning(&format!(
+                    "the edit committed as {} before the doc commit stopped; nothing to put back",
+                    report.commit.as_str()
+                ))
+                .map_err(output_error)?;
+            Err(CowshedError::environment_missing(
+                format!("the ref turn was lost: {loss}"),
+                "check the host gateway (`cowshed gateway status`), then run cowshed doc-commit again",
+            ))
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(loss)) => Err(lead_with_loss(error, &loss)),
     }
-    held
+}
+
+fn lead_with_loss(error: CowshedError, loss: &std::io::Error) -> CowshedError {
+    let reason = loss.to_string();
+    let prefix = format!("the ref turn was lost: {reason}");
+    if error.message.starts_with(&prefix) {
+        return error;
+    }
+    CowshedError::environment_missing(format!("{prefix}; {}", error.message), error.hint)
 }
 
 /// A file argument or stdin (`-`).
@@ -173,18 +198,25 @@ fn icm_program() -> Result<PathBuf> {
 /// Main's checkout: the git top level at `start`, when cowshed's in-checkout marker gives it no
 /// role other than main. A doc edit in a shed is refused: commit in the shed and land it.
 async fn main_checkout(start: &Path) -> Result<PathBuf> {
-    let top = git(start, &["rev-parse", "--show-toplevel"], &[], None)
-        .await
-        .map_err(|error| {
-            CowshedError::usage(
-                format!(
-                    "{} is not in a checkout: {}",
-                    start.display(),
-                    error.message
-                ),
-                "run cowshed doc-commit in main's checkout, or name it with --project",
-            )
-        })?;
+    let top = git(
+        start,
+        &["rev-parse", "--show-toplevel"],
+        &[],
+        None,
+        &[],
+        None,
+    )
+    .await
+    .map_err(|error| {
+        CowshedError::usage(
+            format!(
+                "{} is not in a checkout: {}",
+                start.display(),
+                error.message
+            ),
+            "run cowshed doc-commit in main's checkout, or name it with --project",
+        )
+    })?;
     let main = PathBuf::from(String::from_utf8_lossy(&top).trim());
     let marker = main.join(cowshed_core::storage::WORKSPACE_MARKER_PATH);
     match cowshed_core::metadata::WorkspaceMarker::read_from(&marker) {
@@ -397,6 +429,94 @@ fn partition_rollback(
     rollback
 }
 
+/// What this doc commit last wrote to one path while holding the ref turn: its working-tree entry
+/// (compared by content and mode, never mtime) and whether `git add -A` has staged it in the index.
+struct Written {
+    entry: Entry,
+    staged: bool,
+}
+
+/// One path's `HEAD` tree entry from `git ls-tree -r -z HEAD`.
+#[derive(Debug, Eq, PartialEq)]
+struct HeadEntry {
+    mode: String,
+    oid: String,
+}
+
+/// Parse `git ls-tree -r -z HEAD` (`<mode> <type> <oid>\t<path>\0`) by UTF-8 path, passing over
+/// non-UTF-8 or malformed records.
+fn head_entries_by_path(listed: &[u8]) -> BTreeMap<String, HeadEntry> {
+    let mut entries = BTreeMap::new();
+    for record in listed.split(|&byte| byte == 0) {
+        let Some(tab) = record.iter().position(|&byte| byte == b'\t') else {
+            continue;
+        };
+        let Ok(header) = std::str::from_utf8(&record[..tab]) else {
+            continue;
+        };
+        let Ok(path) = std::str::from_utf8(&record[tab + 1..]) else {
+            continue;
+        };
+        let mut parts = header.split(' ');
+        let (Some(mode), Some(_kind), Some(oid), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        entries.insert(
+            path.to_owned(),
+            HeadEntry {
+                mode: mode.to_owned(),
+                oid: oid.to_owned(),
+            },
+        );
+    }
+    entries
+}
+
+/// The stage-0 `git ls-files -s -z` record matching `head` at `path`.
+fn expected_head_index_record(head: &HeadEntry, path: &str) -> Vec<u8> {
+    let mut record = format!("{} {} 0\t{path}", head.mode, head.oid).into_bytes();
+    record.push(0);
+    record
+}
+
+/// Extract `(mode, oid)` when `records` (from `git ls-files -s -z -- <path>`) holds exactly one
+/// stage-0 entry for `path`.
+fn parse_single_stage_zero_index_record(records: &[u8], path: &str) -> Option<(String, String)> {
+    let mut found = None;
+    for record in records.split(|&byte| byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let tab = record.iter().position(|&byte| byte == b'\t')?;
+        if &record[tab + 1..] != path.as_bytes() {
+            return None;
+        }
+        let header = std::str::from_utf8(&record[..tab]).ok()?;
+        let mut parts = header.split(' ');
+        let (Some(mode), Some(oid), Some("0"), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        found = Some((mode.to_owned(), oid.to_owned()));
+    }
+    found
+}
+
+/// Git's index blob mode for a regular file's POSIX permissions.
+const fn git_file_mode(mode: u32) -> &'static str {
+    if mode & 0o111 != 0 {
+        "100755"
+    } else {
+        "100644"
+    }
+}
+
 /// Paths as one NUL-terminated stdin list, for the git reads and writes that take theirs so:
 /// no path travels on a command line, whatever it spells or however many there are.
 fn nul_paths(paths: &[String]) -> Vec<u8> {
@@ -465,30 +585,45 @@ impl Hold<'_> {
         output: &mut Output<W, E>,
     ) -> Result<DocCommitReport> {
         let Basis { head, before, kept } = basis;
-        let mut touched: BTreeSet<String> = judged.iter().cloned().collect();
+        let mut touched: BTreeSet<String> = BTreeSet::new();
+        let mut written_state: BTreeMap<String, Written> = BTreeMap::new();
         let committed: Result<Vec<String>> = async {
             let paths = match (edit, icm) {
                 (Edit::Patch(patch), _) => {
                     self.git(&["apply", "-"], Some(patch)).await?;
+                    touched.extend(judged.iter().cloned());
+                    self.record_written(judged, false, &mut written_state)?;
                     judged.to_vec()
                 }
                 (Edit::Icm(program), Some(icm)) => {
                     std::fs::write(self.state.path("program.ts"), program)
                         .map_err(|error| self.state.failed("write the ICM program", &error))?;
-                    let ran = self.declared(
-                        &[
-                            icm.as_os_str().to_owned(),
-                            OsString::from("run"),
-                            self.state.path("program.ts").into_os_string(),
-                            OsString::from("--root"),
-                            self.main.as_os_str().to_owned(),
-                            OsString::from("--json"),
-                        ],
-                        None,
+                    let ran = self
+                        .declared(
+                            &[
+                                icm.as_os_str().to_owned(),
+                                OsString::from("run"),
+                                self.state.path("program.ts").into_os_string(),
+                                OsString::from("--root"),
+                                self.main.as_os_str().to_owned(),
+                                OsString::from("--json"),
+                            ],
+                            None,
                         )
                         .await;
+                    if let Some(loss) = self.turn.loss() {
+                        return Err(match ran {
+                            Err(error) => lead_with_loss(error, &loss),
+                            Ok(_) => CowshedError::environment_missing(
+                                format!("the ref turn was lost: {loss}"),
+                                "check the host gateway (`cowshed gateway status`), then run cowshed doc-commit again",
+                            ),
+                        });
+                    }
                     let written = self.written(before, kept).await?;
                     touched.extend(written.iter().cloned());
+                    let written_vec: Vec<String> = written.iter().cloned().collect();
+                    self.record_written(&written_vec, false, &mut written_state)?;
                     let (status, stdout) = ran?;
                     if !status.success() {
                         return Err(CowshedError::conflict(
@@ -514,8 +649,16 @@ impl Hold<'_> {
                 let mut argv: Vec<OsString> = check.iter().map(OsString::from).collect();
                 argv.extend(paths.iter().map(OsString::from));
                 let (status, stdout) = self.declared(&argv, None).await?;
+                if let Some(loss) = self.turn.loss() {
+                    return Err(CowshedError::environment_missing(
+                        format!("the ref turn was lost: {loss}"),
+                        "check the host gateway (`cowshed gateway status`), then run cowshed doc-commit again",
+                    ));
+                }
                 let after_check = self.written(before, kept).await?;
                 touched.extend(after_check.iter().cloned());
+                let touched_vec: Vec<String> = touched.iter().cloned().collect();
+                self.record_written(&touched_vec, false, &mut written_state)?;
                 if !status.success() {
                     return Err(CowshedError::conflict(
                         format!(
@@ -546,6 +689,11 @@ impl Hold<'_> {
             let mut add: Vec<&str> = vec!["--literal-pathspecs", "add", "-A", "--"];
             add.extend(paths.iter().map(String::as_str));
             self.git(&add, None).await?;
+            for path in &paths {
+                if let Some(written) = written_state.get_mut(path) {
+                    written.staged = true;
+                }
+            }
             let message = self.state.path("message");
             let mut argv: Vec<OsString> = ["git", "--literal-pathspecs", "commit", "--only", "-F"]
                 .map(OsString::from)
@@ -573,6 +721,11 @@ impl Hold<'_> {
                 paths,
             }),
             Err(error) => {
+                let loss = self.turn.loss();
+                let error = match &loss {
+                    Some(loss) => lead_with_loss(error, loss),
+                    None => error,
+                };
                 let now = self.head()?;
                 if &now != head {
                     output
@@ -583,10 +736,39 @@ impl Hold<'_> {
                         .map_err(output_error)?;
                     return Err(error);
                 }
+                if touched.is_empty() {
+                    return Err(error);
+                }
+                if loss.is_some() {
+                    return self
+                        .put_back_after_loss(&touched, &written_state, kept, output, error)
+                        .await;
+                }
                 self.put_back(&touched, kept, output).await?;
                 Err(error)
             }
         }
+    }
+
+    /// Snapshot each path's working-tree entry right after this doc commit wrote it (by content
+    /// and mode, never mtime), so a guarded put-back after a lost turn can compare against it.
+    fn record_written(
+        &self,
+        paths: &[String],
+        staged: bool,
+        written_state: &mut BTreeMap<String, Written>,
+    ) -> Result<()> {
+        for path in paths {
+            let file = self.main.join(path);
+            let entry = Entry::read(&file).map_err(|error| {
+                CowshedError::internal(format!(
+                    "cannot snapshot {} written by the doc commit: {error}",
+                    file.display()
+                ))
+            })?;
+            written_state.insert(path.clone(), Written { entry, staged });
+        }
+        Ok(())
     }
 
     /// The paths a patch writes, by git's own account: applied to a scratch index of HEAD, never
@@ -596,14 +778,18 @@ impl Hold<'_> {
         let scratch = [(OsString::from("GIT_INDEX_FILE"), index.into_os_string())];
         self.git_with(&["read-tree", "HEAD"], None, &scratch)
             .await?;
-        self.git_with(&["apply", "--cached", "-"], Some(patch), &scratch)
+        if let Err(error) = self
+            .git_with(&["apply", "--cached", "-"], Some(patch), &scratch)
             .await
-            .map_err(|error| {
-                CowshedError::conflict(
-                    format!("the patch does not apply to main's HEAD: {}", error.message),
-                    "make the patch against main's current HEAD, then run cowshed doc-commit again",
-                )
-            })?;
+        {
+            if let Some(loss) = self.turn.loss() {
+                return Err(lead_with_loss(error, &loss));
+            }
+            return Err(CowshedError::conflict(
+                format!("the patch does not apply to main's HEAD: {}", error.message),
+                "make the patch against main's current HEAD, then run cowshed doc-commit again",
+            ));
+        }
         let names = self
             .git_with(
                 &[
@@ -829,6 +1015,242 @@ impl Hold<'_> {
             .map_err(output_error)
     }
 
+    /// Put paths back after the ref turn was lost: runs unbound because no turn exists to bind to,
+    /// and compares each path's working-tree content and index entry against what this doc commit
+    /// wrote before restoring it because the next holder may already be writing main. Any path
+    /// that changed since is left alone and named in the refusal, which leads with `error` (the
+    /// loss reason).
+    async fn put_back_after_loss<W: Write + Send, E: Write + Send>(
+        &mut self,
+        paths: &BTreeSet<String>,
+        written_state: &BTreeMap<String, Written>,
+        kept: &BTreeMap<String, Kept>,
+        output: &mut Output<W, E>,
+        error: CowshedError,
+    ) -> Result<DocCommitReport> {
+        let unheld = paths.iter().any(|path| !kept.contains_key(path));
+        let head_entries = if unheld {
+            self.git_unbound(&["ls-tree", "-r", "-z", "HEAD"], None)
+                .await
+                .ok()
+                .map(|listed| head_entries_by_path(&listed))
+        } else {
+            Some(BTreeMap::new())
+        };
+
+        let mut restored = Vec::new();
+        let mut changed_by_other = Vec::new();
+        let mut failed = Vec::new();
+
+        for path in paths {
+            let Some(expected) = written_state.get(path) else {
+                changed_by_other.push(path.clone());
+                continue;
+            };
+            let Ok(current_entry) = Entry::read(&self.main.join(path)) else {
+                failed.push(path.clone());
+                continue;
+            };
+            let Ok(current_index) = self
+                .git_unbound(
+                    &["--literal-pathspecs", "ls-files", "-s", "-z", "--", path],
+                    None,
+                )
+                .await
+            else {
+                failed.push(path.clone());
+                continue;
+            };
+            let held = kept.get(path);
+            let head_entry = match (&head_entries, held) {
+                (_, Some(_)) => None,
+                (Some(entries), None) => entries.get(path),
+                (None, None) => {
+                    failed.push(path.clone());
+                    continue;
+                }
+            };
+            let index_matches = self
+                .index_matches_written(path, &current_index, expected, held, head_entry)
+                .await;
+            if current_entry != expected.entry || !index_matches {
+                changed_by_other.push(path.clone());
+                continue;
+            }
+            if self.restore_one_unbound(path, held, head_entry).await {
+                restored.push(path.clone());
+            } else {
+                failed.push(path.clone());
+            }
+        }
+
+        if changed_by_other.is_empty() && failed.is_empty() {
+            output
+                .guidance(&format!(
+                    "doc-commit: the edit did not commit; main's tree is back as it was at {}",
+                    if restored.is_empty() {
+                        "every path".to_owned()
+                    } else {
+                        restored.join(" ")
+                    }
+                ))
+                .map_err(output_error)?;
+            return Err(error);
+        }
+
+        let mut message = error.message;
+        if !changed_by_other.is_empty() {
+            changed_by_other.sort();
+            message.push_str(&format!(
+                "; changed by another holder after the loss (left alone): {}",
+                changed_by_other.join(", ")
+            ));
+        }
+        if !failed.is_empty() {
+            failed.sort();
+            message.push_str(&format!(
+                "; main's tree still differs from HEAD at: {}",
+                failed.join(", ")
+            ));
+        }
+        let hint = if failed.is_empty() {
+            error.hint
+        } else {
+            "put those paths back by hand: git -C <main> restore --source=HEAD --staged --worktree -- <path>".to_owned()
+        };
+        Err(CowshedError::new(error.code, message, hint))
+    }
+
+    /// Whether `current_index` (from `git ls-files -s -z -- <path>`) still equals what this doc
+    /// commit left in the index for `path`, compared by mode, stage, and blob content (never mtime).
+    async fn index_matches_written(
+        &self,
+        path: &str,
+        current_index: &[u8],
+        expected: &Written,
+        held: Option<&Kept>,
+        head_entry: Option<&HeadEntry>,
+    ) -> bool {
+        if !expected.staged {
+            return match (held, head_entry) {
+                (Some(held), _) => current_index == held.index.as_slice(),
+                (None, Some(head)) => {
+                    current_index == expected_head_index_record(head, path).as_slice()
+                }
+                (None, None) => current_index.is_empty(),
+            };
+        }
+        match &expected.entry {
+            Entry::Absent => current_index.is_empty(),
+            Entry::File { bytes, mode } => {
+                let Some((idx_mode, idx_oid)) =
+                    parse_single_stage_zero_index_record(current_index, path)
+                else {
+                    return false;
+                };
+                if idx_mode != git_file_mode(*mode) {
+                    return false;
+                }
+                self.git_unbound(&["cat-file", "blob", &idx_oid], None)
+                    .await
+                    .is_ok_and(|blob| blob == *bytes)
+            }
+            Entry::Link(target) => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let Some((idx_mode, idx_oid)) =
+                    parse_single_stage_zero_index_record(current_index, path)
+                else {
+                    return false;
+                };
+                if idx_mode != "120000" {
+                    return false;
+                }
+                self.git_unbound(&["cat-file", "blob", &idx_oid], None)
+                    .await
+                    .is_ok_and(|blob| blob == target.as_os_str().as_bytes())
+            }
+            Entry::Directory => false,
+        }
+    }
+
+    /// Restore one verified path unbound after a lost turn.
+    async fn restore_one_unbound(
+        &self,
+        path: &str,
+        held: Option<&Kept>,
+        head_entry: Option<&HeadEntry>,
+    ) -> bool {
+        let single = [path.to_owned()];
+        let listed = nul_paths(&single);
+        if let Some(held) = held {
+            if self
+                .git_unbound(
+                    &[
+                        "--literal-pathspecs",
+                        "update-index",
+                        "--force-remove",
+                        "-z",
+                        "--stdin",
+                    ],
+                    Some(&listed),
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            if !held.index.is_empty()
+                && self
+                    .git_unbound(&["update-index", "-z", "--index-info"], Some(&held.index))
+                    .await
+                    .is_err()
+            {
+                return false;
+            }
+            return held.entry.restore(&self.main.join(path)).is_ok();
+        }
+        if head_entry.is_some() {
+            return self
+                .git_unbound(
+                    &[
+                        "--literal-pathspecs",
+                        "restore",
+                        "--source=HEAD",
+                        "--staged",
+                        "--worktree",
+                        "--pathspec-from-file=-",
+                        "--pathspec-file-nul",
+                    ],
+                    Some(&listed),
+                )
+                .await
+                .is_ok();
+        }
+        if self
+            .git_unbound(
+                &[
+                    "--literal-pathspecs",
+                    "rm",
+                    "-q",
+                    "--cached",
+                    "--ignore-unmatch",
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                ],
+                Some(&listed),
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        match std::fs::remove_file(self.main.join(path)) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
+    }
+
     fn head(&self) -> Result<GitOid> {
         crate::declared_land::main_head(self.main)
     }
@@ -864,13 +1286,17 @@ impl Hold<'_> {
             self.main,
             args,
             self.environment,
-            Some(Held {
-                turn: &mut *self.turn,
-                stdin,
-                extra,
-            }),
+            stdin,
+            extra,
+            Some(&mut *self.turn),
         )
         .await
+    }
+
+    /// Plain git in main, in the pure environment, unbound: used only for the guarded put-back
+    /// after the ref turn has already been lost.
+    async fn git_unbound(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        git(self.main, args, self.environment, stdin, &[], None).await
     }
 
     /// A command in main's pure environment (`direnv exec` when main has an `.envrc`), bound to
@@ -885,21 +1311,15 @@ impl Hold<'_> {
     }
 }
 
-/// What a git run under the ref turn carries: the turn it is bound to, its stdin and the variables
-/// it adds to the pure environment.
-struct Held<'a> {
-    turn: &'a mut RefTurn,
-    stdin: Option<&'a [u8]>,
-    extra: &'a [(OsString, OsString)],
-}
-/// Run `git -C <dir> <args>`: in `environment` (the caller's when empty) and, when `held` is
-/// given, bound to its turn with its stdin and extra variables. A nonzero exit is an error naming
-/// git's stderr.
+/// Run `git -C <dir> <args>`: in `environment` (the caller's when empty) and, when `turn` is
+/// given, bound to that turn. A nonzero exit is an error naming git's stderr.
 async fn git(
     directory: &Path,
     args: &[&str],
     environment: &[(OsString, OsString)],
-    held: Option<Held<'_>>,
+    stdin: Option<&[u8]>,
+    extra: &[(OsString, OsString)],
+    turn: Option<&mut RefTurn>,
 ) -> Result<Vec<u8>> {
     let mut command = std::process::Command::new("git");
     command.arg("-C").arg(directory).args(args);
@@ -911,13 +1331,7 @@ async fn git(
             .map_err(CowshedError::internal)?;
         command.envs(policy.iter().map(|(name, value)| (&**name, &**value)));
     }
-    let (stdin, turn) = match held {
-        Some(Held { turn, stdin, extra }) => {
-            command.envs(extra.iter().map(|(name, value)| (name, value)));
-            (stdin, Some(turn))
-        }
-        None => (None, None),
-    };
+    command.envs(extra.iter().map(|(name, value)| (name, value)));
     let (status, stdout, stderr) = run_split(command, stdin, turn).await?;
     if status.success() {
         return Ok(stdout);
@@ -968,19 +1382,30 @@ pub(crate) async fn run_split(
     if let Some(turn) = turn.as_deref() {
         turn.bind_at_exec(&mut command);
     }
-    let mut child = tokio::process::Command::from(command)
-        .spawn()
-        .map_err(|error| {
-            CowshedError::environment_missing(
+    let mut child = match tokio::process::Command::from(command).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(loss) = turn.as_deref_mut().and_then(RefTurn::loss) {
+                return Err(CowshedError::environment_missing(
+                    format!("the ref turn was lost: {loss}"),
+                    "check the host gateway (`cowshed gateway status`), then run cowshed doc-commit again",
+                ));
+            }
+            return Err(CowshedError::environment_missing(
                 format!("cannot run {program}: {error}"),
                 "install it, or put it on the bootstrap PATH",
-            )
-        })?;
+            ));
+        }
+    };
     let pid = crate::land_turn::spawned_pid(&child);
     if let Some(turn) = turn.as_deref_mut()
         && let Err(error) = turn.bound(pid.unsigned_abs()).await
     {
-        return Err(stopped(&mut child, pid, &program, &error.message).await);
+        let reason = match turn.loss() {
+            Some(loss) => format!("the ref turn was lost: {loss}"),
+            None => error.message,
+        };
+        return Err(stopped(&mut child, pid, &program, &reason).await);
     }
     let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(stopped(
@@ -1227,5 +1652,48 @@ mod tests {
             nul_paths(&["a.md".to_owned(), "b\tc.md".to_owned()]),
             b"a.md\0b\tc.md\0".to_vec()
         );
+    }
+
+    #[test]
+    fn head_tree_entries_and_stage_zero_index_records_match_by_content() {
+        let mut listed = Vec::new();
+        listed.extend_from_slice(&terminated(
+            b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tREADME.md",
+        ));
+        listed.extend_from_slice(&terminated(
+            b"100755 blob bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tdocs/run.sh",
+        ));
+        listed.extend_from_slice(&terminated(b"malformed"));
+        let entries = head_entries_by_path(&listed);
+        assert_eq!(
+            entries.get("README.md"),
+            Some(&HeadEntry {
+                mode: "100644".to_owned(),
+                oid: "a".repeat(40),
+            })
+        );
+        let expected_index = expected_head_index_record(&entries["README.md"], "README.md");
+        assert_eq!(
+            parse_single_stage_zero_index_record(&expected_index, "README.md"),
+            Some(("100644".to_owned(), "a".repeat(40)))
+        );
+        // Conflict stages (more than one record or non-zero stage) never match a single stage-0 entry.
+        let mut conflict = expected_index.clone();
+        conflict.extend_from_slice(&terminated(
+            b"100644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2\tREADME.md",
+        ));
+        assert_eq!(
+            parse_single_stage_zero_index_record(&conflict, "README.md"),
+            None
+        );
+        assert_eq!(
+            parse_single_stage_zero_index_record(
+                &terminated(b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1\tREADME.md"),
+                "README.md"
+            ),
+            None
+        );
+        assert_eq!(git_file_mode(0o100644), "100644");
+        assert_eq!(git_file_mode(0o100755), "100755");
     }
 }

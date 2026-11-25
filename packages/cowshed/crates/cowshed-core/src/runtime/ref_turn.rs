@@ -117,6 +117,12 @@ impl RefTurn {
         })
     }
 
+    /// Return the turn's loss reason if the turn is already lost, draining any unread answer or
+    /// EOF from the connection without blocking ([`Turn::loss`]).
+    pub fn loss(&mut self) -> Option<std::io::Error> {
+        self.turn.loss()
+    }
+
     /// Resolves once the gateway has closed the connection that holds the turn ([`Turn::lost`]).
     /// Cancel-safe, so a holder waits on it beside its git.
     pub async fn lost(&mut self) -> std::io::Error {
@@ -124,8 +130,8 @@ impl RefTurn {
     }
 
     /// End the turn, recording `outcome` (how the fence ended) with the gateway.
-    pub fn end(self, outcome: String) {
-        self.turn.end(outcome);
+    pub fn end(self, outcome: String) -> std::io::Result<()> {
+        self.turn.end(outcome)
     }
 }
 

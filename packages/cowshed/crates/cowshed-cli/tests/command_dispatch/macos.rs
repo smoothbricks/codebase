@@ -4605,7 +4605,7 @@ async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_subs
         fs::write(main.join("doc.md"), b"doc\n").unwrap();
         git(&main, &["add", "doc.md"]);
         git(&main, &["commit", "-q", "-m", "doc"]);
-        writer.end("committed".to_owned());
+        writer.end("committed".to_owned()).expect("end writer");
         let (result, _, stderr) = land.await;
         (result, stderr)
     };
@@ -9731,7 +9731,7 @@ async fn settled_land_turn(socket: &Path, turn: &str) -> Vec<cowshed_core::land_
         .into_iter()
         .find(|queue| queue.repo.as_str() == turn)
         .expect("the probe's land turn is listed");
-    probe.end("probed".to_owned());
+    probe.end("probed".to_owned()).expect("end probe");
     queue.abandoned
 }
 

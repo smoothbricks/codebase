@@ -98,7 +98,14 @@ where
     let held = match command.spawn(turn.outside_descriptor().into_iter().collect(), Some(&turn)) {
         Ok(held) => held,
         Err(error) => {
-            turn.end(format!("did not start: {}", error.message));
+            if let Some(loss) = turn.loss() {
+                let _ = turn.end(format!("did not start: {loss}"));
+                return Err(CowshedError::environment_missing(
+                    format!("land turn {} was lost: {loss}", args.repo),
+                    "check the host gateway (`cowshed gateway status`), then land again",
+                ));
+            }
+            let _ = turn.end(format!("did not start: {}", error.message));
             return Err(error);
         }
     };
@@ -106,7 +113,7 @@ where
     if let Err(error) = turn.bound(held.pid.unsigned_abs()).await {
         // A command the turn does not hold must not run beside the next land: it is stopped.
         let (stopped, ended) = held.stop().await;
-        turn.end(format!("stopped: the gateway did not bind it: {error}"));
+        let _ = turn.end(format!("stopped: the gateway did not bind it: {error}"));
         return Err(CowshedError::environment_missing(
             format!(
                 "the gateway did not bind {program_name} to land turn {}: {error}; {}; it {ended}",
@@ -152,7 +159,7 @@ where
         (None, Some(signal)) => format!("killed by signal {signal}"),
         (None, None) => "ended with neither an exit code nor a signal".to_owned(),
     };
-    turn.end(outcome);
+    let _ = turn.end(outcome);
     relay?;
     exit_code(status)
 }
@@ -221,7 +228,7 @@ where
         Ok(())
     });
     if let Err(error) = reported {
-        turn.end(format!("did not start: {}", error.message));
+        let _ = turn.end(format!("did not start: {}", error.message));
         return Err(error);
     }
     Ok(turn)

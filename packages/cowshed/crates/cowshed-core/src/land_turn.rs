@@ -30,7 +30,7 @@ use std::time::Duration;
 use cowshed_os::fork_lock::Fenced;
 use cowshed_os::process::Holder;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
 
 use crate::api::dto::LandTurnName;
@@ -248,18 +248,224 @@ pub fn outside_holders(me: i32, open: Result<Vec<Holder>, String>) -> OutsideHol
     }
 }
 
+/// One buffered reader/writer over a land-turn connection: cancel-safe async line reads and
+/// non-blocking drains share one buffer, so no second reader ever splits the stream.
+#[derive(Debug)]
+struct Connection {
+    stream: Fenced<UnixStream>,
+    buf: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum NonBlockingLine {
+    Line(String),
+    Eof,
+    Pending,
+}
+
+impl Connection {
+    fn new(stream: Fenced<UnixStream>) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let on: libc::c_int = 1;
+            // SAFETY: `stream` is a live owned Unix socket descriptor and `on` is a live `c_int`.
+            unsafe {
+                libc::setsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&*stream),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    std::ptr::from_ref(&on).cast(),
+                    libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).unwrap_or(4),
+                );
+            }
+        }
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
+    }
+
+    fn take_buffered_line(&mut self) -> io::Result<Option<String>> {
+        let Some(pos) = self.buf.iter().position(|&byte| byte == b'\n') else {
+            return Ok(None);
+        };
+        let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        String::from_utf8(line)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn take_remaining_line(&mut self) -> io::Result<Option<String>> {
+        if self.buf.is_empty() {
+            return Ok(None);
+        }
+        let mut line = std::mem::take(&mut self.buf);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        String::from_utf8(line)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// Read directly from the kernel receive queue without blocking and without relying on
+    /// Tokio's cached reactor readiness flag.
+    fn recv_nonblocking(&self, chunk: &mut [u8]) -> io::Result<usize> {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&*self.stream);
+        loop {
+            // SAFETY: `fd` is a live owned socket descriptor and `chunk` is a writable stack slice.
+            let rc = unsafe {
+                libc::recv(
+                    fd,
+                    chunk.as_mut_ptr().cast(),
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if let Ok(read) = usize::try_from(rc) {
+                return Ok(read);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// Cancel-safe async read of the next newline-delimited line, or `Ok(None)` at EOF.
+    async fn next_line(&mut self) -> io::Result<Option<String>> {
+        let mut chunk = [0_u8; 512];
+        loop {
+            if let Some(line) = self.take_buffered_line()? {
+                return Ok(Some(line));
+            }
+            self.stream.readable().await?;
+            match self.stream.try_read(&mut chunk) {
+                Ok(0) => return self.take_remaining_line(),
+                Ok(read) => self.buf.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Non-blocking drain of one line or EOF already sitting in the buffer or kernel receive queue.
+    fn try_next_line(&mut self) -> io::Result<NonBlockingLine> {
+        let mut chunk = [0_u8; 512];
+        loop {
+            if let Some(line) = self.take_buffered_line()? {
+                return Ok(NonBlockingLine::Line(line));
+            }
+            match self.recv_nonblocking(&mut chunk) {
+                Ok(0) => {
+                    return match self.take_remaining_line()? {
+                        Some(line) => Ok(NonBlockingLine::Line(line)),
+                        None => Ok(NonBlockingLine::Eof),
+                    };
+                }
+                Ok(read) => self.buf.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(NonBlockingLine::Pending);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn try_write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&*self.stream);
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::MSG_DONTWAIT;
+        let mut written = 0;
+        while written < bytes.len() {
+            let rest = &bytes[written..];
+            // SAFETY: `fd` is a live owned socket descriptor and `rest` is a valid byte slice.
+            let rc = unsafe { libc::send(fd, rest.as_ptr().cast(), rest.len(), flags) };
+            match usize::try_from(rc) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("{written} of its {} bytes were written", bytes.len()),
+                    ));
+                }
+                Ok(wrote) => written += wrote,
+                Err(_) => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The recorded reason a held turn was lost, shared by `lost()`, `bound()`, `loss()` and `end()`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Loss {
+    Expired {
+        bound_ms: u64,
+    },
+    Closed,
+    Unexpected(String),
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+impl Loss {
+    fn from_line(line: String) -> Self {
+        match decode(&line) {
+            Ok(TurnAnswer::Expired { bound_ms }) => Self::Expired { bound_ms },
+            _ => Self::Unexpected(line),
+        }
+    }
+
+    fn from_io(error: &io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_io_error(&self) -> io::Error {
+        match self {
+            Self::Expired { bound_ms } => expired_error(*bound_ms),
+            Self::Closed => io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the gateway closed the connection that holds the turn",
+            ),
+            Self::Unexpected(line) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the gateway sent {line:?} to a held turn that asked nothing"),
+            ),
+            Self::Io { kind, message } => io::Error::new(*kind, message.clone()),
+        }
+    }
+}
+
 /// A held turn, the asker's connection to the gateway. The gateway holds the turn for as long as
-/// the asker holds this, or any command bound to it ([`Self::bind`]) runs. Ending it records how
-/// the land's command ended; dropping it, or this process's exit, ends the asker's hold without an
-/// outcome, which the gateway records as an abandonment.
+/// the asker holds this, or any command bound to it ([`Self::bind_at_exec`]) runs. Ending it records
+/// how the land's command ended; dropping it, or this process's exit, ends the asker's hold without
+/// an outcome, which the gateway records as an abandonment.
 #[derive(Debug)]
 pub struct Turn {
     ticket: Ticket,
-    connection: Lines<BufReader<Fenced<UnixStream>>>,
+    connection: Connection,
     /// The connection's descriptor, open for as long as `connection` is: a child armed by
     /// [`Self::bind_at_exec`] writes its bind to it before its exec.
     socket: RawFd,
     outside: Option<HeldLock>,
+    /// The first loss reason observed on this turn's connection, reused by every subsequent check.
+    loss: Option<Loss>,
 }
 
 impl Turn {
@@ -287,45 +493,100 @@ impl Turn {
         }
     }
 
+    /// Return the turn's loss reason if the turn is already lost, draining without blocking any
+    /// answer (such as `expired`) or EOF the gateway already wrote before closing the connection.
+    /// Any unread `bound` or `refused` reply from a child whose `exec` failed after `write_bind`
+    /// is skipped rather than treated as a loss. Once recorded, every later call to `loss()`,
+    /// `lost()`, `bound()`, or `end()` reports that same reason.
+    pub fn loss(&mut self) -> Option<io::Error> {
+        if let Some(loss) = &self.loss {
+            return Some(loss.to_io_error());
+        }
+        let loss = loop {
+            match self.connection.try_next_line() {
+                Ok(NonBlockingLine::Pending) => return None,
+                Ok(NonBlockingLine::Line(line)) => match decode(&line) {
+                    Ok(TurnAnswer::Expired { bound_ms }) => break Loss::Expired { bound_ms },
+                    Ok(TurnAnswer::Bound { .. } | TurnAnswer::Refused { .. }) => continue,
+                    _ => break Loss::Unexpected(line),
+                },
+                Ok(NonBlockingLine::Eof) => break Loss::Closed,
+                Err(error) => break Loss::from_io(&error),
+            }
+        };
+        let io_error = loss.to_io_error();
+        self.loss = Some(loss);
+        Some(io_error)
+    }
+
     /// The gateway's answer to the bind the command `pid`, armed by [`Self::bind_at_exec`] and
     /// just spawned, wrote: `Ok` once the gateway holds the turn for it until it exits. A command
     /// that exited before the gateway could watch it holds nothing.
     pub async fn bound(&mut self, pid: u32) -> io::Result<()> {
-        match answer(&mut self.connection).await? {
-            TurnAnswer::Bound { pid: bound } if bound == pid => Ok(()),
-            TurnAnswer::Expired { bound_ms } => Err(expired_error(bound_ms)),
-            TurnAnswer::Refused { error } => Err(io::Error::other(format!(
+        if let Some(loss) = &self.loss {
+            return Err(loss.to_io_error());
+        }
+        match answer(&mut self.connection).await {
+            Ok(TurnAnswer::Bound { pid: bound }) if bound == pid => Ok(()),
+            Ok(TurnAnswer::Expired { bound_ms }) => {
+                let loss = Loss::Expired { bound_ms };
+                let error = loss.to_io_error();
+                self.loss = Some(loss);
+                Err(error)
+            }
+            Ok(TurnAnswer::Refused { error }) => Err(io::Error::other(format!(
                 "the gateway refused to bind pid {pid} to land turn ticket {}: {error}",
                 self.ticket.number
             ))),
-            other => Err(unexpected(&other, "a bind")),
+            Ok(other) => Err(unexpected(&other, "a bind")),
+            Err(error) => {
+                let loss = if error.kind() == io::ErrorKind::UnexpectedEof {
+                    Loss::Closed
+                } else {
+                    Loss::from_io(&error)
+                };
+                let io_error = loss.to_io_error();
+                self.loss = Some(loss);
+                Err(io_error)
+            }
         }
     }
 
     /// End the asker's hold, recording `outcome` (how the command ended). The turn passes on once
-    /// every command bound to it has exited too. An end that cannot be sent is said on stderr; the
-    /// connection then closes without it and the gateway records the turn abandoned.
-    pub fn end(mut self, outcome: String) {
+    /// every command bound to it has exited too. If the gateway already ended or closed the turn
+    /// (including an unread `expired` answer waiting on the connection when send fails with EPIPE),
+    /// that loss reason is returned and reported on stderr rather than an abandonment.
+    pub fn end(mut self, outcome: String) -> io::Result<()> {
+        let already_known = self.loss.is_some();
+        if let Some(loss) = self.loss() {
+            if !already_known {
+                cowshed_os::eprintln!(
+                    "cowshed: land turn ticket {}: its end ({outcome}) was not sent: {loss}",
+                    self.ticket.number,
+                );
+            }
+            return Err(loss);
+        }
         let sent = line(&TurnStep::End {
             outcome: outcome.clone(),
         })
-        .and_then(
-            |line| match self.connection.get_mut().get_ref().try_write(&line) {
-                Ok(written) if written == line.len() => Ok(()),
-                Ok(written) => Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!("{written} of its {} bytes were written", line.len()),
-                )),
-                Err(error) => Err(error),
-            },
-        );
+        .and_then(|line| self.connection.try_write_all(&line));
         if let Err(error) = sent {
+            if let Some(loss) = self.loss() {
+                cowshed_os::eprintln!(
+                    "cowshed: land turn ticket {}: its end ({outcome}) was not sent: {loss}",
+                    self.ticket.number,
+                );
+                return Err(loss);
+            }
             cowshed_os::eprintln!(
                 "cowshed: land turn ticket {}: its end ({outcome}) was not sent to the gateway: \
                  {error}; the gateway records the turn abandoned",
                 self.ticket.number,
             );
+            return Err(error);
         }
+        Ok(())
     }
 
     /// The outside lock's descriptor, for the command to inherit
@@ -338,20 +599,17 @@ impl Turn {
     /// Resolves once the gateway has closed the connection that holds the turn, and never before:
     /// the turn is lost with it. Cancel-safe, so a holder waits on it beside its command.
     pub async fn lost(&mut self) -> io::Error {
-        match self.connection.next_line().await {
-            Ok(None) => io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the gateway closed the connection that holds the turn",
-            ),
-            Ok(Some(line)) => match decode(&line) {
-                Ok(TurnAnswer::Expired { bound_ms }) => expired_error(bound_ms),
-                _ => io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("the gateway sent {line:?} to a held turn that asked nothing"),
-                ),
-            },
-            Err(error) => error,
+        if let Some(loss) = &self.loss {
+            return loss.to_io_error();
         }
+        let loss = match self.connection.next_line().await {
+            Ok(None) => Loss::Closed,
+            Ok(Some(line)) => Loss::from_line(line),
+            Err(error) => Loss::from_io(&error),
+        };
+        let io_error = loss.to_io_error();
+        self.loss = Some(loss);
+        io_error
     }
 }
 
@@ -396,7 +654,12 @@ fn write_bind(socket: RawFd, pid: u32) -> io::Result<()> {
     let mut written = 0;
     while written < end {
         let rest = &line[written..end];
-        // SAFETY: `rest` is a live stack buffer of `rest.len()` bytes.
+        // SAFETY: `rest` is a live stack buffer of `rest.len()` bytes; `send`/`write` are
+        // async-signal-safe per POSIX.
+        #[cfg(target_os = "linux")]
+        let wrote =
+            unsafe { libc::send(socket, rest.as_ptr().cast(), rest.len(), libc::MSG_NOSIGNAL) };
+        #[cfg(not(target_os = "linux"))]
         let wrote = unsafe { libc::write(socket, rest.as_ptr().cast(), rest.len()) };
         match usize::try_from(wrote) {
             Ok(wrote) => written += wrote,
@@ -414,7 +677,7 @@ fn write_bind(socket: RawFd, pid: u32) -> io::Result<()> {
 /// The gateway's next answer. A gateway that refuses the request before it reads it as a land turn
 /// (an older build, which does not know the operation) answers a control failure,
 /// `{"ok":false,…}`, which is returned as that refusal.
-async fn answer(connection: &mut Lines<BufReader<Fenced<UnixStream>>>) -> io::Result<TurnAnswer> {
+async fn answer(connection: &mut Connection) -> io::Result<TurnAnswer> {
     let Some(line) = connection.next_line().await? else {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -447,7 +710,7 @@ fn expired_error(bound_ms: u64) -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "the bounded turn exceeded its {} deadline",
+            "expired: exceeded bounded-turn deadline ({})",
             format_bound(bound_ms)
         ),
     )
@@ -482,10 +745,7 @@ pub struct OutsideLock<'a> {
 /// Connect to `gateway` across an install that restarts it
 /// ([`crate::runtime::supervisor_manager::connect_across_install`]) and send `ask`: the
 /// connection its answers come on, and its descriptor.
-async fn asked(
-    gateway: &TurnGateway,
-    ask: &TurnAsk,
-) -> io::Result<(Lines<BufReader<Fenced<UnixStream>>>, RawFd)> {
+async fn asked(gateway: &TurnGateway, ask: &TurnAsk) -> io::Result<(Connection, RawFd)> {
     #[derive(Serialize)]
     struct Asking<'a> {
         op: &'static str,
@@ -523,7 +783,7 @@ async fn asked(
         },
     )
     .await?;
-    Ok((BufReader::new(stream).lines(), descriptor))
+    Ok((Connection::new(stream), descriptor))
 }
 
 /// Read the gateway's answers to `ask` on `connection` until its turn is held, telling `waiting`
@@ -532,7 +792,7 @@ async fn asked(
 /// numbered on its own connection; one the install's restart drains is asked again. A close with
 /// no `fenced` before it is an error.
 async fn queued(
-    connection: &mut Lines<BufReader<Fenced<UnixStream>>>,
+    connection: &mut Connection,
     gateway: &TurnGateway,
     ask: &TurnAsk,
     report_every: Duration,
@@ -647,6 +907,7 @@ pub async fn take(
         connection,
         socket: descriptor,
         outside,
+        loss: None,
     })
 }
 
@@ -721,6 +982,107 @@ mod tests {
                 serde_json::to_string(&TurnStep::Bind { pid }).unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn end_drains_unread_expired_answer_after_peer_close() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (client, mut server) = UnixStream::pair().expect("unix stream pair");
+        let descriptor = std::os::fd::AsRawFd::as_raw_fd(&client);
+        let turn = Turn {
+            ticket: ticket(1),
+            connection: Connection::new(Fenced::new(client)),
+            socket: descriptor,
+            outside: None,
+            loss: None,
+        };
+        server
+            .write_all(b"{\"turn\":\"expired\",\"boundMs\":250}\n")
+            .await
+            .expect("write expired");
+        drop(server);
+
+        let error = turn
+            .end("exited 0".to_owned())
+            .expect_err("end must report the unread expired answer");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "expired: exceeded bounded-turn deadline (250 ms)"
+        );
+    }
+
+    #[tokio::test]
+    async fn loss_after_bind_epipe_drains_unread_expired_and_reuses_it_for_lost_and_end() {
+        use cowshed_os::test_backstop::CommandBackstop as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let (client, mut server) = UnixStream::pair().expect("unix stream pair");
+        let descriptor = std::os::fd::AsRawFd::as_raw_fd(&client);
+        let mut turn = Turn {
+            ticket: ticket(1),
+            connection: Connection::new(Fenced::new(client)),
+            socket: descriptor,
+            outside: None,
+            loss: None,
+        };
+        server
+            .write_all(b"{\"turn\":\"expired\",\"boundMs\":250}\n")
+            .await
+            .expect("write expired");
+        drop(server);
+
+        // Child pre_exec write_bind fails with EPIPE on the closed socket.
+        let mut command = std::process::Command::new("true");
+        turn.bind_at_exec(&mut command);
+        let spawn_err = command
+            .status_bounded()
+            .expect_err("bind_at_exec on closed socket fails before exec");
+        assert_eq!(spawn_err.kind(), io::ErrorKind::BrokenPipe);
+
+        let loss = turn
+            .loss()
+            .expect("loss drains the unread expired answer after EPIPE");
+        assert_eq!(
+            loss.to_string(),
+            "expired: exceeded bounded-turn deadline (250 ms)"
+        );
+        assert_eq!(
+            turn.lost().await.to_string(),
+            "expired: exceeded bounded-turn deadline (250 ms)"
+        );
+        assert_eq!(
+            turn.end("refused".to_owned())
+                .expect_err("end repeats the recorded loss")
+                .to_string(),
+            "expired: exceeded bounded-turn deadline (250 ms)"
+        );
+    }
+
+    #[tokio::test]
+    async fn end_reports_closed_connection_on_eof_without_expired() {
+        let (client, server) = UnixStream::pair().expect("unix stream pair");
+        let descriptor = std::os::fd::AsRawFd::as_raw_fd(&client);
+        let turn = Turn {
+            ticket: ticket(1),
+            connection: Connection::new(Fenced::new(client)),
+            socket: descriptor,
+            outside: None,
+            loss: None,
+        };
+        drop(server);
+
+        let error = turn
+            .end("exited 0".to_owned())
+            .expect_err("end on closed socket fails");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection that holds the turn"),
+            "{error}"
+        );
     }
 
     proptest! {

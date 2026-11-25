@@ -126,7 +126,7 @@ where
     // holding its turn, and ends before anything moves when it is another; `run` then goes on as
     // the installed cowshed (05_gateway.md "A land step waits for an install in progress").
     if let Err(refused) = service.require_daemon_of_this_build().await {
-        turn.end(format!("refused: {}", refused.message));
+        let _ = turn.end(format!("refused: {}", refused.message));
         return Err(refused);
     }
     if land.gate_only {
@@ -145,7 +145,7 @@ where
         .await;
         return match gated {
             Ok(()) => {
-                turn.end(format!("gated {}", preflight.source_head.as_str()));
+                let _ = turn.end(format!("gated {}", preflight.source_head.as_str()));
                 say(
                     output,
                     &format!(
@@ -158,7 +158,7 @@ where
                 Ok(LandReport::Preflighted(preflight))
             }
             Err(error) => {
-                turn.end(format!("refused: {}", error.message));
+                let _ = turn.end(format!("refused: {}", error.message));
                 Err(error)
             }
         };
@@ -176,7 +176,7 @@ where
     .await;
     let routed = match routed {
         Ok(routed) => {
-            turn.end(match &routed.retire {
+            let _ = turn.end(match &routed.retire {
                 Ok(_) => format!("landed {}", routed.head.as_str()),
                 Err(refused) => format!(
                     "landed {}; its retire was refused: {}",
@@ -187,7 +187,7 @@ where
             routed
         }
         Err(error) => {
-            turn.end(format!("refused: {}", error.message));
+            let _ = turn.end(format!("refused: {}", error.message));
             return Err(error);
         }
     };
@@ -667,9 +667,21 @@ async fn gate(
         .stderr(stderr()?);
     let shown = shown(&argv);
     turn.bind_at_exec(&mut command);
-    let mut child = tokio::process::Command::from(command)
-        .spawn()
-        .map_err(|error| crate::land_turn::spawn_error(declaration.gate().program(), &error))?;
+    let mut child = match tokio::process::Command::from(command).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(loss) = turn.loss() {
+                return Err(CowshedError::environment_missing(
+                    format!("land turn {} was lost: {loss}", declaration.turn()),
+                    "check the host gateway (`cowshed gateway status`), then land again",
+                ));
+            }
+            return Err(crate::land_turn::spawn_error(
+                declaration.gate().program(),
+                &error,
+            ));
+        }
+    };
     let pid = crate::land_turn::spawned_pid(&child);
     // WHY unbounded: the gate is the land's own work and runs as long as it does; the turn's loss
     // ends the wait, and the gate is then sent SIGTERM and reaped within the reap bound.
@@ -829,7 +841,7 @@ where
         .args(["merge", "--ff-only", "--quiet", theirs.as_str()]);
     let ran = crate::doc_commit::run_split(command, None, Some(&mut turn)).await;
     let moved = matches!(&ran, Ok((status, _, _)) if status.success());
-    turn.end(if moved {
+    let _ = turn.end(if moved {
         format!("fast-forwarded main to {}", theirs.as_str())
     } else {
         "refused: main was not fast-forwarded".to_owned()

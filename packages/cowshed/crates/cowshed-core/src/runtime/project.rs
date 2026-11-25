@@ -18100,7 +18100,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .await;
         drop(ref_lock);
         if let Some(turn) = ref_turn {
-            turn.end(match &delivered {
+            let _ = turn.end(match &delivered {
                 Ok(()) => format!("delivered {source_head}"),
                 Err(error) => format!("refused: {}", error.message),
             });
@@ -22494,13 +22494,26 @@ async fn fence_git(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let handle = tokio::runtime::Handle::current();
-    let mut child = tokio::task::spawn_blocking(move || {
+    let mut child = match tokio::task::spawn_blocking(move || {
         let _enter = handle.enter();
         command.spawn_locked()
     })
     .await
     .map_err(|error| CowshedError::internal(format!("fence git spawn task failed: {error}")))?
-    .map_err(git_missing)?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(Fence::Turn(turn)) = fence
+                && let Some(loss) = turn.loss()
+            {
+                return Err(CowshedError::environment_missing(
+                    format!("the ref turn was lost: {loss}"),
+                    "check the host gateway (`cowshed gateway status`), then land again",
+                ));
+            }
+            return Err(git_missing(error));
+        }
+    };
     let Some(Fence::Turn(turn)) = fence else {
         return child.wait_with_output().await.map_err(git_missing);
     };
