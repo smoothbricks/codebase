@@ -2562,6 +2562,10 @@ mod lifecycle_authority_tests {
         }
     }
 
+    /// The Nx environment of a fixture workspace at `root`: its data, its cache and its sockets
+    /// beside it in the fixture's scratch. Without `NX_SOCKET_DIR` the daemon binds under the
+    /// host's shared `/tmp/.nx/<uid>/sockets`, which any other Nx on the host may clear while the
+    /// fixture's daemon lives (sb-batch-6 gate 1).
     fn nx_environment(root: &Path) -> [(&'static str, PathBuf); 3] {
         [
             ("NX_WORKSPACE_ROOT_PATH", root.to_owned()),
@@ -2571,6 +2575,11 @@ mod lifecycle_authority_tests {
             ),
             ("NX_CACHE_DIRECTORY", root.join(".nx/cache")),
         ]
+    }
+
+    /// The fixture's own socket directory, a sibling of its workspace in the same scratch.
+    fn nx_sockets(root: &Path) -> PathBuf {
+        root.with_file_name("nx-sockets")
     }
 
     /// The real Nx daemon server, started by its own entry point under the same-pid signal profile
@@ -2675,6 +2684,26 @@ mod lifecycle_authority_tests {
             recorded["socketPath"]
                 .as_str()
                 .expect("the record names its socket"),
+        );
+        // Another Nx on the host clears the shared socket root's directory for this workspace,
+        // as one did while this test ran in sb-batch-6 gate 1; the fixture's daemon is not there.
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        if let Some(name) = socket.parent().and_then(Path::file_name) {
+            let shared = Path::new("/tmp/.nx")
+                .join(uid.to_string())
+                .join("sockets")
+                .join(name);
+            match std::fs::remove_dir_all(&shared) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("clear {}: {error}", shared.display()),
+            }
+        }
+        assert!(
+            socket.starts_with(nx_sockets(&root)),
+            "the daemon binds in the fixture's own socket directory, not {}",
+            socket.display()
         );
         assert!(
             socket.exists(),
