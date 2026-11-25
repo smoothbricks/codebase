@@ -42,6 +42,8 @@ export type ConnectionEvent =
       readonly name?: string | undefined;
       /** When the interactive job the request runs for started, which mbx decays its band by; absent, it does not decay. */
       readonly jobStartedMs?: number | undefined;
+      /** The host-unique id of the interactive job the request runs for, paired with {@link jobStartedMs} in mbx's first-admission decay. */
+      readonly jobId?: string | undefined;
     }
   | { readonly type: 'release'; readonly id: number }
   | { readonly type: 'data'; readonly text: string }
@@ -84,6 +86,13 @@ type ReservationRequest =
       name?: string;
       /** When the job an interactive request runs for started, in milliseconds since the Unix epoch. */
       job_started_ms?: number & tags.Type<'uint64'>;
+      /**
+       * The host-unique id of the interactive job the request runs for, paired with `job_started_ms` to key mbx's
+       * first-admission decay clock (mbx d95f93d). Sent without a capability gate because this change lands in the same
+       * batch right after the host mbx pin bump (specs/cowshed/05_gateway.md, "An Nx run serves its leaves one
+       * reservation endpoint", lines 2238-2240).
+       */
+      job_id?: string & tags.MinLength<1>;
     }
   | { type: 'release'; id: Uint };
 
@@ -121,6 +130,7 @@ export function connectionStep(connection: Connection, event: ConnectionEvent): 
         ...(gathers > 1 ? { min: gathers } : {}),
         ...(event.name === undefined ? {} : { name: event.name }),
         ...(event.jobStartedMs === undefined ? {} : { job_started_ms: event.jobStartedMs }),
+        ...(event.jobId === undefined || event.jobId === '' ? {} : { job_id: event.jobId }),
       });
       return [
         { ...connection, entries: new Map(connection.entries).set(event.id, 'waiting') },

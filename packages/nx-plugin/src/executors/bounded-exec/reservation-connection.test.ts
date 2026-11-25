@@ -259,17 +259,33 @@ describe("a leaf's connection to its run's reservation endpoint", () => {
     }
   });
 
-  it("writes an interactive job's start on its request, and none on a request that names none", () => {
+  it("writes an interactive job's start and id on its request, and neither when absent or empty", () => {
     const written = (event: ConnectionEvent): unknown => {
       const [, effects] = connectionStep(opened(ENDPOINT), event);
       const line = effects.flatMap((effect) => (effect.do === 'write' ? [effect.line] : []))[0];
       if (line === undefined) throw new Error('a reserve on an open connection writes its request');
       return JSON.parse(line);
     };
+    const jobId = 'job-0198f2c0b7e34dc795f17b238b331c80-7';
     expect(
-      written({ type: 'reserve', id: 1, cpus: 2, priority: 'interactive', min: 1, jobStartedMs: 1_700_000_000_000 }),
-    ).toEqual({ type: 'reserve', id: 1, cpus: 2, priority: 'interactive', job_started_ms: 1_700_000_000_000 });
-    expect(written({ type: 'reserve', id: 1, cpus: 2, priority: 'interactive', min: 1 })).toEqual({
+      written({
+        type: 'reserve',
+        id: 1,
+        cpus: 2,
+        priority: 'interactive',
+        min: 1,
+        jobStartedMs: 1_700_000_000_000,
+        jobId,
+      }),
+    ).toEqual({
+      type: 'reserve',
+      id: 1,
+      cpus: 2,
+      priority: 'interactive',
+      job_started_ms: 1_700_000_000_000,
+      job_id: jobId,
+    });
+    expect(written({ type: 'reserve', id: 1, cpus: 2, priority: 'interactive', min: 1, jobId: '' })).toEqual({
       type: 'reserve',
       id: 1,
       cpus: 2,
