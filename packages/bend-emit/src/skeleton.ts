@@ -1269,6 +1269,10 @@ function generateOneSkeleton(
   };
 }
 
+function definedInRoot(tld: Bend.Def): boolean {
+  return (tld.m ?? '') === '' && tld.b !== true;
+}
+
 /**
  * Generates proof skeletons for unfilled or single-hole laws and proof lemmas in a checked book.
  * Never overwrites an existing non-hole proof (returns such names in `skipped`).
@@ -1286,6 +1290,12 @@ export function generateSkeletons(book: Bend.Book, options: SkeletonOptions = {}
       if (tld === undefined || tld.$ !== 'Def') {
         throw new Error(`bend-emit refuses: ${rawName} is not a def or law in this book`);
       }
+      if (!definedInRoot(tld)) {
+        const origin = tld.b === true ? 'Base' : (tld.m ?? '');
+        throw new Error(
+          `bend-emit refuses: ${rawName} is defined in imported book ${origin}; run skeleton on that book`,
+        );
+      }
       if (!isProofDef(book, tld)) {
         throw new Error(`bend-emit refuses: ${rawName} is not a law or proof lemma`);
       }
@@ -1298,6 +1308,7 @@ export function generateSkeletons(book: Bend.Book, options: SkeletonOptions = {}
       seen.add(k);
       const tld = book.tlds[k];
       if (tld === undefined || tld.$ !== 'Def') continue;
+      if (!definedInRoot(tld)) continue;
       if (isProofDef(book, tld)) candidateKeys.push(k);
     }
   }

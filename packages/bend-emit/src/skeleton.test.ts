@@ -714,3 +714,91 @@ def single_hole_lemma(+b: Bool) -> {not(not(b)) == b : Bool}:
     expect(outAll).not.toContain('def already_proved(');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 7. Imported books: --all selects only root book defs; --law refuses imports
+// ---------------------------------------------------------------------------
+
+test('--all selects only root book laws and skips imported defs; explicit --law refuses imported defs', async () => {
+  await withTempDir(async (dir) => {
+    const lemmasPath = join(dir, 'lemmas.bend');
+    writeFileSync(
+      lemmasPath,
+      `import Base
+
+def flip(+b: Bool) -> Bool:
+  match b:
+    case True{}:
+      False{}
+    case False{}:
+      True{}
+
+def imported_proved(+b: Bool) -> {flip(flip(b)) == b : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+def imported_unproved(+b: Bool) -> {flip(flip(b)) == b : Bool}:
+  ?TODO
+`,
+    );
+
+    const rootPath = join(dir, 'root.bend');
+    writeFileSync(
+      rootPath,
+      `import Base
+import ./lemmas.bend as L
+
+law root_proved:
+  for +b: Bool
+  {L.flip(L.flip(b)) == b : Bool}
+
+def root_proved(b):
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+law root_law:
+  for +b: Bool
+  {L.flip(L.flip(b)) == b : Bool}
+`,
+    );
+
+    const book = await checkBendFile(rootPath);
+    const res = book.skeleton();
+    expect(res.defs.map((d) => d.name)).toEqual(['root_law']);
+    expect(res.skipped).toEqual(['root_proved']);
+
+    const errChunks: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: unknown[]): void => {
+      errChunks.push(`${args.map(String).join(' ')}\n`);
+    };
+    let outAll = '';
+    try {
+      outAll = await captureStdout(() => runCli(['skeleton', rootPath, '--all']));
+    } finally {
+      console.error = origErr;
+    }
+    expect(outAll).toContain('def root_law(b):');
+    expect(outAll).not.toContain('imported_unproved');
+    const stderr = errChunks.join('');
+    expect(stderr).toContain('root_proved');
+    expect(stderr).not.toContain('imported_proved');
+
+    // Explicit --law naming an imported def refuses by name with the defining book
+    expect(() => book.skeleton({ laws: ['lemmas:imported_unproved'] })).toThrow(
+      'bend-emit refuses: lemmas:imported_unproved is defined in imported book lemmas; run skeleton on that book',
+    );
+    await expect(runCli(['skeleton', rootPath, '--law', 'lemmas:imported_unproved'])).rejects.toThrow(
+      'bend-emit refuses: lemmas:imported_unproved is defined in imported book lemmas; run skeleton on that book',
+    );
+    expect(() => book.skeleton({ laws: ['Pair.fst'] })).toThrow(
+      'bend-emit refuses: Pair.fst is defined in imported book Base; run skeleton on that book',
+    );
+  });
+});
