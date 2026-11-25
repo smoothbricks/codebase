@@ -470,6 +470,7 @@ async fn a_host_credential_upload_is_the_stdin_secret_and_nothing_else() {
 
 /// The host and CLI refuse the same forbidden disk operation before a native tool is needed.
 /// Successful native output and exit streaming belongs to the real_apfs_host lane above.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_host_disk_command_refuses_volume_renames_as_the_verb_does() {
     let root = temp_root::TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-host-disk");
@@ -508,6 +509,69 @@ async fn a_host_disk_command_refuses_volume_renames_as_the_verb_does() {
         refused.message.contains(target.to_str().unwrap()),
         "{refused:?}"
     );
+    assert_eq!(
+        String::from_utf8(verb.stderr).unwrap(),
+        format!("cowshed: {}\nnext: {}\n", refused.message, refused.hint)
+    );
+    assert!(
+        events.next().await.is_none(),
+        "no event follows the refusal"
+    );
+
+    drop(events);
+    drop(host);
+    let output = child
+        .wait_with_output_bounded()
+        .await
+        .expect("wait for cowshed host");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "the connection never writes stdout"
+    );
+}
+
+/// On Linux neither `diskutil` nor `hdiutil` exists: `disk-command` and `host.diskCommand` both
+/// refuse before taking a lease or spawning anything, exiting 104 (`EnvironmentMissing`).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_host_disk_command_refuses_on_linux_as_the_verb_does() {
+    let root = temp_root::TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-host-disk");
+    let target = root.join("absent-volume");
+    let verb = Command::new(cowshed())
+        .args(["disk-command", "diskutil", "--", "renameVolume"])
+        .arg(&target)
+        .arg("renamed")
+        .output_bounded()
+        .expect("run the disk-command verb");
+    assert_eq!(verb.status.code(), Some(104), "{verb:?}");
+    assert!(verb.stdout.is_empty(), "{verb:?}");
+
+    let (host, child) = host_without_supervisor().await;
+    let mut arguments = Arguments::new();
+    arguments.insert("tool".to_owned(), serde_json::json!("diskutil"));
+    arguments.insert(
+        "argv".to_owned(),
+        serde_json::json!([
+            { "encoding": "utf8", "data": "renameVolume" },
+            { "encoding": "utf8", "data": target },
+            { "encoding": "utf8", "data": "renamed" }
+        ]),
+    );
+    let mut events = call::call_stream::<HostDiskCommand, _>(&host, arguments)
+        .await
+        .expect("open host.diskCommand");
+    let refused = events
+        .next()
+        .await
+        .expect("the operation answers")
+        .expect_err("disk-command is refused on Linux");
+    assert_eq!(
+        refused.code,
+        cowshed_core::ErrorCode::EnvironmentMissing,
+        "{refused:?}"
+    );
+    assert!(refused.message.contains("only macOS"), "{refused:?}");
     assert_eq!(
         String::from_utf8(verb.stderr).unwrap(),
         format!("cowshed: {}\nnext: {}\n", refused.message, refused.hint)
