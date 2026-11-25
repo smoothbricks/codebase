@@ -92,7 +92,7 @@ impl Pool {
     /// ([`reservation_name`]): `mbx reserve` in a process group of its own, its held command's
     /// stdin a pipe whose write end the returned hold alone keeps and its stdout the grant. The
     /// count granted, or why none was, reaches the supervisor on `events`.
-    pub fn reserve(
+    pub async fn reserve(
         &self,
         job: JobId,
         name: &str,
@@ -100,39 +100,56 @@ impl Pool {
         priority: PoolPriority,
         events: mpsc::Sender<ProcessEvent>,
     ) -> io::Result<Hold> {
-        use cowshed_os::fork_lock::Spawn as _;
+        let handle = tokio::runtime::Handle::current();
+        let pool = self.clone();
+        let name = name.to_owned();
+        let spawned = tokio::task::spawn_blocking(move || -> io::Result<UnadoptedHold> {
+            use cowshed_os::fork_lock::Spawn as _;
 
-        let (held_input, release) = super::shell_job::pipe()?;
-        let mut command = self.command();
-        command
-            .args([
-                "reserve",
-                "--name",
-                name,
-                "--cpus",
-                &cpus.to_string(),
-                "--priority",
-                priority.as_str(),
-                "--",
-            ])
-            .args(HELD)
-            .stdin(Stdio::from(held_input))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = tokio::process::Command::from(command).spawn_locked()?;
-        // A spawned mbx reports its pid and has the pipes it was given; should either be missing,
-        // it is killed before the error returns, so no reservation outlives this call.
-        let (Some(group), Some(grant)) = (
-            child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()),
-            child.stdout.take(),
-        ) else {
-            let _ = child.start_kill();
-            return Err(io::Error::other(
-                "the spawned mbx reserve reports no pid or has no stdout",
-            ));
-        };
-        let stderr = child.stderr.take().map(kept_stderr);
+            let (held_input, release) = super::shell_job::pipe()?;
+            let mut command = pool.command();
+            command
+                .args([
+                    "reserve",
+                    "--name",
+                    &name,
+                    "--cpus",
+                    &cpus.to_string(),
+                    "--priority",
+                    priority.as_str(),
+                    "--",
+                ])
+                .args(HELD)
+                .stdin(Stdio::from(held_input))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0);
+            let _enter = handle.enter();
+            let mut child = tokio::process::Command::from(command).spawn_locked()?;
+            // A spawned mbx reports its pid and has the pipes it was given; should either be
+            // missing, it is killed before the error returns, so no reservation outlives this
+            // call.
+            let (Some(group), Some(grant)) = (
+                child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()),
+                child.stdout.take(),
+            ) else {
+                let _ = child.start_kill();
+                return Err(io::Error::other(
+                    "the spawned mbx reserve reports no pid or has no stdout",
+                ));
+            };
+            let stderr = child.stderr.take();
+            Ok(UnadoptedHold {
+                child: Some((child, group)),
+                grant: Some(grant),
+                stderr,
+                release: Some(release),
+            })
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("host hold spawn task failed: {error}")))??;
+        let (child, group, grant, stderr, release) = spawned.adopt();
+        let stderr = stderr.map(kept_stderr);
         let (withdraw, withdrawn) = oneshot::channel();
         tokio::spawn(watch(Watch {
             job,
@@ -149,6 +166,50 @@ impl Pool {
             _withdraw: withdraw,
             _release: release,
         })
+    }
+}
+
+/// An `mbx reserve` child awaiting adoption by [`watch`]: if [`Pool::reserve`] is cancelled across
+/// its blocking-pool await before `watch` takes ownership, dropping this guard kills the hold's
+/// process group and signals its child so no pool reservation leaks.
+struct UnadoptedHold {
+    child: Option<(tokio::process::Child, libc::pid_t)>,
+    grant: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    release: Option<OwnedFd>,
+}
+
+impl UnadoptedHold {
+    fn adopt(
+        mut self,
+    ) -> (
+        tokio::process::Child,
+        libc::pid_t,
+        tokio::process::ChildStdout,
+        Option<tokio::process::ChildStderr>,
+        OwnedFd,
+    ) {
+        let (child, group) = self.child.take().expect("an unadopted hold owns its child");
+        let grant = self
+            .grant
+            .take()
+            .expect("an unadopted hold owns its grant stdout");
+        let stderr = self.stderr.take();
+        let release = self
+            .release
+            .take()
+            .expect("an unadopted hold owns its release pipe");
+        (child, group, grant, stderr, release)
+    }
+}
+
+impl Drop for UnadoptedHold {
+    fn drop(&mut self) {
+        let Some((mut child, group)) = self.child.take() else {
+            return;
+        };
+        signal_group(group, libc::SIGKILL);
+        let _ = child.start_kill();
     }
 }
 

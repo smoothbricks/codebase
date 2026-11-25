@@ -345,43 +345,59 @@ fn probe_environment(
 /// the sandbox serves ([`crate::exec::ProfileLaunch`]), under [`probe_profile`] rather than the
 /// executed child's.
 async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Result<Vec<u8>> {
-    use cowshed_os::fork_lock::Spawn as _;
-
     let profile = probe_profile(sandbox)?;
-    let profile = crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile)
-        .map_err(|error| {
+    let profile_dir = sandbox.profile_directory();
+    let workspace_mount = sandbox.workspace_mount.clone();
+    let root_owned = root.to_path_buf();
+    let args_owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let handle = tokio::runtime::Handle::current();
+    let mut child = tokio::task::spawn_blocking(move || -> Result<tokio::process::Child> {
+        use cowshed_os::fork_lock::Spawn as _;
+
+        let profile =
+            crate::exec::ProfileLaunch::write(&profile_dir, &profile).map_err(|error| {
+                failure(format!(
+                    "cannot write the Git probe's sandbox profile into {}: {error}",
+                    profile_dir.display()
+                ))
+            })?;
+        let git = crate::git::sandboxed_git();
+        let launcher = crate::sandbox::launcher().map_err(|error| {
             failure(format!(
-                "cannot write the Git probe's sandbox profile into {}: {error}",
-                sandbox.profile_directory().display()
+                "cannot inspect local Git object store {}: {error}",
+                root_owned.display()
             ))
         })?;
-    let git = crate::git::sandboxed_git();
-    let launcher = crate::sandbox::launcher().map_err(|error| {
+        let arg_refs: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        let mut command = tokio::process::Command::new(launcher.program());
+        command
+            .args(profile.args(launcher))
+            .args(probe_command(&git.program, &root_owned, &arg_refs))
+            .current_dir(&workspace_mount)
+            .env_clear()
+            .envs(probe_environment(&workspace_mount, git.search_path))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::exec::prepare_child_descriptors(command.as_std_mut())
+            .map_err(|error| failure(error.source.to_string()))?;
+        let _enter = handle.enter();
+        command.spawn_locked().map_err(|error| {
+            failure(format!(
+                "cannot inspect local Git object store {}: cannot start {}: {error}",
+                root_owned.display(),
+                launcher.program().display()
+            ))
+        })
+    })
+    .await
+    .map_err(|error| {
         failure(format!(
-            "cannot inspect local Git object store {}: {error}",
+            "cannot inspect local Git object store {}: probe spawn task failed: {error}",
             root.display()
         ))
-    })?;
-    let mut command = tokio::process::Command::new(launcher.program());
-    command
-        .args(profile.args(launcher))
-        .args(probe_command(&git.program, root, args))
-        .current_dir(&sandbox.workspace_mount)
-        .env_clear()
-        .envs(probe_environment(&sandbox.workspace_mount, git.search_path))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    crate::exec::prepare_child_descriptors(command.as_std_mut())
-        .map_err(|error| failure(error.source.to_string()))?;
-    let mut child = command.spawn_locked().map_err(|error| {
-        failure(format!(
-            "cannot inspect local Git object store {}: cannot start {}: {error}",
-            root.display(),
-            launcher.program().display()
-        ))
-    })?;
+    })??;
     let (stdout, stderr, status) = collect_probe_output(&mut child).await.map_err(|error| {
         failure(format!(
             "cannot inspect local Git object store {}: {error}",

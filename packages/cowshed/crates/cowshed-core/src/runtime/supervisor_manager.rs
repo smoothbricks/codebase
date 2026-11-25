@@ -332,9 +332,36 @@ impl SupervisorPeers for SocketPeers {
     }
 }
 
+/// A supervisor child awaiting adoption by [`SupervisorManager::ensure`]: `ProgramSpawner` sets
+/// `kill_on_drop(false)` so an adopted supervisor outlives the manager, so cancellation across
+/// the blocking-pool await uses this guard to end an unadopted child.
+struct UnadoptedSupervisor {
+    child: Option<tokio::process::Child>,
+}
+
+impl UnadoptedSupervisor {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn adopt(mut self) -> tokio::process::Child {
+        self.child
+            .take()
+            .expect("an unadopted supervisor owns its child")
+    }
+}
+
+impl Drop for UnadoptedSupervisor {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 pub struct SupervisorManager {
     store_root: PathBuf,
-    spawner: Box<dyn SupervisorSpawner>,
+    spawner: Arc<dyn SupervisorSpawner>,
     /// One lock per workspace socket: ensures of one workspace run one at a time.
     ensuring: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
     /// The sockets whose supervisors served before this manager started and are not recovered
@@ -353,7 +380,7 @@ impl SupervisorManager {
     ) -> Arc<Self> {
         Arc::new(Self {
             store_root: store_root.into(),
-            spawner,
+            spawner: Arc::from(spawner),
             ensuring: Mutex::default(),
             recovering: std::sync::Mutex::default(),
             startup,
@@ -528,11 +555,20 @@ impl SupervisorManager {
                 "reinstall cowshed with `cowshed gateway start`",
             )
         };
-        let (report, report_writer) = io::pipe().map_err(cannot_start)?;
-        let mut child = self
-            .spawner
-            .spawn(project_root, &authority.workspace, report_writer)
-            .map_err(cannot_start)?;
+        let spawner = Arc::clone(&self.spawner);
+        let project_root = project_root.to_path_buf();
+        let workspace = authority.workspace.clone();
+        let handle = tokio::runtime::Handle::current();
+        let (report, spawned) = tokio::task::spawn_blocking(move || {
+            let (report, report_writer) = io::pipe()?;
+            let _enter = handle.enter();
+            let child = spawner.spawn(&project_root, &workspace, report_writer)?;
+            Ok::<_, io::Error>((report, UnadoptedSupervisor::new(child)))
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("supervisor spawn task failed: {error}")))?
+        .map_err(cannot_start)?;
+        let mut child = spawned.adopt();
         let deadline = tokio::time::Instant::now() + START_BOUND;
         loop {
             if let Some(status) = child.try_wait().map_err(|error| {

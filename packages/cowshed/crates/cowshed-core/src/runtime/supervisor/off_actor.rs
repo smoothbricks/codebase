@@ -107,16 +107,16 @@ impl<T: Send + 'static> Drop for OffActor<T> {
 /// A spawn awaiting adoption: its owned child and observed fence travel together across the
 /// blocking-pool await. Cancellation or refused pipes end the unadopted group and reap it away
 /// from the actor; only adoption hands reaping to the ordinary process watcher.
-pub(super) struct Spawned {
+pub(in crate::runtime) struct Spawned {
     child: Option<std::process::Child>,
     fence: Option<ChildFence>,
-    pub(super) at: Instant,
-    pub(super) nice: Option<i32>,
+    pub(in crate::runtime) at: Instant,
+    pub(in crate::runtime) nice: Option<i32>,
 }
 
 impl Spawned {
     /// Observe the owned, unreaped group leader before returning it to the actor.
-    pub(super) fn new(child: std::process::Child, nice: Option<i32>) -> Result<Self> {
+    pub(in crate::runtime) fn new(child: std::process::Child, nice: Option<i32>) -> Result<Self> {
         let mut spawned = Self {
             child: Some(child),
             fence: None,
@@ -133,14 +133,14 @@ impl Spawned {
             .expect("an unadopted spawn owns its child")
     }
 
-    pub(super) fn fence(&self) -> &ChildFence {
+    pub(in crate::runtime) fn fence(&self) -> &ChildFence {
         self.fence
             .as_ref()
             .expect("a returned spawn has observed its child's fence")
     }
 
     /// All fallible pipe setup is over. The watcher alone may now reap this leader.
-    pub(super) fn adopt(mut self) -> ChildFence {
+    pub(in crate::runtime) fn adopt(mut self) -> ChildFence {
         self.child.take();
         self.fence.take().expect("an adopted spawn has its fence")
     }

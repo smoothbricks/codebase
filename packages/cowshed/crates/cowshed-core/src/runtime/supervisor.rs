@@ -90,6 +90,7 @@ use linux as platform;
 use liveness::{Liveness, LivenessSlot, LivenessWriter};
 #[cfg(target_os = "macos")]
 use macos as platform;
+pub(super) use off_actor::Spawned;
 use off_actor::{InMemory, OffActor};
 pub(super) use platform::CommandPlacement;
 pub use platform::JobMembership;
@@ -2782,28 +2783,30 @@ impl SpawnSink for SystemSpawnSink {
                     ));
                 };
                 let (sandbox, profile) = policy.child(request.mode);
-                shells.spawn(
-                    super::shell_job::PooledSpawn {
-                        job_id: request.job_id,
-                        command,
-                        cwd,
-                        profile,
-                        read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
-                        workspace_mount: sandbox.workspace_mount.clone(),
-                        envrc_directory: shell_directory(sandbox),
-                        environment,
-                        caller: &request.env,
-                        grant_revision: request.authority.grant_revision,
-                        cpu: &request.cpu,
-                        mbx: sandbox
-                            .capabilities
-                            .active
-                            .contains(&crate::capabilities::CapabilityId::Mbx),
-                        placement,
-                        monitor,
-                    },
-                    events,
-                )
+                shells
+                    .spawn(
+                        super::shell_job::PooledSpawn {
+                            job_id: request.job_id,
+                            command,
+                            cwd,
+                            profile,
+                            read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
+                            workspace_mount: sandbox.workspace_mount.clone(),
+                            envrc_directory: shell_directory(sandbox),
+                            environment,
+                            caller: &request.env,
+                            grant_revision: request.authority.grant_revision,
+                            cpu: &request.cpu,
+                            mbx: sandbox
+                                .capabilities
+                                .active
+                                .contains(&crate::capabilities::CapabilityId::Mbx),
+                            placement,
+                            monitor,
+                        },
+                        events,
+                    )
+                    .await
             }
             PreparedSpawn::OneShot {
                 plan,
@@ -5890,7 +5893,7 @@ impl SupervisorActor {
                     job,
                     cpus,
                     priority,
-                } => self.reserve_hold(job, cpus, priority),
+                } => self.reserve_hold(job, cpus, priority).await,
                 Effect::Release { job } => {
                     self.holds.remove(&job);
                 }
@@ -5958,7 +5961,7 @@ impl SupervisorActor {
     /// canonical mbx environment of the sandbox it was admitted under, named by the job's
     /// repository and command ([`super::host_hold::reservation_name`]). A hold that cannot start
     /// is refused at once.
-    fn reserve_hold(
+    async fn reserve_hold(
         &mut self,
         job_id: JobId,
         cpus: std::num::NonZeroUsize,
@@ -5973,7 +5976,10 @@ impl SupervisorActor {
             &sandbox.capabilities.contribution.env,
         );
         let name = super::host_hold::reservation_name(&pending.authority.repo_id, &pending.command);
-        match pool.reserve(job_id, &name, cpus, priority, self.events.clone()) {
+        match pool
+            .reserve(job_id, &name, cpus, priority, self.events.clone())
+            .await
+        {
             Ok(hold) => {
                 self.holds.insert(job_id, hold);
             }

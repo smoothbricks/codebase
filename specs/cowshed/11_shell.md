@@ -851,9 +851,13 @@ stale, and only a job it does not publish is judged through the actor. Each call
 a read, the kill below) is made in one turn of its actor under the authority it serves then, so a grant advance during
 the hold changes nothing. Measured 2026-11-11: a land gate died when its hold, judged through the actor, waited out the
 5 s bound behind the spawn turn of the job it held, which sat 12 s in one `stat` of the store's main image at load 128
-on 18 cores. It then answers the job's terminal `JobInfo` when the job ends, or `null` again when the client sends the
-demand `release`, which lets the job outlive the connection. A connection that closes before either has left a running
-job with nobody waiting for it: the supervisor kills it under the authority it serves then, and says so on its stderr.
+on 18 cores. No fork-lock acquisition or child spawn runs on a supervisor's or gateway's runtime thread either: the
+runtime stops for as long as one waits, and a client's `wait` reads that silence as `SILENT` (05_gateway.md,
+"Deadlines"; measured 2026-11-25 on `bun-main-pin`'s land: 17 s between a job's admission and its host's spawn, with
+zero heartbeats). It then answers the job's terminal `JobInfo` when the job ends, or `null` again when the client sends
+the demand `release`, which lets the job outlive the connection. A connection that closes before either has left a
+running job with nobody waiting for it: the supervisor kills it under the authority it serves then, and says so on its
+stderr.
 
 - **hello** — the supervisor answers with its build, the authority it serves (repository, workspace, incarnation, grant
   and lifecycle revisions) and its pid. The authority is the one its actor last published (05_gateway.md, "Deadlines"),

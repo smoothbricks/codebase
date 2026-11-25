@@ -15,7 +15,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::process::ExitStatusExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -169,32 +169,48 @@ impl WorkspaceShells {
             .fold(self.retired, |sum, (_, pool)| sum + pool.counts())
     }
 
-    pub(super) fn spawn(
+    pub(super) async fn spawn(
         &mut self,
         spawn: PooledSpawn<'_>,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
-        let base = spawn.environment.base();
+        let PooledSpawn {
+            job_id,
+            command,
+            cwd,
+            profile,
+            read_only,
+            workspace_mount,
+            envrc_directory,
+            environment,
+            caller,
+            grant_revision,
+            cpu,
+            mbx,
+            placement,
+            monitor,
+        } = spawn;
+        let base = environment.base();
         let key = pool_key(
-            spawn.profile.planned(),
+            profile.planned(),
             &base,
-            spawn.envrc_directory.as_deref(),
-            spawn.grant_revision,
+            envrc_directory.as_deref(),
+            grant_revision,
             &self.program,
         );
-        let family = (spawn.read_only, spawn.envrc_directory.clone());
+        let family = (read_only, envrc_directory.clone());
         let pool = match self.pools.get(&family) {
             Some((current, pool)) if *current == key => pool.clone(),
             _ => {
                 let pool = ShellPool::start(
                     Arc::new(HostActivator {
                         program: self.program.clone(),
-                        workspace_mount: spawn.workspace_mount.clone(),
-                        profile: spawn.profile.clone(),
-                        read_only: spawn.read_only,
+                        workspace_mount,
+                        profile: profile.clone(),
+                        read_only,
                         environment: base,
-                        shared_daemons: spawn.environment.shared_daemons.clone(),
-                        envrc_directory: spawn.envrc_directory.clone(),
+                        shared_daemons: environment.shared_daemons.clone(),
+                        envrc_directory,
                         activation: Arc::clone(&self.activation),
                     }),
                     self.config,
@@ -207,12 +223,25 @@ impl WorkspaceShells {
             }
         };
         // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
-        let mut overlay = spawn.environment.overlay(spawn.caller);
-        overlay.extend(spawn.cpu.environment(spawn.caller, spawn.mbx));
-        let (stdin_read, stdin_write) = pipe().map_err(pipe_error)?;
-        let (stdout_read, stdout_write) = pipe().map_err(pipe_error)?;
-        let (stderr_read, stderr_write) = pipe().map_err(pipe_error)?;
-        let job_id = spawn.job_id;
+        let mut overlay = environment.overlay(caller);
+        overlay.extend(cpu.environment(caller, mbx));
+        let (stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) =
+            tokio::task::spawn_blocking(|| -> io::Result<_> {
+                let (stdin_read, stdin_write) = pipe()?;
+                let (stdout_read, stdout_write) = pipe()?;
+                let (stderr_read, stderr_write) = pipe()?;
+                Ok((
+                    stdin_read,
+                    stdin_write,
+                    stdout_read,
+                    stdout_write,
+                    stderr_read,
+                    stderr_write,
+                ))
+            })
+            .await
+            .map_err(|error| CowshedError::internal(format!("job pipe task failed: {error}")))?
+            .map_err(pipe_error)?;
         let stdout =
             tokio::net::unix::pipe::Receiver::from_owned_fd(stdout_read).map_err(pipe_error)?;
         let stderr =
@@ -238,7 +267,7 @@ impl WorkspaceShells {
             stderr,
             events.clone(),
         ));
-        let control = Arc::new(JobControl::new(spawn.placement.membership().cloned()));
+        let control = Arc::new(JobControl::new(placement.membership().cloned()));
         let (release, released) = oneshot::channel();
         tokio::spawn(drive(
             pool,
@@ -248,11 +277,11 @@ impl WorkspaceShells {
                 stderr: stderr_write,
             },
             RunCommand {
-                command: spawn.command,
-                cwd: spawn.cwd,
+                command,
+                cwd,
                 overlay,
-                placement: spawn.placement,
-                monitor: spawn.monitor.clone(),
+                placement,
+                monitor: monitor.clone(),
             },
             Arc::clone(&control),
             released,
@@ -263,7 +292,7 @@ impl WorkspaceShells {
             stdin: StdinLane::new(stdin_sender),
             control,
             _release: release,
-            monitor: spawn.monitor,
+            monitor,
         }))
     }
 }
@@ -930,7 +959,10 @@ impl ExecHost {
             })
             .and_then(FrameWriter::finish)
             .map_err(|error| protocol_error("request", error))?;
-        let handoff = platform::Handoff::prepare(&command.placement)?;
+        let placement = command.placement.clone();
+        let handoff = tokio::task::spawn_blocking(move || platform::Handoff::prepare(&placement))
+            .await
+            .map_err(|error| CowshedError::internal(format!("handoff task failed: {error}")))??;
         let raw = handoff.descriptors(descriptors.each_ref().map(AsRawFd::as_raw_fd));
         self.send(frame, &raw).await?;
         drop(descriptors);
@@ -1227,65 +1259,71 @@ impl HostActivator {
     async fn spawn_host(&self) -> Result<ExecHost> {
         let mount = self.workspace_mount.clone();
         let program = self.program.clone();
-        let staged = tokio::task::spawn_blocking(move || stage_host_executable(&mount, &program))
-            .await
-            .map_err(|error| CowshedError::internal(format!("staging task failed: {error}")))??;
-        let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(pipe_error)?;
-        let theirs_raw = theirs.as_raw_fd();
-        let launcher = crate::sandbox::launcher().map_err(|error| error.report())?;
-        let mut command = tokio::process::Command::new(launcher.program());
-        command
-            .args(self.profile.launch()?.args(launcher))
-            .arg(&staged)
-            .args(self.program.arguments())
-            .env_clear()
-            .envs(&self.environment)
-            .env("PWD", self.home())
-            .current_dir(self.home())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        prepare_child_descriptors(command.as_std_mut())
-            .map_err(ExecError::from)
-            .map_err(super::supervisor::map_exec_error)?;
-        // SAFETY: runs between fork and exec; setpgid, dup2 and fcntl are async-signal-safe and
-        // touch no memory the closure captures beyond one integer. The host leads its own group
-        // so a command's group kill never reaches it, and a kill during activation reaches the
-        // direnv/nix processes it started. `prepare_child_descriptors` above marked every
-        // non-stdio descriptor close-on-exec; dup2 yields a descriptor 3 without that flag.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                let installed = if theirs_raw == super::shell_host::CONTROL_DESCRIPTOR {
-                    libc::fcntl(theirs_raw, libc::F_SETFD, 0)
-                } else {
-                    libc::dup2(theirs_raw, super::shell_host::CONTROL_DESCRIPTOR)
-                };
-                if installed == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        // Through `std`: this process alone reaps the host, inside its fence ([`ChildFence`]).
-        let child = command
-            .into_std()
-            .spawn_locked()
-            .map_err(classify_spawn_error)
-            .map_err(ExecError::from)
-            .map_err(super::supervisor::map_exec_error)?;
-        drop(theirs);
-        let spawned = Instant::now();
-        let fence = ChildFence::new(child.id())?;
-        let process = OwnedProcess {
-            birth: fence.birth().clone(),
-            spawned,
-            host: crate::host_load::read_host_load(),
-        };
-        ours.set_nonblocking(true).map_err(pipe_error)?;
+        let profile = self.profile.clone();
+        let environment = self.environment.clone();
+        let home = self.home().to_path_buf();
+        let (ours, spawned, process) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let staged = stage_host_executable(&mount, &program)?;
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(pipe_error)?;
+            let theirs_raw = theirs.as_raw_fd();
+            let launcher = crate::sandbox::launcher().map_err(|error| error.report())?;
+            let mut command = std::process::Command::new(launcher.program());
+            command
+                .args(profile.launch()?.args(launcher))
+                .arg(&staged)
+                .args(program.arguments())
+                .env_clear()
+                .envs(&environment)
+                .env("PWD", &home)
+                .current_dir(&home)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            prepare_child_descriptors(&mut command)
+                .map_err(ExecError::from)
+                .map_err(super::supervisor::map_exec_error)?;
+            // SAFETY: runs between fork and exec; setpgid, dup2 and fcntl are async-signal-safe
+            // and touch no memory the closure captures beyond one integer. The host leads its own
+            // group so a command's group kill never reaches it, and a kill during activation
+            // reaches the direnv/nix processes it started. `prepare_child_descriptors` above
+            // marked every non-stdio descriptor close-on-exec; dup2 yields a descriptor 3 without
+            // that flag.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setpgid(0, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let installed = if theirs_raw == super::shell_host::CONTROL_DESCRIPTOR {
+                        libc::fcntl(theirs_raw, libc::F_SETFD, 0)
+                    } else {
+                        libc::dup2(theirs_raw, super::shell_host::CONTROL_DESCRIPTOR)
+                    };
+                    if installed == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            // Through `std`: this process alone reaps the host, inside its fence ([`ChildFence`]).
+            let child = command
+                .spawn_locked()
+                .map_err(classify_spawn_error)
+                .map_err(ExecError::from)
+                .map_err(super::supervisor::map_exec_error)?;
+            drop(theirs);
+            let spawned = super::supervisor::Spawned::new(child, None)?;
+            let process = OwnedProcess {
+                birth: spawned.fence().birth().clone(),
+                spawned: spawned.at,
+                host: crate::host_load::read_host_load(),
+            };
+            ours.set_nonblocking(true).map_err(pipe_error)?;
+            Ok((ours, spawned, process))
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("host spawn task failed: {error}")))??;
         let control = tokio::net::UnixStream::from_std(ours).map_err(pipe_error)?;
+        let fence = spawned.adopt();
         Ok(ExecHost {
             fence,
             process,
@@ -1378,7 +1416,7 @@ impl HostActivator {
             Err(error) => return HostActivation::Broken(protocol_error("request", error)),
         };
         // The evaluation writes to the job's stderr through a tee that keeps its last line.
-        let (evaluation_stderr, mut tee) = match Tee::new(stderr_lane) {
+        let (evaluation_stderr, mut tee) = match Tee::new(stderr_lane).await {
             Ok(tee) => tee,
             Err(error) => return HostActivation::Broken(pipe_error(error)),
         };

@@ -375,45 +375,57 @@ async fn run_fetch_helper(
     executable: &Path,
     plan: RepoFetchPlan,
 ) -> Result<RepoFetchOutcome, RepoMirrorError> {
-    validate_helper_executable(executable)?;
-    let git = resolve_git_executable().ok_or(RepoMirrorError::HelperUnavailable)?;
-    if !validate_git_executable(&git) {
-        return Err(RepoMirrorError::HelperUnavailable);
-    }
-    let allowed_root = plan
-        .destination
-        .parent()
-        .ok_or(RepoMirrorError::HelperUnavailable)?;
-    let credential = plan
-        .credential
-        .as_ref()
-        .map(|credential| HelperCredentialOut {
+    let RepoFetchPlan {
+        remote,
+        destination,
+        credential,
+        cancellation,
+    } = plan;
+    let executable = executable.to_path_buf();
+    let destination_for_spawn = destination.clone();
+    let handle = tokio::runtime::Handle::current();
+    let (mut child, encoded) = tokio::task::spawn_blocking(move || {
+        validate_helper_executable(&executable)?;
+        let git = resolve_git_executable().ok_or(RepoMirrorError::HelperUnavailable)?;
+        if !validate_git_executable(&git) {
+            return Err(RepoMirrorError::HelperUnavailable);
+        }
+        let allowed_root = destination_for_spawn
+            .parent()
+            .ok_or(RepoMirrorError::HelperUnavailable)?;
+        let credential = credential.as_ref().map(|credential| HelperCredentialOut {
             header_name: &credential.header_name,
             header_value: credential.header_value.as_str(),
         });
-    let request = HelperRequestOut {
-        version: 1,
-        remote: &plan.remote,
-        destination: &plan.destination,
-        allowed_root,
-        git_executable: &git,
-        credential,
-    };
-    let encoded =
-        Zeroizing::new(serde_json::to_vec(&request).map_err(|_| RepoMirrorError::HelperProtocol)?);
-    if encoded.len() > MAX_HELPER_FRAME as usize {
-        return Err(RepoMirrorError::HelperProtocol);
-    }
-    let mut child = Command::new(executable)
-        .arg(GATEWAY_GIT_FETCH_HELPER_ARG)
-        .current_dir(allowed_root)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn_locked()
-        .map_err(|_| RepoMirrorError::HelperUnavailable)?;
+        let request = HelperRequestOut {
+            version: 1,
+            remote: &remote,
+            destination: &destination_for_spawn,
+            allowed_root,
+            git_executable: &git,
+            credential,
+        };
+        let encoded = Zeroizing::new(
+            serde_json::to_vec(&request).map_err(|_| RepoMirrorError::HelperProtocol)?,
+        );
+        if encoded.len() > MAX_HELPER_FRAME as usize {
+            return Err(RepoMirrorError::HelperProtocol);
+        }
+        let _enter = handle.enter();
+        let child = Command::new(&executable)
+            .arg(GATEWAY_GIT_FETCH_HELPER_ARG)
+            .current_dir(allowed_root)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .map_err(|_| RepoMirrorError::HelperUnavailable)?;
+        Ok::<_, RepoMirrorError>((child, encoded))
+    })
+    .await
+    .map_err(|_| RepoMirrorError::HelperUnavailable)??;
     let mut stdin = child.stdin.take().ok_or(RepoMirrorError::HelperProtocol)?;
     let stdout = child.stdout.take().ok_or(RepoMirrorError::HelperProtocol)?;
     let writer = tokio::spawn(async move {
@@ -432,7 +444,7 @@ async fn run_fetch_helper(
     #[allow(clippy::disallowed_methods)]
     let status = tokio::select! {
         status = child.wait() => status.map_err(|_| RepoMirrorError::FetchFailed)?,
-        _ = plan.cancellation.cancelled() => {
+        _ = cancellation.cancelled() => {
             // A helper that already exited refuses the signal; the reap answers for it either way.
             // A helper that already exited refuses the signal; the reap answers for it either way. One
             // whose reap expires is dropped: kill_on_drop and tokio's orphan reaper collect it
@@ -455,7 +467,7 @@ async fn run_fetch_helper(
             }
             writer.abort();
             reader.abort();
-            remove_tree(&plan.destination);
+            remove_tree(&destination);
             return Err(RepoMirrorError::Cancelled);
         }
     };
@@ -468,13 +480,13 @@ async fn run_fetch_helper(
         .map_err(|_| RepoMirrorError::FetchFailed)?
         .map_err(|_| RepoMirrorError::FetchFailed)?;
     if !status.success() || response.is_empty() || response.len() > MAX_HELPER_FRAME as usize {
-        remove_tree(&plan.destination);
+        remove_tree(&destination);
         return Err(RepoMirrorError::FetchFailed);
     }
     let response: HelperResponse =
         serde_json::from_slice(&response).map_err(|_| RepoMirrorError::HelperProtocol)?;
     if !response.ok {
-        remove_tree(&plan.destination);
+        remove_tree(&destination);
         return Err(RepoMirrorError::FetchFailed);
     }
     Ok(RepoFetchOutcome::Fetched {

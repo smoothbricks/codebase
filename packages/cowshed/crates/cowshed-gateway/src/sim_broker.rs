@@ -7,7 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 #[cfg(target_os = "macos")]
-use cowshed_os::fork_lock::RunAsync as _;
+use cowshed_os::fork_lock::Spawn as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -121,13 +121,26 @@ impl SimRunner for XcrunSimRunner {
                 process.arg("boot").arg(device);
             }
         }
-        process.kill_on_drop(true);
-        // WHY unbounded: the 120 s timeout around it ends it, and `kill_on_drop` ends the runner.
-        #[allow(clippy::disallowed_methods)]
-        let output = timeout(Duration::from_secs(120), process.output_locked())
+        process
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let handle = tokio::runtime::Handle::current();
+        let output = timeout(Duration::from_secs(120), async move {
+            let child = tokio::task::spawn_blocking(move || {
+                let _enter = handle.enter();
+                process.spawn_locked()
+            })
             .await
-            .map_err(|_| SimBrokerError::RunnerTimeout)?
-            .map_err(|_| SimBrokerError::RunnerFailed)?;
+            .map_err(|_| std::io::Error::other("simulator spawn task failed"))??;
+            // WHY unbounded: the 120 s timeout around it ends it, and `kill_on_drop` ends the runner.
+            #[allow(clippy::disallowed_methods)]
+            child.wait_with_output().await
+        })
+        .await
+        .map_err(|_| SimBrokerError::RunnerTimeout)?
+        .map_err(|_| SimBrokerError::RunnerFailed)?;
         if !output.status.success() || output.stdout.len() > MAX_DEVICE_OUTPUT {
             return Err(SimBrokerError::RunnerFailed);
         }

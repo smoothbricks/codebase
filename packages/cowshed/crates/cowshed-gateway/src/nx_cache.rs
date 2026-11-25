@@ -271,8 +271,6 @@ pub(crate) async fn start_backend(
     config: &NxCacheServiceConfig,
     repo_id: &str,
 ) -> Result<(NxCacheBackend, tokio::process::Child), String> {
-    use cowshed_os::fork_lock::Spawn as _;
-    use std::{os::unix::fs::DirBuilderExt as _, process::Stdio};
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 
     cowshed_gateway_types::validate_repo_id(repo_id)
@@ -287,54 +285,65 @@ pub(crate) async fn start_backend(
                 .to_owned(),
         );
     }
-    // A missing interpreter is a setup fault, said as one: nothing beside cowshed stands in.
-    let bun = bun_on_path(&config.path).ok_or_else(|| {
-        format!(
-            "Nx cache backend {repo_id}: no bun on the gateway's PATH {}; run `cowshed setup` from a shell whose PATH has bun (devenv provides it)",
-            std::path::Path::new(&config.path).display()
-        )
-    })?;
-    let project = project_store(&config.directory, repo_id);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&project)
-        .map_err(|error| format!("create project Nx cache {}: {error}", project.display()))?;
-    for path in [&config.directory, &project] {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|error| format!("inspect Nx cache {}: {error}", path.display()))?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(format!(
-                "Nx cache {} must be a host-owned private directory",
-                path.display()
-            ));
-        }
-    }
-    let mut child = tokio::process::Command::new(&bun)
-        .arg(&config.script)
-        .arg("--exit-on-stdin-eof")
-        .env_clear()
-        .env("NX_CACHE_SERVER_DIR", project.join("entries"))
-        .env("NX_CACHE_SERVER_PORT", "0")
-        .env("NX_CACHE_SERVER_MAX_BYTES", config.max_bytes.to_string())
-        .env("NX_CACHE_SERVER_CAP_BYTES", config.cap_bytes.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn_locked()
-        .map_err(|error| {
+    let config = config.clone();
+    let repo = repo_id.to_owned();
+    let handle = tokio::runtime::Handle::current();
+    let mut child = tokio::task::spawn_blocking(move || -> Result<tokio::process::Child, String> {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::{os::unix::fs::DirBuilderExt as _, process::Stdio};
+
+        // A missing interpreter is a setup fault, said as one: nothing beside cowshed stands in.
+        let bun = bun_on_path(&config.path).ok_or_else(|| {
             format!(
-                "start Nx cache {} {}: {error}",
-                bun.display(),
-                config.script.display()
+                "Nx cache backend {repo}: no bun on the gateway's PATH {}; run `cowshed setup` from a shell whose PATH has bun (devenv provides it)",
+                std::path::Path::new(&config.path).display()
             )
         })?;
+        let project = project_store(&config.directory, &repo);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&project)
+            .map_err(|error| format!("create project Nx cache {}: {error}", project.display()))?;
+        for path in [&config.directory, &project] {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| format!("inspect Nx cache {}: {error}", path.display()))?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(format!(
+                    "Nx cache {} must be a host-owned private directory",
+                    path.display()
+                ));
+            }
+        }
+        let _enter = handle.enter();
+        tokio::process::Command::new(&bun)
+            .arg(&config.script)
+            .arg("--exit-on-stdin-eof")
+            .env_clear()
+            .env("NX_CACHE_SERVER_DIR", project.join("entries"))
+            .env("NX_CACHE_SERVER_PORT", "0")
+            .env("NX_CACHE_SERVER_MAX_BYTES", config.max_bytes.to_string())
+            .env("NX_CACHE_SERVER_CAP_BYTES", config.cap_bytes.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .map_err(|error| {
+                format!(
+                    "start Nx cache {} {}: {error}",
+                    bun.display(),
+                    config.script.display()
+                )
+            })
+    })
+    .await
+    .map_err(|error| format!("Nx cache backend {repo_id} spawn task failed: {error}"))??;
     let stdout = child
         .stdout
         .take()

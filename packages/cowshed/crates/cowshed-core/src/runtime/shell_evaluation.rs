@@ -337,18 +337,24 @@ pub(super) struct Tee {
 
 impl Tee {
     /// A pipe whose write end is the evaluation's stderr, and the tee that forwards its read end
-    /// onto the job's stderr lane (`None` for a spare).
-    pub(super) fn new(job: Option<JobStderr>) -> io::Result<(OwnedFd, Self)> {
-        let (read, write) = super::pipe()?;
-        // SAFETY: fcntl on a descriptor this function owns; only its own flags change.
-        let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
-        // SAFETY: as above.
-        if flags == -1
-            || unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
-                == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
+    /// onto the job's stderr lane (`None` for a spare). Pipe creation runs on the blocking pool
+    /// because Darwin acquires the exclusive fork lock around `pipe` + `FD_CLOEXEC`.
+    pub(super) async fn new(job: Option<JobStderr>) -> io::Result<(OwnedFd, Self)> {
+        let (read, write) = tokio::task::spawn_blocking(|| {
+            let (read, write) = super::pipe()?;
+            // SAFETY: fcntl on a descriptor this function owns; only its own flags change.
+            let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+            // SAFETY: as above.
+            if flags == -1
+                || unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                    == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((read, write))
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("evaluation tee pipe task failed: {error}")))??;
         let tee = Self {
             pipe: AsyncFd::new(std::fs::File::from(read))?,
             job,
@@ -587,7 +593,7 @@ mod tests {
                 });
 
                 let lane = super::super::JobStderr::from_file(std::fs::File::from(job_write));
-                let (eval_write, mut tee) = super::Tee::new(Some(lane)).expect("tee");
+                let (eval_write, mut tee) = super::Tee::new(Some(lane)).await.expect("tee");
 
                 let producer = std::thread::spawn(move || {
                     let mut eval_stderr = std::fs::File::from(eval_write);
@@ -645,7 +651,7 @@ mod tests {
             runtime.block_on(async move {
                 let (job_read, job_write) = super::super::pipe().expect("job stderr pipe");
                 let lane = super::super::JobStderr::from_file(std::fs::File::from(job_write));
-                let (eval_write, mut tee) = super::Tee::new(Some(lane)).expect("tee");
+                let (eval_write, mut tee) = super::Tee::new(Some(lane)).await.expect("tee");
 
                 let producer = std::thread::spawn(move || {
                     let mut eval_stderr = std::fs::File::from(eval_write);
