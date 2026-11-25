@@ -13784,7 +13784,7 @@ s.recv(16)
             let reaped_wait = Arc::clone(&reaped);
             let job_id = request.job_id;
             tokio::task::spawn_blocking(move || {
-                let exit = match child.wait() {
+                let exit = match child.wait_bounded() {
                     Ok(status) => {
                         reaped_wait.store(true, std::sync::atomic::Ordering::Release);
                         if let Some(code) = status.code() {

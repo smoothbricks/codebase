@@ -917,7 +917,7 @@ impl JobCells {
             RowKind::GatePriority(GatePriorityRow::DarwinBgUnconfirmed { pid }) => {
                 (None, None, Some(pid))
             }
-            RowKind::GatePriority(GatePriorityRow::DarwinBgCleared) | _ => (None, None, None),
+            _ => (None, None, None),
         };
         let span = SpanAddress {
             thread_id: job_span_thread(&row.repo_id, &row.workspace_incarnation, row.job_id),

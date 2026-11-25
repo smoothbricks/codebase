@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use cowshed_os::deadline;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::api::dto::{ExecClass, JobId};
@@ -255,8 +254,10 @@ async fn run_watch_loop(
     let mut backoff = Duration::from_millis(100);
     let max_backoff = deadline::HEARTBEAT;
 
+    let peer = deadline::Peer::unix("gateway", &gateway_socket);
     loop {
-        match UnixStream::connect(&gateway_socket).await {
+        let connect_deadline = deadline::start("gate-watch", deadline::HANDSHAKE);
+        match deadline::connect_unix(&connect_deadline, &peer, &gateway_socket).await {
             Ok(stream) => {
                 let (reader, mut writer) = stream.into_split();
                 let open = GateWatchOpen::new(ledger.clone());

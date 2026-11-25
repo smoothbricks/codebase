@@ -553,7 +553,8 @@ async fn real_gateway_clears_darwinbg_from_ledger_on_watch_eof() {
 
     // Open a second observer `gate-watch` stream so we observe the exact `active: false`
     // transition that fires after the dead supervisor's EOF handler clears `PRIO_DARWIN_BG`.
-    let observer = UnixStream::connect(&socket).await.unwrap();
+    use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
+    let observer = UnixStream::connect_bounded(&socket).await.unwrap();
     let (obs_reader, mut obs_writer) = observer.into_split();
     let mut obs_open = serde_json::to_vec(&GateWatchOpen::new(None)).unwrap();
     obs_open.push(b'\n');
@@ -568,7 +569,7 @@ async fn real_gateway_clears_darwinbg_from_ledger_on_watch_eof() {
 
     // Connect `gate-watch` for the dead supervisor, register a gate job so EOF produces a
     // deterministic `active: false` event on `observer`, then close (EOF).
-    let stream = UnixStream::connect(&socket).await.unwrap();
+    let stream = UnixStream::connect_bounded(&socket).await.unwrap();
     let (reader, mut writer) = stream.into_split();
     let mut open = serde_json::to_vec(&GateWatchOpen::new(Some(ledger))).unwrap();
     open.push(b'\n');
