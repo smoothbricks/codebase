@@ -34,7 +34,7 @@ pub use platform::{
 // group only to a census of `/proc`, so procinfo offers no group facts there: cowshed's Linux job
 // runner reads its own (cowshed-os) and a job's cgroup.
 #[cfg(target_os = "macos")]
-pub use macos::{group_cpu, group_members, group_pids};
+pub use macos::{group_cpu, group_members, group_pids, thread_max_priorities};
 // What a Linux census of a process group or a cgroup reads of each pid it lists: the running
 // processes among the pids, and the lineage of one with its stat line.
 #[cfg(target_os = "linux")]

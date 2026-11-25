@@ -257,9 +257,84 @@ pub fn run_state(pid: libc::pid_t) -> RunState {
     darwin_run_state(pid).unwrap_or_else(|error| RunState::Unread(error.to_string()))
 }
 
+/// xnu `bsd/sys/proc_info.h`: the thread handles of a process, one `u64` each.
+const PROC_PIDLISTTHREADS: libc::c_int = 6;
+
+/// List every thread handle of `pid` (`PROC_PIDLISTTHREADS`), growing the buffer until every
+/// thread fits. Returns `Ok(None)` when no process holds `pid`.
+fn list_threads(pid: libc::pid_t) -> io::Result<Option<Vec<u64>>> {
+    let mut threads = vec![0_u64; 64];
+    loop {
+        let capacity = libc::c_int::try_from(std::mem::size_of_val(threads.as_slice()))
+            .map_err(io::Error::other)?;
+        // SAFETY: `threads` is writable storage of exactly `capacity` bytes.
+        let listed = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                threads.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        if listed <= 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ESRCH) => Ok(None),
+                _ => Err(error),
+            };
+        }
+        if listed < capacity {
+            let count =
+                usize::try_from(listed).map_err(io::Error::other)? / std::mem::size_of::<u64>();
+            threads.truncate(count);
+            return Ok(Some(threads));
+        }
+        threads.resize(threads.len() * 2, 0);
+    }
+}
+
+/// Read `PROC_PIDTHREADINFO` for one thread handle of `pid`; `None` if the thread ended since it
+/// was listed.
+fn thread_info(pid: libc::pid_t, thread: u64) -> io::Result<Option<libc::proc_threadinfo>> {
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>())
+        .map_err(io::Error::other)?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::zeroed();
+    // SAFETY: `info` is writable storage of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTHREADINFO,
+            thread,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return Ok(None);
+    }
+    // SAFETY: proc_pidinfo filled all `size` bytes.
+    Ok(Some(unsafe { info.assume_init() }))
+}
+
+/// The kernel priority ceiling (`pth_maxpriority` from `PROC_PIDTHREADINFO`) of every live thread
+/// of `pid`: `4` while `PRIO_DARWIN_BG` is set on the process, `63` once cleared (05_gateway.md
+/// "On macOS the order between classes is admission, not OS priority", "Read back, never assumed").
+/// Returns `Ok(None)` when no process holds `pid`.
+pub fn thread_max_priorities(pid: libc::pid_t) -> io::Result<Option<Vec<i32>>> {
+    let Some(threads) = list_threads(pid)? else {
+        return Ok(None);
+    };
+    let mut ceilings = Vec::with_capacity(threads.len());
+    for thread in threads {
+        if let Some(info) = thread_info(pid, thread)? {
+            ceilings.push(info.pth_maxpriority);
+        }
+    }
+    Ok(Some(ceilings))
+}
+
 fn darwin_run_state(pid: libc::pid_t) -> io::Result<RunState> {
-    // xnu `bsd/sys/proc_info.h`: the thread handles of a process, one `u64` each.
-    const PROC_PIDLISTTHREADS: libc::c_int = 6;
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .map_err(io::Error::other)?;
@@ -294,54 +369,16 @@ fn darwin_run_state(pid: libc::pid_t) -> io::Result<RunState> {
         libc::SSTOP => return Ok(RunState::Stopped),
         _ => {}
     }
-    // The kernel copies as many thread handles as fit: a full buffer may have left some out.
-    let mut threads = vec![0_u64; 64];
-    let count = loop {
-        let capacity = libc::c_int::try_from(std::mem::size_of_val(threads.as_slice()))
-            .map_err(io::Error::other)?;
-        // SAFETY: `threads` is writable storage of exactly `capacity` bytes.
-        let listed = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                PROC_PIDLISTTHREADS,
-                0,
-                threads.as_mut_ptr().cast(),
-                capacity,
-            )
-        };
-        if listed <= 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(libc::ESRCH) => Ok(RunState::Gone),
-                _ => Err(error),
-            };
-        }
-        if listed < capacity {
-            break usize::try_from(listed).map_err(io::Error::other)? / std::mem::size_of::<u64>();
-        }
-        threads.resize(threads.len() * 2, 0);
+    let Some(threads) = list_threads(pid)? else {
+        return Ok(RunState::Gone);
     };
-    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>())
-        .map_err(io::Error::other)?;
     let mut uninterruptible = false;
-    for &thread in threads.iter().take(count) {
-        let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::zeroed();
-        // SAFETY: `info` is writable storage of exactly `size` bytes.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTHREADINFO,
-                thread,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        // A thread that ended since it was listed says nothing.
-        if written != size {
+    for thread in threads {
+        let Some(info) = thread_info(pid, thread)? else {
+            // A thread that ended since it was listed says nothing.
             continue;
-        }
-        // SAFETY: proc_pidinfo filled all `size` bytes.
-        match unsafe { info.assume_init() }.pth_run_state {
+        };
+        match info.pth_run_state {
             libc::TH_STATE_RUNNING => return Ok(RunState::Running),
             libc::TH_STATE_UNINTERRUPTIBLE => uninterruptible = true,
             _ => {}
@@ -1452,5 +1489,50 @@ mod tests {
             drop(stdin);
             assert!(child.wait().unwrap().success());
         }
+    }
+
+    /// `PROC_PIDTHREADINFO` reports `pth_maxpriority` 63 on a normal child and 4 while
+    /// `PRIO_DARWIN_BG` is set on it, returning to 63 once cleared.
+    #[test]
+    fn thread_max_priorities_reads_back_darwin_bg() {
+        use std::io::Read as _;
+        let mut child = crate::test_support::SpawnReaped::spawn_reaped(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "printf r; read line; exit 0"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped()),
+        )
+        .expect("spawn");
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let normal = thread_max_priorities(pid).unwrap().expect("child runs");
+        assert!(!normal.is_empty());
+        assert!(normal.iter().all(|&p| p == 63), "normal: {normal:?}");
+        // SAFETY: setting PRIO_DARWIN_BG on our own live child.
+        assert_eq!(
+            unsafe {
+                libc::setpriority(libc::PRIO_DARWIN_PROCESS, child.id(), libc::PRIO_DARWIN_BG)
+            },
+            0
+        );
+        let bg = thread_max_priorities(pid).unwrap().expect("child runs");
+        assert!(!bg.is_empty());
+        assert!(bg.iter().all(|&p| p == 4), "backgrounded: {bg:?}");
+        // SAFETY: clearing PRIO_DARWIN_BG on our own live child.
+        assert_eq!(
+            unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, child.id(), 0) },
+            0
+        );
+        let cleared = thread_max_priorities(pid).unwrap().expect("child runs");
+        assert!(!cleared.is_empty());
+        assert!(cleared.iter().all(|&p| p == 63), "cleared: {cleared:?}");
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
     }
 }
