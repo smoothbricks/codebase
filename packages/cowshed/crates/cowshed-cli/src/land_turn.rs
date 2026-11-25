@@ -85,6 +85,7 @@ where
             workspace: args.workspace.clone(),
             command: description,
             class: None,
+            resumable: true,
         },
         args.outside_lock.clone(),
         output,
@@ -94,10 +95,23 @@ where
     // on reaches the child, and the turn is held until the child ends.
     let mut interrupts = policy.arm_forwarding();
 
+    // Ensure the turn is active (not mid-fence/restart) and defer any fence ack until bound.
+    let _bind_guard = match turn.prepare_bind().await {
+        Ok(guard) => guard,
+        Err(loss) => {
+            let _ = turn.end(format!("did not start: {loss}"));
+            return Err(CowshedError::environment_missing(
+                format!("land turn {} was lost: {loss}", args.repo),
+                "check the host gateway (`cowshed gateway status`), then land again",
+            ));
+        }
+    };
+
     // The child inherits the outside lock's descriptor and binds itself to the turn as it starts.
     let held = match command.spawn(turn.outside_descriptor().into_iter().collect(), Some(&turn)) {
         Ok(held) => held,
         Err(error) => {
+            drop(_bind_guard);
             if let Some(loss) = turn.loss() {
                 let _ = turn.end(format!("did not start: {loss}"));
                 return Err(CowshedError::environment_missing(
@@ -111,6 +125,7 @@ where
     };
     let program_name = held.name.clone();
     if let Err(error) = turn.bound(held.pid.unsigned_abs()).await {
+        drop(_bind_guard);
         // A command the turn does not hold must not run beside the next land: it is stopped.
         let (stopped, ended) = held.stop().await;
         let _ = turn.end(format!("stopped: the gateway did not bind it: {error}"));
@@ -123,6 +138,7 @@ where
             "start the host gateway (`cowshed gateway start`), then run it again",
         ));
     }
+    drop(_bind_guard);
     let (ended, relay) = held.wait_holding(&mut interrupts, &mut turn).await;
     // The turn ends with the child, never before it, recording how the child ended.
     let status = match ended {

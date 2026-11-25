@@ -1133,10 +1133,24 @@ impl ProcessRecord {
 /// ([`ProcessRecord::unique_id`]). An exec keeps the token, so a life is found again after one,
 /// while a [`Process`] held from before it may not be (macOS gives the pid a new version). On
 /// Linux the token is no identity without the pid, so the two are only ever compared together.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Life {
     pub(crate) pid: i32,
     pub(crate) unique_id: u64,
+}
+
+impl Life {
+    /// The process id of this life.
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+}
+
+/// The host's current boot session identifier, used to fence persisted process lives across
+/// reboots.
+pub fn current_boot_session() -> io::Result<String> {
+    platform::boot_session()
 }
 
 /// A process the trusted ledger proves is a job's own: a member of a recorded group whose
@@ -1224,6 +1238,11 @@ impl Process {
         Ok(self
             .watch_running()?
             .map_or(ProcessExit::Before, ProcessExit::Watching))
+    }
+
+    /// This process's persistent [`Life`] through any exec; `None` once it has exited.
+    pub fn life(&self) -> io::Result<Option<Life>> {
+        Ok(self.record()?.map(|record| record.life()))
     }
 }
 

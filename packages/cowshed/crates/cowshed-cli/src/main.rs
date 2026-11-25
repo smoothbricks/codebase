@@ -33,6 +33,11 @@ fn main() {
     if let Some(code) = cowshed_cli::land_after::dispatch() {
         std::process::exit(code);
     }
+    // A declared land whose gateway changed build mid-gate hands step 5 (fast-forward + retire) to
+    // the installed build with its recorded proof explicitly (02_workspaces.md step 5).
+    if let Some(code) = cowshed_cli::declared_land::dispatch_step5() {
+        std::process::exit(code);
+    }
     // Before the runtime starts any thread: this binary is also every workspace's warm
     // exec host, and in that role it never returns from here.
     cowshed_shell::dispatch();

@@ -212,6 +212,20 @@ impl<T: AsFd> Fenced<T> {
     pub fn create(make: impl FnOnce() -> io::Result<T>) -> io::Result<Self> {
         create(make).map(Self::new)
     }
+
+    /// Transform the wrapped descriptor type without closing the underlying OS descriptor (for
+    /// example, converting a `tokio::net::UnixStream` to a `std::os::unix::net::UnixStream` to
+    /// move it across runtimes). If `convert` fails, `T` is dropped inside `convert`.
+    pub fn try_map<U: AsFd, E>(
+        mut self,
+        convert: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<Fenced<U>, E> {
+        // SAFETY: `self.0` is taken once and `self` is forgotten so `Drop::drop` does not run on
+        // the moved-out value.
+        let inner = unsafe { ManuallyDrop::take(&mut self.0) };
+        std::mem::forget(self);
+        convert(inner).map(Fenced::new)
+    }
 }
 
 /// Make descriptors in two steps -- create, then mark close-on-exec -- under the exclusive lock,

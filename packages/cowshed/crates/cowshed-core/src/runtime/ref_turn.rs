@@ -71,6 +71,7 @@ impl RefTurn {
                 RefWriter::DocCommit => Some(TurnClass::Bounded),
                 RefWriter::Land { .. } => None,
             },
+            resumable: false,
         };
         let verb = writer.verb();
         let started = Instant::now();

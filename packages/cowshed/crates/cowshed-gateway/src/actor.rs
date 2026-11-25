@@ -352,6 +352,13 @@ impl Gateway {
         let cleanup = Arc::new(std::sync::OnceLock::new());
         let control = match &config.control_socket {
             Some(path) => {
+                let handoff = path
+                    .parent()
+                    .map(|dir| dir.join(crate::land_turn::HANDOFF_FILE_NAME));
+                let land_turns = crate::land_turn::LandTurns::start_adopted(
+                    handoff.as_deref(),
+                    config.bounded_turn_deadline,
+                );
                 match ControlRuntime::start(
                     path,
                     config.authorized_control_uid,
@@ -365,9 +372,7 @@ impl Gateway {
                         ram_leases: crate::ram_lease::Records::beside(path),
                         first_launch: config.first_launch.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
-                        land_turns: crate::land_turn::LandTurns::start_with_bounded_deadline(
-                            config.bounded_turn_deadline,
-                        ),
+                        land_turns,
                         task_server: crate::task_server::TaskServer::start(config.task_server),
                         cleanup: Arc::clone(&cleanup),
                     },
@@ -3448,6 +3453,7 @@ fn unlink_endpoint(endpoint: &WorkspaceEndpoint) {
 
 struct ControlRuntime {
     path: std::path::PathBuf,
+    land_turns: crate::land_turn::LandTurns,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -3529,6 +3535,7 @@ impl ControlRuntime {
         ));
         let capacity = 1024;
         let (stop, stopped) = watch::channel(false);
+        let land_turns = services.land_turns.clone();
         let unix_services = services.clone();
         let unix_stopped = stopped.clone();
         let unix_task = tokio::spawn(async move {
@@ -3550,13 +3557,23 @@ impl ControlRuntime {
         }
         Ok(Self {
             path: path.to_path_buf(),
+            land_turns,
             stop,
             tasks,
         })
     }
 
-    /// Stop serving: end every control connection and remove the socket.
+    /// Stop serving: freeze land turns and write any fenced handoff snapshot before ending control
+    /// connections, then remove the socket.
     async fn stop(mut self) {
+        if let Some(parent) = self.path.parent() {
+            let handoff = parent.join(crate::land_turn::HANDOFF_FILE_NAME);
+            if let Err(error) = self.land_turns.freeze_and_snapshot(handoff).await {
+                cowshed_os::eprintln!(
+                    "cowshed: land turns: could not write handoff snapshot during drain: {error}"
+                );
+            }
+        }
         let _ = self.stop.send(true);
         for task in self.tasks.drain(..) {
             let _ = task.await;

@@ -4569,6 +4569,7 @@ async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_subs
             workspace: "doc-commit".to_owned(),
             command: "git commit".to_owned(),
             class: None,
+            resumable: false,
         },
         None,
         Duration::from_secs(10),
@@ -9714,6 +9715,7 @@ async fn settled_land_turn(socket: &Path, turn: &str) -> Vec<cowshed_core::land_
                 workspace: "probe".to_owned(),
                 command: "probe".to_owned(),
                 class: None,
+                resumable: false,
             },
             None,
             Duration::from_secs(90),
@@ -10553,22 +10555,25 @@ async fn await_fenced_wait(
         .await
         .expect("send fence wait");
     let mut lines = BufReader::new(install).lines();
-    let mut saw_fenced = false;
-    while !saw_fenced {
-        let line = tokio::time::timeout(NO_PROGRESS, lines.next_line())
-            .await
-            .expect("waiting install must be fenced within one heartbeat")
-            .expect("read waiting install line")
-            .expect("waiting install connection closed before fencing");
-        let answer: serde_json::Value =
-            serde_json::from_str(&line).expect("parse waiting install answer");
-        if answer.get("progress").is_some() {
-            continue;
+    tokio::time::timeout(NO_PROGRESS, async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read waiting install line")
+                .expect("waiting install connection closed before fencing");
+            let answer: serde_json::Value =
+                serde_json::from_str(&line).expect("parse waiting install answer");
+            if answer.get("progress").is_some() {
+                continue;
+            }
+            if answer["fenced"] == serde_json::json!(true) {
+                break;
+            }
         }
-        if answer["fenced"] == serde_json::json!(true) {
-            saw_fenced = true;
-        }
-    }
+    })
+    .await
+    .expect("waiting install must be fenced within one heartbeat");
     lines
 }
 
@@ -10659,12 +10664,12 @@ async fn directory_a_declared_land_whose_daemon_changed_build_mid_gate_hands_ste
                  pids=[p for q in d.get(\"landTurns\",[]) for t in q.get(\"tickets\",[]) for p in t.get(\"bound\",[])]; \
                  open(sys.argv[2],\"w\").write(\"bound\" if os.getppid() in pids or os.getpid() in pids else \"unbound\")' \
                  '{sock}' '{bound}'\n\
-                 git -C '{main}' merge --ff-only '{head}' >/dev/null\n\
-                 exit 0\n",
+                 git -C '{main}' fetch -q '{topic}' '{head}' && git -C '{main}' merge --ff-only '{head}' >/dev/null\n",
                 argv = installed_argv.display(),
                 sock = socket.display(),
                 bound = bound_check.display(),
                 main = main.display(),
+                topic = topic.display(),
                 head = topic_head,
             ),
         )

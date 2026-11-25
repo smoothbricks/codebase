@@ -6105,6 +6105,7 @@ mod tests {
                     workspace: "widget-land".to_owned(),
                     command: "land".to_owned(),
                     class: None,
+                    resumable: false,
                 },
                 None,
                 Duration::from_secs(90),

@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
+use cowshed_os::test_backstop::{
+    ChildBackstop as _, CommandBackstop as _, UnixStreamBackstop as _,
+};
 
 use cowshed_core::api::dto::LandTurnQueue;
 
@@ -884,32 +886,26 @@ fn doc_commit_completes_behind_a_held_land_while_an_install_waits() {
     let repo = Repo::new("paths = [\"*.md\"]\n");
     let before = repo.head();
 
-    // Hold the repository's non-bounded land turn `<TURN>`.
-    let mut land = repo
-        .command(&[
-            "land-turn",
-            TURN,
-            "--gateway-socket",
-            repo.gateway.socket.to_str().unwrap(),
-            "--workspace",
-            "long-land",
-            "--",
-            "sh",
-            "-c",
-            "echo held && exec cat >/dev/null",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn land-turn holder");
-    let land_said = lines(land.stdout.take().expect("land stdout"));
-    assert_eq!(
-        land_said
-            .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
-            .expect("land holds its turn"),
-        "held"
-    );
+    // Hold the repository's non-bounded land turn `<TURN>` with a legacy (unfenced) ask so the
+    // waiting install genuinely waits (`w > 0, f = 0`) while `doc-commit` runs behind it.
+    let mut land = std::os::unix::net::UnixStream::connect_bounded(&repo.gateway.socket)
+        .expect("connect legacy land holder");
+    let ask = serde_json::json!({
+        "op": cowshed_core::land_turn::LAND_TURN_OP,
+        "repo": TURN,
+        "workspace": "long-land",
+        "command": "legacy land",
+    });
+    land.write_all(format!("{ask}\n").as_bytes())
+        .expect("send legacy land ask");
+    let mut land_reader = BufReader::new(land.try_clone().expect("clone legacy land stream"));
+    let mut held_line = String::new();
+    land_reader
+        .read_line(&mut held_line)
+        .expect("read legacy land answer");
+    let held: serde_json::Value =
+        serde_json::from_str(&held_line).expect("parse legacy land answer");
+    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
 
     // Start a waiting install behind that held land turn.
     let mut install = repo
@@ -956,8 +952,11 @@ fn doc_commit_completes_behind_a_held_land_while_an_install_waits() {
         "install must still be waiting on the held land turn"
     );
 
-    drop(land.stdin.take());
-    assert!(land.wait_bounded().expect("land exits").success());
+    land.write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+        .expect("end legacy land");
+    let _ = land.shutdown(std::net::Shutdown::Write);
+    let mut rest = String::new();
+    let _ = land_reader.read_to_string(&mut rest);
     assert!(install.wait_bounded().expect("install exits").success());
 }
 
@@ -1381,7 +1380,7 @@ fn doc_commit_put_back_after_loss_skips_path_rewritten_by_another_holder() {
             "#!/bin/sh\n\
              bg=\"\"\n\
              on_term() {{\n\
-                 if [ -n \"$bg\" ]; then kill \"$bg\" 2>/dev/null || true; fi\n\
+                 if [ -n \"$bg\" ]; then kill \"$bg\" 2>/dev/null || true; wait \"$bg\" 2>/dev/null || true; fi\n\
                  printf 'written by next holder\\n' > '{main}/docs/a.md'\n\
                  git -C '{main}' add docs/c.md\n\
                  touch -t 202311141313.20 '{main}/docs/b.md'\n\
@@ -1563,7 +1562,7 @@ fn a_land_turn_command_survives_an_await_turns_gateway_restart_and_a_doc_commit_
             "--",
             "sh",
             "-c",
-            "echo fenced && read line",
+            "echo fenced && exec cat >/dev/null",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

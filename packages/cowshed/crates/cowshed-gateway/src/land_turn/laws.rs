@@ -125,6 +125,7 @@ impl Pair {
                         command: format!("land {workspace}"),
                         workspace,
                         class: bounded.then_some(TurnClass::Bounded),
+                        resumable: false,
                     },
                     pid(*asker),
                     self.now_unix_ms,
@@ -163,9 +164,8 @@ impl Pair {
                 None
             }
             Op::TWaitLeave => {
-                if let Some(install) = self.waiting.pop_front() {
-                    self.turns.wait_left(install, self.now_unix_ms);
-                }
+                let install = self.waiting.pop_front().unwrap_or(u64::MAX);
+                self.turns.wait_left(install, self.now_unix_ms);
                 None
             }
             Op::TBind(number, p) => {
@@ -173,6 +173,7 @@ impl Pair {
                     Ok(_) => Bound::BGranted,
                     Err(BindRefusal::Gone) => Bound::BGone,
                     Err(BindRefusal::Waiting) => Bound::BWaiting,
+                    Err(BindRefusal::Fenced) => Bound::BFenced,
                 };
                 Some((model::find(*number, self.model_queue()), code))
             }
@@ -190,10 +191,14 @@ impl Pair {
                     .retain(|install| !settled.fenced.contains(install));
                 None
             }
-            Op::TFenced(_) | Op::TResume(_) => {
-                // `Turns` has no fence/resume op yet: leave `self.turns` unchanged so any model
-                // state change (marking `fenced`, waking waiting installs, or clearing `fenced`)
-                // is recorded below as a parity mismatch rather than a setup panic.
+            Op::TFenced(number) => {
+                let settled = self.turns.mark_fenced(*number);
+                self.waiting
+                    .retain(|install| !settled.fenced.contains(install));
+                None
+            }
+            Op::TResume(number) => {
+                self.turns.resume_ticket(*number);
                 None
             }
         };

@@ -5448,6 +5448,60 @@ async fn finish_dispatch<S: CliService>(
     }
 }
 
+/// Execute step 5 (fast-forward under the ref turn and optional retire) for an older build's
+/// declared land that resumed across a mid-gate daemon upgrade (`__land-step5`). Never re-runs the
+/// declared gate.
+pub(crate) async fn run_step5_handoff(
+    workspace: &str,
+    source_head: cowshed_core::api::dto::GitOid,
+    target_head: cowshed_core::api::dto::GitOid,
+    ref_turn: cowshed_core::api::dto::LandTurnName,
+    retire: bool,
+) -> Result<cowshed_core::api::dto::LandedReport> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot read current directory for step 5 hand-off: {error}"),
+            "run from the project checkout",
+        )
+    })?;
+    let scope = RecoveryScope::Workspaces(
+        [WorkspaceName::new(workspace)
+            .map_err(|error| CowshedError::usage(error.to_string(), "name a workspace"))?]
+        .into(),
+    );
+    let mut bridge = ActorBridge::open_existing(&cwd, scope).await?;
+    let outcome = async {
+        let report = bridge
+            .land(
+                workspace,
+                None,
+                LandOptions {
+                    retire,
+                    expected_source_head: Some(source_head),
+                    expected_target_head: Some(ExpectedRefHead::Oid(target_head)),
+                    ref_turn: Some(ref_turn),
+                    ..LandOptions::default()
+                },
+            )
+            .await?;
+        let LandReport::Landed(landed) = report else {
+            return Err(CowshedError::internal(format!(
+                "step 5 hand-off of {workspace} answered {report:?}, not a landed report"
+            )));
+        };
+        if landed.retired {
+            bridge.reconcile_gateway().await?;
+        }
+        Ok(landed)
+    }
+    .await;
+    let shutdown = bridge.shutdown().await;
+    match (outcome, shutdown) {
+        (Ok(landed), Ok(())) => Ok(landed),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 pub(crate) async fn run_bridge_command<R, W, E>(
     cli: Cli,
     prepared: PreparedProject,

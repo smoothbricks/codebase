@@ -1912,6 +1912,7 @@ const READERS: Readers<ReaderName> = {
       ['askedUnixMs', 'LEAF'],
       ['command', 'LEAF'],
       ['bound', 'LEAF'],
+      ['fenced', 'LEAF'],
     ],
   },
   TRACE_CONTEXT: {

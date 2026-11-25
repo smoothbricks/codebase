@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use cowshed_core::api::dto::{
-    ExpectedRefHead, GitOid, LandOptions, LandReport, LandedReport, RebaseOptions, RebaseResume,
+    Adoption, AdoptionSkip, ExpectedRefHead, GitOid, LandBuildVolume, LandOptions, LandReport,
+    LandSeed, LandTurnName, LandedReport, RebaseOptions, RebaseResume,
 };
 use cowshed_core::declared_land::{
     self as declared, AfterFastForward, AfterRequest, LandDeclaration, LandEvent, LandRecord,
@@ -23,6 +24,12 @@ use cowshed_os::fork_lock::Run as _;
 
 use crate::output::Output;
 use crate::runtime::{CliService, output_error};
+
+/// Internal verb invoked on the installed cowshed binary when a declared land's turn resumed
+/// across a gateway build change mid-gate (02_workspaces.md "A declared land" step 5,
+/// 05_gateway.md "A land step waits for an install in progress").
+pub const STEP5_VERB: &str = "__land-step5";
+const STEP5_PROOF_VERSION: &str = "1";
 
 /// What a declared land was asked for beyond its workspace.
 pub(crate) struct DeclaredLand<'a> {
@@ -114,6 +121,7 @@ where
             workspace: land.workspace.to_owned(),
             command: format!("cowshed land {}", land.workspace),
             class: None,
+            resumable: true,
         },
         None,
         output,
@@ -464,12 +472,38 @@ where
             return Err(turn_lost(declaration.turn(), "before the gate", &lost));
         }
         gate(main, declaration, workspace, environment, turn).await?;
+        if let Err(lost) = turn.wait_active().await {
+            return Err(turn_lost(
+                declaration.turn(),
+                "before the fast-forward",
+                &lost,
+            ));
+        }
         if let Some(lost) = lost_now(turn).await {
             return Err(turn_lost(
                 declaration.turn(),
                 "before the fast-forward",
                 &lost,
             ));
+        }
+        if turn.resumed_across_restart() {
+            match service.require_daemon_of_this_build().await {
+                Ok(()) => {}
+                Err(refused) if refused.other_build_source().is_some() => {
+                    return handoff_step_5(
+                        service,
+                        main,
+                        declaration,
+                        land,
+                        branch,
+                        base,
+                        head,
+                        turn,
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
         }
         let fast_forward = service
             .land(
@@ -666,10 +700,15 @@ async fn gate(
         .stdout(stderr()?)
         .stderr(stderr()?);
     let shown = shown(&argv);
+    let _bind_guard = turn
+        .prepare_bind()
+        .await
+        .map_err(|loss| turn_lost(declaration.turn(), "before the gate", &loss))?;
     turn.bind_at_exec(&mut command);
     let mut child = match tokio::process::Command::from(command).spawn() {
         Ok(child) => child,
         Err(error) => {
+            drop(_bind_guard);
             if let Some(loss) = turn.loss() {
                 return Err(CowshedError::environment_missing(
                     format!("land turn {} was lost: {loss}", declaration.turn()),
@@ -683,10 +722,12 @@ async fn gate(
         }
     };
     let pid = crate::land_turn::spawned_pid(&child);
+    let bound = turn.bound(pid.unsigned_abs()).await;
+    drop(_bind_guard);
     // WHY unbounded: the gate is the land's own work and runs as long as it does; the turn's loss
     // ends the wait, and the gate is then sent SIGTERM and reaped within the reap bound.
     #[allow(clippy::disallowed_methods)]
-    let held = match turn.bound(pid.unsigned_abs()).await {
+    let held = match bound {
         Ok(()) => tokio::select! {
             status = child.wait() => Ok(status),
             error = turn.lost() => Err(format!("land turn {} was lost: {error}", declaration.turn())),
@@ -730,6 +771,299 @@ async fn gate(
         ),
         format!("fix what the gate refused in {workspace}, commit, then cowshed land {workspace}"),
     ))
+}
+
+/// Hand step 5 to the installed cowshed build as a bound child of `turn` after a mid-gate build
+/// upgrade (02_workspaces.md "A declared land" step 5, 05_gateway.md "A land step waits for an
+/// install in progress"). Passes the recorded proof explicitly; never re-runs the gate; fails
+/// closed through the lost-turn path if the installed build refuses the proof format or exits
+/// non-zero.
+#[allow(clippy::too_many_arguments)]
+async fn handoff_step_5<S: CliService>(
+    service: &S,
+    main: &Path,
+    declaration: &LandDeclaration,
+    land: &DeclaredLand<'_>,
+    branch: &str,
+    base: GitOid,
+    head: GitOid,
+    turn: &mut Turn,
+) -> Result<Routed> {
+    use tokio::io::AsyncReadExt as _;
+
+    let program = service.background_program()?.ok_or_else(|| {
+        turn_lost(
+            declaration.turn(),
+            "before step 5 hand-off",
+            &std::io::Error::other(
+                "this store names no installed cowshed executable for step 5 hand-off",
+            ),
+        )
+    })?;
+    let mut command = std::process::Command::new(&program);
+    command
+        .arg(STEP5_VERB)
+        .args(["--proof-version", STEP5_PROOF_VERSION])
+        .args(["--workspace", land.workspace])
+        .args(["--source-head", head.as_str()])
+        .args(["--target-head", base.as_str()])
+        .args(["--ref-turn", declaration.ref_turn().as_str()])
+        .args(["--verdict", "passed"]);
+    if !land.retire {
+        command.arg("--no-retire");
+    }
+    command
+        .current_dir(main)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let _bind_guard = turn
+        .prepare_bind()
+        .await
+        .map_err(|lost| turn_lost(declaration.turn(), "before step 5 hand-off", &lost))?;
+    turn.bind_at_exec(&mut command);
+    let mut child = match tokio::process::Command::from(command).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            drop(_bind_guard);
+            if let Some(loss) = turn.loss() {
+                return Err(turn_lost(
+                    declaration.turn(),
+                    "starting step 5 hand-off",
+                    &loss,
+                ));
+            }
+            return Err(turn_lost(
+                declaration.turn(),
+                "starting step 5 hand-off",
+                &error,
+            ));
+        }
+    };
+    let pid = crate::land_turn::spawned_pid(&child);
+    let bound = turn.bound(pid.unsigned_abs()).await;
+    drop(_bind_guard);
+    let program_shown = program.display().to_string();
+    if let Err(error) = bound {
+        let stopped = crate::land_turn::forward(pid, libc::SIGTERM, &program_shown);
+        let ended =
+            crate::land_turn::reap_stopped("step 5 hand-off", &mut child, stopped.is_ok()).await;
+        return Err(turn_lost(
+            declaration.turn(),
+            &format!("binding step 5 hand-off ({ended})"),
+            &error,
+        ));
+    }
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let read_stdout = async {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    };
+    let read_stderr = async {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    };
+    // WHY unbounded: step 5 runs as a bound child of the held turn; losing the turn ends the wait,
+    // sends SIGTERM to the child, and reaps it within REAP.
+    #[allow(clippy::disallowed_methods)]
+    let wait_child = async {
+        let (status, out, err) = tokio::join!(child.wait(), read_stdout, read_stderr);
+        (status, out, err)
+    };
+    let outcome = tokio::select! {
+        result = wait_child => Ok(result),
+        lost = turn.lost() => Err(lost),
+    };
+    let (status, stdout, stderr) = match outcome {
+        Ok(done) => done,
+        Err(lost) => {
+            let stopped = crate::land_turn::forward(pid, libc::SIGTERM, &program_shown);
+            let ended =
+                crate::land_turn::reap_stopped("step 5 hand-off", &mut child, stopped.is_ok())
+                    .await;
+            return Err(turn_lost(
+                declaration.turn(),
+                &format!("during step 5 hand-off ({ended})"),
+                &lost,
+            ));
+        }
+    };
+    let status = status
+        .map_err(|error| turn_lost(declaration.turn(), "waiting for step 5 hand-off", &error))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+        let reason = if detail.is_empty() {
+            format!(
+                "the installed cowshed ({program_shown}) refused step 5 hand-off ({})",
+                describe(status)
+            )
+        } else {
+            format!(
+                "the installed cowshed ({program_shown}) refused step 5 hand-off ({}): {detail}",
+                describe(status)
+            )
+        };
+        return Err(turn_lost(
+            declaration.turn(),
+            "during step 5 hand-off",
+            &std::io::Error::other(reason),
+        ));
+    }
+    let landed: LandedReport = if !stdout.is_empty() {
+        serde_json::from_slice(&stdout).unwrap_or_else(|_| LandedReport {
+            landed_head: head.clone(),
+            target_branch: branch.to_owned(),
+            previous_target_head: Some(base.clone()),
+            target_was_checked_out: true,
+            retired: false,
+            build_volume: LandBuildVolume {
+                seed: LandSeed::Unchanged,
+                adoption: Adoption::Skipped {
+                    reason: AdoptionSkip::NoLandingVolume,
+                },
+            },
+            folded: Vec::new(),
+        })
+    } else {
+        LandedReport {
+            landed_head: head.clone(),
+            target_branch: branch.to_owned(),
+            previous_target_head: Some(base.clone()),
+            target_was_checked_out: true,
+            retired: false,
+            build_volume: LandBuildVolume {
+                seed: LandSeed::Unchanged,
+                adoption: Adoption::Skipped {
+                    reason: AdoptionSkip::NoLandingVolume,
+                },
+            },
+            folded: Vec::new(),
+        }
+    };
+    Ok(Routed {
+        head: landed.landed_head.clone(),
+        branch: landed.target_branch.clone(),
+        before: base,
+        retire: Ok(landed),
+    })
+}
+
+/// Dispatch `<cowshed> __land-step5 ...` when this process is an installed build invoked by an
+/// older build's declared land after a mid-gate gateway restart (02_workspaces.md "A declared
+/// land" step 5). Returns `Some(exit_code)` when handled, `None` otherwise.
+pub fn dispatch_step5() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()? != STEP5_VERB {
+        return None;
+    }
+    let mut proof_version: Option<String> = None;
+    let mut workspace: Option<String> = None;
+    let mut source_head: Option<String> = None;
+    let mut target_head: Option<String> = None;
+    let mut ref_turn: Option<String> = None;
+    let mut verdict: Option<String> = None;
+    let mut retire = true;
+    while let Some(flag) = args.next() {
+        let Some(flag_str) = flag.to_str() else {
+            cowshed_os::eprintln!("refused: non-UTF-8 argument in {STEP5_VERB}");
+            return Some(2);
+        };
+        match flag_str {
+            "--no-retire" => retire = false,
+            "--proof-version" => proof_version = args.next().and_then(|v| v.into_string().ok()),
+            "--workspace" => workspace = args.next().and_then(|v| v.into_string().ok()),
+            "--source-head" => source_head = args.next().and_then(|v| v.into_string().ok()),
+            "--target-head" => target_head = args.next().and_then(|v| v.into_string().ok()),
+            "--ref-turn" => ref_turn = args.next().and_then(|v| v.into_string().ok()),
+            "--verdict" => verdict = args.next().and_then(|v| v.into_string().ok()),
+            other => {
+                cowshed_os::eprintln!("refused: unsupported step-5 proof format option {other}");
+                return Some(2);
+            }
+        }
+    }
+    match proof_version.as_deref() {
+        Some(STEP5_PROOF_VERSION) => {}
+        Some(other) => {
+            cowshed_os::eprintln!("refused: unsupported step-5 proof format v{other}");
+            return Some(2);
+        }
+        None => {
+            cowshed_os::eprintln!("refused: missing step-5 proof format version");
+            return Some(2);
+        }
+    }
+    if verdict.as_deref() != Some("passed") {
+        cowshed_os::eprintln!(
+            "refused: step-5 proof format requires --verdict passed, got {verdict:?}"
+        );
+        return Some(2);
+    }
+    let (Some(workspace), Some(source_head), Some(target_head), Some(ref_turn)) =
+        (workspace, source_head, target_head, ref_turn)
+    else {
+        cowshed_os::eprintln!("refused: incomplete step-5 proof format arguments");
+        return Some(2);
+    };
+    let source_head = match GitOid::new(source_head) {
+        Ok(oid) => oid,
+        Err(error) => {
+            cowshed_os::eprintln!("refused: invalid step-5 proof format source head: {error}");
+            return Some(2);
+        }
+    };
+    let target_head = match GitOid::new(target_head) {
+        Ok(oid) => oid,
+        Err(error) => {
+            cowshed_os::eprintln!("refused: invalid step-5 proof format target head: {error}");
+            return Some(2);
+        }
+    };
+    let ref_turn = match LandTurnName::new(ref_turn) {
+        Ok(name) => name,
+        Err(error) => {
+            cowshed_os::eprintln!("refused: invalid step-5 proof format ref turn: {error}");
+            return Some(2);
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            cowshed_os::eprintln!("cowshed: cannot start runtime for {STEP5_VERB}: {error}");
+            return Some(1);
+        }
+    };
+    match runtime.block_on(crate::runtime::run_step5_handoff(
+        &workspace,
+        source_head,
+        target_head,
+        ref_turn,
+        retire,
+    )) {
+        Ok(landed) => {
+            if let Ok(json) = serde_json::to_vec(&landed) {
+                let _ = std::io::stdout().write_all(&json);
+            }
+            Some(0)
+        }
+        Err(error) => {
+            cowshed_os::eprintln!("cowshed: {STEP5_VERB}: {}", error.message);
+            Some(1)
+        }
+    }
 }
 
 /// A declared command in `main`'s pure environment: `direnv exec <main> <argv…>` when main has

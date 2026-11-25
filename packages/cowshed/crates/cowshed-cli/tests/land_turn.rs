@@ -755,6 +755,55 @@ fn a_land_takes_its_ref_turn_under_a_waiting_install_and_both_end() {
     );
 }
 
+/// An unfenced legacy (no `"resumable":true`) holder on `REPO` held directly from the test
+/// process so `cowshed gateway await-turns` genuinely waits (`w > 0, f = 0`) and every spawned
+/// `cowshed` child asks from outside its held turn.
+struct LegacyHolder {
+    stream: std::os::unix::net::UnixStream,
+    reader: BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl LegacyHolder {
+    fn take(home: &Home, workspace: &str) -> Self {
+        let mut stream = std::os::unix::net::UnixStream::connect_bounded(&home.gateway.socket)
+            .expect("connect legacy holder");
+        let ask = serde_json::json!({
+            "op": cowshed_core::land_turn::LAND_TURN_OP,
+            "repo": REPO,
+            "workspace": workspace,
+            "command": format!("legacy land {workspace}"),
+        });
+        stream
+            .write_all(format!("{ask}\n").as_bytes())
+            .expect("send legacy ask");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone legacy stream"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read legacy answer");
+        let answer: serde_json::Value = serde_json::from_str(&line).expect("parse legacy answer");
+        assert_eq!(answer["turn"], serde_json::json!("held"), "{answer}");
+        let mut order = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.order())
+            .expect("open order file");
+        writeln!(order, "{workspace}").expect("record legacy holder in order file");
+        Self { stream, reader }
+    }
+
+    fn pid(&self) -> u32 {
+        std::process::id()
+    }
+
+    fn release(mut self) {
+        self.stream
+            .write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
+            .expect("end legacy holder");
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        let mut rest = String::new();
+        let _ = std::io::Read::read_to_string(&mut self.reader, &mut rest);
+    }
+}
+
 /// Withdrawing a waiting install via `cowshed gateway withdraw-install` causes `await-turns` to
 /// exit 103 (`Conflict`) with empty stdout without running its command, names the withdrawer pid
 /// on stderr, and admits every parked land in arrival order at once (05_gateway.md "The read
@@ -763,8 +812,7 @@ fn a_land_takes_its_ref_turn_under_a_waiting_install_and_both_end() {
 fn withdrawing_a_waiting_install_exits_await_turns_without_running_and_admits_parked_lands_in_order()
  {
     let home = Home::new();
-    let mut holder = Land::gated(&home, "H");
-    wait_for_order(&home, &mut holder, &["H"]);
+    let holder = LegacyHolder::take(&home, "H");
 
     let ran = home.path.join("install-ran");
     let stdout_path = home.path.join("install-stdout");
@@ -845,7 +893,6 @@ fn withdrawing_a_waiting_install_exits_await_turns_without_running_and_admits_pa
     assert_eq!(queue(&home), ["H", "P1", "P2"]);
 
     holder.release();
-    holder.wait_success();
     wait_for_order(&home, &mut parked_first, &["H", "P1"]);
     parked_first.release();
     parked_first.wait_success();
@@ -864,8 +911,7 @@ fn gateway_status_names_a_waiting_install_and_each_parked_ask() {
     use std::os::unix::net::UnixStream;
 
     let home = Home::new();
-    let mut holder = Land::gated(&home, "H");
-    wait_for_order(&home, &mut holder, &["H"]);
+    let holder = LegacyHolder::take(&home, "H");
 
     let mut install = Land::start(
         "install",
@@ -1019,7 +1065,7 @@ fn a_land_turn_stops_its_command_when_the_restarted_gateway_cannot_resume_its_ti
         .env("HOME", &home.path)
         .args(["gateway", "await-turns", "--gateway-socket"])
         .arg(&home.gateway.socket)
-        .args(["--", "sh", "-c", "echo fenced && read line"])
+        .args(["--", "sh", "-c", "echo fenced && exec cat >/dev/null"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

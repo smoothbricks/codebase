@@ -3578,6 +3578,11 @@ export type Ticket = {
    * exits, and nothing it starts holds it.
    */
   readonly bound?: ReadonlyArray<number & tags.Type<'uint32'>>;
+  /**
+   * Whether this ticket's asker has acknowledged a fence for a planned gateway restart (or has
+   * already departed, leaving only bound commands).
+   */
+  readonly fenced?: boolean;
 };
 
 export type TraceContext = {

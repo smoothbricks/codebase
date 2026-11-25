@@ -8,7 +8,7 @@ pub mod capabilities;
 pub mod code_signing;
 pub mod controller_service;
 pub mod credential_service;
-mod declared_land;
+pub mod declared_land;
 pub mod disk_command;
 mod doc_commit;
 mod fd_holders;

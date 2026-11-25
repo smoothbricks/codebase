@@ -25,13 +25,19 @@
 use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use cowshed_os::fork_lock::Fenced;
 use cowshed_os::process::Holder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot, watch};
+use zeroize::Zeroize as _;
 
 use crate::api::dto::LandTurnName;
 use crate::census::CensusScope;
@@ -67,6 +73,27 @@ pub enum TurnClass {
     Bounded,
 }
 
+/// Mint a 32-byte cryptographically random resume token (encoded as unpadded base64url) together
+/// with its SHA-256 digest (05_gateway.md "Land turns").
+pub fn mint_resume_token() -> io::Result<(String, [u8; 32])> {
+    let mut raw = [0_u8; 32];
+    getrandom::fill(&mut raw).map_err(|error| {
+        io::Error::other(format!(
+            "cannot generate random bytes for land-turn resume token: {error}"
+        ))
+    })?;
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+    raw.zeroize();
+    let digest = hash_resume_token(&token);
+    Ok((token, digest))
+}
+
+/// SHA-256 digest of a resume token string, stored in gateway memory and the handoff snapshot so
+/// the raw token is never persisted or exposed.
+pub fn hash_resume_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
 /// What a land asks for: its repository's queue, the workspace it lands, and the command its turn
 /// runs, which the queue names to whoever waits behind it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -77,6 +104,10 @@ pub struct TurnAsk {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<TurnClass>,
+    /// Opt into fencing within one heartbeat and surviving planned gateway restarts. Omitted or
+    /// `false` for legacy callers, which are never sent `{"turn":"fence"}`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumable: bool,
 }
 
 impl TurnAsk {
@@ -132,12 +163,14 @@ pub struct Abandonment {
     pub reason: String,
 }
 
-/// What an asker sends on its connection once its turn is held.
+/// What an asker sends on its connection once its turn is held (or queued, for `Fenced`).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "step", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum TurnStep {
     /// Bind the command `pid` to the turn: it holds the turn until it exits.
     Bind { pid: u32 },
+    /// Acknowledge a gateway fence request (`{"turn":"fence"}`) for a planned restart.
+    Fenced,
     /// End the asker's hold, recording how its command ended.
     End { outcome: String },
 }
@@ -152,9 +185,27 @@ pub enum TurnAnswer {
         ticket: Ticket,
         holder: Ticket,
         ahead: usize,
+        /// Delivered once on a resumable ticket's first numbered answer; never repeated or stored
+        /// on `Ticket`.
+        #[serde(
+            default,
+            rename = "resumeToken",
+            skip_serializing_if = "Option::is_none"
+        )]
+        resume_token: Option<String>,
     },
     /// The turn is the asker's.
-    Held { ticket: Ticket },
+    Held {
+        ticket: Ticket,
+        /// Delivered once on a resumable ticket's first numbered answer; never repeated or stored
+        /// on `Ticket`.
+        #[serde(
+            default,
+            rename = "resumeToken",
+            skip_serializing_if = "Option::is_none"
+        )]
+        resume_token: Option<String>,
+    },
     /// The command `pid` holds the turn until it exits.
     Bound { pid: u32 },
     /// The gateway refuses the ask or the step, and why.
@@ -164,6 +215,17 @@ pub enum TurnAnswer {
     /// or closes as the install's restart drains the gateway; then the asker waits for the install
     /// slot and asks the gateway the install leaves (05_gateway.md "The read fences the turns").
     Fenced,
+    /// An install wants to restart the gateway: the resumable asker finishes any in-flight `bind`
+    /// or `end` and replies `{"step":"fenced"}` within one heartbeat (`HEARTBEAT`, 5 s).
+    Fence,
+    /// The install lifted its fence without restarting: the fenced ticket resumes in place on the
+    /// same connection without reconnecting.
+    Unfenced,
+    /// The replacing gateway re-attached the adopted ticket after `land-turn-resume`.
+    Resumed { ticket: Ticket },
+    /// A heartbeat sent by the gateway while a ticket is fenced on an open connection
+    /// (`HEARTBEAT` / `HEARTBEAT_SILENCE`).
+    Heartbeat { progress: u64 },
     /// A bounded ticket exceeded its deadline once held: the gateway ends the ticket and closes
     /// its connection, and the holder treats this as a lost turn naming the bound
     /// (05_gateway.md "Deadlines").
@@ -423,6 +485,26 @@ impl Connection {
         }
         Ok(())
     }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.stream.write_all(bytes).await
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&*self.stream)
+    }
+
+    fn into_std(self) -> io::Result<(Fenced<std::os::unix::net::UnixStream>, Vec<u8>)> {
+        let Self { stream, buf } = self;
+        let std_stream = stream.try_map(UnixStream::into_std)?;
+        Ok((std_stream, buf))
+    }
+
+    fn from_std(stream: Fenced<std::os::unix::net::UnixStream>, buf: Vec<u8>) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        let stream = stream.try_map(UnixStream::from_std)?;
+        Ok(Self { stream, buf })
+    }
 }
 
 /// The recorded reason a held turn was lost, shared by `lost()`, `bound()`, `loss()` and `end()`.
@@ -470,6 +552,82 @@ impl Loss {
     }
 }
 
+/// Guard returned by [`Turn::prepare_bind`]: keeps any incoming `{"turn":"fence"}` deferred until
+/// the child spawned with [`Turn::bind_at_exec`] finishes [`Turn::bound`] (or until this guard is
+/// dropped if spawn fails).
+#[derive(Debug)]
+pub struct BindGuard {
+    cancel: Option<(mpsc::UnboundedSender<DriverCmd>, u64)>,
+}
+
+impl Drop for BindGuard {
+    fn drop(&mut self) {
+        if let Some((tx, seq)) = self.cancel.take() {
+            let _ = tx.send(DriverCmd::CancelBind { seq });
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DirectTurn {
+    connection: Connection,
+    /// The connection's descriptor, open for as long as `connection` is: a child armed by
+    /// [`Turn::bind_at_exec`] writes its bind to it before its exec.
+    socket: RawFd,
+    /// The first loss reason observed on this turn's connection, reused by every subsequent check.
+    loss: Option<Loss>,
+}
+
+enum DriverCmd {
+    PrepareBind {
+        reply: oneshot::Sender<io::Result<(RawFd, u64)>>,
+    },
+    CancelBind {
+        seq: u64,
+    },
+    Bound {
+        pid: u32,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+    WaitActive {
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+    SyncLoss {
+        reply: std::sync::mpsc::Sender<Option<Loss>>,
+    },
+    End {
+        outcome: String,
+        reply: std::sync::mpsc::Sender<io::Result<()>>,
+    },
+}
+
+struct ResumableTurn {
+    socket: Arc<AtomicI32>,
+    resumed_across_restart: Arc<AtomicBool>,
+    loss: Arc<Mutex<Option<Loss>>>,
+    loss_rx: watch::Receiver<Option<Loss>>,
+    cmd_tx: mpsc::UnboundedSender<DriverCmd>,
+}
+
+impl std::fmt::Debug for ResumableTurn {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResumableTurn")
+            .field("socket", &self.socket.load(Ordering::Acquire))
+            .field(
+                "resumed_across_restart",
+                &self.resumed_across_restart.load(Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+enum TurnBackend {
+    Direct(DirectTurn),
+    Resumable(ResumableTurn),
+}
+
 /// A held turn, the asker's connection to the gateway. The gateway holds the turn for as long as
 /// the asker holds this, or any command bound to it ([`Self::bind_at_exec`]) runs. Ending it records
 /// how the land's command ended; dropping it, or this process's exit, ends the asker's hold without
@@ -477,19 +635,158 @@ impl Loss {
 #[derive(Debug)]
 pub struct Turn {
     ticket: Ticket,
-    connection: Connection,
-    /// The connection's descriptor, open for as long as `connection` is: a child armed by
-    /// [`Self::bind_at_exec`] writes its bind to it before its exec.
-    socket: RawFd,
     outside: Option<HeldLock>,
-    /// The first loss reason observed on this turn's connection, reused by every subsequent check.
-    loss: Option<Loss>,
+    backend: TurnBackend,
 }
 
 impl Turn {
+    fn direct(
+        ticket: Ticket,
+        connection: Connection,
+        socket: RawFd,
+        outside: Option<HeldLock>,
+    ) -> Self {
+        Self {
+            ticket,
+            outside,
+            backend: TurnBackend::Direct(DirectTurn {
+                connection,
+                socket,
+                loss: None,
+            }),
+        }
+    }
+
+    fn resumable(
+        ticket: Ticket,
+        connection: Connection,
+        outside: Option<HeldLock>,
+        gateway: TurnGateway,
+        resume_token: String,
+        resumed_across_restart: bool,
+    ) -> io::Result<Self> {
+        let initial_fd = connection.raw_fd();
+        let (std_stream, buf) = connection.into_std()?;
+        let socket = Arc::new(AtomicI32::new(initial_fd));
+        let resumed_flag = Arc::new(AtomicBool::new(resumed_across_restart));
+        let shared_loss = Arc::new(Mutex::new(None));
+        let (loss_tx, loss_rx) = watch::channel(None);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        let thread_socket = Arc::clone(&socket);
+        let thread_resumed = Arc::clone(&resumed_flag);
+        let thread_loss = Arc::clone(&shared_loss);
+        let ticket_number = ticket.number;
+
+        std::thread::Builder::new()
+            .name("land-turn-driver".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        record_shared_loss(&thread_loss, &loss_tx, Loss::from_io(&error));
+                        return;
+                    }
+                };
+                runtime.block_on(run_resumable_driver(
+                    std_stream,
+                    buf,
+                    ticket_number,
+                    gateway,
+                    resume_token,
+                    thread_socket,
+                    thread_resumed,
+                    thread_loss,
+                    loss_tx,
+                    cmd_rx,
+                ));
+            })?;
+
+        Ok(Self {
+            ticket,
+            outside,
+            backend: TurnBackend::Resumable(ResumableTurn {
+                socket,
+                resumed_across_restart: resumed_flag,
+                loss: shared_loss,
+                loss_rx,
+                cmd_tx,
+            }),
+        })
+    }
+
     /// The ticket that holds the turn, as the gateway numbered it.
     pub fn ticket(&self) -> &Ticket {
         &self.ticket
+    }
+
+    /// Whether this turn resumed across a planned gateway restart (`land-turn-resume`), either
+    /// while queued or while held.
+    pub fn resumed_across_restart(&self) -> bool {
+        match &self.backend {
+            TurnBackend::Direct(_) => false,
+            TurnBackend::Resumable(resumable) => {
+                resumable.resumed_across_restart.load(Ordering::Acquire)
+            }
+        }
+    }
+
+    /// Wait until the turn is active (not mid-fence or mid-restart), or return its loss reason if
+    /// the turn was lost.
+    pub async fn wait_active(&mut self) -> io::Result<()> {
+        match &mut self.backend {
+            TurnBackend::Direct(direct) => match direct.loss_check() {
+                Some(loss) => Err(loss),
+                None => Ok(()),
+            },
+            TurnBackend::Resumable(resumable) => {
+                let (reply, answer) = oneshot::channel();
+                if resumable
+                    .cmd_tx
+                    .send(DriverCmd::WaitActive { reply })
+                    .is_err()
+                {
+                    return Err(resumable.current_loss_or_closed());
+                }
+                match answer.await {
+                    Ok(result) => result,
+                    Err(_) => Err(resumable.current_loss_or_closed()),
+                }
+            }
+        }
+    }
+
+    /// Wait until the turn is active and pause acknowledging any incoming `{"turn":"fence"}` until
+    /// [`Self::bound`] completes (or the returned [`BindGuard`] drops on spawn error), so
+    /// [`Self::bind_at_exec`] writes to the live post-resume socket and is never refused with
+    /// `fenced_bind_refused`.
+    pub async fn prepare_bind(&mut self) -> io::Result<BindGuard> {
+        match &mut self.backend {
+            TurnBackend::Direct(direct) => match direct.loss_check() {
+                Some(loss) => Err(loss),
+                None => Ok(BindGuard { cancel: None }),
+            },
+            TurnBackend::Resumable(resumable) => {
+                let (reply, answer) = oneshot::channel();
+                if resumable
+                    .cmd_tx
+                    .send(DriverCmd::PrepareBind { reply })
+                    .is_err()
+                {
+                    return Err(resumable.current_loss_or_closed());
+                }
+                let (_fd, seq) = match answer.await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(resumable.current_loss_or_closed()),
+                };
+                Ok(BindGuard {
+                    cancel: Some((resumable.cmd_tx.clone(), seq)),
+                })
+            }
+        }
     }
 
     /// Arm `command` to bind itself to the turn as it starts: between its fork and its exec the
@@ -503,7 +800,10 @@ impl Turn {
     pub fn bind_at_exec(&self, command: &mut std::process::Command) {
         use std::os::unix::process::CommandExt as _;
 
-        let socket = self.socket;
+        let socket = match &self.backend {
+            TurnBackend::Direct(direct) => direct.socket,
+            TurnBackend::Resumable(resumable) => resumable.socket.load(Ordering::Acquire),
+        };
         // SAFETY: the hook runs in the forked child before its exec and calls only getpid and
         // write(2), both async-signal-safe, on a stack buffer; it allocates nothing.
         unsafe {
@@ -517,6 +817,133 @@ impl Turn {
     /// is skipped rather than treated as a loss. Once recorded, every later call to `loss()`,
     /// `lost()`, `bound()`, or `end()` reports that same reason.
     pub fn loss(&mut self) -> Option<io::Error> {
+        match &mut self.backend {
+            TurnBackend::Direct(direct) => direct.loss_check(),
+            TurnBackend::Resumable(resumable) => {
+                if let Some(loss) = resumable.recorded_loss() {
+                    return Some(loss.to_io_error());
+                }
+                let (reply, answer) = std::sync::mpsc::channel();
+                if resumable
+                    .cmd_tx
+                    .send(DriverCmd::SyncLoss { reply })
+                    .is_err()
+                {
+                    return Some(resumable.current_loss_or_closed());
+                }
+                match answer.recv() {
+                    Ok(Some(loss)) => Some(loss.to_io_error()),
+                    Ok(None) => None,
+                    Err(_) => Some(resumable.current_loss_or_closed()),
+                }
+            }
+        }
+    }
+
+    /// The gateway's answer to the bind the command `pid`, armed by [`Self::bind_at_exec`] and
+    /// just spawned, wrote: `Ok` once the gateway holds the turn for it until it exits. A command
+    /// that exited before the gateway could watch it holds nothing.
+    pub async fn bound(&mut self, pid: u32) -> io::Result<()> {
+        match &mut self.backend {
+            TurnBackend::Direct(direct) => direct.bound(self.ticket.number, pid).await,
+            TurnBackend::Resumable(resumable) => {
+                let (reply, answer) = oneshot::channel();
+                if resumable
+                    .cmd_tx
+                    .send(DriverCmd::Bound { pid, reply })
+                    .is_err()
+                {
+                    return Err(resumable.current_loss_or_closed());
+                }
+                match answer.await {
+                    Ok(result) => result,
+                    Err(_) => Err(resumable.current_loss_or_closed()),
+                }
+            }
+        }
+    }
+
+    /// End the asker's hold, recording `outcome` (how the command ended). The turn passes on once
+    /// every command bound to it has exited too. If the gateway already ended or closed the turn
+    /// (including an unread `expired` answer waiting on the connection when send fails with EPIPE),
+    /// that loss reason is returned and reported on stderr rather than an abandonment.
+    pub fn end(self, outcome: String) -> io::Result<()> {
+        let ticket_number = self.ticket.number;
+        match self.backend {
+            TurnBackend::Direct(direct) => direct.end(ticket_number, outcome),
+            TurnBackend::Resumable(resumable) => {
+                let already_known = resumable.recorded_loss().is_some();
+                let (reply, answer) = std::sync::mpsc::channel();
+                if resumable
+                    .cmd_tx
+                    .send(DriverCmd::End {
+                        outcome: outcome.clone(),
+                        reply,
+                    })
+                    .is_err()
+                {
+                    let loss = resumable.current_loss_or_closed();
+                    if !already_known {
+                        cowshed_os::eprintln!(
+                            "cowshed: land turn ticket {ticket_number}: its end ({outcome}) was \
+                             not sent: {loss}",
+                        );
+                    }
+                    return Err(loss);
+                }
+                match answer.recv() {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => {
+                        if !already_known {
+                            cowshed_os::eprintln!(
+                                "cowshed: land turn ticket {ticket_number}: its end ({outcome}) \
+                                 was not sent: {error}",
+                            );
+                        }
+                        Err(error)
+                    }
+                    Err(_) => {
+                        let loss = resumable.current_loss_or_closed();
+                        if !already_known {
+                            cowshed_os::eprintln!(
+                                "cowshed: land turn ticket {ticket_number}: its end ({outcome}) \
+                                 was not sent: {loss}",
+                            );
+                        }
+                        Err(loss)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The outside lock's descriptor, for the command to inherit
+    /// ([`crate::held_lock::keep_across_exec`]): the kernel keeps that lock until the command, and
+    /// every process it hands the descriptor to, has closed it.
+    pub fn outside_descriptor(&self) -> Option<RawFd> {
+        self.outside.as_ref().map(HeldLock::descriptor)
+    }
+
+    /// Resolves once the gateway has closed the connection that holds the turn unfenced, or a
+    /// fenced turn fails to resume or times out, and never before: the turn is lost with it.
+    /// Cancel-safe, so a holder waits on it beside its command.
+    pub async fn lost(&mut self) -> io::Error {
+        match &mut self.backend {
+            TurnBackend::Direct(direct) => direct.lost().await,
+            TurnBackend::Resumable(resumable) => loop {
+                if let Some(loss) = resumable.loss_rx.borrow().clone() {
+                    return loss.to_io_error();
+                }
+                if resumable.loss_rx.changed().await.is_err() {
+                    return resumable.current_loss_or_closed();
+                }
+            },
+        }
+    }
+}
+
+impl DirectTurn {
+    fn loss_check(&mut self) -> Option<io::Error> {
         if let Some(loss) = &self.loss {
             return Some(loss.to_io_error());
         }
@@ -537,10 +964,7 @@ impl Turn {
         Some(io_error)
     }
 
-    /// The gateway's answer to the bind the command `pid`, armed by [`Self::bind_at_exec`] and
-    /// just spawned, wrote: `Ok` once the gateway holds the turn for it until it exits. A command
-    /// that exited before the gateway could watch it holds nothing.
-    pub async fn bound(&mut self, pid: u32) -> io::Result<()> {
+    async fn bound(&mut self, ticket_number: u64, pid: u32) -> io::Result<()> {
         if let Some(loss) = &self.loss {
             return Err(loss.to_io_error());
         }
@@ -553,8 +977,8 @@ impl Turn {
                 Err(error)
             }
             Ok(TurnAnswer::Refused { error }) => Err(io::Error::other(format!(
-                "the gateway refused to bind pid {pid} to land turn ticket {}: {error}",
-                self.ticket.number
+                "the gateway refused to bind pid {pid} to land turn ticket {ticket_number}: \
+                 {error}"
             ))),
             Ok(other) => Err(unexpected(&other, "a bind")),
             Err(error) => {
@@ -570,17 +994,13 @@ impl Turn {
         }
     }
 
-    /// End the asker's hold, recording `outcome` (how the command ended). The turn passes on once
-    /// every command bound to it has exited too. If the gateway already ended or closed the turn
-    /// (including an unread `expired` answer waiting on the connection when send fails with EPIPE),
-    /// that loss reason is returned and reported on stderr rather than an abandonment.
-    pub fn end(mut self, outcome: String) -> io::Result<()> {
+    fn end(mut self, ticket_number: u64, outcome: String) -> io::Result<()> {
         let already_known = self.loss.is_some();
-        if let Some(loss) = self.loss() {
+        if let Some(loss) = self.loss_check() {
             if !already_known {
                 cowshed_os::eprintln!(
-                    "cowshed: land turn ticket {}: its end ({outcome}) was not sent: {loss}",
-                    self.ticket.number,
+                    "cowshed: land turn ticket {ticket_number}: its end ({outcome}) was not sent: \
+                     {loss}",
                 );
             }
             return Err(loss);
@@ -590,33 +1010,23 @@ impl Turn {
         })
         .and_then(|line| self.connection.try_write_all(&line));
         if let Err(error) = sent {
-            if let Some(loss) = self.loss() {
+            if let Some(loss) = self.loss_check() {
                 cowshed_os::eprintln!(
-                    "cowshed: land turn ticket {}: its end ({outcome}) was not sent: {loss}",
-                    self.ticket.number,
+                    "cowshed: land turn ticket {ticket_number}: its end ({outcome}) was not sent: \
+                     {loss}",
                 );
                 return Err(loss);
             }
             cowshed_os::eprintln!(
-                "cowshed: land turn ticket {}: its end ({outcome}) was not sent to the gateway: \
-                 {error}; the gateway records the turn abandoned",
-                self.ticket.number,
+                "cowshed: land turn ticket {ticket_number}: its end ({outcome}) was not sent to \
+                 the gateway: {error}; the gateway records the turn abandoned",
             );
             return Err(error);
         }
         Ok(())
     }
 
-    /// The outside lock's descriptor, for the command to inherit
-    /// ([`crate::held_lock::keep_across_exec`]): the kernel keeps that lock until the command, and
-    /// every process it hands the descriptor to, has closed it.
-    pub fn outside_descriptor(&self) -> Option<RawFd> {
-        self.outside.as_ref().map(HeldLock::descriptor)
-    }
-
-    /// Resolves once the gateway has closed the connection that holds the turn, and never before:
-    /// the turn is lost with it. Cancel-safe, so a holder waits on it beside its command.
-    pub async fn lost(&mut self) -> io::Error {
+    async fn lost(&mut self) -> io::Error {
         if let Some(loss) = &self.loss {
             return loss.to_io_error();
         }
@@ -629,6 +1039,668 @@ impl Turn {
         self.loss = Some(loss);
         io_error
     }
+}
+
+impl ResumableTurn {
+    fn recorded_loss(&self) -> Option<Loss> {
+        self.loss
+            .lock()
+            .expect("land-turn loss lock poisoned")
+            .clone()
+    }
+
+    fn current_loss_or_closed(&self) -> io::Error {
+        self.recorded_loss().unwrap_or(Loss::Closed).to_io_error()
+    }
+}
+
+fn record_shared_loss(
+    shared: &Arc<Mutex<Option<Loss>>>,
+    loss_tx: &watch::Sender<Option<Loss>>,
+    loss: Loss,
+) -> Loss {
+    let mut guard = shared.lock().expect("land-turn loss lock poisoned");
+    if let Some(existing) = guard.as_ref() {
+        return existing.clone();
+    }
+    *guard = Some(loss.clone());
+    drop(guard);
+    loss_tx.send_replace(Some(loss.clone()));
+    loss
+}
+
+/// Connect to `gateway` after a fenced drain, waiting for any install holding `install.lock`,
+/// then connecting within `HANDSHAKE`, sending `land-turn-resume` within `CONTROL`, and reading
+/// the resume answer within `HEARTBEAT_SILENCE`.
+async fn reconnect_and_resume(
+    gateway: &TurnGateway,
+    ticket_number: u64,
+    resume_token: &str,
+) -> io::Result<(Connection, RawFd, TurnAnswer)> {
+    #[derive(Serialize)]
+    struct Resuming<'a> {
+        op: &'static str,
+        ticket: u64,
+        token: &'a str,
+    }
+
+    let wait_install = |gateway: &TurnGateway| {
+        let (census, support) = (gateway.census.clone(), gateway.support.clone());
+        async move {
+            tokio::task::spawn_blocking(move || {
+                crate::host_dirs::wait_for_running_install(&census, &support)
+            })
+            .await
+            .map_err(io::Error::other)?
+        }
+    };
+
+    wait_install(gateway).await?;
+
+    let socket = gateway.socket.as_path();
+    let deadline = tokio::time::Instant::now() + cowshed_os::deadline::HANDSHAKE.within;
+    let stream = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "cannot reach the gateway at {} within {} s to resume land turn ticket \
+                     {ticket_number}",
+                    socket.display(),
+                    cowshed_os::deadline::HANDSHAKE.within.as_secs(),
+                ),
+            ));
+        }
+        let budget = cowshed_os::deadline::start(
+            "land-turn-resume connect",
+            cowshed_os::deadline::Bound::new(
+                cowshed_os::deadline::LatencyClass::Handshake,
+                remaining,
+            ),
+        );
+        let peer = cowshed_os::deadline::Peer::unix("gateway", socket);
+        match cowshed_os::deadline::connect_unix(&budget, &peer, socket).await {
+            Ok(stream) => break stream,
+            Err(wait_error) => {
+                let error = io::Error::from(wait_error);
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) {
+                    if wait_install(gateway).await? {
+                        continue;
+                    }
+                    let pause = Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                    if !pause.is_zero() {
+                        tokio::time::sleep(pause).await;
+                        continue;
+                    }
+                }
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot reach the gateway at {} to resume land turn ticket \
+                         {ticket_number}: {error}",
+                        socket.display()
+                    ),
+                ));
+            }
+        }
+    };
+    let descriptor = std::os::fd::AsRawFd::as_raw_fd(&stream);
+    let mut connection = Connection::new(Fenced::new(stream));
+    let payload = line(&Resuming {
+        op: LAND_TURN_RESUME_OP,
+        ticket: ticket_number,
+        token: resume_token,
+    })?;
+    tokio::time::timeout(
+        cowshed_os::deadline::CONTROL.within,
+        connection.write_all(&payload),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "timed out writing land-turn-resume for ticket {ticket_number} to {}",
+                socket.display()
+            ),
+        )
+    })??;
+    loop {
+        let next = tokio::time::timeout(
+            cowshed_os::deadline::HEARTBEAT_SILENCE,
+            answer(&mut connection),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the gateway at {} went silent answering land-turn-resume for ticket \
+                     {ticket_number}",
+                    socket.display()
+                ),
+            )
+        })??;
+        match next {
+            TurnAnswer::Heartbeat { .. } => continue,
+            TurnAnswer::Resumed { .. } | TurnAnswer::Held { .. } | TurnAnswer::Queued { .. } => {
+                return Ok((connection, descriptor, next));
+            }
+            TurnAnswer::Refused { error } => {
+                return Err(io::Error::other(format!(
+                    "the gateway at {} refused to resume land turn ticket {ticket_number}: \
+                     {error}",
+                    socket.display()
+                )));
+            }
+            other => return Err(unexpected(&other, "a resume")),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_resumable_driver(
+    std_stream: Fenced<std::os::unix::net::UnixStream>,
+    buf: Vec<u8>,
+    ticket_number: u64,
+    gateway: TurnGateway,
+    resume_token: String,
+    socket_fd: Arc<AtomicI32>,
+    resumed_flag: Arc<AtomicBool>,
+    shared_loss: Arc<Mutex<Option<Loss>>>,
+    loss_tx: watch::Sender<Option<Loss>>,
+    mut cmd_rx: mpsc::UnboundedReceiver<DriverCmd>,
+) {
+    let mut connection = match Connection::from_std(std_stream, buf) {
+        Ok(connection) => connection,
+        Err(error) => {
+            record_shared_loss(&shared_loss, &loss_tx, Loss::from_io(&error));
+            return;
+        }
+    };
+    socket_fd.store(connection.raw_fd(), Ordering::Release);
+
+    let mut fenced = false;
+    let mut bind_in_flight: Option<u64> = None;
+    let mut next_bind_seq: u64 = 1;
+    let mut pending_fence = false;
+    let mut pending_bind_answers: std::collections::VecDeque<TurnAnswer> =
+        std::collections::VecDeque::new();
+    let mut deferred_prepare_bind: Vec<oneshot::Sender<io::Result<(RawFd, u64)>>> = Vec::new();
+    let mut deferred_wait_active: Vec<oneshot::Sender<io::Result<()>>> = Vec::new();
+    let mut deferred_end: Option<(String, std::sync::mpsc::Sender<io::Result<()>>)> = None;
+    let mut silence = Box::pin(tokio::time::sleep(cowshed_os::deadline::HEARTBEAT_SILENCE));
+
+    let fail_all =
+        |loss: Loss,
+         deferred_prepare_bind: &mut Vec<oneshot::Sender<io::Result<(RawFd, u64)>>>,
+         deferred_wait_active: &mut Vec<oneshot::Sender<io::Result<()>>>,
+         deferred_end: &mut Option<(String, std::sync::mpsc::Sender<io::Result<()>>)>| {
+            let loss = record_shared_loss(&shared_loss, &loss_tx, loss);
+            for reply in deferred_prepare_bind.drain(..) {
+                let _ = reply.send(Err(loss.to_io_error()));
+            }
+            for reply in deferred_wait_active.drain(..) {
+                let _ = reply.send(Err(loss.to_io_error()));
+            }
+            if let Some((_, reply)) = deferred_end.take() {
+                let _ = reply.send(Err(loss.to_io_error()));
+            }
+        };
+
+    let ack_fence = async |connection: &mut Connection| -> Result<(), Loss> {
+        let payload = line(&TurnStep::Fenced).map_err(|error| Loss::from_io(&error))?;
+        connection
+            .write_all(&payload)
+            .await
+            .map_err(|error| Loss::from_io(&error))
+    };
+
+    loop {
+        if !fenced {
+            for reply in deferred_wait_active.drain(..) {
+                let _ = reply.send(Ok(()));
+            }
+            if bind_in_flight.is_none()
+                && let Some(reply) = deferred_prepare_bind.pop()
+            {
+                let seq = next_bind_seq;
+                next_bind_seq += 1;
+                bind_in_flight = Some(seq);
+                pending_bind_answers.clear();
+                let _ = reply.send(Ok((connection.raw_fd(), seq)));
+            }
+            if let Some((outcome, reply)) = deferred_end.take() {
+                let result = finish_active_end(&mut connection, outcome).await;
+                if let Err(loss) = &result {
+                    let loss = record_shared_loss(&shared_loss, &loss_tx, loss.clone());
+                    let _ = reply.send(Err(loss.to_io_error()));
+                } else {
+                    let _ = reply.send(Ok(()));
+                }
+                return;
+            }
+        }
+
+        tokio::select! {
+            biased;
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { return };
+                match cmd {
+                    DriverCmd::PrepareBind { reply } => {
+                        if fenced {
+                            deferred_prepare_bind.push(reply);
+                        } else {
+                            let seq = next_bind_seq;
+                            next_bind_seq += 1;
+                            bind_in_flight = Some(seq);
+                            pending_bind_answers.clear();
+                            let _ = reply.send(Ok((connection.raw_fd(), seq)));
+                        }
+                    }
+                    DriverCmd::CancelBind { seq } => {
+                        if bind_in_flight == Some(seq) {
+                            bind_in_flight = None;
+                            pending_bind_answers.clear();
+                            if pending_fence && !fenced {
+                                pending_fence = false;
+                                if let Err(loss) = ack_fence(&mut connection).await {
+                                    fail_all(
+                                        loss,
+                                        &mut deferred_prepare_bind,
+                                        &mut deferred_wait_active,
+                                        &mut deferred_end,
+                                    );
+                                    return;
+                                }
+                                fenced = true;
+                                silence.as_mut().reset(
+                                    tokio::time::Instant::now()
+                                        + cowshed_os::deadline::HEARTBEAT_SILENCE,
+                                );
+                            }
+                        }
+                    }
+                    DriverCmd::WaitActive { reply } => {
+                        if fenced {
+                            deferred_wait_active.push(reply);
+                        } else {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    DriverCmd::SyncLoss { reply } => {
+                        if fenced {
+                            let _ = reply.send(None);
+                            continue;
+                        }
+                        let mut found = None;
+                        loop {
+                            match connection.try_next_line() {
+                                Ok(NonBlockingLine::Pending) => break,
+                                Ok(NonBlockingLine::Line(line)) => match decode(&line) {
+                                    Ok(TurnAnswer::Expired { bound_ms }) => {
+                                        found = Some(Loss::Expired { bound_ms });
+                                        break;
+                                    }
+                                    Ok(TurnAnswer::Fence) => {
+                                        if bind_in_flight.is_some() {
+                                            pending_fence = true;
+                                        } else if let Err(loss) = ack_fence(&mut connection).await {
+                                            found = Some(loss);
+                                            break;
+                                        } else {
+                                            fenced = true;
+                                            silence.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + cowshed_os::deadline::HEARTBEAT_SILENCE,
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Ok(
+                                        TurnAnswer::Bound { .. }
+                                        | TurnAnswer::Refused { .. }
+                                        | TurnAnswer::Heartbeat { .. }
+                                        | TurnAnswer::Unfenced,
+                                    ) => continue,
+                                    _ => {
+                                        found = Some(Loss::Unexpected(line));
+                                        break;
+                                    }
+                                },
+                                Ok(NonBlockingLine::Eof) => {
+                                    found = Some(Loss::Closed);
+                                    break;
+                                }
+                                Err(error) => {
+                                    found = Some(Loss::from_io(&error));
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(loss) = found {
+                            fail_all(
+                                loss.clone(),
+                                &mut deferred_prepare_bind,
+                                &mut deferred_wait_active,
+                                &mut deferred_end,
+                            );
+                            let _ = reply.send(Some(loss));
+                            return;
+                        }
+                        let _ = reply.send(None);
+                    }
+                    DriverCmd::Bound { pid, reply } => {
+                        let mut resolved = None;
+                        while let Some(queued) = pending_bind_answers.pop_front() {
+                            match queued {
+                                TurnAnswer::Bound { pid: bound } if bound == pid => {
+                                    resolved = Some(Ok(()));
+                                    break;
+                                }
+                                TurnAnswer::Bound { .. } => {}
+                                TurnAnswer::Refused { error } => {
+                                    resolved = Some(Err(io::Error::other(format!(
+                                        "the gateway refused to bind pid {pid} to land turn \
+                                         ticket {ticket_number}: {error}"
+                                    ))));
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        let outcome = match resolved {
+                            Some(result) => result,
+                            None => loop {
+                                match answer(&mut connection).await {
+                                    Ok(TurnAnswer::Bound { pid: bound }) if bound == pid => {
+                                        break Ok(());
+                                    }
+                                    Ok(TurnAnswer::Bound { .. }) => {}
+                                    Ok(TurnAnswer::Fence) => {
+                                        pending_fence = true;
+                                    }
+                                    Ok(TurnAnswer::Heartbeat { .. }) => {}
+                                    Ok(TurnAnswer::Expired { bound_ms }) => {
+                                        let loss = Loss::Expired { bound_ms };
+                                        fail_all(
+                                            loss.clone(),
+                                            &mut deferred_prepare_bind,
+                                            &mut deferred_wait_active,
+                                            &mut deferred_end,
+                                        );
+                                        let _ = reply.send(Err(loss.to_io_error()));
+                                        return;
+                                    }
+                                    Ok(TurnAnswer::Refused { error }) => {
+                                        break Err(io::Error::other(format!(
+                                            "the gateway refused to bind pid {pid} to land turn \
+                                             ticket {ticket_number}: {error}"
+                                        )));
+                                    }
+                                    Ok(other) => break Err(unexpected(&other, "a bind")),
+                                    Err(error) => {
+                                        let loss = if error.kind() == io::ErrorKind::UnexpectedEof {
+                                            Loss::Closed
+                                        } else {
+                                            Loss::from_io(&error)
+                                        };
+                                        fail_all(
+                                            loss.clone(),
+                                            &mut deferred_prepare_bind,
+                                            &mut deferred_wait_active,
+                                            &mut deferred_end,
+                                        );
+                                        let _ = reply.send(Err(loss.to_io_error()));
+                                        return;
+                                    }
+                                }
+                            },
+                        };
+                        bind_in_flight = None;
+                        if pending_fence && !fenced {
+                            pending_fence = false;
+                            if let Err(loss) = ack_fence(&mut connection).await {
+                                fail_all(
+                                    loss,
+                                    &mut deferred_prepare_bind,
+                                    &mut deferred_wait_active,
+                                    &mut deferred_end,
+                                );
+                                let _ = reply.send(outcome);
+                                return;
+                            }
+                            fenced = true;
+                            silence.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + cowshed_os::deadline::HEARTBEAT_SILENCE,
+                            );
+                        }
+                        let _ = reply.send(outcome);
+                    }
+                    DriverCmd::End { outcome, reply } => {
+                        if fenced {
+                            deferred_end = Some((outcome, reply));
+                        } else {
+                            let result = finish_active_end(&mut connection, outcome).await;
+                            if let Err(loss) = &result {
+                                let loss =
+                                    record_shared_loss(&shared_loss, &loss_tx, loss.clone());
+                                let _ = reply.send(Err(loss.to_io_error()));
+                            } else {
+                                let _ = reply.send(Ok(()));
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            next = connection.next_line() => {
+                match next {
+                    Ok(Some(line)) => {
+                        if fenced {
+                            silence.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + cowshed_os::deadline::HEARTBEAT_SILENCE,
+                            );
+                        }
+                        match decode(&line) {
+                            Ok(TurnAnswer::Fence) => {
+                                if bind_in_flight.is_some() {
+                                    pending_fence = true;
+                                } else if !fenced {
+                                    if let Err(loss) = ack_fence(&mut connection).await {
+                                        fail_all(
+                                            loss,
+                                            &mut deferred_prepare_bind,
+                                            &mut deferred_wait_active,
+                                            &mut deferred_end,
+                                        );
+                                        return;
+                                    }
+                                    fenced = true;
+                                    silence.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + cowshed_os::deadline::HEARTBEAT_SILENCE,
+                                    );
+                                }
+                            }
+                            Ok(TurnAnswer::Heartbeat { .. }) => {}
+                            Ok(TurnAnswer::Unfenced) => {
+                                fenced = false;
+                            }
+                            Ok(TurnAnswer::Expired { bound_ms }) => {
+                                fail_all(
+                                    Loss::Expired { bound_ms },
+                                    &mut deferred_prepare_bind,
+                                    &mut deferred_wait_active,
+                                    &mut deferred_end,
+                                );
+                                return;
+                            }
+                            Ok(answer @ (TurnAnswer::Bound { .. } | TurnAnswer::Refused { .. })) => {
+                                if pending_bind_answers.len() < 16 {
+                                    pending_bind_answers.push_back(answer);
+                                }
+                            }
+                            _ => {
+                                fail_all(
+                                    Loss::Unexpected(line),
+                                    &mut deferred_prepare_bind,
+                                    &mut deferred_wait_active,
+                                    &mut deferred_end,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) if fenced => {
+                        socket_fd.store(-1, Ordering::Release);
+                        let mut resuming = std::pin::pin!(reconnect_and_resume(
+                            &gateway,
+                            ticket_number,
+                            &resume_token,
+                        ));
+                        let reconnected = loop {
+                            tokio::select! {
+                                result = &mut resuming => break result,
+                                cmd = cmd_rx.recv() => {
+                                    let Some(cmd) = cmd else { return };
+                                    match cmd {
+                                        DriverCmd::PrepareBind { reply } => {
+                                            deferred_prepare_bind.push(reply);
+                                        }
+                                        DriverCmd::CancelBind { .. } => {}
+                                        DriverCmd::WaitActive { reply } => {
+                                            deferred_wait_active.push(reply);
+                                        }
+                                        DriverCmd::SyncLoss { reply } => {
+                                            let _ = reply.send(None);
+                                        }
+                                        DriverCmd::End { outcome, reply } => {
+                                            deferred_end = Some((outcome, reply));
+                                        }
+                                        DriverCmd::Bound { pid, reply } => {
+                                            let _ = reply.send(Err(io::Error::other(format!(
+                                                "cannot bind pid {pid} while land turn ticket \
+                                                 {ticket_number} is resuming across a gateway \
+                                                 restart"
+                                            ))));
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        match reconnected {
+                            Ok((new_conn, new_fd, _answer)) => {
+                                connection = new_conn;
+                                socket_fd.store(new_fd, Ordering::Release);
+                                resumed_flag.store(true, Ordering::Release);
+                                fenced = false;
+                            }
+                            Err(error) => {
+                                fail_all(
+                                    Loss::from_io(&error),
+                                    &mut deferred_prepare_bind,
+                                    &mut deferred_wait_active,
+                                    &mut deferred_end,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        fail_all(
+                            Loss::Closed,
+                            &mut deferred_prepare_bind,
+                            &mut deferred_wait_active,
+                            &mut deferred_end,
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        fail_all(
+                            Loss::from_io(&error),
+                            &mut deferred_prepare_bind,
+                            &mut deferred_wait_active,
+                            &mut deferred_end,
+                        );
+                        return;
+                    }
+                }
+            }
+            () = &mut silence, if fenced => {
+                fail_all(
+                    Loss::Io {
+                        kind: io::ErrorKind::TimedOut,
+                        message: "the gateway went silent while this land turn was fenced"
+                            .to_owned(),
+                    },
+                    &mut deferred_prepare_bind,
+                    &mut deferred_wait_active,
+                    &mut deferred_end,
+                );
+                return;
+            }
+        }
+    }
+}
+
+async fn finish_active_end(connection: &mut Connection, outcome: String) -> Result<(), Loss> {
+    loop {
+        match connection.try_next_line() {
+            Ok(NonBlockingLine::Pending) => break,
+            Ok(NonBlockingLine::Line(line)) => match decode(&line) {
+                Ok(TurnAnswer::Expired { bound_ms }) => return Err(Loss::Expired { bound_ms }),
+                Ok(
+                    TurnAnswer::Bound { .. }
+                    | TurnAnswer::Refused { .. }
+                    | TurnAnswer::Fence
+                    | TurnAnswer::Heartbeat { .. }
+                    | TurnAnswer::Unfenced,
+                ) => continue,
+                _ => return Err(Loss::Unexpected(line)),
+            },
+            Ok(NonBlockingLine::Eof) => return Err(Loss::Closed),
+            Err(error) => return Err(Loss::from_io(&error)),
+        }
+    }
+    let payload = line(&TurnStep::End { outcome }).map_err(|error| Loss::from_io(&error))?;
+    let sent = match connection.try_write_all(&payload) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            connection.write_all(&payload).await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = sent {
+        loop {
+            match connection.try_next_line() {
+                Ok(NonBlockingLine::Pending) => return Err(Loss::from_io(&error)),
+                Ok(NonBlockingLine::Line(line)) => match decode(&line) {
+                    Ok(TurnAnswer::Expired { bound_ms }) => {
+                        return Err(Loss::Expired { bound_ms });
+                    }
+                    Ok(
+                        TurnAnswer::Bound { .. }
+                        | TurnAnswer::Refused { .. }
+                        | TurnAnswer::Fence
+                        | TurnAnswer::Heartbeat { .. }
+                        | TurnAnswer::Unfenced,
+                    ) => continue,
+                    _ => return Err(Loss::Unexpected(line)),
+                },
+                Ok(NonBlockingLine::Eof) => return Err(Loss::Closed),
+                Err(_) => return Err(Loss::from_io(&error)),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One JSON line.
@@ -804,26 +1876,85 @@ async fn asked(gateway: &TurnGateway, ask: &TurnAsk) -> io::Result<(Connection, 
     Ok((Connection::new(stream), descriptor))
 }
 
+/// What [`queued`] returns once the turn is held.
+struct Acquired {
+    ticket: Ticket,
+    resume_token: Option<String>,
+    resumed_across_restart: bool,
+}
+
 /// Read the gateway's answers to `ask` on `connection` until its turn is held, telling `waiting`
-/// who holds it whenever that changes and every `report_every` while it does not: the ticket, or
-/// `None` when the gateway closed the connection after it answered `fenced`. A parked ask is
-/// numbered on its own connection; one the install's restart drains is asked again. A close with
-/// no `fenced` before it is an error.
+/// who holds it whenever that changes and every `report_every` while it does not: the acquired
+/// ticket, or `None` when the gateway closed the connection after it answered `fenced` (parked
+/// ask). A parked ask is numbered on its own connection; one the install's restart drains is asked
+/// again. A queued resumable ticket that receives `{"turn":"fence"}` acknowledges
+/// `{"step":"fenced"}`, stays alive across heartbeats, unfences in place on `{"turn":"unfenced"}`,
+/// or reconnects and resumes via `land-turn-resume` on fenced EOF. A close with no `fenced` before
+/// it is an error.
 async fn queued(
     connection: &mut Connection,
+    descriptor: &mut RawFd,
     gateway: &TurnGateway,
     ask: &TurnAsk,
     report_every: Duration,
     waiting: &mut impl FnMut(&Wait),
-) -> io::Result<Option<Ticket>> {
+) -> io::Result<Option<Acquired>> {
     let mut told: Option<Wait> = None;
+    let mut ticket_number: Option<u64> = None;
+    let mut resume_token: Option<String> = None;
+    let mut fenced = false;
+    let mut resumed_across_restart = false;
     let start = tokio::time::Instant::now() + report_every;
     let mut cadence = tokio::time::interval_at(start, report_every);
+    let mut silence = Box::pin(tokio::time::sleep(cowshed_os::deadline::HEARTBEAT_SILENCE));
     loop {
         tokio::select! {
             line = connection.next_line() => {
                 let line = match line? {
-                    Some(line) => line,
+                    Some(line) => {
+                        if fenced {
+                            silence.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + cowshed_os::deadline::HEARTBEAT_SILENCE,
+                            );
+                        }
+                        line
+                    }
+                    None if fenced => {
+                        let (Some(number), Some(token)) = (ticket_number, resume_token.as_deref()) else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "the gateway closed the fenced land turn's connection without a \
+                                 resume token",
+                            ));
+                        };
+                        let (new_conn, new_fd, resumed) =
+                            reconnect_and_resume(gateway, number, token).await?;
+                        *connection = new_conn;
+                        *descriptor = new_fd;
+                        fenced = false;
+                        resumed_across_restart = true;
+                        match resumed {
+                            TurnAnswer::Held { ticket, .. } => {
+                                return Ok(Some(Acquired {
+                                    ticket,
+                                    resume_token,
+                                    resumed_across_restart,
+                                }));
+                            }
+                            TurnAnswer::Resumed { .. } => continue,
+                            TurnAnswer::Queued { holder, ahead, .. } => {
+                                let wait = Wait::Queued { holder, ahead };
+                                if told.as_ref() != Some(&wait) {
+                                    waiting(&wait);
+                                    cadence.reset();
+                                }
+                                told = Some(wait);
+                                continue;
+                            }
+                            other => return Err(unexpected(&other, "a resume")),
+                        }
+                    }
                     None if matches!(told, Some(Wait::Install { .. })) => return Ok(None),
                     None => {
                         return Err(io::Error::new(
@@ -833,11 +1964,49 @@ async fn queued(
                     }
                 };
                 let wait = match decode(&line)? {
-                    TurnAnswer::Held { ticket } => return Ok(Some(ticket)),
+                    TurnAnswer::Held {
+                        ticket,
+                        resume_token: token,
+                    } => {
+                        if token.is_some() {
+                            resume_token = token;
+                        }
+                        return Ok(Some(Acquired {
+                            ticket,
+                            resume_token,
+                            resumed_across_restart,
+                        }));
+                    }
                     TurnAnswer::Fenced => Wait::Install {
                         lock: gateway.slot(),
                     },
-                    TurnAnswer::Queued { holder, ahead, .. } => Wait::Queued { holder, ahead },
+                    TurnAnswer::Queued {
+                        ticket,
+                        holder,
+                        ahead,
+                        resume_token: token,
+                    } => {
+                        ticket_number = Some(ticket.number);
+                        if token.is_some() {
+                            resume_token = token;
+                        }
+                        Wait::Queued { holder, ahead }
+                    }
+                    TurnAnswer::Fence => {
+                        let payload = self::line(&TurnStep::Fenced)?;
+                        connection.write_all(&payload).await?;
+                        fenced = true;
+                        silence.as_mut().reset(
+                            tokio::time::Instant::now()
+                                + cowshed_os::deadline::HEARTBEAT_SILENCE,
+                        );
+                        continue;
+                    }
+                    TurnAnswer::Heartbeat { .. } => continue,
+                    TurnAnswer::Unfenced => {
+                        fenced = false;
+                        continue;
+                    }
                     TurnAnswer::Refused { error } => {
                         return Err(io::Error::other(format!(
                             "the gateway at {} refused the land turn {}: {error}",
@@ -845,7 +2014,9 @@ async fn queued(
                             ask.repo,
                         )));
                     }
-                    other @ (TurnAnswer::Bound { .. } | TurnAnswer::Expired { .. }) => {
+                    other @ (TurnAnswer::Bound { .. }
+                    | TurnAnswer::Expired { .. }
+                    | TurnAnswer::Resumed { .. }) => {
                         return Err(unexpected(&other, "an ask"));
                     }
                 };
@@ -859,6 +2030,12 @@ async fn queued(
                 if let Some(wait) = &told {
                     waiting(wait);
                 }
+            }
+            () = &mut silence, if fenced => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the gateway went silent while this queued land turn was fenced",
+                ));
             }
         }
     }
@@ -881,12 +2058,19 @@ pub async fn take(
     report_every: Duration,
     mut waiting: impl FnMut(&Wait),
 ) -> io::Result<Turn> {
-    let (ticket, connection, descriptor) = loop {
-        let (mut connection, descriptor) = asked(gateway, ask).await?;
-        if let Some(ticket) =
-            queued(&mut connection, gateway, ask, report_every, &mut waiting).await?
+    let (acquired, connection, descriptor) = loop {
+        let (mut connection, mut descriptor) = asked(gateway, ask).await?;
+        if let Some(acquired) = queued(
+            &mut connection,
+            &mut descriptor,
+            gateway,
+            ask,
+            report_every,
+            &mut waiting,
+        )
+        .await?
         {
-            break (ticket, connection, descriptor);
+            break (acquired, connection, descriptor);
         }
         let (census, support) = (gateway.census.clone(), gateway.support.clone());
         tokio::task::spawn_blocking(move || {
@@ -920,13 +2104,23 @@ pub async fn take(
             }
         }),
     };
-    Ok(Turn {
-        ticket,
-        connection,
-        socket: descriptor,
-        outside,
-        loss: None,
-    })
+    if let Some(resume_token) = acquired.resume_token {
+        Turn::resumable(
+            acquired.ticket,
+            connection,
+            outside,
+            gateway.clone(),
+            resume_token,
+            acquired.resumed_across_restart,
+        )
+    } else {
+        Ok(Turn::direct(
+            acquired.ticket,
+            connection,
+            descriptor,
+            outside,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -951,7 +2145,10 @@ mod tests {
 
     #[test]
     fn an_answer_and_a_control_failure_both_decode_and_anything_else_is_invalid() {
-        let held = TurnAnswer::Held { ticket: ticket(3) };
+        let held = TurnAnswer::Held {
+            ticket: ticket(3),
+            resume_token: None,
+        };
         let line = String::from_utf8(line(&held).unwrap()).unwrap();
         assert_eq!(decode(line.trim_end()).unwrap(), held);
         assert_eq!(
@@ -1009,13 +2206,12 @@ mod tests {
 
         let (client, mut server) = UnixStream::pair().expect("unix stream pair");
         let descriptor = std::os::fd::AsRawFd::as_raw_fd(&client);
-        let turn = Turn {
-            ticket: ticket(1),
-            connection: Connection::new(Fenced::new(client)),
-            socket: descriptor,
-            outside: None,
-            loss: None,
-        };
+        let turn = Turn::direct(
+            ticket(1),
+            Connection::new(Fenced::new(client)),
+            descriptor,
+            None,
+        );
         server
             .write_all(b"{\"turn\":\"expired\",\"boundMs\":250}\n")
             .await
@@ -1039,13 +2235,12 @@ mod tests {
 
         let (client, mut server) = UnixStream::pair().expect("unix stream pair");
         let descriptor = std::os::fd::AsRawFd::as_raw_fd(&client);
-        let mut turn = Turn {
-            ticket: ticket(1),
-            connection: Connection::new(Fenced::new(client)),
-            socket: descriptor,
-            outside: None,
-            loss: None,
-        };
+        let mut turn = Turn::direct(
+            ticket(1),
+            Connection::new(Fenced::new(client)),
+            descriptor,
+            None,
+        );
         server
             .write_all(b"{\"turn\":\"expired\",\"boundMs\":250}\n")
             .await
@@ -1083,13 +2278,12 @@ mod tests {
     async fn end_reports_closed_connection_on_eof_without_expired() {
         let (client, server) = UnixStream::pair().expect("unix stream pair");
         let descriptor = std::os::fd::AsRawFd::as_raw_fd(&client);
-        let turn = Turn {
-            ticket: ticket(1),
-            connection: Connection::new(Fenced::new(client)),
-            socket: descriptor,
-            outside: None,
-            loss: None,
-        };
+        let turn = Turn::direct(
+            ticket(1),
+            Connection::new(Fenced::new(client)),
+            descriptor,
+            None,
+        );
         drop(server);
 
         let error = turn

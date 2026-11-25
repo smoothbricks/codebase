@@ -31,6 +31,7 @@
 //! into its inputs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,13 +39,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cowshed_core::api::dto::{
     LandTurnName, LandTurnQueue, ParkedLandTurn, WaitingInstall, WithdrawnInstall,
 };
-use cowshed_core::land_turn::{Abandonment, Ticket, TurnAnswer, TurnAsk, TurnStep, format_bound};
-use cowshed_core::runtime::job_groups::{Life, Process, ProcessExit};
+use cowshed_core::land_turn::{
+    Abandonment, Ticket, TurnAnswer, TurnAsk, TurnStep, format_bound, hash_resume_token,
+    mint_resume_token,
+};
+use cowshed_core::runtime::job_groups::{Life, Process, ProcessExit, current_boot_session};
+use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 /// How many abandonments the gateway keeps for `land-turns`, newest last.
 const ABANDONMENTS_KEPT: usize = 256;
+
+/// Handoff snapshot file written beside the control socket on planned gateway drain and unlinked
+/// immediately after startup adoption (05_gateway.md "Land turns").
+pub(crate) const HANDOFF_FILE_NAME: &str = "land-turns-handoff.json";
+
+const HANDOFF_VERSION: u32 = 1;
 
 /// One ticket in its queue.
 #[derive(Debug)]
@@ -59,14 +71,36 @@ struct Entry {
     held_unix_ms: Option<u64>,
     /// Whether the ticket was asked with `"class":"bounded"`.
     bounded: bool,
+    /// Whether the ticket opted into fencing and restart survival (`"resumable":true`).
+    resumable: bool,
     /// How the asker ended its hold, once it has.
     outcome: Option<String>,
+    /// Kernel identity of the asking process, persisted across a planned drain for resume
+    /// verification and gap-exit detection.
+    asker_life: Option<Life>,
+    /// Kernel identity of each bound command, persisted across a planned drain so startup adoption
+    /// can re-arm `ExitWatch` (`Life::exit`) without polling.
+    bound_lives: Vec<(u32, Life)>,
+    /// SHA-256 of the minted resume token (never stored on `Ticket`).
+    token_sha256: Option<[u8; 32]>,
+    /// Set when an adopted queued ticket is promoted to `held` before its asker reconnects, so
+    /// `land-turn-resume` answers `Held` instead of `Resumed`.
+    pending_held_after_resume: bool,
+    /// Whether `{"turn":"fence"}` has been sent to this ticket for the current wait.
+    fence_requested: bool,
 }
 
 impl Entry {
     /// Nothing holds the ticket any more: neither its asker nor a bound command.
     fn done(&self) -> bool {
         !self.asker && self.ticket.bound.is_empty()
+    }
+
+    /// Whether this ticket is fenced for a planned restart (`ticket_fenced` in `land_turn.bend`):
+    /// either its live asker acknowledged `{"step":"fenced"}`, or its asker already departed
+    /// leaving only bound commands.
+    const fn is_fenced(&self) -> bool {
+        self.ticket.fenced || !self.asker
     }
 }
 
@@ -116,6 +150,8 @@ pub(crate) enum BindRefusal {
     Gone,
     /// The ticket waits: only a held turn runs a command.
     Waiting,
+    /// The ticket is fenced for a gateway restart (`fenced_bind_refused`).
+    Fenced,
 }
 
 impl std::fmt::Display for BindRefusal {
@@ -124,6 +160,10 @@ impl std::fmt::Display for BindRefusal {
             Self::Gone => "the ticket has left its queue",
             Self::Waiting => {
                 "the ticket still waits for its turn; a command runs only under a held turn"
+            }
+            Self::Fenced => {
+                "the ticket is fenced for a gateway restart; new binds wait until it resumes or \
+                 unfences"
             }
         })
     }
@@ -214,20 +254,23 @@ impl Turns {
         self.queues.values().flatten().any(|entry| !entry.bounded)
     }
 
-    /// `pid` asks from inside a held turn: it is a command bound to a turn, or the asker of a
-    /// ticket that holds its turn and has not ended its hold. A waiting install waits for that
-    /// turn, and the turn ends only once what its holder asks inside it is served (a land takes
-    /// its ref turn inside its land turn), so such an ask is never parked behind the install. A
-    /// process a bound command starts holds no turn and asks from outside. The asker's exit and
-    /// each bound command's are watched, so a pid named here is that process's own; only a bound
-    /// command whose watch failed twice may lend its pid to a later process, whose ask is then
-    /// numbered ahead of the install instead of behind it.
+    /// `pid` asks from inside an unfenced held turn: it is a command bound to an unfenced turn, or
+    /// the asker of an unfenced ticket that holds its turn and has not ended its hold. A fenced
+    /// ticket asks from outside (`a_fenced_ticket_asks_from_outside`).
     fn inside(&self, pid: u32) -> bool {
         self.queues.values().flatten().any(|entry| {
-            entry.ticket.bound.contains(&pid)
-                || (entry.held && entry.asker && entry.ticket.pid == pid)
+            !entry.ticket.fenced
+                && (entry.ticket.bound.contains(&pid)
+                    || (entry.held && entry.asker && entry.ticket.pid == pid))
         })
     }
+
+    /// Whether every live ticket in every queue is fenced (`all_fenced` in `land_turn.bend`,
+    /// vacuously true when no queue holds a ticket).
+    fn all_fenced(&self) -> bool {
+        self.queues.values().flatten().all(Entry::is_fenced)
+    }
+
     /// Number `ask` one past the last number given and put it at the end of its queue: its number
     /// and what its queue is told.
     fn number(
@@ -245,6 +288,7 @@ impl Turns {
             workspace,
             command,
             class: _,
+            resumable,
         } = ask;
         let queue = self.queues.entry(repo).or_default();
         queue.push(Entry {
@@ -261,20 +305,27 @@ impl Turns {
             held: false,
             held_unix_ms: None,
             bounded,
+            resumable,
             outcome: None,
+            asker_life: None,
+            bound_lives: Vec::new(),
+            token_sha256: None,
+            pending_held_after_resume: false,
+            fence_requested: false,
         });
         (number, tell(queue, now_unix_ms))
     }
 
-    /// An install's read of the turns asked with the fence: with no ticket in any queue, so no
-    /// holder, every queue is fenced until [`Self::unfence`]; with one, nothing is set, since the
-    /// install refuses. A parked ask is no ticket. Answers whether it fenced.
+    /// An install's read of the turns asked with the fence: when every ticket in every queue is
+    /// fenced (including an empty queue), every queue is fenced until [`Self::unfence`]; with any
+    /// unfenced ticket, nothing is set, since the install refuses. A parked ask is no ticket.
+    /// Answers whether it fenced.
     pub(crate) fn fence(&mut self) -> bool {
-        let free = self.queues.is_empty();
-        if free {
+        let ready = self.all_fenced();
+        if ready {
             self.fences += 1;
         }
-        free
+        ready
     }
 
     /// An install, keyed `install`, waits for the turns: with no ticket in any queue it is fenced
@@ -315,8 +366,6 @@ impl Turns {
         {
             self.fenced_installs.remove(index);
             self.fences = self.fences.saturating_sub(1);
-        } else {
-            return Settled::default();
         }
         self.release(now_unix_ms)
     }
@@ -384,11 +433,23 @@ impl Turns {
         self.parked.retain(|parked| parked.key != key);
     }
 
-    /// Number every parked ask in arrival order once no install waits and no fence holds.
+    /// Once no install waits and no fence holds without a restart, clear the fenced mark on every
+    /// fenced ticket (sending `{"turn":"unfenced"}` to each so it resumes in place) and number
+    /// every parked ask in arrival order behind every ticket already queued.
     fn release(&mut self, now_unix_ms: u64) -> Settled {
         let mut settled = Settled::default();
         if self.fences > 0 || !self.waiting.is_empty() {
             return settled;
+        }
+        for entry in self.queues.values_mut().flatten() {
+            entry.fence_requested = false;
+            if entry.ticket.fenced {
+                entry.ticket.fenced = false;
+                settled.notices.push(Notice {
+                    number: entry.ticket.number,
+                    answer: TurnAnswer::Unfenced,
+                });
+            }
         }
         while let Some(ParkedAsk {
             key,
@@ -404,12 +465,64 @@ impl Turns {
         settled
     }
 
-    /// Bind the command `pid` to the held ticket `number`: it holds the turn until it exits.
+    /// Fence every waiting install if every live ticket in every queue is now fenced.
+    fn wake_waiting(&mut self) -> Vec<u64> {
+        if self.all_fenced() && !self.waiting.is_empty() {
+            self.fences += u64::try_from(self.waiting.len()).unwrap_or(u64::MAX);
+            let keys: Vec<u64> = std::mem::take(&mut self.waiting)
+                .into_iter()
+                .map(|entry| entry.install)
+                .collect();
+            self.fenced_installs.extend_from_slice(&keys);
+            keys
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Mark ticket `number` fenced (`TFenced` in `land_turn.bend`): if every live ticket in every
+    /// queue is now fenced, fences every waiting install without waiting for fenced tickets to
+    /// end.
+    pub(crate) fn mark_fenced(&mut self, number: u64) -> Settled {
+        if let Some((queue, index)) = self.find(number) {
+            queue[index].ticket.fenced = true;
+        }
+        Settled {
+            fenced: self.wake_waiting(),
+            ..Settled::default()
+        }
+    }
+
+    /// Clear ticket `number`'s fenced mark (`TResume` in `land_turn.bend`) when its asker resumes
+    /// on the replacing gateway, returning the answer to send (`Held` if promoted during the gap,
+    /// otherwise `Resumed`).
+    pub(crate) fn resume_ticket(&mut self, number: u64) -> Option<TurnAnswer> {
+        let (queue, index) = self.find(number)?;
+        let entry = &mut queue[index];
+        entry.ticket.fenced = false;
+        entry.fence_requested = false;
+        let ticket = entry.ticket.clone();
+        if entry.pending_held_after_resume {
+            entry.pending_held_after_resume = false;
+            Some(TurnAnswer::Held {
+                ticket,
+                resume_token: None,
+            })
+        } else {
+            Some(TurnAnswer::Resumed { ticket })
+        }
+    }
+
+    /// Bind the command `pid` to the held, unfenced ticket `number`: it holds the turn until it
+    /// exits. Refused while the ticket waits or is fenced (`fenced_bind_refused`).
     pub(crate) fn bind(&mut self, number: u64, pid: u32) -> Result<Settled, BindRefusal> {
         let (queue, index) = self.find(number).ok_or(BindRefusal::Gone)?;
         let entry = &mut queue[index];
         if !entry.held {
             return Err(BindRefusal::Waiting);
+        }
+        if entry.ticket.fenced {
+            return Err(BindRefusal::Fenced);
         }
         if !entry.ticket.bound.contains(&pid) {
             entry.ticket.bound.push(pid);
@@ -426,6 +539,9 @@ impl Turns {
             return Settled::default();
         };
         queue[index].ticket.bound.retain(|bound| *bound != pid);
+        queue[index]
+            .bound_lives
+            .retain(|(bound_pid, _)| *bound_pid != pid);
         self.settle(number, now_unix_ms)
     }
 
@@ -459,7 +575,14 @@ impl Turns {
                     repo,
                     LandTurnQueue {
                         repo: repo.clone(),
-                        tickets: entries.iter().map(|entry| entry.ticket.clone()).collect(),
+                        tickets: entries
+                            .iter()
+                            .map(|entry| {
+                                let mut ticket = entry.ticket.clone();
+                                ticket.fenced = entry.is_fenced();
+                                ticket
+                            })
+                            .collect(),
                         abandoned: Vec::new(),
                     },
                 )
@@ -562,16 +685,9 @@ impl Turns {
             ended,
             ..Settled::default()
         };
-        // The step that ends the last ticket fences every waiting install.
-        if self.queues.is_empty() && !self.waiting.is_empty() {
-            self.fences += u64::try_from(self.waiting.len()).unwrap_or(u64::MAX);
-            let keys: Vec<u64> = std::mem::take(&mut self.waiting)
-                .into_iter()
-                .map(|entry| entry.install)
-                .collect();
-            self.fenced_installs.extend_from_slice(&keys);
-            settled.fenced = keys;
-        }
+        // The step that leaves every live ticket fenced (including emptying all queues) fences
+        // every waiting install.
+        settled.fenced = self.wake_waiting();
         settled
     }
 }
@@ -590,6 +706,7 @@ fn tell(queue: &mut [Entry], now_unix_ms: u64) -> Vec<Notice> {
             number: head.ticket.number,
             answer: TurnAnswer::Held {
                 ticket: head.ticket.clone(),
+                resume_token: None,
             },
         });
     }
@@ -600,6 +717,7 @@ fn tell(queue: &mut [Entry], now_unix_ms: u64) -> Vec<Notice> {
                 ticket: waiter.ticket.clone(),
                 holder: head.ticket.clone(),
                 ahead: ahead + 1,
+                resume_token: None,
             },
         });
     }
@@ -634,12 +752,260 @@ pub(crate) enum WaitResolution {
     Withdrawn { by_pid: Option<u32> },
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HandoffSnapshot {
+    version: u32,
+    boot_session: String,
+    numbered: u64,
+    queues: Vec<SnapshottedQueue>,
+    #[serde(default)]
+    abandoned: Vec<(LandTurnName, Abandonment)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshottedQueue {
+    repo: LandTurnName,
+    entries: Vec<SnapshottedEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshottedEntry {
+    ticket: Ticket,
+    asker: bool,
+    held: bool,
+    held_unix_ms: Option<u64>,
+    bounded: bool,
+    resumable: bool,
+    outcome: Option<String>,
+    asker_life: Option<Life>,
+    bound_lives: Vec<(u32, Life)>,
+    token_sha256: Option<[u8; 32]>,
+    #[serde(default)]
+    pending_held_after_resume: bool,
+}
+
+fn write_handoff_snapshot(path: &Path, snapshot: &HandoffSnapshot) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let encoded = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+struct AdoptedWatches {
+    bound: Vec<(u64, u32, Life, ProcessExit)>,
+    askers: Vec<(u64, Life, ProcessExit)>,
+}
+
+/// Read, immediately unlink, and adopt any handoff snapshot at `path` whose boot session matches
+/// this host's boot (05_gateway.md "Land turns"). Any bound command or asker already gone during
+/// the restart gap is settled before the control socket accepts.
+fn adopt_handoff(path: &Path) -> (Turns, AdoptedWatches) {
+    let mut turns = Turns::default();
+    let mut watches = AdoptedWatches {
+        bound: Vec::new(),
+        askers: Vec::new(),
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (turns, watches),
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: land turns: cannot read handoff snapshot {}: {error}",
+                path.display()
+            );
+            return (turns, watches);
+        }
+    };
+    // Unlink immediately after reading so a later crash can never resurrect old tickets.
+    let _ = std::fs::remove_file(path);
+    let snapshot: HandoffSnapshot = match serde_json::from_slice(&bytes) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: land turns: discarding malformed handoff snapshot {}: {error}",
+                path.display()
+            );
+            return (turns, watches);
+        }
+    };
+    if snapshot.version != HANDOFF_VERSION {
+        cowshed_os::eprintln!(
+            "cowshed: land turns: discarding handoff snapshot with unsupported version {}",
+            snapshot.version
+        );
+        return (turns, watches);
+    }
+    let boot = match current_boot_session() {
+        Ok(boot) => boot,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: land turns: cannot read boot session for handoff adoption: {error}"
+            );
+            return (turns, watches);
+        }
+    };
+    if snapshot.boot_session != boot {
+        cowshed_os::eprintln!(
+            "cowshed: land turns: discarding handoff snapshot from an earlier boot session"
+        );
+        return (turns, watches);
+    }
+
+    struct AdoptedTicket {
+        number: u64,
+        asker: bool,
+        asker_life: Option<Life>,
+        bound_lives: Vec<(u32, Life)>,
+    }
+
+    turns.numbered = snapshot.numbered;
+    turns.abandoned = snapshot.abandoned.into_iter().collect();
+    let mut adopted_tickets: Vec<AdoptedTicket> = Vec::new();
+    for SnapshottedQueue { repo, entries } in snapshot.queues {
+        if entries.is_empty() {
+            continue;
+        }
+        let mut queue = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let number = entry.ticket.number;
+            adopted_tickets.push(AdoptedTicket {
+                number,
+                asker: entry.asker,
+                asker_life: entry.asker_life,
+                bound_lives: entry.bound_lives.clone(),
+            });
+            queue.push(Entry {
+                ticket: entry.ticket,
+                asker: entry.asker,
+                held: entry.held,
+                held_unix_ms: entry.held_unix_ms,
+                bounded: entry.bounded,
+                resumable: entry.resumable,
+                outcome: entry.outcome,
+                asker_life: entry.asker_life,
+                bound_lives: entry.bound_lives,
+                token_sha256: entry.token_sha256,
+                pending_held_after_resume: entry.pending_held_after_resume,
+                fence_requested: false,
+            });
+        }
+        turns.queues.insert(repo, queue);
+    }
+
+    let now = now_unix_ms();
+    for AdoptedTicket {
+        number,
+        asker,
+        asker_life,
+        bound_lives,
+    } in adopted_tickets
+    {
+        let mut gone_bound: Vec<u32> = Vec::new();
+        for (pid, life) in bound_lives {
+            match life.exit() {
+                Ok(ProcessExit::Before) => {
+                    gone_bound.push(pid);
+                    let settled = turns.exited(number, pid, now);
+                    mark_promoted_unattached(&mut turns, &settled.notices);
+                }
+                Ok(watching @ ProcessExit::Watching(_)) => {
+                    watches.bound.push((number, pid, life, watching));
+                }
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: land turn ticket {number}: cannot re-arm exit watch for bound \
+                         pid {pid} at adoption ({error}); it holds the turn until the gateway \
+                         restarts"
+                    );
+                }
+            }
+        }
+        let mut asker_gone_in_gap = false;
+        if asker {
+            match asker_life {
+                Some(life) => match life.exit() {
+                    Ok(ProcessExit::Before) => {
+                        asker_gone_in_gap = true;
+                        let settled = turns.left(number, None, now);
+                        mark_promoted_unattached(&mut turns, &settled.notices);
+                    }
+                    Ok(watching @ ProcessExit::Watching(_)) => {
+                        watches.askers.push((number, life, watching));
+                    }
+                    Err(error) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: land turn ticket {number}: cannot re-arm exit watch for \
+                             asker pid {} at adoption ({error})",
+                            life.pid()
+                        );
+                    }
+                },
+                None => {
+                    asker_gone_in_gap = true;
+                    let settled = turns.left(number, None, now);
+                    mark_promoted_unattached(&mut turns, &settled.notices);
+                }
+            }
+        }
+        cowshed_os::eprintln!(
+            "cowshed: land turn ticket {number}: adopted from handoff snapshot{}{}",
+            if gone_bound.is_empty() {
+                String::new()
+            } else {
+                format!(" (bound command(s) {gone_bound:?} exited during gap)")
+            },
+            if asker_gone_in_gap {
+                " (asker exited during gap)"
+            } else {
+                ""
+            },
+        );
+    }
+
+    (turns, watches)
+}
+
+/// Record `pending_held_after_resume` on any ticket promoted to `Held` while its asker has no
+/// attached connection yet, so `land-turn-resume` tells it `Held` rather than `Resumed`.
+fn mark_promoted_unattached(turns: &mut Turns, notices: &[Notice]) {
+    for Notice { number, answer } in notices {
+        if matches!(answer, TurnAnswer::Held { .. })
+            && let Some((queue, index)) = turns.find(*number)
+        {
+            queue[index].pending_held_after_resume = true;
+        }
+    }
+}
+
+/// Result of matching a `land-turn-resume` request in the actor.
+struct ResumedTicket {
+    answer: TurnAnswer,
+    held: bool,
+    bounded: bool,
+    held_unix_ms: Option<u64>,
+}
+
 enum Message {
     Ask {
         /// The connection that asks, whose departure names it ([`Message::Left`]).
         connection: u64,
         ask: TurnAsk,
         pid: u32,
+        asker_life: Option<Life>,
         answers: mpsc::UnboundedSender<TurnAnswer>,
         /// Told the ticket's number once the actor has given it: at once, or once the ask, parked
         /// behind an install, is numbered.
@@ -648,7 +1014,23 @@ enum Message {
     Bind {
         number: u64,
         pid: u32,
+        life: Life,
         done: oneshot::Sender<Result<(), BindRefusal>>,
+    },
+    Fenced {
+        number: u64,
+        done: oneshot::Sender<()>,
+    },
+    Resume {
+        connection: u64,
+        ticket: u64,
+        peer_life: Life,
+        token: String,
+        answers: mpsc::UnboundedSender<TurnAnswer>,
+        reply: oneshot::Sender<Result<ResumedTicket, String>>,
+    },
+    AdoptedAskerExited {
+        number: u64,
     },
     Exited {
         number: u64,
@@ -688,6 +1070,12 @@ enum Message {
         install: Option<u64>,
         lifted: Option<oneshot::Sender<()>>,
     },
+    /// Freeze the actor for a planned gateway drain and atomically persist every fenced ticket to
+    /// `path` before control connections are aborted.
+    FreezeAndSnapshot {
+        path: PathBuf,
+        reply: oneshot::Sender<std::io::Result<()>>,
+    },
 }
 
 /// The land turns' shell: one task owns [`Turns`], fed through this handle.
@@ -703,17 +1091,72 @@ pub(crate) struct LandTurns {
 impl LandTurns {
     #[cfg(test)]
     pub(crate) fn start() -> Self {
-        Self::start_with_bounded_deadline(cowshed_core::land_turn::BOUNDED_TURN_DEADLINE)
+        Self::start_adopted(None, cowshed_core::land_turn::BOUNDED_TURN_DEADLINE)
     }
 
-    pub(crate) fn start_with_bounded_deadline(bounded_deadline: Duration) -> Self {
+    pub(crate) fn start_adopted(handoff_path: Option<&Path>, bounded_deadline: Duration) -> Self {
         let (messages, receiver) = mpsc::unbounded_channel();
-        tokio::spawn(run(receiver));
-        Self {
+        let handle = Self {
             messages,
             connections: Arc::new(AtomicU64::new(0)),
             bounded_deadline,
+        };
+        let (turns, watches) = match handoff_path {
+            Some(path) => adopt_handoff(path),
+            None => (
+                Turns::default(),
+                AdoptedWatches {
+                    bound: Vec::new(),
+                    askers: Vec::new(),
+                },
+            ),
+        };
+        for (number, pid, life, exit) in watches.bound {
+            let turns_handle = handle.clone();
+            tokio::spawn(async move {
+                exited(&life, exit, number, pid).await;
+                turns_handle.send(Message::Exited { number, pid });
+            });
         }
+        let mut adopted_asker_watches = HashMap::new();
+        for (number, life, exit) in watches.askers {
+            let turns_handle = handle.clone();
+            let task = tokio::spawn(async move {
+                if let Err(error) = exit.observed().await {
+                    cowshed_os::eprintln!(
+                        "cowshed: land turn ticket {number}: adopted asker pid {} exit watch \
+                         failed ({error})",
+                        life.pid()
+                    );
+                    return;
+                }
+                turns_handle.send(Message::AdoptedAskerExited { number });
+            });
+            adopted_asker_watches.insert(number, task);
+        }
+        tokio::spawn(run(turns, adopted_asker_watches, receiver));
+        handle
+    }
+
+    /// Freeze the actor for a planned gateway drain and atomically write every fenced ticket to
+    /// `path` before control connections are aborted.
+    pub(crate) async fn freeze_and_snapshot(&self, path: PathBuf) -> std::io::Result<()> {
+        let (reply, done) = oneshot::channel();
+        if self
+            .messages
+            .send(Message::FreezeAndSnapshot { path, reply })
+            .is_err()
+        {
+            return Ok(());
+        }
+        done.await.unwrap_or(Ok(()))
+    }
+
+    /// Mark ticket `number` fenced once its asker acknowledges `{"step":"fenced"}`.
+    async fn mark_fenced(&self, number: u64) {
+        let (done, ack) = oneshot::channel();
+        self.send(Message::Fenced { number, done });
+        let _ = ack.await;
     }
 
     /// Every queue with a ticket or a recent abandonment, plus waiting installs and parked asks,
@@ -879,22 +1322,89 @@ impl Drop for Waiting {
         }
     }
 }
-async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
-    let mut turns = Turns::default();
+#[allow(clippy::too_many_lines)]
+async fn run(
+    mut turns: Turns,
+    mut adopted_asker_watches: HashMap<u64, tokio::task::JoinHandle<()>>,
+    mut receiver: mpsc::UnboundedReceiver<Message>,
+) {
     let mut answers: HashMap<u64, mpsc::UnboundedSender<TurnAnswer>> = HashMap::new();
     // Each asking connection's ticket number, which its departure names.
     let mut numbers: HashMap<u64, u64> = HashMap::new();
-    // Each parked asking connection's answers, and where its number is told once it is given.
-    let mut parked: HashMap<u64, (mpsc::UnboundedSender<TurnAnswer>, oneshot::Sender<u64>)> =
-        HashMap::new();
+    type ParkedAsker = (
+        mpsc::UnboundedSender<TurnAnswer>,
+        oneshot::Sender<u64>,
+        Option<Life>,
+    );
+    // Each parked asking connection's answers, number channel, and asker life.
+    let mut parked: HashMap<u64, ParkedAsker> = HashMap::new();
+    // One-time resume tokens waiting to be attached to each newly numbered resumable ticket's
+    // first numbered answer (`Held` or `Queued`), then immediately dropped.
+    let mut pending_tokens: HashMap<u64, String> = HashMap::new();
     // Each waiting install's listing bound, and where it is told once fenced or withdrawn.
     let mut installs: HashMap<u64, (u64, oneshot::Sender<WaitSignal>)> = HashMap::new();
+    // Set during a planned gateway drain so aborted sockets never trigger departures.
+    let mut frozen = false;
+
     while let Some(message) = receiver.recv().await {
         let settled = match message {
+            Message::FreezeAndSnapshot { path, reply } => {
+                frozen = true;
+                for (_, task) in adopted_asker_watches.drain() {
+                    task.abort();
+                }
+                let queues: Vec<SnapshottedQueue> = turns
+                    .queues
+                    .iter()
+                    .filter_map(|(repo, entries)| {
+                        let kept: Vec<SnapshottedEntry> = entries
+                            .iter()
+                            .filter(|entry| entry.is_fenced())
+                            .map(|entry| SnapshottedEntry {
+                                ticket: entry.ticket.clone(),
+                                asker: entry.asker,
+                                held: entry.held,
+                                held_unix_ms: entry.held_unix_ms,
+                                bounded: entry.bounded,
+                                resumable: entry.resumable,
+                                outcome: entry.outcome.clone(),
+                                asker_life: entry.asker_life,
+                                bound_lives: entry.bound_lives.clone(),
+                                token_sha256: entry.token_sha256,
+                                pending_held_after_resume: entry.pending_held_after_resume,
+                            })
+                            .collect();
+                        (!kept.is_empty()).then(|| SnapshottedQueue {
+                            repo: repo.clone(),
+                            entries: kept,
+                        })
+                    })
+                    .collect();
+                let result = if queues.is_empty() {
+                    Ok(())
+                } else {
+                    match current_boot_session() {
+                        Ok(boot_session) => {
+                            let snapshot = HandoffSnapshot {
+                                version: HANDOFF_VERSION,
+                                boot_session,
+                                numbered: turns.numbered,
+                                queues,
+                                abandoned: turns.abandoned.iter().cloned().collect(),
+                            };
+                            write_handoff_snapshot(&path, &snapshot)
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                let _ = reply.send(result);
+                Settled::default()
+            }
             Message::Ask {
                 connection,
                 ask,
                 pid,
+                asker_life,
                 answers: sender,
                 number,
             } => {
@@ -903,8 +1413,24 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 let ahead_of_install = !turns.waiting.is_empty();
                 let inside = turns.inside(pid);
                 let bounded = ask.is_bounded();
+                let resumable = ask.resumable;
                 match turns.ask(connection, ask, pid, now_unix_ms()) {
                     Ok((given, settled)) => {
+                        if let Some((queue, index)) = turns.find(given) {
+                            queue[index].asker_life = asker_life;
+                            if resumable {
+                                match mint_resume_token() {
+                                    Ok((token, digest)) => {
+                                        queue[index].token_sha256 = Some(digest);
+                                        pending_tokens.insert(given, token);
+                                    }
+                                    Err(error) => cowshed_os::eprintln!(
+                                        "cowshed: land turn ticket {given}: cannot mint resume \
+                                         token ({error}); ticket will not be resumable"
+                                    ),
+                                }
+                            }
+                        }
                         let why = if !ahead_of_install {
                             if bounded { ", class bounded" } else { "" }
                         } else if inside {
@@ -929,31 +1455,139 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                              waits for the turns or fences them, and it is numbered once none does"
                         );
                         let _ = sender.send(TurnAnswer::Fenced);
-                        parked.insert(connection, (sender, number));
+                        parked.insert(connection, (sender, number, asker_life));
                         Settled::default()
                     }
                 }
             }
-            Message::Bind { number, pid, done } => {
+            Message::Bind {
+                number,
+                pid,
+                life,
+                done,
+            } => {
                 let bound = turns.bind(number, pid);
                 let reply = bound.as_ref().map(|_| ()).map_err(Clone::clone);
+                if bound.is_ok()
+                    && let Some((queue, index)) = turns.find(number)
+                    && !queue[index]
+                        .bound_lives
+                        .iter()
+                        .any(|(bound_pid, _)| *bound_pid == pid)
+                {
+                    queue[index].bound_lives.push((pid, life));
+                }
                 let _ = done.send(reply);
                 match bound {
                     Ok(settled) => {
                         cowshed_os::eprintln!(
-                            "cowshed: land turn ticket {number}: command pid {pid} holds it until it exits"
+                            "cowshed: land turn ticket {number}: command pid {pid} holds it until \
+                             it exits"
                         );
                         settled
                     }
                     Err(_) => Settled::default(),
                 }
             }
-            Message::Exited { number, pid } => turns.exited(number, pid, now_unix_ms()),
+            Message::Fenced { number, done } => {
+                let settled = turns.mark_fenced(number);
+                cowshed_os::eprintln!("cowshed: land turn ticket {number}: fenced for an install");
+                let _ = done.send(());
+                settled
+            }
+            Message::Resume {
+                connection,
+                ticket,
+                peer_life,
+                token,
+                answers: sender,
+                reply,
+            } => {
+                let outcome = match turns.find(ticket) {
+                    None => Err(format!(
+                        "land turn ticket {ticket} is not held or queued on this gateway"
+                    )),
+                    Some((queue, index)) => {
+                        let entry = &queue[index];
+                        if !entry.asker || !entry.ticket.fenced {
+                            Err(format!("land turn ticket {ticket} is not awaiting resume"))
+                        } else if entry.asker_life != Some(peer_life) {
+                            Err(format!(
+                                "peer process identity does not match land turn ticket {ticket}'s \
+                                 asker"
+                            ))
+                        } else {
+                            match answers.entry(ticket) {
+                                std::collections::hash_map::Entry::Occupied(_) => Err(format!(
+                                    "land turn ticket {ticket} already has an active connection"
+                                )),
+                                std::collections::hash_map::Entry::Vacant(slot) => {
+                                    let expected = entry.token_sha256;
+                                    let actual = hash_resume_token(&token);
+                                    match expected {
+                                        Some(expected) if bool::from(expected.ct_eq(&actual)) => {
+                                            let held = entry.held;
+                                            let bounded = entry.bounded;
+                                            let held_unix_ms = entry.held_unix_ms;
+                                            let workspace = entry.ticket.workspace.clone();
+                                            let pid = entry.ticket.pid;
+                                            if let Some(task) =
+                                                adopted_asker_watches.remove(&ticket)
+                                            {
+                                                task.abort();
+                                            }
+                                            let answer = turns
+                                                .resume_ticket(ticket)
+                                                .expect("ticket was just found");
+                                            numbers.insert(connection, ticket);
+                                            slot.insert(sender);
+                                            cowshed_os::eprintln!(
+                                                "cowshed: land turn ticket {ticket}: resumed by \
+                                                 {workspace} (pid {pid})"
+                                            );
+                                            Ok(ResumedTicket {
+                                                answer,
+                                                held,
+                                                bounded,
+                                                held_unix_ms,
+                                            })
+                                        }
+                                        _ => Err(format!(
+                                            "invalid resume token for land turn ticket {ticket}"
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = reply.send(outcome);
+                Settled::default()
+            }
+            Message::AdoptedAskerExited { number } => {
+                adopted_asker_watches.remove(&number);
+                if frozen || answers.contains_key(&number) {
+                    Settled::default()
+                } else {
+                    turns.left(number, None, now_unix_ms())
+                }
+            }
+            Message::Exited { number, pid } => {
+                if frozen {
+                    Settled::default()
+                } else {
+                    turns.exited(number, pid, now_unix_ms())
+                }
+            }
             Message::Left {
                 connection,
                 outcome,
             } => {
-                if let Some(number) = numbers.remove(&connection) {
+                if frozen {
+                    Settled::default()
+                } else if let Some(number) = numbers.remove(&connection) {
+                    answers.remove(&number);
+                    pending_tokens.remove(&number);
                     turns.left(number, outcome, now_unix_ms())
                 } else {
                     if parked.remove(&connection).is_some() {
@@ -981,8 +1615,8 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 let fenced = turns.fence();
                 if fenced {
                     cowshed_os::eprintln!(
-                        "cowshed: land turns fenced: an install read no holder, and every ask \
-                         is parked until its read's connection closes"
+                        "cowshed: land turns fenced: an install found every ticket fenced, and \
+                         every outside ask is parked until its read's connection closes"
                     );
                 }
                 let _ = reply.send((queues, fenced));
@@ -999,8 +1633,8 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 let now = turns.wait_fence(install, pid, now_unix_ms());
                 if now {
                     cowshed_os::eprintln!(
-                        "cowshed: land turns fenced: an install waited for no ticket, and every \
-                         ask is parked until its connection closes"
+                        "cowshed: land turns fenced: an install waited for no unfenced ticket, \
+                         and every outside ask is parked until its connection closes"
                     );
                     let _ = fenced.send(WaitSignal::Fenced(turns.queues(abandoned_since_unix_ms)));
                 } else {
@@ -1014,6 +1648,20 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                             .sum::<usize>()
                     );
                     installs.insert(install, (abandoned_since_unix_ms, fenced));
+                    // Ask every live unfenced resumable ticket (held and queued) to fence within
+                    // one heartbeat. Legacy non-resumable tickets are never sent `fence`.
+                    for entry in turns.queues.values_mut().flatten() {
+                        if entry.resumable
+                            && entry.asker
+                            && !entry.ticket.fenced
+                            && !entry.fence_requested
+                        {
+                            entry.fence_requested = true;
+                            if let Some(sender) = answers.get(&entry.ticket.number) {
+                                let _ = sender.send(TurnAnswer::Fence);
+                            }
+                        }
+                    }
                 }
                 let _ = reply.send((queues, now));
                 Settled::default()
@@ -1038,38 +1686,62 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 settled
             }
             Message::Unfence { install, lifted } => {
-                let settled = match install {
-                    Some(install) => {
-                        installs.remove(&install);
-                        cowshed_os::eprintln!(
-                            "cowshed: land turns: an install that waited has left; its wait or \
-                             its fence is gone"
-                        );
-                        turns.wait_left(install, now_unix_ms())
+                if frozen {
+                    if let Some(lifted) = lifted {
+                        let _ = lifted.send(());
                     }
-                    None => {
-                        cowshed_os::eprintln!("cowshed: land turns: an install's fence is lifted");
-                        turns.unfence(now_unix_ms())
+                    Settled::default()
+                } else {
+                    let settled = match install {
+                        Some(install) => {
+                            installs.remove(&install);
+                            cowshed_os::eprintln!(
+                                "cowshed: land turns: an install that waited has left; its wait \
+                                 or its fence is gone"
+                            );
+                            turns.wait_left(install, now_unix_ms())
+                        }
+                        None => {
+                            cowshed_os::eprintln!(
+                                "cowshed: land turns: an install's fence is lifted"
+                            );
+                            turns.unfence(now_unix_ms())
+                        }
+                    };
+                    if let Some(lifted) = lifted {
+                        let _ = lifted.send(());
                     }
-                };
-                if let Some(lifted) = lifted {
-                    let _ = lifted.send(());
+                    settled
                 }
-                settled
             }
         };
         for install in &settled.fenced {
             if let Some((abandoned_since_unix_ms, fenced)) = installs.remove(install) {
                 cowshed_os::eprintln!(
-                    "cowshed: land turns fenced: the last ticket queued before a waiting install \
-                     has ended, and every ask is parked until its connection closes"
+                    "cowshed: land turns fenced: every live ticket before a waiting install has \
+                     fenced or ended, and every outside ask is parked until its connection closes"
                 );
                 // An install that has gone hears nothing; its departure lifts the fence.
                 let _ = fenced.send(WaitSignal::Fenced(turns.queues(abandoned_since_unix_ms)));
             }
         }
         for &(connection, number) in &settled.numbered {
-            if let Some((sender, told)) = parked.remove(&connection) {
+            if let Some((sender, told, asker_life)) = parked.remove(&connection) {
+                if let Some((queue, index)) = turns.find(number) {
+                    queue[index].asker_life = asker_life;
+                    if queue[index].resumable {
+                        match mint_resume_token() {
+                            Ok((token, digest)) => {
+                                queue[index].token_sha256 = Some(digest);
+                                pending_tokens.insert(number, token);
+                            }
+                            Err(error) => cowshed_os::eprintln!(
+                                "cowshed: land turn ticket {number}: cannot mint resume token \
+                                 ({error}); ticket will not be resumable"
+                            ),
+                        }
+                    }
+                }
                 cowshed_os::eprintln!(
                     "cowshed: land turn: a parked ask is numbered ticket {number}"
                 );
@@ -1079,14 +1751,33 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 answers.insert(number, sender);
             }
         }
-        for Notice { number, answer } in settled.notices {
-            if let TurnAnswer::Held { ticket } = &answer {
+        for Notice { number, mut answer } in settled.notices {
+            if let Some(token) = pending_tokens.remove(&number) {
+                match &mut answer {
+                    TurnAnswer::Held { resume_token, .. }
+                    | TurnAnswer::Queued { resume_token, .. } => {
+                        *resume_token = Some(token);
+                    }
+                    _ => {
+                        pending_tokens.insert(number, token);
+                    }
+                }
+            }
+            if let TurnAnswer::Held { ticket, .. } = &answer {
                 cowshed_os::eprintln!(
                     "cowshed: land turn ticket {number}: {} (pid {}) holds the turn after {} ms",
                     ticket.workspace,
                     ticket.pid,
                     now_unix_ms().saturating_sub(ticket.asked_unix_ms),
                 );
+                if !answers.contains_key(&number)
+                    && let Some((queue, index)) = turns.find(number)
+                {
+                    queue[index].pending_held_after_resume = true;
+                }
+            }
+            if matches!(answer, TurnAnswer::Unfenced) {
+                cowshed_os::eprintln!("cowshed: land turn ticket {number}: unfenced in place");
             }
             // A land whose connection has gone hears nothing; its departure is on its way.
             if let Some(sender) = answers.get(&number) {
@@ -1102,6 +1793,10 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 held_ms,
             }) => {
                 answers.remove(&ticket.number);
+                pending_tokens.remove(&ticket.number);
+                if let Some(task) = adopted_asker_watches.remove(&ticket.number) {
+                    task.abort();
+                }
                 let held = held_ms
                     .map_or_else(String::new, |ms| format!(" after holding the turn {ms} ms"));
                 let class = if bounded { ", class bounded" } else { "" };
@@ -1119,6 +1814,10 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 held_ms,
             }) => {
                 answers.remove(&abandonment.ticket.number);
+                pending_tokens.remove(&abandonment.ticket.number);
+                if let Some(task) = adopted_asker_watches.remove(&abandonment.ticket.number) {
+                    task.abort();
+                }
                 let held = held_ms
                     .map_or_else(String::new, |ms| format!(" after holding the turn {ms} ms"));
                 let class = if bounded { ", class bounded" } else { "" };
@@ -1176,6 +1875,19 @@ pub(crate) async fn hold<R, W>(
         .await;
         return;
     };
+    let asker_life = match asker.life() {
+        Ok(life) => life,
+        Err(error) => {
+            let _ = write(
+                &mut writer,
+                &TurnAnswer::Refused {
+                    error: format!("cannot read the asking process's identity: {error}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
     let exit = match asker.exit() {
         Ok(exit) => exit,
         Err(error) => {
@@ -1198,6 +1910,7 @@ pub(crate) async fn hold<R, W>(
         connection,
         ask,
         pid: asker.pid().unsigned_abs(),
+        asker_life,
         answers: sender,
         number: numbered,
     });
@@ -1243,8 +1956,183 @@ pub(crate) async fn hold<R, W>(
             () = &mut asker_gone, if parked => return,
         }
     };
-    let mut held = false;
-    let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    serve_numbered(
+        &mut steps,
+        &mut writer,
+        &mut answers,
+        &mut asker_gone,
+        &turns,
+        &mut place,
+        number,
+        false,
+        is_bounded,
+        None,
+        bounded_deadline,
+    )
+    .await;
+}
+
+/// Serve one `land-turn-resume` connection whose peer the kernel named `asker`: verify both the
+/// peer's kernel [`Life`] and the SHA-256 of `token` in constant time, re-attach the adopted
+/// ticket, answer `{"turn":"resumed",…}` (or `{"turn":"held",…}` if promoted during the gap), and
+/// continue serving steps on the same loop as [`hold`].
+pub(crate) async fn resume<R, W>(
+    reader: R,
+    mut writer: W,
+    asker: Option<Process>,
+    ticket: u64,
+    token: String,
+    turns: LandTurns,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Some(asker) = asker else {
+        let _ = write(
+            &mut writer,
+            &TurnAnswer::Refused {
+                error: "land-turn-resume requires the gateway's Unix control socket, whose peer \
+                        the kernel names"
+                    .to_owned(),
+            },
+        )
+        .await;
+        return;
+    };
+    let Some(peer_life) = (match asker.life() {
+        Ok(life) => life,
+        Err(error) => {
+            let _ = write(
+                &mut writer,
+                &TurnAnswer::Refused {
+                    error: format!("cannot read the resuming process's identity: {error}"),
+                },
+            )
+            .await;
+            return;
+        }
+    }) else {
+        let _ = write(
+            &mut writer,
+            &TurnAnswer::Refused {
+                error: "the resuming process has already exited".to_owned(),
+            },
+        )
+        .await;
+        return;
+    };
+    let exit = match asker.exit() {
+        Ok(exit) => exit,
+        Err(error) => {
+            let _ = write(
+                &mut writer,
+                &TurnAnswer::Refused {
+                    error: format!("cannot watch the resuming process's exit: {error}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let connection = turns.connections.fetch_add(1, Ordering::Relaxed);
+    let (sender, mut answers) = mpsc::unbounded_channel();
+    let (reply, resumed) = oneshot::channel();
+    turns.send(Message::Resume {
+        connection,
+        ticket,
+        peer_life,
+        token,
+        answers: sender,
+        reply,
+    });
+    let ResumedTicket {
+        answer,
+        held,
+        bounded,
+        held_unix_ms,
+    } = match resumed.await {
+        Ok(Ok(resumed)) => resumed,
+        Ok(Err(error)) => {
+            let _ = write(&mut writer, &TurnAnswer::Refused { error }).await;
+            return;
+        }
+        Err(_) => {
+            let _ = write(
+                &mut writer,
+                &TurnAnswer::Refused {
+                    error: "the gateway's land turns have stopped".to_owned(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let mut place = Place {
+        turns: turns.clone(),
+        connection,
+        outcome: None,
+    };
+    if write(&mut writer, &answer).await.is_err() {
+        return;
+    }
+    let asker_gone = async {
+        if let Err(error) = exit.observed().await {
+            cowshed_os::eprintln!(
+                "cowshed: land turn connection {connection}: its resumed asker's exit watch \
+                 failed ({error}); its connection alone holds its place"
+            );
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(asker_gone);
+    let mut steps = BufReader::new(reader).lines();
+    let bounded_deadline = turns.bounded_deadline;
+    serve_numbered(
+        &mut steps,
+        &mut writer,
+        &mut answers,
+        &mut asker_gone,
+        &turns,
+        &mut place,
+        ticket,
+        held,
+        bounded,
+        held_unix_ms,
+        bounded_deadline,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_numbered<R, W, F>(
+    steps: &mut tokio::io::Lines<BufReader<R>>,
+    writer: &mut W,
+    answers: &mut mpsc::UnboundedReceiver<TurnAnswer>,
+    asker_gone: &mut std::pin::Pin<&mut F>,
+    turns: &LandTurns,
+    place: &mut Place,
+    number: u64,
+    mut held: bool,
+    is_bounded: bool,
+    held_unix_ms: Option<u64>,
+    bounded_deadline: Duration,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: std::future::Future<Output = ()>,
+{
+    let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = if held && is_bounded {
+        let elapsed = held_unix_ms.map_or(0, |since| now_unix_ms().saturating_sub(since));
+        let remaining = bounded_deadline.saturating_sub(Duration::from_millis(elapsed));
+        Some(Box::pin(tokio::time::sleep(remaining)))
+    } else {
+        None
+    };
+    let mut fenced = false;
+    let mut fence_ack_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut fenced_heartbeat: Option<tokio::time::Interval> = None;
+    let mut heartbeat_seq: u64 = 0;
+
     loop {
         // Biased, in this order: an asker that sends its end and exits leaves both ready, and its
         // end, already in the socket's buffer, is read before its exit, so the turn records how
@@ -1254,24 +2142,77 @@ pub(crate) async fn hold<R, W>(
             biased;
             answer = answers.recv() => {
                 let Some(answer) = answer else { return };
-                if matches!(answer, TurnAnswer::Held { .. }) {
-                    held = true;
-                    if is_bounded && deadline.is_none() {
-                        deadline = Some(Box::pin(tokio::time::sleep(bounded_deadline)));
+                match &answer {
+                    TurnAnswer::Held { .. } => {
+                        held = true;
+                        if is_bounded && deadline.is_none() {
+                            deadline = Some(Box::pin(tokio::time::sleep(bounded_deadline)));
+                        }
                     }
+                    TurnAnswer::Fence => {
+                        fence_ack_deadline = Some(Box::pin(tokio::time::sleep(
+                            cowshed_os::deadline::HEARTBEAT,
+                        )));
+                    }
+                    TurnAnswer::Unfenced => {
+                        fenced = false;
+                        fence_ack_deadline = None;
+                        fenced_heartbeat = None;
+                    }
+                    _ => {}
                 }
-                if write(&mut writer, &answer).await.is_err() {
+                if write(writer, &answer).await.is_err() {
                     break;
                 }
             }
             step = steps.next_line() => {
                 // EOF, or a broken connection: the asker is gone, and so is its hold.
                 let Ok(Some(step)) = step else { return };
-                let Some(answer) = stepped(&turns, number, held, &step, &mut place).await else {
-                    return;
-                };
-                if write(&mut writer, &answer).await.is_err() {
-                    break;
+                match stepped(turns, number, held, &step, place).await {
+                    StepOutcome::Reply(answer) => {
+                        if write(writer, &answer).await.is_err() {
+                            break;
+                        }
+                    }
+                    StepOutcome::Fenced => {
+                        fenced = true;
+                        fence_ack_deadline = None;
+                        fenced_heartbeat = Some(cowshed_os::deadline::beats());
+                    }
+                    StepOutcome::Ended => return,
+                }
+            }
+            () = async {
+                if let Some(beats) = fenced_heartbeat.as_mut() {
+                    beats.tick().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                if fenced {
+                    heartbeat_seq += 1;
+                    if write(writer, &TurnAnswer::Heartbeat { progress: heartbeat_seq })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            () = async {
+                if let Some(sleep) = fence_ack_deadline.as_mut() {
+                    sleep.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                fence_ack_deadline = None;
+                if !fenced {
+                    cowshed_os::eprintln!(
+                        "cowshed: land turn ticket {number}: asker did not acknowledge fence \
+                         within {} s; staying unfenced",
+                        cowshed_os::deadline::HEARTBEAT.as_secs(),
+                    );
                 }
             }
             () = async {
@@ -1286,11 +2227,11 @@ pub(crate) async fn hold<R, W>(
                     "expired: exceeded bounded-turn deadline ({})",
                     format_bound(bound_ms)
                 ));
-                let _ = write(&mut writer, &TurnAnswer::Expired { bound_ms }).await;
+                let _ = write(writer, &TurnAnswer::Expired { bound_ms }).await;
                 let _ = writer.shutdown().await;
                 return;
             }
-            () = &mut asker_gone => break,
+            () = asker_gone.as_mut() => break,
         }
     }
     // The asker has exited or stopped reading, but a command it forked may still be between its
@@ -1298,37 +2239,52 @@ pub(crate) async fn hold<R, W>(
     // closes it. EOF, once every copy is closed, is the proof that none is: each bind before it is
     // read and bound, so no command runs outside the turn (05_gateway.md "Land turns").
     while let Ok(Some(step)) = steps.next_line().await {
-        let Some(answer) = stepped(&turns, number, held, &step, &mut place).await else {
-            return;
-        };
-        // Nobody reads it: the asker is gone, and a command reads no answer after its exec. The
-        // bind holds whether or not the answer is written.
-        write(&mut writer, &answer).await.ok();
+        match stepped(turns, number, held, &step, place).await {
+            StepOutcome::Reply(answer) => {
+                // Nobody reads it: the asker is gone, and a command reads no answer after its exec.
+                // The bind holds whether or not the answer is written.
+                write(writer, &answer).await.ok();
+            }
+            StepOutcome::Fenced => {}
+            StepOutcome::Ended => return,
+        }
     }
 }
 
-/// The answer to one step line of ticket `number`, or `None` once it ends the asker's hold, its
-/// outcome recorded in `place`. A bind is refused while the ticket waits.
+enum StepOutcome {
+    Reply(Box<TurnAnswer>),
+    Fenced,
+    Ended,
+}
+
+/// Process one step line of ticket `number`: `Ended` once it ends the asker's hold, `Fenced` when
+/// it acknowledges fencing (which writes no direct reply), or `Reply` for a bind or refusal.
 async fn stepped(
     turns: &LandTurns,
     number: u64,
     held: bool,
     step: &str,
     place: &mut Place,
-) -> Option<TurnAnswer> {
-    Some(match serde_json::from_str::<TurnStep>(step) {
+) -> StepOutcome {
+    match serde_json::from_str::<TurnStep>(step) {
         Ok(TurnStep::End { outcome }) => {
             place.outcome = Some(outcome);
-            return None;
+            StepOutcome::Ended
         }
-        Ok(TurnStep::Bind { pid }) if held => bind(turns, number, pid).await,
-        Ok(TurnStep::Bind { .. }) => TurnAnswer::Refused {
+        Ok(TurnStep::Fenced) => {
+            turns.mark_fenced(number).await;
+            StepOutcome::Fenced
+        }
+        Ok(TurnStep::Bind { pid }) if held => {
+            StepOutcome::Reply(Box::new(bind(turns, number, pid).await))
+        }
+        Ok(TurnStep::Bind { .. }) => StepOutcome::Reply(Box::new(TurnAnswer::Refused {
             error: BindRefusal::Waiting.to_string(),
-        },
-        Err(error) => TurnAnswer::Refused {
-            error: format!("a land turn step is a bind or an end: {error}"),
-        },
-    })
+        })),
+        Err(error) => StepOutcome::Reply(Box::new(TurnAnswer::Refused {
+            error: format!("a land turn step is a bind, fenced or an end: {error}"),
+        })),
+    }
 }
 
 /// Bind the command `pid` to ticket `number`, its exit watched from before the bind and across an
@@ -1345,7 +2301,12 @@ async fn bind(turns: &LandTurns, number: u64, pid: u32) -> TurnAnswer {
         Err(error) => return refused(format!("cannot watch the exit of process {pid}: {error}")),
     };
     let (done, bound) = oneshot::channel();
-    turns.send(Message::Bind { number, pid, done });
+    turns.send(Message::Bind {
+        number,
+        pid,
+        life,
+        done,
+    });
     match bound.await {
         Ok(Ok(())) => {
             let turns = turns.clone();
@@ -1405,6 +2366,7 @@ mod tests {
             workspace: workspace.to_owned(),
             command: format!("land {workspace}"),
             class: None,
+            resumable: true,
         }
     }
 
@@ -1973,7 +2935,14 @@ mod tests {
         let _ = cli_w.shutdown().await;
         drop(lines);
         drop(cli_w);
-        let _ = child.kill().await;
+        let _ = child.start_kill();
+        let _ = cowshed_os::deadline::reap_async(
+            "fenced bind test child",
+            &mut child,
+            &cowshed_os::deadline::start("reap fenced bind test child", cowshed_os::deadline::REAP),
+            cowshed_os::deadline::Progress::Nothing,
+        )
+        .await;
         let _ = tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, task)
             .await
             .expect("hold task exits on client close");

@@ -88,16 +88,16 @@ impl TestGateway {
     }
 
     fn build_config(
-        socket: &PathBuf,
-        cache: &PathBuf,
-        #[cfg(target_os = "linux")] data: &PathBuf,
+        socket: &std::path::Path,
+        cache: &std::path::Path,
+        #[cfg(target_os = "linux")] data: &std::path::Path,
         bounded_turn_deadline: Option<std::time::Duration>,
     ) -> GatewayConfig {
         let mut config = GatewayConfig {
-            control_socket: Some(socket.clone()),
-            mirror_cache: MirrorCacheConfig::new(cache.clone()),
+            control_socket: Some(socket.to_path_buf()),
+            mirror_cache: MirrorCacheConfig::new(cache.to_path_buf()),
             #[cfg(target_os = "linux")]
-            data_socket_root: Some(data.clone()),
+            data_socket_root: Some(data.to_path_buf()),
             ..GatewayConfig::default()
         };
         if let Some(deadline) = bounded_turn_deadline {

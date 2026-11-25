@@ -155,17 +155,21 @@ impl fmt::Display for Busy {
     }
 }
 
-/// Everything a restart of the gateway would cut off now: the holder of each repository's land
-/// turn (its first live ticket; a queued land behind it runs nothing yet, and its first step
-/// waits for the install slot).
+/// Everything a restart of the gateway would cut off now: every unfenced ticket across every
+/// repository's queue (a fenced ticket survives a planned restart and resumes on the replacing
+/// gateway, 05_gateway.md "An install refuses while an unfenced land runs").
 pub fn restart_blockers(turns: &[LandTurnQueue]) -> Vec<Busy> {
     turns
         .iter()
-        .filter_map(|queue| {
-            queue.tickets.first().map(|holder| Busy::LandTurn {
-                repo: queue.repo.clone(),
-                holder: holder.clone(),
-            })
+        .flat_map(|queue| {
+            queue
+                .tickets
+                .iter()
+                .filter(|ticket| !ticket.fenced)
+                .map(|holder| Busy::LandTurn {
+                    repo: queue.repo.clone(),
+                    holder: holder.clone(),
+                })
         })
         .collect()
 }
@@ -252,15 +256,17 @@ mod tests {
     }
 
     fn ticket() -> impl Strategy<Value = Ticket> {
-        (any::<u64>(), 1..u32::MAX, "[a-z]{1,8}").prop_map(|(number, pid, workspace)| Ticket {
-            number,
-            pid,
-            workspace,
-            asked_unix_ms: 0,
-            command: "land".to_owned(),
-            bound: Vec::new(),
-            fenced: false,
-        })
+        (any::<u64>(), 1..u32::MAX, "[a-z]{1,8}", any::<bool>()).prop_map(
+            |(number, pid, workspace, fenced)| Ticket {
+                number,
+                pid,
+                workspace,
+                asked_unix_ms: 0,
+                command: "land".to_owned(),
+                bound: Vec::new(),
+                fenced,
+            },
+        )
     }
 
     fn queues() -> impl Strategy<Value = Vec<LandTurnQueue>> {
@@ -332,17 +338,23 @@ mod tests {
             prop_assert_eq!(reload(Held::TearingDown(remains)), Reload::Blocked(remains));
         }
 
-        /// An install refuses exactly while a land holds a turn, naming each turn's holder once; a
-        /// queued land is not named.
+        /// An install refuses exactly while any unfenced land ticket is live, naming each unfenced
+        /// ticket once; fenced tickets survive restart and never block it.
         #[test]
         fn an_install_refuses_exactly_while_a_land_runs(turns in queues()) {
             let busy = restart_blockers(&turns);
             let holders: Vec<Busy> = turns
                 .iter()
-                .filter_map(|queue| queue.tickets.first().map(|holder| Busy::LandTurn {
-                    repo: queue.repo.clone(),
-                    holder: holder.clone(),
-                }))
+                .flat_map(|queue| {
+                    queue
+                        .tickets
+                        .iter()
+                        .filter(|ticket| !ticket.fenced)
+                        .map(|holder| Busy::LandTurn {
+                            repo: queue.repo.clone(),
+                            holder: holder.clone(),
+                        })
+                })
                 .collect();
             prop_assert_eq!(&busy, &holders);
             match refusal(&busy) {

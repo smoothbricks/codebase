@@ -692,6 +692,11 @@ enum Incoming {
     LandTurn {
         ask: cowshed_core::land_turn::TurnAsk,
     },
+    /// Resume a fenced land turn after a planned gateway restart (`land-turn-resume`).
+    LandTurnResume {
+        ticket: u64,
+        token: String,
+    },
     /// An install's read of the land turns with the fence, held for as long as its connection is
     /// open (05_gateway.md "The read fences the turns").
     FencedLandTurns {
@@ -1302,6 +1307,26 @@ async fn serve<R, W>(
             });
             crate::land_turn::hold(reader, writer, asker, ask, services.land_turns.clone()).await;
         }
+        Ok(Incoming::LandTurnResume { ticket, token }) => {
+            let asker = peer_socket.and_then(|socket| {
+                cowshed_core::runtime::job_groups::Process::of_socket_peer(&socket)
+                    .map_err(|error| {
+                        cowshed_os::eprintln!(
+                            "cowshed: a land-turn-resume peer process cannot be named: {error}"
+                        );
+                    })
+                    .ok()
+            });
+            crate::land_turn::resume(
+                reader,
+                writer,
+                asker,
+                ticket,
+                token,
+                services.land_turns.clone(),
+            )
+            .await;
+        }
         Ok(Incoming::FencedLandTurns {
             abandoned_since_unix_ms,
         }) => {
@@ -1542,7 +1567,10 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-boot" => &["op", "repoId", "device"],
         cowshed_core::land_turn::LAND_TURNS_OP => &["op", "abandonedSinceUnixMs", "fence"],
         cowshed_core::land_turn::LAND_TURNS_WITHDRAW_OP => &["op"],
-        cowshed_core::land_turn::LAND_TURN_OP => &["op", "repo", "workspace", "command", "class"],
+        cowshed_core::land_turn::LAND_TURN_OP => {
+            &["op", "repo", "workspace", "command", "class", "resumable"]
+        }
+        cowshed_core::land_turn::LAND_TURN_RESUME_OP => &["op", "ticket", "token"],
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
@@ -1622,12 +1650,15 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             command: String,
             #[serde(default)]
             class: Option<cowshed_core::land_turn::TurnClass>,
+            #[serde(default)]
+            resumable: bool,
         }
         let LandTurnIn {
             repo,
             workspace,
             command,
             class,
+            resumable,
         } = serde_json::from_value(value).map_err(encoding)?;
         return Ok(Incoming::LandTurn {
             ask: cowshed_core::land_turn::TurnAsk {
@@ -1635,8 +1666,18 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 workspace,
                 command,
                 class,
+                resumable,
             },
         });
+    }
+    if op == cowshed_core::land_turn::LAND_TURN_RESUME_OP {
+        #[derive(Deserialize)]
+        struct LandTurnResumeIn {
+            ticket: u64,
+            token: String,
+        }
+        let LandTurnResumeIn { ticket, token } = serde_json::from_value(value).map_err(encoding)?;
+        return Ok(Incoming::LandTurnResume { ticket, token });
     }
     if op == RAM_LEASE_OP {
         #[derive(Deserialize)]

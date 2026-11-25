@@ -1005,6 +1005,7 @@ static TICKET: Reader = Reader::Record(&[
     ("askedUnixMs", &LEAF),
     ("command", &LEAF),
     ("bound", &LEAF),
+    ("fenced", &LEAF),
 ]);
 static TRACE_CONTEXT: Reader = Reader::Record(&[("traceId", &LEAF), ("spanId", &LEAF)]);
 static TREE_HOLDER: Reader = Reader::Record(&[

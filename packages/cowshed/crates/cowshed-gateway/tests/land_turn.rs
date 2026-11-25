@@ -107,6 +107,7 @@ fn ask(workspace: &str) -> TurnAsk {
         workspace: workspace.to_owned(),
         command: format!("land {workspace}"),
         class: None,
+        resumable: false,
     }
 }
 
@@ -553,19 +554,9 @@ async fn a_gateway_that_does_not_answer_refuses_the_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bounded_ask_behind_a_held_land_is_numbered_while_an_install_waits() {
     let (_gateway, _root, socket) = gateway().await;
-    // Hold the land turn by a bound command alone so later asks from this process are from outside.
-    let mut land = take_free(&socket, "land").await;
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "read line"])
-        .stdin(std::process::Stdio::piped());
-    land.bind_at_exec(&mut command);
-    let mut command = command.spawn().expect("spawn the land's command");
-    awaiting("the command's bind", land.bound(command.id()))
-        .await
-        .expect("bind the land's command");
-    land.end("its command runs on".to_owned())
-        .expect("end land");
+    // Hold the land turn from a separate unfenced legacy process so later asks from this process
+    // are from outside and the install genuinely waits for the holder to end.
+    let land = LegacyHolder::start(&socket, REPO, "land", false).await;
 
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
@@ -601,8 +592,7 @@ async fn a_bounded_ask_behind_a_held_land_is_numbered_while_an_install_waits() {
     drop(doc_answers);
 
     // Release the land: now the install is fenced.
-    drop(command.stdin.take());
-    command.wait_bounded().expect("the land's command ends");
+    land.finish().await;
     let fenced = control_line(&mut install).await;
     assert_eq!(fenced["fenced"], serde_json::json!(true), "{fenced}");
 }
@@ -613,42 +603,9 @@ async fn a_bounded_ask_behind_a_held_land_is_numbered_while_an_install_waits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bounded_ask_parks_once_only_bounded_tickets_remain() {
     let (_gateway, _root, socket) = gateway().await;
-    // First bounded ticket holds `<REPO>.ref` via its bound command so later asks are from outside.
-    let mut first = UnixStream::connect_bounded(&socket)
-        .await
-        .expect("connect first bounded ask");
-    let first_ask = serde_json::json!({
-        "op": land_turn::LAND_TURN_OP,
-        "repo": format!("{REPO}.ref"),
-        "workspace": "doc-first",
-        "command": "cowshed doc-commit",
-        "class": "bounded",
-    });
-    first
-        .write_all(format!("{first_ask}\n").as_bytes())
-        .await
-        .expect("send first bounded ask");
-    let (first_read, mut first_write) = first.into_split();
-    let mut first_answers = BufReader::new(first_read).lines();
-    let held = raw_answer(&mut first_answers).await;
-    assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "read line"])
-        .stdin(std::process::Stdio::piped());
-    let mut command = command.spawn().expect("spawn first bounded command");
-    first_write
-        .write_all(format!("{{\"step\":\"bind\",\"pid\":{}}}\n", command.id()).as_bytes())
-        .await
-        .expect("bind first bounded command");
-    let bound = raw_answer(&mut first_answers).await;
-    assert_eq!(bound["turn"], serde_json::json!("bound"), "{bound}");
-    first_write
-        .write_all(b"{\"step\":\"end\",\"outcome\":\"command runs on\"}\n")
-        .await
-        .expect("end first bounded asker");
-    drop(first_write);
-    drop(first_answers);
+    // First bounded ticket holds `<REPO>.ref` from a separate unfenced process so later asks are
+    // from outside and the install genuinely waits for it to end.
+    let first = LegacyHolder::start(&socket, &format!("{REPO}.ref"), "doc-first", true).await;
 
     // Install waits: only the bounded ticket is in any queue.
     let mut install = waiting_fence(&socket).await;
@@ -678,8 +635,7 @@ async fn a_bounded_ask_parks_once_only_bounded_tickets_remain() {
     );
 
     // First bounded ticket ends -> install is fenced -> install lifts -> second is numbered.
-    drop(command.stdin.take());
-    command.wait_bounded().expect("first bounded command ends");
+    first.finish().await;
     let fenced = control_line(&mut install).await;
     assert_eq!(fenced["fenced"], serde_json::json!(true), "{fenced}");
     drop(install);
@@ -907,21 +863,9 @@ async fn control_line(answers: &mut Lines<BufReader<UnixStream>>) -> serde_json:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_land_that_asks_after_a_waiting_install_runs_after_it() {
     let (_gateway, _root, socket) = gateway().await;
-    // Every ask of this test comes from one process, and an ask by a turn's own asker is made
-    // inside that turn, never parked: so the first land's turn is held by its command alone.
-    let mut first = take_free(&socket, "first").await;
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "read line"])
-        .stdin(std::process::Stdio::piped());
-    first.bind_at_exec(&mut command);
-    let mut command = command.spawn().expect("spawn the first land's command");
-    awaiting("the command's bind", first.bound(command.id()))
-        .await
-        .expect("bind the first land's command");
-    first
-        .end("its command runs on".to_owned())
-        .expect("end first");
+    // Hold the first turn from a separate unfenced legacy process so later asks from this process
+    // are from outside and the install waits for it to end.
+    let first = LegacyHolder::start(&socket, REPO, "first", false).await;
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
     assert_eq!(
@@ -947,10 +891,7 @@ async fn a_land_that_asks_after_a_waiting_install_runs_after_it() {
         ["first"],
         "an ask while an install waits is parked, never numbered"
     );
-    drop(command.stdin.take());
-    command
-        .wait_bounded()
-        .expect("the first land's command ends");
+    first.finish().await;
     let fenced = control_line(&mut install).await;
     assert_eq!(
         (&fenced["ok"], &fenced["fenced"]),
@@ -1010,6 +951,7 @@ async fn a_land_takes_its_ref_turn_inside_its_turn_though_an_install_waits_for_t
             workspace: "second".to_owned(),
             command: "cowshed land second (ref fence)".to_owned(),
             class: None,
+            resumable: false,
         },
     )
     .await;
@@ -1034,20 +976,9 @@ async fn a_land_takes_its_ref_turn_inside_its_turn_though_an_install_waits_for_t
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_waiting_install_withdrawn_leaves_the_wait_and_admits_parked_asks_in_order() {
     let (_gateway, _root, socket) = gateway().await;
-    // Hold the turn by a bound command alone so later asks from this test process are from outside.
-    let mut first = take_free(&socket, "first").await;
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "read line"])
-        .stdin(std::process::Stdio::piped());
-    first.bind_at_exec(&mut command);
-    let mut command = command.spawn().expect("spawn the first land's command");
-    awaiting("the command's bind", first.bound(command.id()))
-        .await
-        .expect("bind the first land's command");
-    first
-        .end("its command runs on".to_owned())
-        .expect("end first");
+    // Hold the turn from a separate unfenced legacy process so later asks from this process are
+    // from outside and the install waits for it to end.
+    let first = LegacyHolder::start(&socket, REPO, "first", false).await;
 
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
@@ -1154,10 +1085,7 @@ async fn a_waiting_install_withdrawn_leaves_the_wait_and_admits_parked_asks_in_o
     );
     assert_eq!(tickets(&socket).await, ["first", "parked-a", "parked-b"]);
 
-    drop(command.stdin.take());
-    command
-        .wait_bounded()
-        .expect("the first land's command ends");
+    first.finish().await;
 }
 
 /// An unfenced `land-turns` read (what `cowshed gateway status` sends) reports every waiting
@@ -1166,19 +1094,7 @@ async fn a_waiting_install_withdrawn_leaves_the_wait_and_admits_parked_asks_in_o
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn land_turns_lists_waiting_installs_and_parked_asks_without_fencing() {
     let (_gateway, _root, socket) = gateway().await;
-    let mut holder = take_free(&socket, "holder").await;
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "read line"])
-        .stdin(std::process::Stdio::piped());
-    holder.bind_at_exec(&mut command);
-    let mut command = command.spawn().expect("spawn the holder's command");
-    awaiting("the command's bind", holder.bound(command.id()))
-        .await
-        .expect("bind the holder's command");
-    holder
-        .end("its command runs on".to_owned())
-        .expect("end holder");
+    let holder = LegacyHolder::start(&socket, REPO, "holder", false).await;
 
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
@@ -1261,8 +1177,7 @@ async fn land_turns_lists_waiting_installs_and_parked_asks_without_fencing() {
         "unfenced status read must not keep asks parked: {queued}"
     );
 
-    drop(command.stdin.take());
-    command.wait_bounded().expect("the holder's command ends");
+    holder.finish().await;
 }
 /// A gateway stand-in at `socket`: each connection it accepts is said on the returned channel by
 /// its order, from 1, after the ask it carries has been read and the answers `script` gives for
@@ -1607,6 +1522,77 @@ async fn resume_raw(
     (BufReader::new(read).lines(), write)
 }
 
+/// A separate OS process holding an unfenced legacy turn (no `"resumable":true`) so asks from the
+/// test process come from outside the held turn and a waiting install genuinely waits for it to
+/// end.
+struct LegacyHolder {
+    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+}
+
+impl LegacyHolder {
+    async fn start(socket: &Path, repo: &str, workspace: &str, bounded: bool) -> Self {
+        let script = r#"
+import json, socket, sys
+
+sock_path, repo, ws, bounded = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+ask = {
+    "op": "land-turn",
+    "repo": repo,
+    "workspace": ws,
+    "command": f"land {ws}",
+}
+if bounded:
+    ask["class"] = "bounded"
+s.sendall((json.dumps(ask) + "\n").encode())
+f = s.makefile("r", encoding="utf-8")
+first = f.readline()
+sys.stdout.write(first)
+sys.stdout.flush()
+sys.stdin.readline()
+s.sendall(b'{"step":"end","outcome":"exited 0"}\n')
+try:
+    s.shutdown(socket.SHUT_WR)
+except OSError:
+    pass
+f.read()
+"#;
+        let mut cmd = tokio::process::Command::new("python3");
+        cmd.args([
+            "-c",
+            script,
+            socket.to_str().expect("utf8 socket"),
+            repo,
+            workspace,
+            if bounded { "1" } else { "0" },
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
+            .expect("spawn legacy holder (python3, which the development shell provides)");
+        let stdin = child.stdin.take();
+        let mut out = BufReader::new(child.stdout.take().expect("legacy holder stdout")).lines();
+        let held = raw_answer(&mut out).await;
+        assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
+        Self { child, stdin }
+    }
+
+    async fn finish(mut self) {
+        drop(self.stdin.take());
+        let status = self
+            .child
+            .wait_bounded()
+            .await
+            .expect("wait for legacy holder");
+        assert!(status.success(), "legacy holder exited {status}");
+    }
+}
+
 /// Spawn a separate OS process that connects to `socket`, asks for a resumable turn on `REPO`,
 /// optionally spawns and binds a child `sh -c "exec cat >/dev/null"` (reporting its pid), prints
 /// each received JSON line to stdout, and forwards any stdin lines straight onto the socket.
@@ -1785,7 +1771,7 @@ async fn a_held_turn_mid_gate_fences_within_a_heartbeat_survives_restart_and_a_q
     )
     .await
     .expect("doc-commit ref turn takes its turn after restart");
-    ref_turn.end("committed".to_owned());
+    ref_turn.end("committed".to_owned()).expect("end ref turn");
 
     // Gate finishes and land ends its turn cleanly.
     drop(gate.stdin.take());
@@ -1798,12 +1784,10 @@ async fn a_held_turn_mid_gate_fences_within_a_heartbeat_survives_restart_and_a_q
     drop(resumed_r);
     let probe = take_after(&socket, "probe").await;
     assert!(
-        queue(&socket)
-            .await
-            .map_or(true, |q| q.abandoned.is_empty()),
+        queue(&socket).await.is_none_or(|q| q.abandoned.is_empty()),
         "resumed turn must finish cleanly, never abandoned"
     );
-    probe.end("probed".to_owned());
+    probe.end("probed".to_owned()).expect("end probe turn");
     new.drain().await.expect("new gateway drains");
 }
 
@@ -1919,6 +1903,12 @@ async fn adopting_a_snapshot_preserves_queue_order_and_ticket_numbering_and_sett
         .expect("end 1");
     drop(w1);
     assert_eq!(raw_answer(&mut r2).await["turn"], serde_json::json!("held"));
+    let third_moved = raw_answer(&mut third_r).await;
+    assert_eq!(
+        (&third_moved["turn"], &third_moved["ahead"]),
+        (&serde_json::json!("queued"), &serde_json::json!(1)),
+        "third must receive its updated queue position when first ends: {third_moved}"
+    );
     w2.write_all(b"{\"step\":\"end\",\"outcome\":\"exited 0\"}\n")
         .await
         .expect("end 2");
@@ -1974,7 +1964,7 @@ async fn an_asker_that_dies_during_the_restart_gap_keeps_its_bound_command_holdi
     // Drain old gateway, then SIGKILL the asker during the gap while its bound child lives on.
     old.drain().await.expect("drain old");
     drop(install);
-    asker.kill().await.expect("SIGKILL asker during gap");
+    asker.start_kill().expect("SIGKILL asker during gap");
     let _ = asker.wait_bounded().await;
 
     let new = gateway_at(&socket, &cache).await;
@@ -2067,7 +2057,7 @@ async fn an_asker_with_no_bound_command_that_dies_during_the_restart_gap_frees_t
     drop(install);
     drop(waiter_r);
     drop(waiter_w);
-    asker.kill().await.expect("SIGKILL asker during gap");
+    asker.start_kill().expect("SIGKILL asker during gap");
     let _ = asker.wait_bounded().await;
 
     let new = gateway_at(&socket, &cache).await;
@@ -2102,7 +2092,7 @@ async fn a_bound_command_that_exits_during_the_restart_gap_is_cleared_on_adoptio
     let token = held["resumeToken"].as_str().expect("token").to_owned();
 
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.args(["-c", "read line"])
+    cmd.args(["-c", "exec cat >/dev/null"])
         .stdin(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut cmd = cmd.spawn().expect("spawn bound cmd");
@@ -2184,7 +2174,7 @@ async fn a_bound_command_that_exits_during_the_restart_gap_after_asker_ended_fin
     assert_eq!(held["turn"], serde_json::json!("held"), "{held}");
 
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.args(["-c", "read line"])
+    cmd.args(["-c", "exec cat >/dev/null"])
         .stdin(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut cmd = cmd.spawn().expect("spawn bound cmd");
@@ -2234,9 +2224,7 @@ async fn a_bound_command_that_exits_during_the_restart_gap_after_asker_ended_fin
         "ticket whose asker ended and whose bound command exited in the gap must finish at adoption"
     );
     assert!(
-        queue(&socket)
-            .await
-            .map_or(true, |q| q.abandoned.is_empty()),
+        queue(&socket).await.is_none_or(|q| q.abandoned.is_empty()),
         "finished ticket must not be recorded abandoned"
     );
     new.drain().await.expect("drain new");
@@ -2357,7 +2345,7 @@ async fn a_legacy_non_resumable_turn_is_never_sent_fence_and_still_waits_to_end(
     // Sending a bind on the legacy connection proves no `{"turn":"fence"}` was queued ahead of
     // its `{"turn":"bound"}` answer, and the bind still succeeds.
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.args(["-c", "read line"])
+    cmd.args(["-c", "exec cat >/dev/null"])
         .stdin(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut cmd = cmd.spawn().expect("spawn legacy cmd");
