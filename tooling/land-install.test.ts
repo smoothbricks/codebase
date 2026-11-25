@@ -408,6 +408,17 @@ describe('setupOutcome', () => {
       why: 'setup exited 6 without an error envelope',
     });
   });
+
+  it('is withdrawn when await-turns exits 103 without running setup', () => {
+    expect<unknown>(setupOutcome(103, '')).toEqual({
+      kind: 'withdrawn',
+      why: "the install's wait for the land turns was withdrawn",
+    });
+    expect<unknown>(setupOutcome(103, '  \n')).toEqual({
+      kind: 'withdrawn',
+      why: "the install's wait for the land turns was withdrawn",
+    });
+  });
 });
 
 describe('landStatusLine', () => {
@@ -647,6 +658,9 @@ gateway)
   # The install's waited fence: the stand-in takes it at once and runs the command under it.
   if [ "$2" = await-turns ]; then
     [ "$3" = -- ] || exit 64
+    if [ -f "$FIX_STATE/await-turns-exit" ]; then
+      exit "$(cat "$FIX_STATE/await-turns-exit")"
+    fi
     shift 3
     exec "$@"
   fi
@@ -1215,6 +1229,26 @@ describe('land-install.sh', () => {
       `deferred: another install holds the install slot; rerun direnv exec ${install.main} ${binary} setup`,
     );
     expect(install.log('staged.log')).toHaveLength(2);
+  });
+
+  it('defers with the rerun command and runs no setup when await-turns is withdrawn', () => {
+    const install = fixture();
+    install.set('installed-status.json', BUSY_STATUS);
+    install.set('status.json', BUSY_STATUS);
+    install.set('await-turns-exit', '103');
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(0);
+    const line = onlyLine(run.stdout).text;
+    expect(line).toStartWith('deferred: ');
+    expect(line).toContain('withdrawn');
+    expect(line).toEndWith(`; rerun ${RERUN(install)}`);
+    // Withdrawn await-turns must not be retried and must not run setup.
+    const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
+    expect(install.log('staged.log')).toEqual([
+      '--json doctor [cwd /]',
+      '--json gateway status [cwd /]',
+      `gateway await-turns -- ${binary} --json setup [cwd elsewhere]`,
+    ]);
   });
 
   it('removes the partial stages a crashed run left, whatever land they were for, under the stage lock', () => {

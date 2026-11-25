@@ -179,9 +179,13 @@ impl Land {
     }
 
     fn start(workspace: &str, command: &mut Command) -> Self {
+        Self::start_with_stdout(workspace, command, Stdio::null())
+    }
+
+    fn start_with_stdout(workspace: &str, command: &mut Command, stdout: Stdio) -> Self {
         let mut child = command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(stdout)
             .stderr(Stdio::piped())
             .process_group(0)
             .spawn()
@@ -746,6 +750,251 @@ fn a_land_takes_its_ref_turn_under_a_waiting_install_and_both_end() {
     assert!(
         queues(&home, u64::MAX).is_empty(),
         "the land and its ref fence left a ticket in a queue"
+    );
+}
+
+/// Withdrawing a waiting install via `cowshed gateway withdraw-install` causes `await-turns` to
+/// exit 103 (`Conflict`) with empty stdout without running its command, names the withdrawer pid
+/// on stderr, and admits every parked land in arrival order at once (05_gateway.md "The read
+/// fences the turns").
+#[test]
+fn withdrawing_a_waiting_install_exits_await_turns_without_running_and_admits_parked_lands_in_order()
+ {
+    let home = Home::new();
+    let mut holder = Land::gated(&home, "H");
+    wait_for_order(&home, &mut holder, &["H"]);
+
+    let ran = home.path.join("install-ran");
+    let stdout_path = home.path.join("install-stdout");
+    let stdout_file = File::create(&stdout_path).expect("create install stdout capture");
+    let mut install = Land::start_with_stdout(
+        "install",
+        Command::new(cowshed())
+            .env("HOME", &home.path)
+            .args(["gateway", "await-turns", "--gateway-socket"])
+            .arg(&home.gateway.socket)
+            .args(["--", "sh", "-c", r#": > "$1""#, "step"])
+            .arg(&ran),
+        Stdio::from(stdout_file),
+    );
+    install.stderr_line("cowshed: await-turns: the install waits for 1 land turn(s)");
+
+    let mut parked_first = Land::gated(&home, "P1");
+    parked_first.stderr_line(&format!(
+        "cowshed: land turn {REPO}: parked behind an install"
+    ));
+    let mut parked_second = Land::gated(&home, "P2");
+    parked_second.stderr_line(&format!(
+        "cowshed: land turn {REPO}: parked behind an install"
+    ));
+    assert_eq!(queue(&home), ["H"], "parked asks are not numbered yet");
+
+    let withdraw_child = Command::new(cowshed())
+        .env("HOME", &home.path)
+        .args(["gateway", "withdraw-install", "--gateway-socket"])
+        .arg(&home.gateway.socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cowshed gateway withdraw-install");
+    let withdrawer_pid = withdraw_child.id();
+    let withdraw_output = withdraw_child
+        .wait_with_output_bounded()
+        .expect("reap cowshed gateway withdraw-install");
+    let withdraw_stderr = String::from_utf8_lossy(&withdraw_output.stderr);
+    assert!(
+        withdraw_output.status.success(),
+        "withdraw-install failed ({:?}): stderr={withdraw_stderr:?}",
+        withdraw_output.status
+    );
+    assert!(
+        withdraw_stderr.contains(&install.pid().to_string()) && withdraw_stderr.contains("waited"),
+        "withdraw-install names the withdrawn install's pid and wait duration: {withdraw_stderr}"
+    );
+
+    assert_eq!(
+        install.wait_exit(),
+        ExitStatus::Exited { code: 103 },
+        "withdrawn await-turns exits 103 (Conflict)"
+    );
+    install.finish_stderr();
+    let expected_message = format!(
+        "the install's wait for the land turns was withdrawn by {withdrawer_pid}; nothing ran"
+    );
+    assert!(
+        install
+            .seen
+            .iter()
+            .any(|line| line.contains(&expected_message)),
+        "await-turns stderr should contain {expected_message:?}; got {:?}",
+        install.seen
+    );
+    assert!(
+        fs::read(&stdout_path)
+            .expect("read install stdout")
+            .is_empty(),
+        "withdrawn await-turns writes nothing to stdout"
+    );
+    assert!(!ran.exists(), "withdrawn await-turns must run no command");
+
+    parked_first.stderr_line(&format!("cowshed: land turn {REPO}: 1 ahead; H holds it"));
+    parked_second.stderr_line(&format!("cowshed: land turn {REPO}: 2 ahead; H holds it"));
+    assert_eq!(queue(&home), ["H", "P1", "P2"]);
+
+    holder.release();
+    holder.wait_success();
+    wait_for_order(&home, &mut parked_first, &["H", "P1"]);
+    parked_first.release();
+    parked_first.wait_success();
+    wait_for_order(&home, &mut parked_second, &["H", "P1", "P2"]);
+    parked_second.release();
+    parked_second.wait_success();
+}
+
+/// `gateway status` names a waiting install (its pid, how many tickets it waits for, who holds
+/// them, and the `withdraw-install` hint) and each parked ask (repo, asker/workspace, pid,
+/// command, since when) from the gateway's unfenced `land-turns` answer (05_gateway.md:392,
+/// 700-704).
+#[test]
+fn gateway_status_names_a_waiting_install_and_each_parked_ask() {
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    let home = Home::new();
+    let mut holder = Land::gated(&home, "H");
+    wait_for_order(&home, &mut holder, &["H"]);
+
+    let mut install = Land::start(
+        "install",
+        Command::new(cowshed())
+            .env("HOME", &home.path)
+            .args(["gateway", "await-turns", "--gateway-socket"])
+            .arg(&home.gateway.socket)
+            .args(["--", "true"]),
+    );
+    install.stderr_line("cowshed: await-turns: the install waits for 1 land turn(s)");
+
+    let mut parked = Land::gated(&home, "P1");
+    parked.stderr_line(&format!(
+        "cowshed: land turn {REPO}: parked behind an install"
+    ));
+
+    let mut stream = UnixStream::connect(&home.gateway.socket).expect("connect to test gateway");
+    let request = serde_json::json!({
+        "op": cowshed_core::land_turn::LAND_TURNS_OP,
+        "abandonedSinceUnixMs": u64::MAX,
+    });
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .expect("send unfenced land-turns");
+    stream
+        .shutdown(Shutdown::Write)
+        .expect("half-close land-turns");
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .expect("read land-turns reply");
+    let raw: serde_json::Value = serde_json::from_str(&line).expect("parse land-turns reply");
+    assert_eq!(raw["ok"], serde_json::json!(true), "{raw}");
+    assert_eq!(
+        raw["waitingInstalls"].as_array().map(Vec::len),
+        Some(1),
+        "land-turns reports the waiting install: {raw}"
+    );
+    assert_eq!(
+        raw["parkedAsks"].as_array().map(Vec::len),
+        Some(1),
+        "land-turns reports the parked ask: {raw}"
+    );
+
+    let status_json = serde_json::json!({
+        "installed": true,
+        "running": true,
+        "socket": home.gateway.socket,
+        "cliVersion": "0.1.0",
+        "daemonVersion": "0.1.0",
+        "activeWorkspaces": 0,
+        "landTurns": raw["landTurns"],
+        "waitingInstalls": raw["waitingInstalls"],
+        "parkedAsks": raw["parkedAsks"],
+    });
+    let status: cowshed_core::api::GatewayStatus = serde_json::from_value(status_json)
+        .expect("GatewayStatus deserializes waitingInstalls and parkedAsks");
+
+    let mut text_output = cowshed_cli::output::Output::new(Vec::new(), Vec::new(), false);
+    cowshed_cli::gateway_service::emit_gateway_status(&mut text_output, false, status.clone())
+        .expect("emit text gateway status");
+    let (_, text_stderr) = text_output.into_inner();
+    let rendered = String::from_utf8(text_stderr).expect("utf8 gateway status");
+
+    let install_line = rendered
+        .lines()
+        .find(|line| line.contains(&install.pid().to_string()) && line.contains("waiting"))
+        .unwrap_or_else(|| {
+            panic!(
+                "gateway status did not name waiting install pid {}: {rendered}",
+                install.pid()
+            )
+        });
+    assert!(
+        install_line.contains("1 ticket")
+            && install_line.contains("H")
+            && install_line.contains(REPO)
+            && install_line.contains(&holder.pid().to_string())
+            && install_line.contains("cowshed gateway withdraw-install"),
+        "waiting install line should name ticket count, holder and withdraw hint: {install_line}"
+    );
+
+    let parked_line = rendered
+        .lines()
+        .find(|line| line.contains("parked") && line.contains("P1"))
+        .unwrap_or_else(|| panic!("gateway status did not name parked ask P1: {rendered}"));
+    assert!(
+        parked_line.contains(REPO)
+            && parked_line.contains(&parked.pid().to_string())
+            && parked_line.contains("sh -c")
+            && parked_line.contains("asked "),
+        "parked ask line should name repo, asker, pid, command and time: {parked_line}"
+    );
+
+    let mut json_output = cowshed_cli::output::Output::new(Vec::new(), Vec::new(), false);
+    cowshed_cli::gateway_service::emit_gateway_status(&mut json_output, true, status)
+        .expect("emit json gateway status");
+    let (json_stdout, _) = json_output.into_inner();
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&json_stdout).expect("parse json gateway status");
+    assert_eq!(
+        envelope["result"]["waitingInstalls"][0]["pid"],
+        serde_json::json!(install.pid()),
+        "{envelope}"
+    );
+    assert!(
+        envelope["result"]["waitingInstalls"][0]["waitingUnixMs"].is_u64(),
+        "{envelope}"
+    );
+    assert_eq!(
+        (
+            &envelope["result"]["parkedAsks"][0]["repo"],
+            &envelope["result"]["parkedAsks"][0]["workspace"],
+            &envelope["result"]["parkedAsks"][0]["pid"],
+        ),
+        (
+            &serde_json::json!(REPO),
+            &serde_json::json!("P1"),
+            &serde_json::json!(parked.pid()),
+        ),
+        "{envelope}"
+    );
+    assert!(
+        envelope["result"]["parkedAsks"][0]["command"]
+            .as_str()
+            .is_some_and(|cmd| cmd.contains("sh -c")),
+        "{envelope}"
+    );
+    assert!(
+        envelope["result"]["parkedAsks"][0]["askedUnixMs"].is_u64(),
+        "{envelope}"
     );
 }
 //#endregion smoo/cowshed!n/read-fences-turns

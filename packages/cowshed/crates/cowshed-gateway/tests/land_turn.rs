@@ -815,6 +815,240 @@ async fn a_land_takes_its_ref_turn_inside_its_turn_though_an_install_waits_for_t
         "the install is fenced once the land has ended both turns: {fenced}"
     );
 }
+
+/// Withdrawing a waiting install via `{"op":"land-turns-withdraw"}` leaves its wait (`TWaitLeave`),
+/// tells the waiting install it was withdrawn by the withdrawer's pid, and admits every parked ask
+/// in arrival order at once without disturbing the held turn (05_gateway.md "The read fences the
+/// turns").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_install_withdrawn_leaves_the_wait_and_admits_parked_asks_in_order() {
+    let (_gateway, _root, socket) = gateway().await;
+    // Hold the turn by a bound command alone so later asks from this test process are from outside.
+    let mut first = take_free(&socket, "first").await;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped());
+    first.bind_at_exec(&mut command);
+    let mut command = command.spawn().expect("spawn the first land's command");
+    awaiting("the command's bind", first.bound(command.id()))
+        .await
+        .expect("bind the first land's command");
+    first.end("its command runs on".to_owned());
+
+    let mut install = waiting_fence(&socket).await;
+    let waiting = control_line(&mut install).await;
+    assert_eq!(
+        (&waiting["ok"], &waiting["fenced"]),
+        (&serde_json::json!(true), &serde_json::json!(false)),
+        "the install waits behind the held turn: {waiting}"
+    );
+
+    let mut parked_a = ask_raw(&socket, "parked-a").await;
+    assert_eq!(
+        raw_answer(&mut parked_a).await,
+        serde_json::json!({"turn": "fenced"})
+    );
+    let mut parked_b = ask_raw(&socket, "parked-b").await;
+    assert_eq!(
+        raw_answer(&mut parked_b).await,
+        serde_json::json!({"turn": "fenced"})
+    );
+    assert_eq!(tickets(&socket).await, ["first"]);
+
+    let mut withdraw = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("connect to withdraw the waiting install");
+    let request = serde_json::json!({"op": "land-turns-withdraw"});
+    withdraw
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("send land-turns-withdraw");
+    withdraw.shutdown().await.expect("half-close withdraw");
+    let mut reply_line = String::new();
+    awaiting(
+        "the withdraw reply",
+        BufReader::new(&mut withdraw).read_line(&mut reply_line),
+    )
+    .await
+    .expect("read withdraw reply");
+    let reply: serde_json::Value = serde_json::from_str(&reply_line).expect("parse withdraw reply");
+    assert_eq!(
+        reply["ok"],
+        serde_json::json!(true),
+        "withdraw reply: {reply}"
+    );
+    let withdrawn = reply["withdrawnInstalls"]
+        .as_array()
+        .expect("withdrawnInstalls array");
+    assert_eq!(withdrawn.len(), 1, "one install was waiting: {reply}");
+    assert_eq!(
+        withdrawn[0]["pid"],
+        serde_json::json!(std::process::id()),
+        "withdrawn install names its pid: {reply}"
+    );
+    assert!(
+        withdrawn[0]["waitedMs"].is_u64(),
+        "withdrawn install names how long it waited: {reply}"
+    );
+
+    let install_reply = control_line(&mut install).await;
+    assert_eq!(
+        (
+            &install_reply["ok"],
+            &install_reply["withdrawn"],
+            &install_reply["withdrawnByPid"],
+        ),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(true),
+            &serde_json::json!(std::process::id()),
+        ),
+        "the waiting install is told it was withdrawn and by whom: {install_reply}"
+    );
+
+    let queued_a = raw_answer(&mut parked_a).await;
+    let queued_b = raw_answer(&mut parked_b).await;
+    assert_eq!(
+        (
+            &queued_a["turn"],
+            &queued_a["ticket"]["workspace"],
+            &queued_a["ahead"],
+        ),
+        (
+            &serde_json::json!("queued"),
+            &serde_json::json!("parked-a"),
+            &serde_json::json!(1),
+        ),
+        "first parked ask is numbered first behind the holder: {queued_a}"
+    );
+    assert_eq!(
+        (
+            &queued_b["turn"],
+            &queued_b["ticket"]["workspace"],
+            &queued_b["ahead"],
+        ),
+        (
+            &serde_json::json!("queued"),
+            &serde_json::json!("parked-b"),
+            &serde_json::json!(2),
+        ),
+        "second parked ask is numbered second behind the holder: {queued_b}"
+    );
+    assert!(
+        queued_a["ticket"]["number"].as_u64() < queued_b["ticket"]["number"].as_u64(),
+        "parked asks enter in arrival order: {queued_a} vs {queued_b}"
+    );
+    assert_eq!(tickets(&socket).await, ["first", "parked-a", "parked-b"]);
+
+    drop(command.stdin.take());
+    command
+        .wait_bounded()
+        .expect("the first land's command ends");
+}
+
+/// An unfenced `land-turns` read (what `cowshed gateway status` sends) reports every waiting
+/// install and every parked ask from the actor's own state without setting a fence
+/// (05_gateway.md:392, 700-704).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn land_turns_lists_waiting_installs_and_parked_asks_without_fencing() {
+    let (_gateway, _root, socket) = gateway().await;
+    let mut holder = take_free(&socket, "holder").await;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped());
+    holder.bind_at_exec(&mut command);
+    let mut command = command.spawn().expect("spawn the holder's command");
+    awaiting("the command's bind", holder.bound(command.id()))
+        .await
+        .expect("bind the holder's command");
+    holder.end("its command runs on".to_owned());
+
+    let mut install = waiting_fence(&socket).await;
+    let waiting = control_line(&mut install).await;
+    assert_eq!(waiting["fenced"], serde_json::json!(false), "{waiting}");
+
+    let mut parked = ask_raw(&socket, "parked-land").await;
+    assert_eq!(
+        raw_answer(&mut parked).await,
+        serde_json::json!({"turn": "fenced"})
+    );
+
+    let mut status = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("connect to read land-turns");
+    let request = serde_json::json!({
+        "op": land_turn::LAND_TURNS_OP,
+        "abandonedSinceUnixMs": u64::MAX,
+    });
+    status
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("send unfenced land-turns");
+    status.shutdown().await.expect("half-close land-turns");
+    let mut line = String::new();
+    awaiting(
+        "the land-turns answer",
+        BufReader::new(&mut status).read_line(&mut line),
+    )
+    .await
+    .expect("read land-turns");
+    let answer: serde_json::Value = serde_json::from_str(&line).expect("parse land-turns");
+    assert_eq!(answer["ok"], serde_json::json!(true), "{answer}");
+    assert_eq!(
+        answer["landTurns"][0]["tickets"][0]["workspace"],
+        serde_json::json!("holder"),
+        "{answer}"
+    );
+
+    let waiting_installs = answer["waitingInstalls"]
+        .as_array()
+        .expect("waitingInstalls array in land-turns answer");
+    assert_eq!(waiting_installs.len(), 1, "{answer}");
+    assert_eq!(
+        waiting_installs[0]["pid"],
+        serde_json::json!(std::process::id()),
+        "{answer}"
+    );
+    assert!(waiting_installs[0]["waitingUnixMs"].is_u64(), "{answer}");
+
+    let parked_asks = answer["parkedAsks"]
+        .as_array()
+        .expect("parkedAsks array in land-turns answer");
+    assert_eq!(parked_asks.len(), 1, "{answer}");
+    assert_eq!(
+        (
+            &parked_asks[0]["repo"],
+            &parked_asks[0]["workspace"],
+            &parked_asks[0]["pid"],
+            &parked_asks[0]["command"],
+        ),
+        (
+            &serde_json::json!(REPO),
+            &serde_json::json!("parked-land"),
+            &serde_json::json!(std::process::id()),
+            &serde_json::json!("land parked-land"),
+        ),
+        "{answer}"
+    );
+    assert!(parked_asks[0]["askedUnixMs"].is_u64(), "{answer}");
+
+    // The status read set no fence: closing the waiting install immediately admits the parked ask.
+    drop(install);
+    let queued = raw_answer(&mut parked).await;
+    assert_eq!(
+        (&queued["turn"], &queued["ticket"]["workspace"]),
+        (
+            &serde_json::json!("queued"),
+            &serde_json::json!("parked-land")
+        ),
+        "unfenced status read must not keep asks parked: {queued}"
+    );
+
+    drop(command.stdin.take());
+    command.wait_bounded().expect("the holder's command ends");
+}
 /// A gateway stand-in at `socket`: each connection it accepts is said on the returned channel by
 /// its order, from 1, after the ask it carries has been read and the answers `script` gives for
 /// that order have been written. `script` answers `None` once the stand-in has nothing more to
