@@ -1623,9 +1623,14 @@ it('fails a run at once, naming LINKED_PLUGIN_CHANGED, when its linked plugin ch
         expect(existsSync(join(workspace, 'q', 'dist', 'q.txt')), `${title}: q:build ran:\n${printed}`).toBe(false);
       };
       // A daemon a client started restarts itself, and a host shell's client (no NX_DAEMON_START) could resume on it.
-      await startDaemon(workspace, env);
-      await failsNamingTheChange('a self-restarting daemon under a host client', 'two', {});
+      // It spawns its successor itself, so the phase ends with that successor serving: the kept phase starts once it
+      // has been stopped and has exited, or it would find the workspace still served and exit unrecorded.
+      const restarting = await startDaemon(workspace, env);
+      const successor = await restarted(workspace, restarting, 'its linked plugin changing', () =>
+        failsNamingTheChange('a self-restarting daemon under a host client', 'two', {}),
+      );
       nx(workspace, env, 'daemon', '--stop');
+      await awaitExit([successor.entry], `the restarted daemon ${successor.record.processId} before the kept phase`);
       // A kept daemon stops for its keeper to start the successor; the client is a cowshed job's.
       const kept = await startKeptDaemon(workspace, env);
       try {
