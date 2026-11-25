@@ -12952,6 +12952,7 @@ mod land_gate_priority {
         )
         .unwrap();
         let handle = WorkspaceSupervisor::start(config, commitments).unwrap();
+        handle.gateway_hello();
         GateFixture {
             handle,
             gateway,
@@ -13929,6 +13930,7 @@ s.recv(16)
             Box::new(commitments),
         )
         .unwrap();
+        handle.gateway_hello();
         GateFixture {
             handle,
             gateway,

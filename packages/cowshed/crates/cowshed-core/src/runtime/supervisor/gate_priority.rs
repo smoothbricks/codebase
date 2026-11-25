@@ -8,11 +8,13 @@ use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 use cowshed_os::deadline;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::api::dto::{ExecClass, JobId};
 #[cfg(target_os = "macos")]
@@ -195,9 +197,10 @@ pub(super) fn clear_darwinbg_from_lives(
     outcomes
 }
 
-/// One persistent `gate-watch` client task per supervisor, keeping the bidirectional connection to
-/// `<store>/gateway.sock` open and forwarding `GateWatchState` and silence-bound resets as
-/// [`ProcessEvent::GateWatchState`].
+/// One persistent `gate-watch` client task per supervisor, opening its bidirectional connection to
+/// `<store>/gateway.sock` when the gateway says `hello` (`Request::Hello` on the supervisor
+/// socket), forwarding `GateWatchState` and silence-bound resets as
+/// [`ProcessEvent::GateWatchState`], and waiting for the next `hello` whenever the watch ends.
 pub(super) struct GateWatchClient {
     commands: mpsc::UnboundedSender<GateWatchEvent>,
     task: tokio::task::JoinHandle<()>,
@@ -207,10 +210,11 @@ impl GateWatchClient {
     pub(super) fn start(
         gateway_socket: PathBuf,
         ledger: Option<PathBuf>,
+        hello: Arc<Notify>,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_watch_loop(gateway_socket, ledger, rx, events));
+        let task = tokio::spawn(run_watch_loop(gateway_socket, ledger, rx, hello, events));
         Self { commands: tx, task }
     }
 
@@ -243,159 +247,143 @@ async fn write_json_line(
     writer.flush().await
 }
 
+fn record_local_gate(active_local_gates: &mut BTreeSet<u64>, event: &GateWatchEvent) {
+    match event {
+        GateWatchEvent::GateStart { job_id } => {
+            active_local_gates.insert(*job_id);
+        }
+        GateWatchEvent::GateEnd { job_id } => {
+            active_local_gates.remove(job_id);
+        }
+    }
+}
+
+async fn clear_active(last_active: &mut bool, events: &mpsc::Sender<ProcessEvent>) -> bool {
+    if !*last_active {
+        return true;
+    }
+    *last_active = false;
+    events
+        .send(ProcessEvent::GateWatchState {
+            active: false,
+            heartbeat: false,
+        })
+        .await
+        .is_ok()
+}
+
 async fn run_watch_loop(
     gateway_socket: PathBuf,
     ledger: Option<PathBuf>,
     mut commands: mpsc::UnboundedReceiver<GateWatchEvent>,
+    hello: Arc<Notify>,
     events: mpsc::Sender<ProcessEvent>,
 ) {
     let mut active_local_gates = BTreeSet::<u64>::new();
     let mut last_active = false;
-    let mut backoff = Duration::from_millis(100);
-    let max_backoff = deadline::HEARTBEAT;
-
     let peer = deadline::Peer::unix("gateway", &gateway_socket);
+
     loop {
-        let connect_deadline = deadline::start("gate-watch", deadline::HANDSHAKE);
-        match deadline::connect_unix(&connect_deadline, &peer, &gateway_socket).await {
-            Ok(stream) => {
-                let (reader, mut writer) = stream.into_split();
-                let open = GateWatchOpen::new(ledger.clone());
-                if write_json_line(&mut writer, &open).await.is_err() {
-                    if last_active {
-                        last_active = false;
-                        if events
-                            .send(ProcessEvent::GateWatchState {
-                                active: false,
-                                heartbeat: false,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    continue;
-                }
-                let mut replayed = true;
-                for &job_id in &active_local_gates {
-                    if write_json_line(&mut writer, &GateWatchEvent::GateStart { job_id })
-                        .await
-                        .is_err()
-                    {
-                        replayed = false;
-                        break;
-                    }
-                }
-                if !replayed {
-                    continue;
-                }
-                let mut lines = BufReader::new(reader).lines();
-                let mut saw_frame = false;
-                loop {
-                    let silence = tokio::time::sleep(deadline::HEARTBEAT_SILENCE);
-                    tokio::pin!(silence);
-                    tokio::select! {
-                        cmd = commands.recv() => {
-                            let Some(event) = cmd else {
-                                return;
-                            };
-                            match &event {
-                                GateWatchEvent::GateStart { job_id } => {
-                                    active_local_gates.insert(*job_id);
-                                }
-                                GateWatchEvent::GateEnd { job_id } => {
-                                    active_local_gates.remove(job_id);
-                                }
-                            }
-                            if write_json_line(&mut writer, &event).await.is_err() {
-                                break;
-                            }
-                        }
-                        line = lines.next_line() => {
-                            match line {
-                                Ok(Some(line)) => {
-                                    match serde_json::from_str::<GateWatchState>(&line) {
-                                        Ok(state) if state.ok => {
-                                            saw_frame = true;
-                                            backoff = Duration::from_millis(100);
-                                            last_active = state.active;
-                                            if events
-                                                .send(ProcessEvent::GateWatchState {
-                                                    active: state.active,
-                                                    heartbeat: true,
-                                                })
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                Ok(None) | Err(_) => break,
-                            }
-                        }
-                        () = &mut silence => {
-                            // Silence past `HEARTBEAT_SILENCE` (15 s): treat gate state as off.
-                            break;
-                        }
-                    }
-                }
-                if last_active {
-                    last_active = false;
-                    if events
-                        .send(ProcessEvent::GateWatchState {
-                            active: false,
-                            heartbeat: false,
-                        })
-                        .await
-                        .is_err()
-                    {
+        // Wait for the gateway's `hello` event before opening or re-opening the watch (no retry
+        // timer). Local gate start/end events arriving while disconnected update
+        // `active_local_gates` so they are replayed once `hello` establishes the watch.
+        loop {
+            tokio::select! {
+                cmd = commands.recv() => {
+                    let Some(event) = cmd else {
                         return;
-                    }
+                    };
+                    record_local_gate(&mut active_local_gates, &event);
                 }
-                if !saw_frame {
-                    backoff = (backoff * 2).min(max_backoff);
+                () = hello.notified() => {
+                    break;
                 }
-            }
-            Err(_) => {
-                if last_active {
-                    last_active = false;
-                    if events
-                        .send(ProcessEvent::GateWatchState {
-                            active: false,
-                            heartbeat: false,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                backoff = (backoff * 2).min(max_backoff);
             }
         }
 
-        // Wait for reconnect backoff, waking immediately if a local land-gate event arrives.
-        let retry = tokio::time::sleep(backoff);
-        tokio::pin!(retry);
-        tokio::select! {
-            cmd = commands.recv() => {
-                let Some(event) = cmd else {
-                    return;
-                };
-                match event {
-                    GateWatchEvent::GateStart { job_id } => {
-                        active_local_gates.insert(job_id);
-                    }
-                    GateWatchEvent::GateEnd { job_id } => {
-                        active_local_gates.remove(&job_id);
+        let connect_deadline = deadline::start("gate-watch", deadline::HANDSHAKE);
+        let Ok(stream) = deadline::connect_unix(&connect_deadline, &peer, &gateway_socket).await
+        else {
+            if !clear_active(&mut last_active, &events).await {
+                return;
+            }
+            continue;
+        };
+        let (reader, mut writer) = stream.into_split();
+        let open = GateWatchOpen::new(ledger.clone());
+        if write_json_line(&mut writer, &open).await.is_err() {
+            if !clear_active(&mut last_active, &events).await {
+                return;
+            }
+            continue;
+        }
+        let mut replayed = true;
+        for &job_id in &active_local_gates {
+            if write_json_line(&mut writer, &GateWatchEvent::GateStart { job_id })
+                .await
+                .is_err()
+            {
+                replayed = false;
+                break;
+            }
+        }
+        if !replayed {
+            if !clear_active(&mut last_active, &events).await {
+                return;
+            }
+            continue;
+        }
+
+        let mut lines = BufReader::new(reader).lines();
+        // Armed once at connect and reset only when a valid gateway frame arrives; local
+        // `gate-start`/`gate-end` commands never extend the gateway silence deadline.
+        let silence = tokio::time::sleep(deadline::HEARTBEAT_SILENCE);
+        tokio::pin!(silence);
+        loop {
+            tokio::select! {
+                cmd = commands.recv() => {
+                    let Some(event) = cmd else {
+                        return;
+                    };
+                    record_local_gate(&mut active_local_gates, &event);
+                    if write_json_line(&mut writer, &event).await.is_err() {
+                        break;
                     }
                 }
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            match serde_json::from_str::<GateWatchState>(&line) {
+                                Ok(state) if state.ok => {
+                                    silence.as_mut().reset(
+                                        tokio::time::Instant::now() + deadline::HEARTBEAT_SILENCE,
+                                    );
+                                    last_active = state.active;
+                                    if events
+                                        .send(ProcessEvent::GateWatchState {
+                                            active: state.active,
+                                            heartbeat: true,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                () = &mut silence => {
+                    // Silence past `HEARTBEAT_SILENCE` (15 s): treat gate state as off.
+                    break;
+                }
             }
-            () = &mut retry => {}
+        }
+        if !clear_active(&mut last_active, &events).await {
+            return;
         }
     }
 }

@@ -207,6 +207,7 @@ fn start_supervisor(
         CommitmentPublisher::start(Box::new(cowshed_core::storage::audit::NullAuditSink), 8)
             .unwrap();
     let handle = WorkspaceSupervisor::start(config, commitments).unwrap();
+    handle.gateway_hello();
     (handle, telemetry, ledger)
 }
 

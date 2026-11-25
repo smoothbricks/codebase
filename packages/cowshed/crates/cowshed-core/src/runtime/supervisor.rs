@@ -3583,6 +3583,9 @@ pub struct WorkspaceSupervisorHandle {
     /// Where the actor publishes its liveness; `None` for a handle whose calls another process's
     /// supervisor answers ([`super::supervisor_socket::connect`]).
     liveness: Option<LivenessSlot>,
+    /// Wakes the local supervisor's `gate-watch` client when the gateway sends `Request::Hello`
+    /// (on supervisor start or gateway re-adoption), avoiding any retry timer.
+    gate_watch_hello: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl std::fmt::Debug for WorkspaceSupervisorHandle {
@@ -3603,6 +3606,7 @@ impl WorkspaceSupervisorHandle {
             authority,
             commands,
             liveness: None,
+            gate_watch_hello: None,
         }
     }
 
@@ -3612,6 +3616,16 @@ impl WorkspaceSupervisorHandle {
             authority,
             commands: self.commands.clone(),
             liveness: self.liveness.clone(),
+            gate_watch_hello: self.gate_watch_hello.clone(),
+        }
+    }
+
+    /// Signal the local supervisor's `gate-watch` client that the gateway has reached this
+    /// supervisor with `hello` (start or re-adoption), so it opens or re-opens its watch without
+    /// a retry timer or actor round-trip.
+    pub fn gateway_hello(&self) {
+        if let Some(hello) = &self.gate_watch_hello {
+            hello.notify_one();
         }
     }
 
@@ -3706,6 +3720,7 @@ impl WorkspaceSupervisorHandle {
             authority,
             commands: self.commands.clone(),
             liveness: self.liveness.clone(),
+            gate_watch_hello: self.gate_watch_hello.clone(),
         })
     }
 
@@ -4247,10 +4262,12 @@ impl WorkspaceSupervisor {
         let (events, event_receiver) = mpsc::channel(config.event_capacity);
         let job_spans = config.telemetry_root.map(JobSpanPublisher::start);
         let (liveness, published) = LivenessWriter::new(&config.authority);
+        let gate_watch_hello = Arc::new(tokio::sync::Notify::new());
         let handle = WorkspaceSupervisorHandle {
             authority: config.authority.clone(),
             commands,
             liveness: Some(published),
+            gate_watch_hello: Some(Arc::clone(&gate_watch_hello)),
         };
         let nx_daemon = NxDaemonKeeper::for_role(
             WorkspaceRole::for_name(&config.authority.workspace),
@@ -4304,6 +4321,7 @@ impl WorkspaceSupervisor {
         let gate_watch = gate_priority::GateWatchClient::start(
             gate_watch_socket,
             gate_watch_ledger,
+            gate_watch_hello,
             events.clone(),
         );
         let mut actor = SupervisorActor {

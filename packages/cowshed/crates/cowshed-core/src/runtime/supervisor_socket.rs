@@ -2745,6 +2745,9 @@ async fn serve_call(
             // Read from what the actor published, never through it: a turn waiting on the
             // blocking pool must not hold a hello past its handshake bound.
             let liveness = supervisor.liveness()?;
+            // A gateway `hello` (on supervisor start or gateway re-adoption) is the event that
+            // opens or re-opens this supervisor's `gate-watch` without a retry timer.
+            supervisor.gateway_hello();
             let value = to_value(&HelloWire {
                 build: BuildId::current()?.clone(),
                 authority: liveness.authority.as_ref().into(),
