@@ -8731,29 +8731,50 @@ fn main() {
             mbx: None,
             mbx_targets: None,
         };
-        let sqlite = |mount: &Path, statement: &str| {
-            let output = std::process::Command::new("sqlite3")
-                .arg(mount.join("nx/workspace-data/task-v3.db"))
-                .arg(statement)
-                .output_bounded()
-                .expect("run the sqlite3 command-line shell, which this test needs on PATH");
-            assert!(output.status.success(), "{output:?}");
-            output.stdout
+        let db_path = |mount: &Path| mount.join("nx/workspace-data/task-v3.db");
+        // Stock Nx's two cache tables on macOS (where cowshed links SQLite, sqlite.rs:1-5),
+        // and distinct opaque bytes per side on Linux (where adoption never opens task databases),
+        // plus one cache entry each side ran: the target's "1", the landing workspace's "2".
+        #[cfg(target_os = "macos")]
+        let write_task_db = |mount: &Path, hash: &str| {
+            use crate::build_volume::sqlite::Connection;
+
+            let database = db_path(mount);
+            fs::write(&database, b"").unwrap();
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT)",
+                    &[],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "CREATE TABLE cache_outputs (hash TEXT PRIMARY KEY NOT NULL, code INTEGER NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (hash) REFERENCES task_details(hash))",
+                    &[],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO task_details VALUES (?1, 'a', 'build', NULL)",
+                    &[hash],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cache_outputs (hash, code, size) VALUES (?1, 0, 4)",
+                    &[hash],
+                )
+                .unwrap();
         };
-        // Stock Nx's two cache tables, and one entry each side ran: the target's "1", the
-        // landing workspace's "2".
+        #[cfg(not(target_os = "macos"))]
+        let write_task_db = |mount: &Path, hash: &str| {
+            fs::write(db_path(mount), format!("task-db-{hash}")).unwrap();
+        };
         for (mount, hash) in [(&target, "1"), (&landing, "2")] {
             state.write(mount).unwrap();
             fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
-            sqlite(
-                mount,
-                &format!(
-                    "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT); \
-                     CREATE TABLE cache_outputs (hash TEXT PRIMARY KEY NOT NULL, code INTEGER NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (hash) REFERENCES task_details(hash)); \
-                     INSERT INTO task_details VALUES ('{hash}', 'a', 'build', NULL); \
-                     INSERT INTO cache_outputs (hash, code, size) VALUES ('{hash}', 0, 4);"
-                ),
-            );
+            write_task_db(mount, hash);
             fs::create_dir_all(mount.join("nx/cache").join(hash)).unwrap();
             fs::write(mount.join("nx/cache").join(hash).join("output"), b"warm").unwrap();
         }
@@ -8791,14 +8812,35 @@ fn main() {
         drop(quiet);
         drop(locked);
         let linked = scratch.layout.linked(&main_checkout).unwrap();
-        let indexed = sqlite(&landing, "SELECT hash FROM cache_outputs ORDER BY hash;");
+        #[cfg(target_os = "macos")]
+        let indexed = {
+            use crate::build_volume::sqlite::Connection;
+
+            let connection = Connection::open(&db_path(&landing)).unwrap();
+            let mut rows = connection
+                .prepare("SELECT hash FROM cache_outputs ORDER BY hash")
+                .unwrap();
+            let mut hashes = Vec::new();
+            while rows.step().unwrap() {
+                hashes.push(rows.text(0));
+            }
+            hashes
+        };
+        #[cfg(not(target_os = "macos"))]
+        let adopted_db_bytes = fs::read(db_path(&landing)).unwrap();
         let copied = landing.join("nx/cache/1").exists();
         scratch.release_all();
         assert_eq!(linked, Some(topic), "the target adopted the landing volume");
+        #[cfg(target_os = "macos")]
         assert_eq!(
-            String::from_utf8_lossy(&indexed),
-            "2\n",
+            indexed,
+            vec!["2"],
             "the adopted volume indexes only its own entry"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            adopted_db_bytes, b"task-db-2",
+            "the adopted volume keeps only its own task database bytes"
         );
         assert!(!copied, "the target's entry stays with its previous volume");
     }
