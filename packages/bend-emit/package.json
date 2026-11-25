@@ -27,6 +27,7 @@
     "src",
     "vendor/bend2",
     "dist/ts/src/*.d.ts",
+    "dist/ts/vendor/bend2/*.d.ts",
     "!src/**/*.test.ts"
   ],
   "scripts": {
