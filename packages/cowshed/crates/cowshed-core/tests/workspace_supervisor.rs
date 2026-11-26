@@ -12654,13 +12654,14 @@ mod land_gate_priority {
     use tokio::net::UnixListener;
     use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
-    /// Await `fut` bounded only by the spec's heartbeat silence bound (`deadline::HEARTBEAT_SILENCE`).
-    async fn within_silence<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
-        match tokio::time::timeout(deadline::HEARTBEAT_SILENCE, fut).await {
+    /// Await `fut` bounded by the test no-progress backstop
+    /// (`cowshed_os::test_backstop::NO_PROGRESS`).
+    async fn within_backstop<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, fut).await {
             Ok(value) => value,
             Err(_) => panic!(
-                "{what} did not happen within the silence bound ({:?})",
-                deadline::HEARTBEAT_SILENCE
+                "{what} did not happen within the test backstop ({:?})",
+                cowshed_os::test_backstop::NO_PROGRESS
             ),
         }
     }
@@ -12860,7 +12861,7 @@ mod land_gate_priority {
         }
 
         async fn recv_event(&mut self, what: &str) -> GateWatchEvent {
-            within_silence(what, self.events.recv())
+            within_backstop(what, self.events.recv())
                 .await
                 .expect("stand-in gateway event channel closed")
         }
@@ -13091,13 +13092,13 @@ for line in f_in:
                 )
                 .await
                 .unwrap();
-            let (stream, _) = within_silence("jobserver client connect", listener.accept())
+            let (stream, _) = within_backstop("jobserver client connect", listener.accept())
                 .await
                 .unwrap();
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
             let mut line = String::new();
-            within_silence("jobserver client ready", reader.read_line(&mut line))
+            within_backstop("jobserver client ready", reader.read_line(&mut line))
                 .await
                 .unwrap();
             let mut parts = line.trim().split(' ');
@@ -13127,7 +13128,7 @@ for line in f_in:
                 .unwrap();
             self.writer.flush().await.unwrap();
             let mut line = String::new();
-            within_silence(command, self.reader.read_line(&mut line))
+            within_backstop(command, self.reader.read_line(&mut line))
                 .await
                 .unwrap();
             line.trim().to_owned()
@@ -13181,7 +13182,7 @@ for line in f_in:
 
         async fn exit(mut self, handle: &WorkspaceSupervisorHandle) {
             assert_eq!(self.cmd("exit").await, "bye");
-            let ended = within_silence("jobserver client exit", handle.wait(self.job_id))
+            let ended = within_backstop("jobserver client exit", handle.wait(self.job_id))
                 .await
                 .unwrap();
             assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
@@ -13243,13 +13244,13 @@ s.recv(16)
                 )
                 .await
                 .unwrap();
-            let (stream, _) = within_silence("gate job connect", listener.accept())
+            let (stream, _) = within_backstop("gate job connect", listener.accept())
                 .await
                 .unwrap();
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
             let mut line = String::new();
-            within_silence("gate job ready", reader.read_line(&mut line))
+            within_backstop("gate job ready", reader.read_line(&mut line))
                 .await
                 .unwrap();
             assert_eq!(line.trim(), "ready");
@@ -13262,7 +13263,7 @@ s.recv(16)
         async fn finish(mut self, handle: &WorkspaceSupervisorHandle) {
             let _ = self.writer.write_all(b"go\n").await;
             let _ = self.writer.shutdown().await;
-            let ended = within_silence("gate job exit", handle.wait(self.job_id))
+            let ended = within_backstop("gate job exit", handle.wait(self.job_id))
                 .await
                 .unwrap();
             assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
@@ -13355,7 +13356,7 @@ s.recv(16)
     }
 
     /// Wait on the supervisor's published liveness watch until `job_id` has at least
-    /// `expected_tokens` withdrawn, bounded by the silence bound. Telemetry rows are asserted once
+    /// `expected_tokens` withdrawn, bounded by the test backstop. Telemetry rows are asserted once
     /// after the job concludes, never polled.
     async fn wait_for_withdrawn(
         handle: &WorkspaceSupervisorHandle,
@@ -13365,7 +13366,7 @@ s.recv(16)
         wait_for_liveness(
             handle,
             "job tokens withdrawn on published liveness",
-            deadline::HEARTBEAT_SILENCE,
+            cowshed_os::test_backstop::NO_PROGRESS,
             |liveness| {
                 liveness
                     .job_gate_priority(job_id)
@@ -14016,13 +14017,13 @@ for pid in children:
                 )
                 .await
                 .unwrap();
-            let (stream, _) = within_silence("cpu burner connect", listener.accept())
+            let (stream, _) = within_backstop("cpu burner connect", listener.accept())
                 .await
                 .unwrap();
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
             let mut line = String::new();
-            within_silence("cpu burner pids", reader.read_line(&mut line))
+            within_backstop("cpu burner pids", reader.read_line(&mut line))
                 .await
                 .unwrap();
             let pids: Vec<u32> = line
@@ -14043,7 +14044,7 @@ for pid in children:
         async fn stop(mut self, handle: &WorkspaceSupervisorHandle) {
             let _ = self.writer.write_all(b"stop\n").await;
             let _ = self.writer.shutdown().await;
-            let ended = within_silence("cpu burner exit", handle.wait(self.job_id))
+            let ended = within_backstop("cpu burner exit", handle.wait(self.job_id))
                 .await
                 .unwrap();
             assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
@@ -14094,7 +14095,7 @@ for pid in children:
         wait_for_liveness(
             &fixture.handle,
             "darwinbg active on published liveness",
-            deadline::HEARTBEAT_SILENCE,
+            cowshed_os::test_backstop::NO_PROGRESS,
             |liveness| {
                 liveness
                     .job_gate_priority(burner.job_id)
@@ -14131,7 +14132,7 @@ for pid in children:
         wait_for_liveness(
             &fixture.handle,
             "darwinbg cleared on published liveness",
-            deadline::HEARTBEAT_SILENCE,
+            cowshed_os::test_backstop::NO_PROGRESS,
             |liveness| {
                 liveness
                     .job_gate_priority(burner.job_id)
@@ -14390,7 +14391,7 @@ os.read(0, 1)
             wait_for_liveness(
                 &fixture.handle,
                 "darwinbg active before gateway silence",
-                deadline::HEARTBEAT_SILENCE,
+                cowshed_os::test_backstop::NO_PROGRESS,
                 |liveness| {
                     liveness
                         .job_gate_priority(burner.job_id)
@@ -14520,7 +14521,7 @@ os.read(0, 1)
         wait_for_liveness(
             &fixture.handle,
             "liveness reflects span off after jobs finish",
-            deadline::HEARTBEAT_SILENCE,
+            cowshed_os::test_backstop::NO_PROGRESS,
             |liveness| {
                 !liveness.gate_active()
                     && liveness
@@ -14593,7 +14594,7 @@ os.read(0, 1)
         wait_for_liveness(
             &fixture.handle,
             "span off after gateway #1 close",
-            deadline::HEARTBEAT_SILENCE,
+            cowshed_os::test_backstop::NO_PROGRESS,
             |liveness| {
                 !liveness.gate_active()
                     && liveness
@@ -14887,7 +14888,7 @@ os.read(0, 1)
                 )
                 .await
         });
-        within_silence("stalled spawn entered", entered_rx)
+        within_backstop("stalled spawn entered", entered_rx)
             .await
             .expect("stalled spawn entered channel closed");
 
@@ -14899,13 +14900,14 @@ os.read(0, 1)
 
         // Release the stall, finish all jobs, and verify the actor records `job.tokens.restored`.
         release_guard.release();
-        let stalled_job_id = within_silence("stalled exec admission", stalled_exec)
+        let stalled_job_id = within_backstop("stalled exec admission", stalled_exec)
             .await
             .expect("stalled exec task")
             .expect("stalled exec succeeded");
-        let stalled_ended = within_silence("stalled job exit", fixture.handle.wait(stalled_job_id))
-            .await
-            .unwrap();
+        let stalled_ended =
+            within_backstop("stalled job exit", fixture.handle.wait(stalled_job_id))
+                .await
+                .unwrap();
         assert_eq!(stalled_ended.exit, Some(ExitStatus::Exited { code: 0 }));
         land_gate.finish(&fixture.handle).await;
         let bg_id = bg.job_id;
@@ -14953,7 +14955,7 @@ os.read(0, 1)
         wait_for_liveness(
             &fixture.handle,
             "darwinbg active before stalled spawn",
-            deadline::HEARTBEAT_SILENCE,
+            cowshed_os::test_backstop::NO_PROGRESS,
             |liveness| {
                 liveness
                     .job_gate_priority(burner.job_id)
@@ -14994,7 +14996,7 @@ os.read(0, 1)
                 )
                 .await
         });
-        within_silence("stalled spawn entered", entered_rx)
+        within_backstop("stalled spawn entered", entered_rx)
             .await
             .expect("stalled spawn entered channel closed");
 
@@ -15035,18 +15037,19 @@ os.read(0, 1)
 
         // Release the stall; the actor finishes the turn, flushes `.groups`, and records the row.
         release_guard.release();
-        let stalled_job_id = within_silence("stalled exec admission", stalled_exec)
+        let stalled_job_id = within_backstop("stalled exec admission", stalled_exec)
             .await
             .expect("stalled exec task")
             .expect("stalled exec succeeded");
-        let stalled_ended = within_silence("stalled job exit", fixture.handle.wait(stalled_job_id))
-            .await
-            .unwrap();
+        let stalled_ended =
+            within_backstop("stalled job exit", fixture.handle.wait(stalled_job_id))
+                .await
+                .unwrap();
         assert_eq!(stalled_ended.exit, Some(ExitStatus::Exited { code: 0 }));
         wait_for_liveness(
             &fixture.handle,
             "darwinbg cleared on liveness after stall release",
-            deadline::HEARTBEAT_SILENCE,
+            cowshed_os::test_backstop::NO_PROGRESS,
             |liveness| {
                 liveness
                     .job_gate_priority(burner.job_id)
