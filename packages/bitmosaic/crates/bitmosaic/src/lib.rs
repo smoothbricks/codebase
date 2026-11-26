@@ -52,7 +52,7 @@ pub use ef::{Ef2Range, Ef2View, EfView, ef2_len, write_ef2};
 pub use list::{
     ListRange, ListView, SingleRange, SingleView, list_len, single_len, write_list, write_single,
 };
-pub use maplet::{EMPTY_MAPLET_IMAGE, Maplet, MapletView};
+pub use maplet::{EMPTY_MAPLET_IMAGE, Maplet, MapletInsert, MapletMatch, MapletView};
 pub use patch::{
     BatchOutcome, PatchError, PatchReport, PatchScratch, PreparedPatch, Witness, patch,
     patch_witnessed, prepare_patch_in_witnessed, prepare_patch_witnessed,

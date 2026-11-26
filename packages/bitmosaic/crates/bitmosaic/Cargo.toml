@@ -72,6 +72,21 @@ item = "is_multi_value"
 consumer = "private"
 why = "a caller distinguishes unique-key and multi-value sealed maplets before routing lookups"
 
+[[package.metadata.wiring.external]]
+item = "insert_bounded"
+consumer = "private"
+why = "a router folds repeated keys into a maplet with O(1) per-bucket saturation and zero spill growth"
+
+[[package.metadata.wiring.external]]
+item = "for_each_match_bounded"
+consumer = "private"
+why = "a router probes candidate values with O(1) per-bucket saturation fallback and zero global cold gate"
+
+[[package.metadata.wiring.external]]
+item = "is_key_saturated"
+consumer = "private"
+why = "an incidence filter checks whether a key's home bucket is saturated before probing inline slots"
+
 [dependencies]
 
 [features]

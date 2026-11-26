@@ -196,6 +196,31 @@ fn try_place_in_bucket(bucket: &mut Bucket, slot: u32) -> SlotPlace {
     SlotPlace::Full
 }
 
+/// Outcome of [`Maplet::insert_bounded`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapletInsert {
+    /// Entry was placed into bucket `b0` or its linear-probe neighbour `b1`.
+    Inserted,
+    /// Exact `(fp16, value)` slot already existed in `b0` or `b1`.
+    Duplicate,
+    /// Home bucket `b0` is saturated (both `b0` and `b1` full, or
+    /// `value > MAX_INDEXED_VAL`); no spill entry was recorded and bounded
+    /// lookups for keys hashing to `b0` return [`MapletMatch::Saturated`].
+    Saturated,
+}
+
+/// Outcome of [`Maplet::for_each_match_bounded`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapletMatch<R = ()> {
+    /// Every candidate value for `key` was visited without early break.
+    Complete,
+    /// Visitor returned `ControlFlow::Break(value)`.
+    Break(R),
+    /// The key's home bucket is saturated; caller must fall back to a
+    /// conservative full scan (zero false negatives).
+    Saturated,
+}
+
 // ── Mutable Live Profile: Maplet ─────────────────────────────────────────
 
 /// Live mutable O(1) cache-line-bucketed multi-value routing maplet.
@@ -212,6 +237,25 @@ pub struct Maplet {
     /// 1-bit-per-bucket overflow bitmap: bit `b` is set iff a slot belonging
     /// to bucket `b` spilled into `(b + 1) & mask`.
     overflow: Vec<u64>,
+    /// 1-bit-per-bucket spill bitmap: bit `b` is set iff an entry belonging to
+    /// home bucket `b` was placed into `spill` by [`Self::insert`]. Replaces
+    /// the global `spill.is_empty()` lookup gate so a spill in one bucket never
+    /// forces unrelated buckets off the single-cache-line hot path.
+    spilled: Vec<u64>,
+    /// 1-bit-per-bucket saturation bitmap: bit `b` is set iff a bounded insert
+    /// for home bucket `b` found both `b` and `(b + 1) & mask` full (or saw an
+    /// unindexable value). Bounded inserts for `b` short-circuit in O(1) with
+    /// zero spill and zero growth, and bounded lookups for `b` return
+    /// [`MapletMatch::Saturated`] without disturbing unsaturated buckets.
+    saturated: Vec<u64>,
+    /// 1-bit-per-bucket bitmap recording buckets where [`Self::insert_bounded`]
+    /// observed a non-tail `(fp16, val)` slot duplicate without scanning
+    /// `entries` (eliminating the O(N) `entries.iter().rev().any` scan). Before
+    /// a resize the matching slot is already in `b0`/`b1` (zero false negatives,
+    /// zero saturation); if `grow()` later splits the bucket, any set bit here
+    /// promotes to `saturated` across the split strides so a colliding key is
+    /// never dropped.
+    dup_on_grow: Vec<u64>,
     /// Exact insertion-ordered log of unique `(key, val)` entries for O(N)
     /// dynamic resize and canonical sealing via [`Self::seal_into`].
     entries: Vec<MapletEntry>,
@@ -238,10 +282,14 @@ impl Maplet {
             .div_ceil(MAX_LOAD_PER_BUCKET)
             .max(MIN_BUCKETS)
             .next_power_of_two();
+        let bitmap_words = target_buckets.div_ceil(64);
         Self {
             buckets: vec![Bucket::EMPTY; target_buckets],
             mask: target_buckets - 1,
-            overflow: vec![0u64; target_buckets.div_ceil(64)],
+            overflow: vec![0u64; bitmap_words],
+            spilled: vec![0u64; bitmap_words],
+            saturated: vec![0u64; bitmap_words],
+            dup_on_grow: vec![0u64; bitmap_words],
             entries: Vec::with_capacity(expected_entries),
             spill: Vec::new(),
         }
@@ -261,10 +309,36 @@ impl Maplet {
         self.len() == 0
     }
 
+    /// Whether `key`'s home bucket is currently marked saturated.
+    #[inline(always)]
+    #[must_use]
+    pub fn is_key_saturated(&self, key: u32) -> bool {
+        if self.buckets.is_empty() {
+            return false;
+        }
+        let b0 = (mix32(key) as usize) & self.mask;
+        self.bucket_saturated(b0)
+    }
+
+    /// Exact heap capacity retained by every backing vector of this maplet.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.buckets.capacity() * core::mem::size_of::<Bucket>()
+            + self.overflow.capacity() * core::mem::size_of::<u64>()
+            + self.spilled.capacity() * core::mem::size_of::<u64>()
+            + self.saturated.capacity() * core::mem::size_of::<u64>()
+            + self.dup_on_grow.capacity() * core::mem::size_of::<u64>()
+            + self.entries.capacity() * core::mem::size_of::<MapletEntry>()
+            + self.spill.capacity() * core::mem::size_of::<MapletEntry>()
+    }
+
     /// Capacity-retaining reset: subsequent inserts reuse bucket allocations.
     pub fn clear(&mut self) {
         self.buckets.fill(Bucket::EMPTY);
         self.overflow.fill(0);
+        self.spilled.fill(0);
+        self.saturated.fill(0);
+        self.dup_on_grow.fill(0);
         self.entries.clear();
         self.spill.clear();
     }
@@ -280,12 +354,16 @@ impl Maplet {
             if self.spill.contains(&entry) {
                 return;
             }
+            if !self.buckets.is_empty() {
+                let b0 = (mix32(key) as usize) & self.mask;
+                self.set_bucket_spilled(b0);
+            }
             self.entries.push(entry);
             self.spill.push(entry);
             return;
         }
 
-        self.ensure_capacity_for_one();
+        self.ensure_capacity_for_one(false);
         let mixed = mix32(key);
         let fp16 = maplet_fp(mixed);
         let slot = pack_slot(fp16, value);
@@ -298,7 +376,9 @@ impl Maplet {
                     return;
                 }
                 SlotPlace::Duplicate => {
-                    if !self.entries.iter().rev().any(|e| *e == entry) {
+                    if self.entries.last() != Some(&entry)
+                        && !self.entries.iter().rev().any(|e| *e == entry)
+                    {
                         self.entries.push(entry);
                     }
                     return;
@@ -317,7 +397,9 @@ impl Maplet {
                 }
                 SlotPlace::Duplicate => {
                     self.set_bucket_overflow(b0);
-                    if !self.entries.iter().rev().any(|e| *e == entry) {
+                    if self.entries.last() != Some(&entry)
+                        && !self.entries.iter().rev().any(|e| *e == entry)
+                    {
                         self.entries.push(entry);
                     }
                     return;
@@ -327,9 +409,82 @@ impl Maplet {
         }
 
         if !self.spill.contains(&entry) {
+            self.set_bucket_spilled(b0);
             self.entries.push(entry);
             self.spill.push(entry);
         }
+    }
+
+    /// Bounded-work insert with per-bucket saturation and zero spill growth.
+    ///
+    /// Attempts to place `(key, value)` into home bucket `b0` or its neighbour
+    /// `b1` (at most `2 * BUCKET_SLOTS = 32` slot checks). When `b0` is
+    /// already saturated, both `b0` and `b1` are full, or `value == u16::MAX`,
+    /// sets `saturated[b0]` and stores nothing in `spill` or `entries`.
+    /// Subsequent [`Self::for_each_match_bounded`] probes for keys hashing to
+    /// `b0` return [`MapletMatch::Saturated`] in O(1), while all unsaturated
+    /// buckets stay on the single-cache-line hot path with zero spill scans.
+    #[inline]
+    pub fn insert_bounded(&mut self, key: u32, value: u16) -> MapletInsert {
+        let mixed = mix32(key);
+        if !self.buckets.is_empty() {
+            let b0 = (mixed as usize) & self.mask;
+            if self.bucket_saturated(b0) {
+                return MapletInsert::Saturated;
+            }
+        }
+
+        self.ensure_capacity_for_one(true);
+        let b0 = (mixed as usize) & self.mask;
+        if self.bucket_saturated(b0) {
+            return MapletInsert::Saturated;
+        }
+        if value > MAX_INDEXED_VAL {
+            self.set_bucket_saturated(b0);
+            return MapletInsert::Saturated;
+        }
+
+        let entry = MapletEntry { key, val: value };
+        let fp16 = maplet_fp(mixed);
+        let slot = pack_slot(fp16, value);
+
+        if let Some(bucket0) = self.buckets.get_mut(b0) {
+            match try_place_in_bucket(bucket0, slot) {
+                SlotPlace::Inserted => {
+                    self.entries.push(entry);
+                    return MapletInsert::Inserted;
+                }
+                SlotPlace::Duplicate => {
+                    if self.entries.last() != Some(&entry) {
+                        self.set_bucket_dup_on_grow(b0);
+                    }
+                    return MapletInsert::Duplicate;
+                }
+                SlotPlace::Full => {}
+            }
+        }
+
+        let b1 = (b0 + 1) & self.mask;
+        if let Some(bucket1) = self.buckets.get_mut(b1) {
+            match try_place_in_bucket(bucket1, slot) {
+                SlotPlace::Inserted => {
+                    self.set_bucket_overflow(b0);
+                    self.entries.push(entry);
+                    return MapletInsert::Inserted;
+                }
+                SlotPlace::Duplicate => {
+                    self.set_bucket_overflow(b0);
+                    if self.entries.last() != Some(&entry) {
+                        self.set_bucket_dup_on_grow(b0);
+                    }
+                    return MapletInsert::Duplicate;
+                }
+                SlotPlace::Full => {}
+            }
+        }
+
+        self.set_bucket_saturated(b0);
+        MapletInsert::Saturated
     }
 
     /// Return the newest candidate value matching `key`, or `None` if absent.
@@ -341,6 +496,56 @@ impl Maplet {
         match self.for_each_match(key, ControlFlow::Break) {
             ControlFlow::Break(v) => Some(v),
             ControlFlow::Continue(()) => None,
+        }
+    }
+
+    /// Visit every candidate value matching `key` in newest-first order,
+    /// returning [`MapletMatch::Saturated`] in O(1) when `key`'s home bucket
+    /// was saturated by [`Self::insert_bounded`].
+    ///
+    /// Zero heap allocation; unsaturated non-overflowed buckets stay on the
+    /// single 64-byte cache-line SIMD hot path regardless of how many other
+    /// buckets are saturated.
+    #[inline(always)]
+    pub fn for_each_match_bounded<R>(
+        &self,
+        key: u32,
+        mut visit: impl FnMut(u16) -> ControlFlow<R>,
+    ) -> MapletMatch<R> {
+        if self.buckets.is_empty() {
+            return match self.visit_spill_only(key, &mut visit) {
+                ControlFlow::Continue(()) => MapletMatch::Complete,
+                ControlFlow::Break(done) => MapletMatch::Break(done),
+            };
+        }
+        let mixed = mix32(key);
+        let b0 = (mixed as usize) & self.mask;
+        if self.bucket_saturated(b0) {
+            return MapletMatch::Saturated;
+        }
+        let Some(bucket0) = self.buckets.get(b0) else {
+            return MapletMatch::Complete;
+        };
+        let fp16 = maplet_fp(mixed);
+        let mask0 = match_bucket(&bucket0.slots, fp16);
+
+        if !self.bucket_overflowed(b0) && !self.bucket_spilled(b0) {
+            let mut m = mask0;
+            while m != 0 {
+                let slot_idx = 15 - (m.leading_zeros() as usize);
+                m &= !(1u16 << slot_idx);
+                if let Some(&slot) = bucket0.slots.get(slot_idx)
+                    && let ControlFlow::Break(done) = visit(slot_val(slot))
+                {
+                    return MapletMatch::Break(done);
+                }
+            }
+            return MapletMatch::Complete;
+        }
+
+        match self.for_each_match_cold(key, b0, bucket0, mask0, fp16, visit) {
+            ControlFlow::Continue(()) => MapletMatch::Complete,
+            ControlFlow::Break(done) => MapletMatch::Break(done),
         }
     }
 
@@ -366,7 +571,7 @@ impl Maplet {
         let fp16 = maplet_fp(mixed);
         let mask0 = match_bucket(&bucket0.slots, fp16);
 
-        if !self.bucket_overflowed(b0) && self.spill.is_empty() {
+        if !self.bucket_overflowed(b0) && !self.bucket_spilled(b0) {
             let mut m = mask0;
             while m != 0 {
                 let slot_idx = 15 - (m.leading_zeros() as usize);
@@ -411,11 +616,13 @@ impl Maplet {
         fp16: u16,
         mut visit: impl FnMut(u16) -> ControlFlow<R>,
     ) -> ControlFlow<R> {
-        for entry in self.spill.iter().rev() {
-            if entry.key == key
-                && let ControlFlow::Break(done) = visit(entry.val)
-            {
-                return ControlFlow::Break(done);
+        if self.bucket_spilled(b0) {
+            for entry in self.spill.iter().rev() {
+                if entry.key == key
+                    && let ControlFlow::Break(done) = visit(entry.val)
+                {
+                    return ControlFlow::Break(done);
+                }
             }
         }
         if self.bucket_overflowed(b0) {
@@ -586,7 +793,49 @@ impl Maplet {
         }
     }
 
-    fn ensure_capacity_for_one(&mut self) {
+    #[inline(always)]
+    fn bucket_spilled(&self, bucket_idx: usize) -> bool {
+        self.spilled
+            .get(bucket_idx >> 6)
+            .is_some_and(|&word| (word & (1u64 << (bucket_idx & 63))) != 0)
+    }
+
+    #[inline(always)]
+    fn set_bucket_spilled(&mut self, bucket_idx: usize) {
+        if let Some(word) = self.spilled.get_mut(bucket_idx >> 6) {
+            *word |= 1u64 << (bucket_idx & 63);
+        }
+    }
+
+    #[inline(always)]
+    fn bucket_saturated(&self, bucket_idx: usize) -> bool {
+        self.saturated
+            .get(bucket_idx >> 6)
+            .is_some_and(|&word| (word & (1u64 << (bucket_idx & 63))) != 0)
+    }
+
+    #[inline(always)]
+    fn set_bucket_saturated(&mut self, bucket_idx: usize) {
+        if let Some(word) = self.saturated.get_mut(bucket_idx >> 6) {
+            *word |= 1u64 << (bucket_idx & 63);
+        }
+    }
+
+    #[inline(always)]
+    fn bucket_dup_on_grow(&self, bucket_idx: usize) -> bool {
+        self.dup_on_grow
+            .get(bucket_idx >> 6)
+            .is_some_and(|&word| (word & (1u64 << (bucket_idx & 63))) != 0)
+    }
+
+    #[inline(always)]
+    fn set_bucket_dup_on_grow(&mut self, bucket_idx: usize) {
+        if let Some(word) = self.dup_on_grow.get_mut(bucket_idx >> 6) {
+            *word |= 1u64 << (bucket_idx & 63);
+        }
+    }
+
+    fn ensure_capacity_for_one(&mut self, bounded: bool) {
         let needed = self.entries.len().saturating_add(1);
         let current_max = self.buckets.len().saturating_mul(MAX_LOAD_PER_BUCKET);
         if !self.buckets.is_empty() && needed <= current_max {
@@ -596,29 +845,64 @@ impl Maplet {
             .div_ceil(MAX_LOAD_PER_BUCKET)
             .max(MIN_BUCKETS)
             .next_power_of_two();
-        self.grow(target_buckets);
+        self.grow(target_buckets, bounded);
     }
 
-    fn grow(&mut self, target_buckets: usize) {
+    fn grow(&mut self, target_buckets: usize, bounded: bool) {
         debug_assert!(target_buckets.is_power_of_two() && target_buckets >= MIN_BUCKETS);
+        let old_buckets = self.buckets.len();
         self.buckets.clear();
         self.buckets.resize(target_buckets, Bucket::EMPTY);
         self.mask = target_buckets - 1;
-        let overflow_words = target_buckets.div_ceil(64);
+        let bitmap_words = target_buckets.div_ceil(64);
         self.overflow.clear();
-        self.overflow.resize(overflow_words, 0);
+        self.overflow.resize(bitmap_words, 0);
+        self.spilled.clear();
+        self.spilled.resize(bitmap_words, 0);
+
+        // Preserve per-bucket saturation across power-of-two bucket doubling:
+        // every key whose old home bucket `old_b = mix32(k) & (old_buckets - 1)`
+        // was saturated (or held an unlogged `(fp16, val)` duplicate) now hashes
+        // to `old_b + j * old_buckets` for some `j`. Replicating each set bit
+        // in-place guarantees zero false negatives after resize with zero
+        // temporary allocation.
+        if old_buckets == 0 {
+            self.saturated.clear();
+            self.saturated.resize(bitmap_words, 0);
+        } else {
+            self.saturated.resize(bitmap_words, 0);
+            for old_b in 0..old_buckets {
+                if self.bucket_saturated(old_b) || self.bucket_dup_on_grow(old_b) {
+                    let mut dst = old_b;
+                    while dst < target_buckets {
+                        self.set_bucket_saturated(dst);
+                        dst += old_buckets;
+                    }
+                }
+            }
+        }
+        self.dup_on_grow.clear();
+        self.dup_on_grow.resize(bitmap_words, 0);
         self.spill.clear();
 
         for i in 0..self.entries.len() {
             let entry = self.entries[i];
-            if entry.val > MAX_INDEXED_VAL {
-                self.spill.push(entry);
+            let mixed = mix32(entry.key);
+            let b0 = (mixed as usize) & self.mask;
+            if self.bucket_saturated(b0) {
                 continue;
             }
-            let mixed = mix32(entry.key);
+            if entry.val > MAX_INDEXED_VAL {
+                if bounded {
+                    self.set_bucket_saturated(b0);
+                } else {
+                    self.set_bucket_spilled(b0);
+                    self.spill.push(entry);
+                }
+                continue;
+            }
             let fp16 = maplet_fp(mixed);
             let slot = pack_slot(fp16, entry.val);
-            let b0 = (mixed as usize) & self.mask;
             let placed0 = self
                 .buckets
                 .get_mut(b0)
@@ -635,7 +919,12 @@ impl Maplet {
                 self.set_bucket_overflow(b0);
                 continue;
             }
-            self.spill.push(entry);
+            if bounded {
+                self.set_bucket_saturated(b0);
+            } else {
+                self.set_bucket_spilled(b0);
+                self.spill.push(entry);
+            }
         }
     }
 }
@@ -1193,5 +1482,84 @@ mod tests {
             });
             assert!(found.contains(&(i as u16)));
         }
+    }
+
+    #[test]
+    fn bounded_insert_whitebox_zero_spill_local_gate_and_resize_soundness() {
+        // 1. 240-frame x 100-key storm: 0 spill entries, bounded entry count,
+        //    per-bucket saturation bitset active, unsaturated sibling unaffected.
+        let mut maplet = Maplet::with_capacity(4096);
+        let storm_keys: Vec<u32> = (1u32..=100u32)
+            .map(|i| i.wrapping_mul(0x9E37_79B1))
+            .collect();
+        for frame in 0u16..240 {
+            for &k in &storm_keys {
+                let _ = maplet.insert_bounded(k, frame);
+            }
+        }
+        assert!(
+            maplet.spill.is_empty(),
+            "bounded storm must accumulate 0 spill entries"
+        );
+        assert!(maplet.len() <= storm_keys.len() * 32);
+        let sat_count: usize = maplet
+            .saturated
+            .iter()
+            .map(|&w| w.count_ones() as usize)
+            .sum();
+        assert!(sat_count > 0);
+        for &k in &storm_keys {
+            assert!(maplet.is_key_saturated(k));
+        }
+
+        // 2. Per-bucket spill gate on legacy insert: spilling bucket 5 leaves
+        //    unrelated buckets' `bucket_spilled` bit clear.
+        let mut legacy = Maplet::with_capacity(64);
+        let mask = legacy.mask;
+        let mut b5_keys = Vec::new();
+        let mut cand = 0u32;
+        while b5_keys.len() < 40 {
+            if (mix32(cand) as usize & mask) == 5 {
+                b5_keys.push(cand);
+            }
+            cand += 1;
+        }
+        for (i, &k) in b5_keys.iter().enumerate() {
+            legacy.insert(k, i as u16);
+        }
+        assert!(legacy.bucket_spilled(5));
+        let other_b = (0..legacy.buckets.len())
+            .find(|&b| b != 5 && !legacy.bucket_spilled(b))
+            .expect("other bucket must remain unspilled");
+        assert!(!legacy.bucket_spilled(other_b));
+
+        // 3. Saturation survives power-of-two grow() with 0 spill.
+        let mut grow_map = Maplet::new();
+        let hot = 0xCAFE_BABEu32;
+        for frame in 0u16..40 {
+            let _ = grow_map.insert_bounded(hot, frame);
+        }
+        let buckets_before = grow_map.buckets.len();
+        assert!(grow_map.spill.is_empty());
+        for i in 1u32..600 {
+            let k = i.wrapping_mul(0x045D_9F3B);
+            if k != hot {
+                let _ = grow_map.insert_bounded(k, (i & 0xFF) as u16);
+            }
+        }
+        assert!(grow_map.buckets.len() > buckets_before);
+        assert!(grow_map.spill.is_empty());
+        assert_eq!(
+            grow_map.for_each_match_bounded::<()>(hot, |_| ControlFlow::Continue(())),
+            MapletMatch::Saturated
+        );
+
+        // 4. u16::MAX under insert_bounded sets saturation with 0 spill.
+        let mut max_map = Maplet::with_capacity(64);
+        assert_eq!(
+            max_map.insert_bounded(42, u16::MAX),
+            MapletInsert::Saturated
+        );
+        assert!(max_map.spill.is_empty());
     }
 }

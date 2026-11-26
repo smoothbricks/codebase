@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use bitmosaic::{AdmissionClass, EMPTY_MAPLET_IMAGE, Maplet, MapletView};
+use bitmosaic::{
+    AdmissionClass, EMPTY_MAPLET_IMAGE, Maplet, MapletInsert, MapletMatch, MapletView,
+};
 
 struct CountingAlloc;
 
@@ -471,4 +473,188 @@ fn zero_allocation_on_live_and_sealed_lookup_and_open() {
     });
     assert_eq!(vcount, 2);
     assert_eq!(allocs_view_iter, 0, "MapletView::for_each_match allocated");
+}
+
+#[test]
+fn bounded_insert_240_frame_100_key_storm_zero_spill_and_local_saturation() {
+    let mut maplet = Maplet::with_capacity(4096);
+    let storm_keys: Vec<u32> = (1u32..=100u32)
+        .map(|i| i.wrapping_mul(0x9E37_79B1))
+        .collect();
+
+    // 240 storm frames hitting the same 100 keys.
+    for frame in 0u16..240 {
+        for &k in &storm_keys {
+            let _ = maplet.insert_bounded(k, frame);
+        }
+    }
+
+    assert!(
+        maplet.len() <= storm_keys.len() * 32,
+        "bounded storm entries must stay within 32 slots/key, got {}",
+        maplet.len()
+    );
+
+    // Every storm key must route to Saturated (zero false negatives for all 240 frames).
+    for &k in &storm_keys {
+        assert!(maplet.is_key_saturated(k));
+        let res = maplet.for_each_match_bounded::<()>(k, |_| ControlFlow::Continue(()));
+        assert_eq!(res, MapletMatch::Saturated);
+    }
+
+    // Find a sibling key whose home bucket is NOT saturated; insert one value
+    // and verify it stays narrow on the zero-alloc hot path.
+    let sibling = (10_000u32..20_000u32)
+        .find(|&cand| !maplet.is_key_saturated(cand))
+        .expect("unsaturated sibling bucket must exist");
+    assert_eq!(maplet.insert_bounded(sibling, 777), MapletInsert::Inserted);
+
+    let ((res, found), allocs) = count_allocs(|| {
+        let mut vals = [0u16; 4];
+        let mut n = 0usize;
+        let res = maplet.for_each_match_bounded::<()>(sibling, |v| {
+            if n < vals.len() {
+                vals[n] = v;
+                n += 1;
+            }
+            ControlFlow::Continue(())
+        });
+        (res, (vals, n))
+    });
+    assert_eq!(res, MapletMatch::Complete);
+    assert_eq!(allocs, 0, "bounded lookup on sibling must allocate 0 bytes");
+    assert!(found.0[..found.1].contains(&777));
+
+    // Exact retained_bytes survives clear() unchanged and resets saturation.
+    let retained_before = maplet.retained_bytes();
+    assert!(retained_before > 0);
+    maplet.clear();
+    assert_eq!(maplet.retained_bytes(), retained_before);
+    assert!(!maplet.is_key_saturated(storm_keys[0]));
+}
+
+#[test]
+fn bounded_saturation_survives_grow_and_u16_max_and_negative_silent_drop() {
+    // 1. Saturate a single key on an initial 16-bucket maplet, then force
+    //    multiple bucket doublings with unrelated keys. The saturated key MUST
+    //    remain Saturated after grow() (zero false negative across resize).
+    let mut maplet = Maplet::new();
+    let hot_key = 0xCAFE_BABEu32;
+    for frame in 0u16..40 {
+        let _ = maplet.insert_bounded(hot_key, frame);
+    }
+    assert!(maplet.is_key_saturated(hot_key));
+    let retained_before = maplet.retained_bytes();
+
+    for i in 1u32..600 {
+        let k = i.wrapping_mul(0x045D_9F3B);
+        if k != hot_key {
+            let _ = maplet.insert_bounded(k, (i & 0xFF) as u16);
+        }
+    }
+    assert!(
+        maplet.retained_bytes() > retained_before,
+        "unrelated inserts must trigger bucket growth"
+    );
+    assert_eq!(
+        maplet.for_each_match_bounded::<()>(hot_key, |_| ControlFlow::Continue(())),
+        MapletMatch::Saturated,
+        "saturation must survive grow() with zero false negatives"
+    );
+
+    // 2. u16::MAX saturates only its own bucket with zero spill.
+    let mut max_val_map = Maplet::with_capacity(64);
+    let max_key = 42u32;
+    assert_eq!(
+        max_val_map.insert_bounded(max_key, u16::MAX),
+        MapletInsert::Saturated
+    );
+    assert_eq!(
+        max_val_map.for_each_match_bounded::<()>(max_key, |_| ControlFlow::Continue(())),
+        MapletMatch::Saturated
+    );
+    let other = (100u32..2000u32)
+        .find(|&k| !max_val_map.is_key_saturated(k))
+        .expect("unsaturated bucket");
+    assert_eq!(max_val_map.insert_bounded(other, 9), MapletInsert::Inserted);
+    let mut saw_nine = false;
+    let res = max_val_map.for_each_match_bounded::<()>(other, |v| {
+        if v == 9 {
+            saw_nine = true;
+        }
+        ControlFlow::Continue(())
+    });
+    assert_eq!(res, MapletMatch::Complete);
+    assert!(saw_nine);
+
+    // 3. Negative counterexample: ignoring the saturation bit (calling plain
+    //    `for_each_match` on a bounded maplet where frame 32+ were dropped)
+    //    loses frame 32 — proving the saturation bit is required for soundness.
+    let mut dropped_probe = Vec::new();
+    let _ = maplet.for_each_match::<()>(hot_key, |v| {
+        dropped_probe.push(v);
+        ControlFlow::Continue(())
+    });
+    assert!(
+        !dropped_probe.contains(&35),
+        "without checking the saturation bit, frame 35 is silently lost"
+    );
+
+    // 4. Repeated identical (key, val) duplicates under insert_bounded perform
+    //    O(1) work with zero `entries` growth, zero `spill`, and zero false
+    //    negatives even under `(b0, fp16, val)` hash collisions across grow().
+    let mut dup_map = Maplet::new();
+    for _ in 0..10_000 {
+        let _ = dup_map.insert_bounded(1234, 7);
+        let _ = dup_map.insert_bounded(5678, 7);
+    }
+    assert_eq!(dup_map.len(), 2);
+    for k in [1234u32, 5678] {
+        let mut saw = false;
+        let res = dup_map.for_each_match_bounded::<()>(k, |v| {
+            if v == 7 {
+                saw = true;
+            }
+            ControlFlow::Continue(())
+        });
+        assert_eq!(res, MapletMatch::Complete);
+        assert!(saw);
+    }
+
+    // Force an exact `(b0, fp16, val)` slot collision between two distinct keys
+    // before grow(), then force grow() and confirm zero false negatives.
+    let mut probe_map = Maplet::new();
+    assert_eq!(probe_map.insert_bounded(0, 99), MapletInsert::Inserted);
+    // Any key matching `0` in `probe_map` shares the exact `(b0, fp16)` at mask=15.
+    let k2 = (1u32..2_000_000)
+        .find(|&cand| {
+            matches!(
+                probe_map.for_each_match_bounded(cand, ControlFlow::Break),
+                MapletMatch::Break(99)
+            )
+        })
+        .expect("deterministic (b0, fp16) collision with key 0 exists within 2^19 keys");
+    let mut fresh = Maplet::new();
+    assert_eq!(fresh.insert_bounded(0, 99), MapletInsert::Inserted);
+    assert_eq!(fresh.insert_bounded(k2, 99), MapletInsert::Duplicate);
+    assert_eq!(fresh.len(), 1);
+    let fresh_retained_before = fresh.retained_bytes();
+    // Force grow() past 16 buckets.
+    for i in 1u32..300 {
+        let _ = fresh.insert_bounded(i.wrapping_mul(0x9E37_79B1), (i & 0x7F) as u16);
+    }
+    assert!(fresh.retained_bytes() > fresh_retained_before);
+    for k in [0u32, k2] {
+        let mut saw = false;
+        let res = fresh.for_each_match_bounded::<()>(k, |v| {
+            if v == 99 {
+                saw = true;
+            }
+            ControlFlow::Continue(())
+        });
+        assert!(
+            res == MapletMatch::Saturated || saw,
+            "false negative after grow() for colliding key {k}: {res:?}"
+        );
+    }
 }
