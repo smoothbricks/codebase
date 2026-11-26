@@ -341,9 +341,20 @@ export function validateRootPackagePolicy(root: string): number {
   }
   const bunVersion = packageManager?.startsWith('bun@') ? packageManager.slice('bun@'.length) : null;
   const typesBun = dependencyVersion(rootPackage, 'devDependencies', rootPackage.devDependencies, '@types/bun');
-  if (!bunVersion || typesBun?.version !== bunVersion) {
+  const typesBunVersion = typesBun?.version;
+  // `@types/bun` is published with a Bun release, and the shell's Bun can be ahead of the newest one (a canary, or a
+  // release whose types are not out yet). Runtime sync then writes the newest published types, so an exact version
+  // older than the Bun is right; a range, or types of a Bun newer than the shell's, is not.
+  const exactVersion = /^\d+\.\d+\.\d+$/;
+  if (
+    !bunVersion ||
+    !typesBunVersion ||
+    !exactVersion.test(bunVersion) ||
+    !exactVersion.test(typesBunVersion) ||
+    Bun.semver.order(typesBunVersion, bunVersion) > 0
+  ) {
     console.error(
-      `package.json ${typesBun?.path ?? 'devDependencies.@types/bun'} must match packageManager bun version`,
+      `package.json ${typesBun?.path ?? 'devDependencies.@types/bun'} must be an exact version no newer than the packageManager bun version`,
     );
     failures++;
   }

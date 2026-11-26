@@ -72,7 +72,7 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
 /**
  * Validate that package.json runtime pins agree with the LIVE PATH runtimes,
  * never a stored template. Offline by design: structural alignment only
- * (Node types float within the runtime major; Bun types stay exact) — the registry
+ * (Node types float within the runtime major; Bun types are one exact version) — the registry
  * is not consulted. Repair: `smoo monorepo init --runtime-only` inside the devenv shell.
  */
 export async function validateRootRuntimeVersions(root: string): Promise<number> {

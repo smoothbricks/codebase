@@ -264,6 +264,35 @@ describe('root smoo monorepo policy', () => {
     }
   });
 
+  it('accepts the newest published @types/bun under a Bun whose own types are not published', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      const refusal =
+        'package.json devDependencies.@types/bun must be an exact version no newer than the packageManager bun version';
+      const errorsWith = async (packageManager: string, typesBun: string): Promise<string[]> => {
+        await writeJson(
+          join(root, 'package.json'),
+          validRootPackage({ packageManager, devDependencies: { '@types/bun': typesBun } }),
+        );
+        const errors = captureConsoleErrors();
+        validateRootPackagePolicy(root);
+        return errors;
+      };
+
+      // The managed shell's canary reports 1.4.6 while 1.4.5 is the newest @types/bun: what runtime sync writes.
+      expect(await errorsWith('bun@1.4.6', '1.4.5')).not.toContain(refusal);
+      expect(await errorsWith('bun@1.4.6', '1.4.6')).not.toContain(refusal);
+      // Types of a Bun newer than the shell's declare what it does not have, and a range names no one version.
+      expect(await errorsWith('bun@1.4.6', '1.4.7')).toContain(refusal);
+      expect(await errorsWith('bun@1.4.6', '^1.4.5')).toContain(refusal);
+      // A declaration that names no exact Bun leaves nothing to compare the types with: reported, not thrown.
+      expect(await errorsWith('bun@^1.4.6', '1.4.5')).toContain(refusal);
+      expect(await errorsWith('bun@latest', '1.4.5')).toContain(refusal);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('writes the managed Nx patch policy into a root config that lacks it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
     try {

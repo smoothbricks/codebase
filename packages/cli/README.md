@@ -127,10 +127,14 @@ the same binaries shell entry probes for drift; no checkout path is consulted, b
 `tooling/direnv/.devenv/profile` link is re-pointed by every activation of that checkout and once wrote another
 evaluation's Bun over the shell's.
 
-Bun types are also a root runtime policy. The root `@types/bun` version follows the exact `packageManager` Bun version,
-while package manifests are not forced to depend on Bun just because a test tsconfig opts into Bun globals. If a package
-does explicitly declare `@types/bun`, it names the root's catalog entry for it (below), and `smoo` owns the semantic
-root `bun@x.y.z` to `@types/bun x.y.z` relationship.
+Bun types are also a root runtime policy. The root `@types/bun` is one exact version: the `packageManager` Bun version
+when the registry has published it, and otherwise the newest published one, which runtime synchronization selects.
+`@types/bun` is published with a Bun release, and the managed shell's Bun can precede its release (the canary in
+[managed-files.md](docs/managed-files.md) reports 1.4.6 while 1.4.5 is the newest `@types/bun`). Validation is offline,
+so it refuses what can never be right: a range, or types newer than the `packageManager` Bun. Package manifests are not
+forced to depend on Bun just because a test tsconfig opts into Bun globals. If a package does explicitly declare
+`@types/bun`, it names the root's catalog entry for it (below), and `smoo` owns the root `bun@x.y.z` to `@types/bun`
+relationship.
 
 A root dependency these policies check (the tool devDependencies, `@types/bun`, `@types/node`, `ttsc`) may be a Bun
 catalog reference, `catalog:` or `catalog:<name>`. smoo then judges the catalog entry Bun installs, names that entry in
