@@ -10842,6 +10842,8 @@ self.finish_retire_intent(&workspace).await?;
             // while the job ran: inside this controller, awaited before the job is told ended,
             // and a release that cannot run or fails is that job's terminal failure.
             memory_pressure: self.descriptor.storage.memory_pressure(),
+            #[cfg(target_os = "macos")]
+            host_cpu: crate::host_cpu::Source::Kernel,
             build_volume_released: Some({
                 let host = self.substrate.shared_host();
                 let layout = self.build_volume_layout()?;
@@ -11094,7 +11096,9 @@ self.finish_retire_intent(&workspace).await?;
                     if cleared_jobs.insert(job_id) {
                         publisher.record_recovered_gate_priority(
                             record,
-                            super::job_spans::GatePriorityRow::DarwinBgCleared,
+                            super::job_spans::GatePriorityRow::DarwinBgCleared {
+                                host_idle_millicores: None,
+                            },
                         );
                     }
                 }

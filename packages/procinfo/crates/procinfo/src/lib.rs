@@ -18,6 +18,8 @@ mod proc_locks;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(target_os = "macos")]
+pub use host_load::HostCpuTicks;
 pub use host_load::HostLoad;
 #[cfg(target_os = "linux")]
 use linux as platform;

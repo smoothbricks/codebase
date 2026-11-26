@@ -72,6 +72,7 @@ fn spec_job_columns() -> Vec<Column> {
         ("admission_pool_ahead", "u64", true),
         ("tokens", "u32", true),
         ("cpu_millicores", "u32", true),
+        ("host_idle_millicores", "u32", true),
         ("pid", "u32", true),
     ]
 }
@@ -390,10 +391,22 @@ async fn each_land_gate_priority_effect_is_one_row_of_its_span() {
         GatePriorityRow::DarwinBgSet {
             cpu_millicores: 2400,
             tokens: 1,
+            host_idle_millicores: 250,
         },
     );
     publisher.record_gate_priority(&only, GatePriorityRow::DarwinBgUnconfirmed { pid: 4242 });
-    publisher.record_gate_priority(&only, GatePriorityRow::DarwinBgCleared);
+    publisher.record_gate_priority(
+        &only,
+        GatePriorityRow::DarwinBgCleared {
+            host_idle_millicores: Some(1500),
+        },
+    );
+    publisher.record_gate_priority(
+        &only,
+        GatePriorityRow::DarwinBgCleared {
+            host_idle_millicores: None,
+        },
+    );
     publisher.record_gate_priority(&only, GatePriorityRow::TokensRestored { tokens: 3 });
     let health = publisher.health().await.expect("the writer answers");
     assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
@@ -406,6 +419,7 @@ async fn each_land_gate_priority_effect_is_one_row_of_its_span() {
             "info job.darwinbg.set",
             "warn job.darwinbg.unconfirmed",
             "info job.darwinbg.cleared",
+            "info job.darwinbg.cleared",
             "info job.tokens.restored",
         ]
     );
@@ -415,15 +429,17 @@ async fn each_land_gate_priority_effect_is_one_row_of_its_span() {
         (
             number_cell::<UInt32Type>(batch, "tokens", row),
             number_cell::<UInt32Type>(batch, "cpu_millicores", row),
+            number_cell::<UInt32Type>(batch, "host_idle_millicores", row),
             number_cell::<UInt32Type>(batch, "pid", row),
         )
     };
-    assert_eq!(cells(0), (None, None, None));
-    assert_eq!(cells(1), (Some(3), None, None));
-    assert_eq!(cells(2), (Some(1), Some(2400), None));
-    assert_eq!(cells(3), (None, None, Some(4242)));
-    assert_eq!(cells(4), (None, None, None));
-    assert_eq!(cells(5), (Some(3), None, None));
+    assert_eq!(cells(0), (None, None, None, None));
+    assert_eq!(cells(1), (Some(3), None, None, None));
+    assert_eq!(cells(2), (Some(1), Some(2400), Some(250), None));
+    assert_eq!(cells(3), (None, None, None, Some(4242)));
+    assert_eq!(cells(4), (None, None, Some(1500), None));
+    assert_eq!(cells(5), (None, None, None, None));
+    assert_eq!(cells(6), (Some(3), None, None, None));
 }
 
 /// `info`'s job, running as job `job_id`.

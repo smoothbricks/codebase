@@ -564,6 +564,8 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
+        #[cfg(target_os = "macos")]
+        host_cpu: cowshed_core::host_cpu::Source::Kernel,
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
         scratch: None,
         host_job_path: cowshed_core::runtime::HostJobPath::Host,
@@ -12918,6 +12920,10 @@ mod land_gate_priority {
         let (mut config, root) = isolated_config(&temp_parent::canonical_parent(), name);
         config.default_cwd = None;
         config.term_grace = Duration::from_secs(1);
+        #[cfg(target_os = "macos")]
+        {
+            config.host_cpu = driven_host_cpu(0).1;
+        }
         std::fs::create_dir_all(&config.sandbox.home).unwrap();
         std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
         {
@@ -13276,6 +13282,7 @@ s.recv(16)
         message: String,
         tokens: Option<u32>,
         cpu_millicores: Option<u32>,
+        host_idle_millicores: Option<u32>,
         pid: Option<u32>,
     }
 
@@ -13323,6 +13330,7 @@ s.recv(16)
                     message,
                     tokens: opt_u32("tokens", row),
                     cpu_millicores: opt_u32("cpu_millicores", row),
+                    host_idle_millicores: opt_u32("host_idle_millicores", row),
                     pid: opt_u32("pid", row),
                 });
             }
@@ -13873,11 +13881,49 @@ s.recv(16)
         }
     }
 
+    /// Synthetic `HOST_CPU_LOAD_INFO` step for an 8-core host with `idle_millicores` idle CPU
+    /// (`0..=8000`): 8000 ticks per read so `host_idle_millicores` computes `idle_millicores`
+    /// directly.
+    #[cfg(target_os = "macos")]
+    fn host_cpu_reading(idle_millicores: u32) -> cowshed_core::host_cpu::Reading {
+        let total = 8_000_u64;
+        let idle = u64::from(idle_millicores).min(total);
+        cowshed_core::host_cpu::Reading {
+            ticks_per_sample: procinfo::HostCpuTicks {
+                user: total - idle,
+                system: 0,
+                idle,
+                nice: 0,
+            },
+            cores: std::num::NonZeroU32::new(8).expect("8 online cores"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn driven_host_cpu(
+        initial_idle_millicores: u32,
+    ) -> (
+        watch::Sender<cowshed_core::host_cpu::Reading>,
+        cowshed_core::host_cpu::Source,
+    ) {
+        let (tx, rx) = watch::channel(host_cpu_reading(initial_idle_millicores));
+        (tx, cowshed_core::host_cpu::Source::Driven(rx))
+    }
+
     #[cfg(target_os = "macos")]
     fn start_burner_fixture(name: &str) -> GateFixture {
+        start_burner_fixture_with_host_cpu(name, driven_host_cpu(0).1)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_burner_fixture_with_host_cpu(
+        name: &str,
+        host_cpu: cowshed_core::host_cpu::Source,
+    ) -> GateFixture {
         let (mut config, root) = isolated_config(&temp_parent::canonical_parent(), name);
         config.default_cwd = None;
         config.term_grace = Duration::from_secs(1);
+        config.host_cpu = host_cpu;
         std::fs::create_dir_all(&config.sandbox.home).unwrap();
         std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
         {
@@ -14166,10 +14212,271 @@ for pid in children:
             Some(1),
             "token-ignoring job holds only the implicit token: {set_row:?}"
         );
+        assert_eq!(
+            set_row.host_idle_millicores,
+            Some(0),
+            "job.darwinbg.set must carry the host idle reading that decided it: {set_row:?}"
+        );
+        let cleared_row = rows
+            .iter()
+            .find(|row| row.entry_type == "info" && row.message == "job.darwinbg.cleared")
+            .unwrap_or_else(|| panic!("missing job.darwinbg.cleared row: {rows:?}"));
+        assert_eq!(
+            cleared_row.host_idle_millicores, None,
+            "span-off clear must not carry a window host_idle_millicores: {cleared_row:?}"
+        );
+
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
+    /// Red (idle host): a background job that ignores tokens and burns > 1.5 cores is never set
+    /// `PRIO_DARWIN_BG` while the driven host CPU source reports at least one idle core across
+    /// several 3 s windows (`pth_maxpriority == 63`, no ledger entry, no `job.darwinbg.set` row).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_job_past_its_tokens_is_not_backgrounded_while_the_host_has_an_idle_core() {
+        let (_host_cpu_tx, host_cpu) = driven_host_cpu(2_000);
+        let mut fixture = start_burner_fixture_with_host_cpu("gate-darwinbg-idle", host_cpu);
+        let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
+        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+
+        let land_gate = GateJob::start(
+            &fixture.handle,
+            &fixture.root,
+            "land-gate",
+            Some(JobLander {
+                pid: std::process::id(),
+                start: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+
+        wait_for_liveness(
+            &fixture.handle,
+            "several darwinbg evaluation windows on published liveness",
+            cowshed_os::test_backstop::NO_PROGRESS,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| state.darwinbg_windows >= 2)
+            },
+        )
+        .await;
+        let state = fixture
+            .handle
+            .watch_liveness()
+            .expect("watch supervisor liveness")
+            .borrow()
+            .job_gate_priority(burner.job_id)
+            .expect("burner is live");
         assert!(
-            rows.iter()
-                .any(|row| row.entry_type == "info" && row.message == "job.darwinbg.cleared"),
-            "missing job.darwinbg.cleared row: {rows:?}"
+            !state.darwinbg_active && state.darwinbg_cleared == 0,
+            "burner must never be backgrounded while an idle core exists: {state:?}"
+        );
+        assert_tree_max_priority(&burner.pids, 63, "during land gate with idle core");
+        if let Ok(bytes) = std::fs::read(&fixture.ledger) {
+            let ledger_value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("parse group ledger");
+            assert!(
+                ledger_value.get("darwinbg").is_none(),
+                "darwinbg must stay absent from ledger while host has idle core: {ledger_value}"
+            );
+        }
+
+        let gate_id = land_gate.job_id;
+        land_gate.finish(&fixture.handle).await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-end").await,
+            GateWatchEvent::GateEnd {
+                job_id: gate_id.get(),
+            }
+        );
+
+        let burner_id = burner.job_id;
+        burner.stop(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let rows = gate_span_rows(&fixture.telemetry, burner_id);
+        assert!(
+            !rows.iter().any(|row| {
+                row.message == "job.darwinbg.set" || row.message == "job.darwinbg.cleared"
+            }),
+            "no job.darwinbg.set or cleared row while host has an idle core: {rows:?}"
+        );
+
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
+    /// Red (busy -> idle -> busy -> span-off): a token-ignoring burner is backgrounded when the
+    /// driven host CPU source shows < 1 idle core (readback 4, `job.darwinbg.set` carries
+    /// `host_idle_millicores`), restored within one window as soon as an idle core returns while
+    /// the gate still runs (readback 63, ledger cleared, `job.darwinbg.cleared` carries
+    /// `host_idle_millicores`), judged again from its next window when the host loses its idle
+    /// core again (readback 4), and cleared again when the gate ends (`host_idle_millicores` null).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_job_past_its_tokens_is_backgrounded_without_an_idle_core_and_restored_when_one_returns()
+     {
+        let (host_cpu_tx, host_cpu) = driven_host_cpu(500);
+        let mut fixture = start_burner_fixture_with_host_cpu("gate-darwinbg-toggle", host_cpu);
+        let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
+        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+
+        let land_gate = GateJob::start(
+            &fixture.handle,
+            &fixture.root,
+            "land-gate",
+            Some(JobLander {
+                pid: std::process::id(),
+                start: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+
+        // 1. Host has < 1 idle core (500 mcores): burner is backgrounded (pth_maxpriority == 4).
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg active when host has < 1 idle core",
+            cowshed_os::test_backstop::NO_PROGRESS,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| state.darwinbg_active)
+            },
+        )
+        .await;
+        assert_tree_max_priority(&burner.pids, 4, "backgrounded without an idle core");
+
+        // 2. An idle core returns (2000 mcores) while the gate still runs: cleared within one
+        // window (pth_maxpriority == 63, ledger cleared).
+        host_cpu_tx
+            .send(host_cpu_reading(2_000))
+            .expect("send idle host CPU reading");
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg cleared on idle core while land gate still runs",
+            cowshed_os::test_backstop::NO_PROGRESS,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| !state.darwinbg_active && state.darwinbg_cleared >= 1)
+            },
+        )
+        .await;
+        let cleared_ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.ledger).expect("read group ledger"))
+                .expect("parse group ledger");
+        assert!(
+            cleared_ledger.get("darwinbg").is_none(),
+            "darwinbg must be absent from group ledger after idle-core clear: {cleared_ledger}"
+        );
+        assert_tree_max_priority(&burner.pids, 63, "restored when idle core returns");
+
+        // 3. Host loses its idle core again (250 mcores) while the gate still runs: the cleared
+        // job is judged again from its next window and backgrounded again.
+        host_cpu_tx
+            .send(host_cpu_reading(250))
+            .expect("send busy host CPU reading");
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg re-applied when host loses its idle core again",
+            cowshed_os::test_backstop::NO_PROGRESS,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| state.darwinbg_active && state.darwinbg_cleared >= 1)
+            },
+        )
+        .await;
+        assert_tree_max_priority(&burner.pids, 4, "re-backgrounded without an idle core");
+
+        // 4. Gate ends: span-off clears it again.
+        let gate_id = land_gate.job_id;
+        land_gate.finish(&fixture.handle).await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-end").await,
+            GateWatchEvent::GateEnd {
+                job_id: gate_id.get(),
+            }
+        );
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg cleared on land gate end",
+            cowshed_os::test_backstop::NO_PROGRESS,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| !state.darwinbg_active && state.darwinbg_cleared >= 2)
+            },
+        )
+        .await;
+        assert_tree_max_priority(&burner.pids, 63, "cleared when land gate ends");
+
+        let burner_id = burner.job_id;
+        burner.stop(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let rows = gate_span_rows(&fixture.telemetry, burner_id);
+        let set_rows: Vec<&GateSpanRow> = rows
+            .iter()
+            .filter(|row| row.entry_type == "info" && row.message == "job.darwinbg.set")
+            .collect();
+        let cleared_rows: Vec<&GateSpanRow> = rows
+            .iter()
+            .filter(|row| row.entry_type == "info" && row.message == "job.darwinbg.cleared")
+            .collect();
+        assert_eq!(
+            set_rows.len(),
+            2,
+            "expected two job.darwinbg.set rows: {rows:?}"
+        );
+        assert!(
+            set_rows[0].cpu_millicores.is_some_and(|mc| mc > 1500)
+                && set_rows[0].tokens == Some(1)
+                && set_rows[0].host_idle_millicores == Some(500),
+            "first set row mismatch: {:?}",
+            set_rows[0]
+        );
+        assert!(
+            set_rows[1].cpu_millicores.is_some_and(|mc| mc > 1500)
+                && set_rows[1].tokens == Some(1)
+                && set_rows[1].host_idle_millicores == Some(250),
+            "second set row mismatch: {:?}",
+            set_rows[1]
+        );
+        assert_eq!(
+            cleared_rows.len(),
+            2,
+            "expected two job.darwinbg.cleared rows: {rows:?}"
+        );
+        assert_eq!(
+            cleared_rows[0].host_idle_millicores,
+            Some(2_000),
+            "idle-core clear row must carry host_idle_millicores: {:?}",
+            cleared_rows[0]
+        );
+        assert_eq!(
+            cleared_rows[1].host_idle_millicores, None,
+            "span-off clear row must leave host_idle_millicores null: {:?}",
+            cleared_rows[1]
         );
 
         fixture
@@ -14726,6 +15033,10 @@ os.read(0, 1)
         let (mut config, root) = isolated_config(&temp_parent::canonical_parent(), name);
         config.default_cwd = None;
         config.term_grace = Duration::from_secs(1);
+        #[cfg(target_os = "macos")]
+        {
+            config.host_cpu = driven_host_cpu(0).1;
+        }
         std::fs::create_dir_all(&config.sandbox.home).unwrap();
         std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
         {

@@ -234,6 +234,10 @@ pub struct WorkspaceSupervisorConfig {
     pub build_volume_released: Option<BuildVolumeReleased>,
     /// Where the host's memory-pressure reports come from: the kernel's notification, or a test's.
     pub memory_pressure: crate::host_pressure::Source,
+    /// Where the host's cumulative CPU ticks come from for macOS `PRIO_DARWIN_BG` decisions:
+    /// Mach `HOST_CPU_LOAD_INFO` from the kernel, or a test's driven source.
+    #[cfg(target_os = "macos")]
+    pub host_cpu: crate::host_cpu::Source,
     /// How long the shed may go unused before the keeper stops its Nx daemon: main's
     /// `.cowshed.toml` `[nx] daemon_idle` (04_sandbox.md, "The Nx daemon stays on").
     pub nx_daemon_idle: NxDaemonIdle,
@@ -436,6 +440,8 @@ impl Default for WorkspaceSupervisorConfig {
             job_sampling: JobSamplingPolicy::default(),
             build_volume_released: None,
             memory_pressure: crate::calm_pressure::calm(),
+            #[cfg(target_os = "macos")]
+            host_cpu: crate::host_cpu::Source::Kernel,
             nx_daemon_idle: NxDaemonIdle::DEFAULT,
             scratch: None,
             host_job_path: HostJobPath::Host,
@@ -4878,6 +4884,8 @@ impl WorkspaceSupervisor {
             admission: super::job_admission::Admission::default(),
             admission_effects: VecDeque::new(),
             pressure: config.memory_pressure.open(),
+            #[cfg(target_os = "macos")]
+            host_cpu: config.host_cpu.open(),
             turns: 0,
             caller_keys: std::collections::HashMap::new(),
             output_quota: config.artifacts.combined_output_quota_bytes,
@@ -5656,6 +5664,8 @@ struct JobStateRecord {
     tokens_withdrawn: usize,
     /// Completed `PRIO_DARWIN_BG` clear transitions for this job.
     darwinbg_cleared: u64,
+    /// Completed macOS `PRIO_DARWIN_BG` evaluation windows for this job.
+    darwinbg_windows: u64,
     /// macOS `PRIO_DARWIN_BG` measurement window and active set for this job during a land's gate.
     #[cfg(target_os = "macos")]
     darwinbg: Option<gate_priority::JobDarwinBg>,
@@ -6030,6 +6040,9 @@ struct SupervisorActor {
     admission_effects: VecDeque<super::job_admission::Effect>,
     /// The host's memory pressure, as the kernel reports it.
     pressure: crate::host_pressure::Feed,
+    /// The host's cumulative CPU ticks for macOS `PRIO_DARWIN_BG` window decisions.
+    #[cfg(target_os = "macos")]
+    host_cpu: crate::host_cpu::Feed,
     /// Turns begun so far: a job's admission and spawn in one turn read the checkout once.
     turns: u64,
     /// The project's lifecycle-intent journal, which `asIs` judges (`None`: its store's layout
@@ -6310,6 +6323,7 @@ fn unconcluded(
             tokens_withdrawn: u32::try_from(job.tokens_withdrawn).unwrap_or(u32::MAX),
             darwinbg_active,
             darwinbg_cleared: job.darwinbg_cleared,
+            darwinbg_windows: job.darwinbg_windows,
         };
         liveness::LiveJob {
             pulse: super::supervisor_socket::JobPulse::of(&job.info, gate_priority),
@@ -8250,6 +8264,7 @@ impl SupervisorActor {
             token_drainer: None,
             tokens_withdrawn: 0,
             darwinbg_cleared: 0,
+            darwinbg_windows: 0,
             #[cfg(target_os = "macos")]
             darwinbg: None,
         };
@@ -9659,30 +9674,72 @@ impl SupervisorActor {
         if !self.gate_active {
             return;
         }
+        let eligible = self.jobs.get(&job_id).is_some_and(|job| {
+            !job.terminal() && job.darwinbg.as_ref().is_some_and(|bg| !bg.active)
+        });
+        if !eligible {
+            return;
+        }
+        let host_cpu = match self.host_cpu.read() {
+            Ok(sample) => sample,
+            Err(error) => {
+                cowshed_os::eprintln!("cowshed: reading host CPU ticks failed: {error}");
+                return;
+            }
+        };
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        if job.terminal() {
-            return;
-        }
-        let sample = job
+        let Some(job_cpu) = job
             .monitor
             .as_ref()
-            .and_then(ProcessMonitor::observed_cpu_sample);
+            .and_then(ProcessMonitor::observed_cpu_sample)
+        else {
+            return;
+        };
         if let Some(bg) = &mut job.darwinbg
             && !bg.active
         {
-            bg.window_start = sample;
+            bg.window_start = Some(gate_priority::DarwinBgWindowStart { job_cpu, host_cpu });
         }
     }
 
     #[cfg(target_os = "macos")]
     async fn handle_darwinbg_window(&mut self, job_id: JobId) {
+        enum WindowAction {
+            Set {
+                cpu_millicores: u32,
+                held: u32,
+                host_idle_millicores: u32,
+                lives: Vec<super::process_tree::ProcessIdentity>,
+            },
+            Clear {
+                active_clear: gate_priority::ActiveClear,
+                monitor: Option<ProcessMonitor>,
+                host_idle_millicores: u32,
+            },
+        }
+
         if !self.gate_active || !self.gate_watch.span_active() {
             return;
         }
+        let eligible = self.jobs.get(&job_id).is_some_and(|job| {
+            !job.terminal()
+                && matches!(job.cpu, CpuStanding::Admitted { .. })
+                && job.darwinbg.is_some()
+        });
+        if !eligible {
+            return;
+        }
+        let end_host = match self.host_cpu.read() {
+            Ok(sample) => sample,
+            Err(error) => {
+                cowshed_os::eprintln!("cowshed: reading host CPU ticks failed: {error}");
+                return;
+            }
+        };
         let span = self.gate_watch.span();
-        let (cpu_millicores, held, lives) = {
+        let action = {
             let Some(job) = self.jobs.get_mut(&job_id) else {
                 return;
             };
@@ -9693,82 +9750,150 @@ impl SupervisorActor {
                 CpuStanding::Admitted { granted_tokens, .. } => *granted_tokens,
                 _ => return,
             };
-            let end = job
+            let end_cpu = job
                 .monitor
                 .as_ref()
                 .and_then(ProcessMonitor::observed_cpu_sample);
             let Some(bg) = &mut job.darwinbg else {
                 return;
             };
-            if bg.active {
-                return;
-            }
-            let Some(end) = end else {
+            let Some(end_cpu) = end_cpu else {
                 return;
             };
-            let Some(start) = bg.window_start.replace(end) else {
+            let end_window = gate_priority::DarwinBgWindowStart {
+                job_cpu: end_cpu,
+                host_cpu: end_host,
+            };
+            let Some(start) = bg.window_start.replace(end_window) else {
                 return;
             };
-            let Some(cpu_millicores) = gate_priority::window_cpu_millicores(start, end) else {
+            let Some(host_idle_millicores) = gate_priority::host_idle_millicores(
+                start.host_cpu.ticks,
+                end_host.ticks,
+                end_host.cores.get(),
+            ) else {
                 return;
             };
             let held = gate_priority::held_tokens(granted, job.tokens_withdrawn);
-            if !gate_priority::exceeds_token_budget(cpu_millicores, held) {
+            let cpu_millicores = gate_priority::window_cpu_millicores(start.job_cpu, end_cpu);
+            if !bg.active && cpu_millicores.is_none() {
                 return;
             }
-            let mut lives: Vec<super::process_tree::ProcessIdentity> = job
-                .monitor
-                .as_ref()
-                .map(|monitor| monitor.running_lives().to_vec())
-                .unwrap_or_default();
-            if lives.is_empty() {
-                return;
+            let over_budget =
+                cpu_millicores.is_some_and(|mc| gate_priority::exceeds_token_budget(mc, held));
+            let step = gate_priority::darwinbg_step(bg.active, over_budget, host_idle_millicores);
+            job.darwinbg_windows = job.darwinbg_windows.saturating_add(1);
+            match step {
+                gate_priority::DarwinBgStep::Keep => None,
+                gate_priority::DarwinBgStep::Set => {
+                    let Some(cpu_millicores) = cpu_millicores else {
+                        return;
+                    };
+                    let mut lives: Vec<super::process_tree::ProcessIdentity> = job
+                        .monitor
+                        .as_ref()
+                        .map(|monitor| monitor.running_lives().to_vec())
+                        .unwrap_or_default();
+                    if lives.is_empty() {
+                        return;
+                    }
+                    lives.sort_unstable_by_key(|life| (life.pid, life.birth.0));
+                    lives.dedup();
+                    bg.active = true;
+                    bg.record_applied(&lives);
+                    bg.arm_clear_task(job.monitor.clone(), span);
+                    Some(WindowAction::Set {
+                        cpu_millicores,
+                        held,
+                        host_idle_millicores,
+                        lives,
+                    })
+                }
+                gate_priority::DarwinBgStep::Clear => {
+                    let active_clear = bg.take_active_clear();
+                    let monitor = job.monitor.clone();
+                    Some(WindowAction::Clear {
+                        active_clear,
+                        monitor,
+                        host_idle_millicores,
+                    })
+                }
             }
-            lives.sort_unstable_by_key(|life| (life.pid, life.birth.0));
-            lives.dedup();
-            bg.stop_window_task();
-            bg.active = true;
-            bg.record_applied(&lives);
-            bg.arm_clear_task(job.monitor.clone(), span);
-            (cpu_millicores, held, lives)
         };
-        // Persist every life to `.groups` BEFORE calling `setpriority(PRIO_DARWIN_BG)`.
-        self.flush_groups_darwinbg().await;
-        // Re-check the live span watch before applying: if span-off happened during the flush,
-        // do not apply `PRIO_DARWIN_BG` and remove the unpublished entry from `.groups`.
-        if !self.gate_watch.span_active() {
-            if let Some(job) = self.jobs.get_mut(&job_id) {
-                job.darwinbg = None;
-            }
-            self.flush_groups_darwinbg().await;
-            return;
-        }
-        let applied_lives = lives.clone();
-        let outcomes = off_actor::run(move || gate_priority::apply_darwinbg_to_lives(lives)).await;
-        // If span-off happened while `apply_darwinbg_to_lives` was executing on the blocking pool
-        // (potentially racing ahead of the out-of-turn clear task), clear those lives immediately
-        // so no process is left backgrounded past span-off.
-        if !self.gate_watch.span_active() {
-            let clear_outcomes =
-                off_actor::run(move || gate_priority::clear_darwinbg_from_lives(applied_lives))
+        match action {
+            None => {}
+            Some(WindowAction::Set {
+                cpu_millicores,
+                held,
+                host_idle_millicores,
+                lives,
+            }) => {
+                // Persist every life to `.groups` BEFORE calling `setpriority(PRIO_DARWIN_BG)`.
+                self.flush_groups_darwinbg().await;
+                // Re-check the live span watch before applying: if span-off happened during the
+                // flush, do not apply `PRIO_DARWIN_BG` and remove the unpublished entry from
+                // `.groups`.
+                if !self.gate_watch.span_active() {
+                    if let Some(job) = self.jobs.get_mut(&job_id) {
+                        job.darwinbg = None;
+                    }
+                    self.flush_groups_darwinbg().await;
+                    return;
+                }
+                let applied_lives = lives.clone();
+                let outcomes =
+                    off_actor::run(move || gate_priority::apply_darwinbg_to_lives(lives)).await;
+                // If span-off happened while `apply_darwinbg_to_lives` was executing on the
+                // blocking pool (potentially racing ahead of the out-of-turn clear task), clear
+                // those lives immediately so no process is left backgrounded past span-off.
+                if !self.gate_watch.span_active() {
+                    let clear_outcomes = off_actor::run(move || {
+                        gate_priority::clear_darwinbg_from_lives(applied_lives)
+                    })
                     .await;
-            self.record_darwinbg_unconfirmed(job_id, &clear_outcomes);
-            return;
-        }
-        self.record_darwinbg_unconfirmed(job_id, &outcomes);
-        let Some(job) = self.jobs.get(&job_id) else {
-            return;
-        };
-        if let Some(job_spans) = &self.job_spans
-            && job.caller.is_none()
-        {
-            job_spans.record_gate_priority(
-                &job.info,
-                super::job_spans::GatePriorityRow::DarwinBgSet {
-                    cpu_millicores,
-                    tokens: held,
-                },
-            );
+                    self.record_darwinbg_unconfirmed(job_id, &clear_outcomes);
+                    return;
+                }
+                self.record_darwinbg_unconfirmed(job_id, &outcomes);
+                let Some(job) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                if let Some(job_spans) = &self.job_spans
+                    && job.caller.is_none()
+                {
+                    job_spans.record_gate_priority(
+                        &job.info,
+                        super::job_spans::GatePriorityRow::DarwinBgSet {
+                            cpu_millicores,
+                            tokens: held,
+                            host_idle_millicores,
+                        },
+                    );
+                }
+            }
+            Some(WindowAction::Clear {
+                active_clear,
+                monitor,
+                host_idle_millicores,
+            }) => {
+                let outcomes = active_clear.finish(monitor.as_ref()).await;
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    job.darwinbg_cleared = job.darwinbg_cleared.saturating_add(1);
+                }
+                self.record_darwinbg_unconfirmed(job_id, &outcomes);
+                if let Some(job) = self.jobs.get(&job_id)
+                    && let Some(job_spans) = &self.job_spans
+                    && job.caller.is_none()
+                {
+                    job_spans.record_gate_priority(
+                        &job.info,
+                        super::job_spans::GatePriorityRow::DarwinBgCleared {
+                            host_idle_millicores: Some(host_idle_millicores),
+                        },
+                    );
+                }
+                self.flush_groups_darwinbg().await;
+            }
         }
     }
 
@@ -9900,7 +10025,9 @@ impl SupervisorActor {
                 {
                     job_spans.record_gate_priority(
                         &job.info,
-                        super::job_spans::GatePriorityRow::DarwinBgCleared,
+                        super::job_spans::GatePriorityRow::DarwinBgCleared {
+                            host_idle_millicores: None,
+                        },
                     );
                 }
                 self.flush_groups_darwinbg().await;
@@ -13563,6 +13690,8 @@ mod lifecycle_commitment_tests {
             job_sampling: JobSamplingPolicy::default(),
             build_volume_released: None,
             memory_pressure: crate::calm_pressure::calm(),
+            #[cfg(target_os = "macos")]
+            host_cpu: defaults.host_cpu,
             nx_daemon_idle: defaults.nx_daemon_idle,
             scratch: None,
             host_job_path: defaults.host_job_path,

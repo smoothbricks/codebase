@@ -19,6 +19,8 @@ pub mod git;
 mod git_preservation;
 mod held_change;
 pub mod held_lock;
+#[cfg(target_os = "macos")]
+pub mod host_cpu;
 pub mod host_dirs;
 pub mod host_load;
 pub mod host_path;

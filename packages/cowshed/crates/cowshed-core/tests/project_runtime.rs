@@ -2771,6 +2771,8 @@ fn supervisor_config_of(
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
+        #[cfg(target_os = "macos")]
+        host_cpu: cowshed_core::host_cpu::Source::Kernel,
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
         scratch: None,
         host_job_path: cowshed_core::runtime::HostJobPath::Host,

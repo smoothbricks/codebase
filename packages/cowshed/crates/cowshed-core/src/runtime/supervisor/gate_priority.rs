@@ -46,6 +46,12 @@ pub(super) const DARWIN_BG_WINDOW: Duration = Duration::from_secs(3);
 #[cfg(target_os = "macos")]
 pub(super) const DARWIN_BG_THRESHOLD_MILLICORES_PER_TOKEN: u64 = 1500;
 
+/// Host idle CPU threshold below which a job running past its tokens is backgrounded, and at or
+/// above which a backgrounded job returns to its class: one core idle = 1000 millicores
+/// (05_gateway.md "A land's gate takes tokens back").
+#[cfg(target_os = "macos")]
+pub(super) const DARWIN_BG_HOST_IDLE_THRESHOLD_MILLICORES: u32 = 1000;
+
 /// Whether a job of `class` is withdrawn from while a land's gate runs.
 ///
 /// - `Gate` is never withdrawn from (a train's proof included).
@@ -94,6 +100,120 @@ pub(super) const fn exceeds_token_budget(cpu_millicores: u32, held_tokens: u32) 
         > (held_tokens as u64).saturating_mul(DARWIN_BG_THRESHOLD_MILLICORES_PER_TOKEN)
 }
 
+/// Average idle CPU across the host in millicores between two cumulative `HOST_CPU_LOAD_INFO`
+/// tick snapshots (`start` at window open, `end` at window close), scaled by `cores` online
+/// cores: `idle_delta * cores * 1000 / total_delta`. Returns `None` when `cores == 0`, when any
+/// counter went backwards, or when the two readings are identical.
+#[cfg(target_os = "macos")]
+pub(super) fn host_idle_millicores(
+    start: procinfo::HostCpuTicks,
+    end: procinfo::HostCpuTicks,
+    cores: u32,
+) -> Option<u32> {
+    if cores == 0 {
+        return None;
+    }
+    let user = end.user.checked_sub(start.user)?;
+    let system = end.system.checked_sub(start.system)?;
+    let idle = end.idle.checked_sub(start.idle)?;
+    let nice = end.nice.checked_sub(start.nice)?;
+    let total = u128::from(user) + u128::from(system) + u128::from(idle) + u128::from(nice);
+    if total == 0 {
+        return None;
+    }
+    let millicores = u128::from(idle)
+        .saturating_mul(u128::from(cores))
+        .saturating_mul(1000)
+        / total;
+    Some(u32::try_from(millicores).unwrap_or(u32::MAX))
+}
+
+/// Action decided at the end of a macOS `PRIO_DARWIN_BG` measurement window (05_gateway.md
+/// "A land's gate takes tokens back").
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DarwinBgStep {
+    Set,
+    Clear,
+    Keep,
+}
+
+/// Pure window decision for macOS `PRIO_DARWIN_BG`:
+/// - Not set, job over its token budget, and host had less than one core idle (< 1000
+///   millicores) -> `Set`.
+/// - Currently set and host had at least one core idle (>= 1000 millicores) -> `Clear`.
+/// - Otherwise -> `Keep`.
+#[cfg(target_os = "macos")]
+pub(super) const fn darwinbg_step(
+    set: bool,
+    over_budget: bool,
+    host_idle_millicores: u32,
+) -> DarwinBgStep {
+    if !set {
+        if over_budget && host_idle_millicores < DARWIN_BG_HOST_IDLE_THRESHOLD_MILLICORES {
+            DarwinBgStep::Set
+        } else {
+            DarwinBgStep::Keep
+        }
+    } else if host_idle_millicores >= DARWIN_BG_HOST_IDLE_THRESHOLD_MILLICORES {
+        DarwinBgStep::Clear
+    } else {
+        DarwinBgStep::Keep
+    }
+}
+
+/// Both window-open samples captured at grace (or the previous window close): the job's own
+/// process-tree CPU sample and the host's cumulative CPU ticks snapshot.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DarwinBgWindowStart {
+    pub(super) job_cpu: (Instant, CpuMicros),
+    pub(super) host_cpu: crate::host_cpu::Snapshot,
+}
+
+/// Active `PRIO_DARWIN_BG` state detached from [`JobDarwinBg`] so the actor can run the off-actor
+/// clear without holding a borrow of `self.jobs` across `.await` and while keeping the window task
+/// alive when clearing mid-span.
+#[cfg(target_os = "macos")]
+pub(super) struct ActiveClear {
+    applied: Arc<Mutex<HashSet<ProcessIdentity>>>,
+    clear_stop: Option<oneshot::Sender<bool>>,
+    clear_task: Option<tokio::task::JoinHandle<DarwinBgClearResult>>,
+}
+
+#[cfg(target_os = "macos")]
+impl ActiveClear {
+    /// Complete clearing for the detached active lives: joins the out-of-turn clear task
+    /// (triggering it now if still waiting), clears any residual life added after that task
+    /// snapshotted, and returns all readback outcomes for actor span recording.
+    pub(super) async fn finish(
+        mut self,
+        monitor: Option<&ProcessMonitor>,
+    ) -> Vec<(u32, crate::runtime::placement::DarwinBgOutcome)> {
+        if let Some(stop) = self.clear_stop.take() {
+            let _ = stop.send(true);
+        }
+        let (already_cleared, mut outcomes) = match self.clear_task.take() {
+            Some(task) => task.await.unwrap_or_default(),
+            None => (HashSet::new(), Vec::new()),
+        };
+        let mut remaining: HashSet<ProcessIdentity> =
+            std::mem::take(&mut *self.applied.lock().expect("darwinbg applied lock poisoned"));
+        if let Some(monitor) = monitor {
+            for &life in monitor.running_lives().iter() {
+                remaining.insert(life);
+            }
+        }
+        remaining.retain(|life| !already_cleared.contains(life));
+        if !remaining.is_empty() {
+            let to_clear: Vec<_> = remaining.into_iter().collect();
+            let extra = super::off_actor::run(move || clear_darwinbg_from_lives(to_clear)).await;
+            outcomes.extend(extra);
+        }
+        outcomes
+    }
+}
+
 /// Result of one per-job out-of-turn `PRIO_DARWIN_BG` clear task: the exact lives already cleared
 /// and each life's `PROC_PIDTHREADINFO` readback outcome.
 #[cfg(target_os = "macos")]
@@ -106,7 +226,7 @@ type DarwinBgClearResult = (
 #[cfg(target_os = "macos")]
 pub(super) struct JobDarwinBg {
     window_task: Option<tokio::task::JoinHandle<()>>,
-    pub(super) window_start: Option<(Instant, CpuMicros)>,
+    pub(super) window_start: Option<DarwinBgWindowStart>,
     pub(super) active: bool,
     applied: Arc<Mutex<HashSet<ProcessIdentity>>>,
     clear_stop: Option<oneshot::Sender<bool>>,
@@ -222,35 +342,28 @@ impl JobDarwinBg {
         self.clear_task = Some(task);
     }
 
-    /// Complete clearing for this job inside `end_job_withdrawal`: joins the out-of-turn clear
-    /// task (triggering it now if still waiting, e.g. on job exit), clears any residual life added
-    /// after that task snapshotted, and returns all readback outcomes for actor span recording.
+    /// Detach the active `PRIO_DARWIN_BG` lives and out-of-turn clear task for clearing while
+    /// leaving `window_task` running so the job is judged again from its next window.
+    pub(super) fn take_active_clear(&mut self) -> ActiveClear {
+        self.active = false;
+        let applied = std::mem::replace(&mut self.applied, Arc::new(Mutex::new(HashSet::new())));
+        ActiveClear {
+            applied,
+            clear_stop: self.clear_stop.take(),
+            clear_task: self.clear_task.take(),
+        }
+    }
+
+    /// Complete clearing for this job inside `end_job_withdrawal`: stops the window task, joins
+    /// the out-of-turn clear task (triggering it now if still waiting, e.g. on job exit), clears
+    /// any residual life added after that task snapshotted, and returns all readback outcomes for
+    /// actor span recording.
     pub(super) async fn finish_clear(
         mut self,
         monitor: Option<&ProcessMonitor>,
     ) -> Vec<(u32, crate::runtime::placement::DarwinBgOutcome)> {
         self.stop_window_task();
-        if let Some(stop) = self.clear_stop.take() {
-            let _ = stop.send(true);
-        }
-        let (already_cleared, mut outcomes) = match self.clear_task.take() {
-            Some(task) => task.await.unwrap_or_default(),
-            None => (HashSet::new(), Vec::new()),
-        };
-        let mut remaining: HashSet<ProcessIdentity> =
-            std::mem::take(&mut *self.applied.lock().expect("darwinbg applied lock poisoned"));
-        if let Some(monitor) = monitor {
-            for &life in monitor.running_lives().iter() {
-                remaining.insert(life);
-            }
-        }
-        remaining.retain(|life| !already_cleared.contains(life));
-        if !remaining.is_empty() {
-            let to_clear: Vec<_> = remaining.into_iter().collect();
-            let extra = super::off_actor::run(move || clear_darwinbg_from_lives(to_clear)).await;
-            outcomes.extend(extra);
-        }
-        outcomes
+        self.take_active_clear().finish(monitor).await
     }
 }
 
@@ -623,5 +736,97 @@ mod tests {
         // 2 tokens allow up to 3000 millicores.
         assert!(!exceeds_token_budget(3000, 2));
         assert!(exceeds_token_budget(3001, 2));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_idle_millicores_table() {
+        use procinfo::HostCpuTicks;
+
+        let ticks = |user, system, idle, nice| HostCpuTicks {
+            user,
+            system,
+            idle,
+            nice,
+        };
+        let cases = [
+            // Identical readings -> None.
+            (ticks(10, 20, 30, 40), ticks(10, 20, 30, 40), 8, None),
+            // Zero online cores -> None.
+            (ticks(0, 0, 0, 0), ticks(100, 0, 100, 0), 0, None),
+            // Any counter going backwards -> None.
+            (ticks(10, 20, 30, 40), ticks(9, 25, 35, 45), 8, None),
+            (ticks(10, 20, 30, 40), ticks(15, 19, 35, 45), 8, None),
+            (ticks(10, 20, 30, 40), ticks(15, 25, 29, 45), 8, None),
+            (ticks(10, 20, 30, 40), ticks(15, 25, 35, 39), 8, None),
+            // Fully busy (0 idle ticks) on 8 cores -> 0 millicores.
+            (ticks(100, 50, 200, 0), ticks(800, 150, 200, 0), 8, Some(0)),
+            // Fully idle on 8 cores -> 8000 millicores.
+            (
+                ticks(100, 50, 200, 0),
+                ticks(100, 50, 1000, 0),
+                8,
+                Some(8000),
+            ),
+            // Half idle on 8 cores -> 4000 millicores.
+            (ticks(0, 0, 0, 0), ticks(400, 0, 400, 0), 8, Some(4000)),
+            // Exactly 1 core idle on 8 cores (1/8 idle) -> 1000 millicores.
+            (ticks(0, 0, 0, 0), ticks(700, 0, 100, 0), 8, Some(1000)),
+            // Just below 1 core idle on 8 cores -> 990 millicores.
+            (ticks(0, 0, 0, 0), ticks(701, 0, 99, 0), 8, Some(990)),
+            // Mixed user/system/nice/idle on 4 cores: 250 / 1000 idle -> 1000 millicores.
+            (
+                ticks(10, 20, 30, 40),
+                ticks(310, 220, 280, 290),
+                4,
+                Some(1000),
+            ),
+        ];
+        for (start, end, cores, expected) in cases {
+            assert_eq!(
+                host_idle_millicores(start, end, cores),
+                expected,
+                "start={start:?} end={end:?} cores={cores}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwinbg_step_table() {
+        let cases = [
+            // Not set, over budget, idle host (>= 1000 mcores) -> never sets.
+            (false, true, 1000, DarwinBgStep::Keep),
+            (false, true, 1001, DarwinBgStep::Keep),
+            (false, true, 4000, DarwinBgStep::Keep),
+            // Not set, over budget, no idle core (< 1000 mcores) -> sets.
+            (false, true, 0, DarwinBgStep::Set),
+            (false, true, 500, DarwinBgStep::Set),
+            (false, true, 999, DarwinBgStep::Set),
+            // Not set, under budget -> never sets regardless of host idle.
+            (false, false, 0, DarwinBgStep::Keep),
+            (false, false, 999, DarwinBgStep::Keep),
+            (false, false, 1000, DarwinBgStep::Keep),
+            (false, false, 4000, DarwinBgStep::Keep),
+            // Set, idle core returns (>= 1000 mcores) -> clears regardless of job budget.
+            (true, true, 1000, DarwinBgStep::Clear),
+            (true, true, 1001, DarwinBgStep::Clear),
+            (true, true, 4000, DarwinBgStep::Clear),
+            (true, false, 1000, DarwinBgStep::Clear),
+            (true, false, 4000, DarwinBgStep::Clear),
+            // Set, still no idle core (< 1000 mcores) -> keeps set regardless of job budget.
+            (true, true, 0, DarwinBgStep::Keep),
+            (true, true, 500, DarwinBgStep::Keep),
+            (true, true, 999, DarwinBgStep::Keep),
+            (true, false, 0, DarwinBgStep::Keep),
+            (true, false, 999, DarwinBgStep::Keep),
+        ];
+        for (set, over_budget, host_idle, expected) in cases {
+            assert_eq!(
+                darwinbg_step(set, over_budget, host_idle),
+                expected,
+                "set={set} over_budget={over_budget} host_idle={host_idle}"
+            );
+        }
     }
 }

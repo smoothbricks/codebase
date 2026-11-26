@@ -100,10 +100,17 @@ pub enum GatePriorityRow {
     /// `tokens` bytes were written back to the job's jobserver fifo when the span ended.
     TokensRestored { tokens: u32 },
     /// `PRIO_DARWIN_BG` was set on the job's process tree after a window of `cpu_millicores` CPU
-    /// while the job held `tokens` tokens (the implicit first token counted).
-    DarwinBgSet { cpu_millicores: u32, tokens: u32 },
-    /// `PRIO_DARWIN_BG` was cleared from the job's process tree.
-    DarwinBgCleared,
+    /// while the job held `tokens` tokens (the implicit first token counted) and the host had
+    /// `host_idle_millicores` idle CPU (< 1000).
+    DarwinBgSet {
+        cpu_millicores: u32,
+        tokens: u32,
+        host_idle_millicores: u32,
+    },
+    /// `PRIO_DARWIN_BG` was cleared from the job's process tree; carries `host_idle_millicores`
+    /// when a window with an idle core cleared it, or `None` for span-off, job-end, silence, or
+    /// recovery clears.
+    DarwinBgCleared { host_idle_millicores: Option<u32> },
     /// A `PRIO_DARWIN_BG` set or clear on `pid` did not read back as expected from
     /// `PROC_PIDTHREADINFO`.
     DarwinBgUnconfirmed { pid: u32 },
@@ -275,7 +282,9 @@ impl RowKind {
                 JOB_TOKENS_RESTORED_MESSAGE
             }
             Self::GatePriority(GatePriorityRow::DarwinBgSet { .. }) => JOB_DARWINBG_SET_MESSAGE,
-            Self::GatePriority(GatePriorityRow::DarwinBgCleared) => JOB_DARWINBG_CLEARED_MESSAGE,
+            Self::GatePriority(GatePriorityRow::DarwinBgCleared { .. }) => {
+                JOB_DARWINBG_CLEARED_MESSAGE
+            }
             Self::GatePriority(GatePriorityRow::DarwinBgUnconfirmed { .. }) => {
                 JOB_DARWINBG_UNCONFIRMED_MESSAGE
             }
@@ -850,6 +859,9 @@ trace_columns! {
     tokens: Optional<U32>,
     /// Window CPU in millicores on `job.darwinbg.set`.
     cpu_millicores: Optional<U32>,
+    /// Host idle CPU in millicores over the window that set `PRIO_DARWIN_BG` (`job.darwinbg.set`)
+    /// or cleared it on an idle core (`job.darwinbg.cleared`).
+    host_idle_millicores: Optional<U32>,
     /// Process id whose `PROC_PIDTHREADINFO` readback disagreed on `job.darwinbg.unconfirmed`.
     pid: Optional<U32>,
 }
@@ -905,19 +917,28 @@ impl JobCells {
             ),
             _ => (None, None, None, None),
         };
-        let (tokens, cpu_millicores, pid) = match row.kind {
+        let (tokens, cpu_millicores, host_idle_millicores, pid) = match row.kind {
             RowKind::GatePriority(GatePriorityRow::TokensWithdrawn { tokens })
             | RowKind::GatePriority(GatePriorityRow::TokensRestored { tokens }) => {
-                (Some(tokens), None, None)
+                (Some(tokens), None, None, None)
             }
             RowKind::GatePriority(GatePriorityRow::DarwinBgSet {
                 cpu_millicores,
                 tokens,
-            }) => (Some(tokens), Some(cpu_millicores), None),
+                host_idle_millicores,
+            }) => (
+                Some(tokens),
+                Some(cpu_millicores),
+                Some(host_idle_millicores),
+                None,
+            ),
+            RowKind::GatePriority(GatePriorityRow::DarwinBgCleared {
+                host_idle_millicores,
+            }) => (None, None, host_idle_millicores, None),
             RowKind::GatePriority(GatePriorityRow::DarwinBgUnconfirmed { pid }) => {
-                (None, None, Some(pid))
+                (None, None, None, Some(pid))
             }
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         };
         let span = SpanAddress {
             thread_id: job_span_thread(&row.repo_id, &row.workspace_incarnation, row.job_id),
@@ -955,6 +976,7 @@ impl JobCells {
             admission_pool_ahead: ahead,
             tokens,
             cpu_millicores,
+            host_idle_millicores,
             pid,
         };
         Ok(Self {

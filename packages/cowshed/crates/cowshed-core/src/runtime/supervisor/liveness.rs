@@ -44,12 +44,19 @@ pub struct JobGatePriority {
     /// so a watcher distinguishes "never set" from "set and cleared").
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub darwinbg_cleared: u64,
+    /// Completed macOS `PRIO_DARWIN_BG` evaluation windows for this job (monotonically incremented
+    /// each time a 3 s window decides a step).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub darwinbg_windows: u64,
 }
 
 impl JobGatePriority {
     /// Whether no land-gate withdrawal or `PRIO_DARWIN_BG` transition has occurred on this job.
     pub(crate) const fn is_default(&self) -> bool {
-        self.tokens_withdrawn == 0 && !self.darwinbg_active && self.darwinbg_cleared == 0
+        self.tokens_withdrawn == 0
+            && !self.darwinbg_active
+            && self.darwinbg_cleared == 0
+            && self.darwinbg_windows == 0
     }
 }
 

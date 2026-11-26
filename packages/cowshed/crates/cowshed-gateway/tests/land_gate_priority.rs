@@ -216,6 +216,8 @@ fn start_supervisor(
         job_sampling: Default::default(),
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
+        #[cfg(target_os = "macos")]
+        host_cpu: cowshed_core::host_cpu::Source::Kernel,
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
         scratch: None,
     };
