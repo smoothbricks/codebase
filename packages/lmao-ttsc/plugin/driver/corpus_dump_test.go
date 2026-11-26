@@ -127,7 +127,7 @@ func transformCorpusEntry(t *testing.T, body string) string {
 	defer program.Close()
 	var inputSource *shimast.SourceFile
 	for _, sourceFile := range program.SourceFiles() {
-		if sourceFile != nil && filepath.Clean(sourceFile.FileName()) == filepath.Clean(inputPath) {
+		if sourceFile != nil && filepath.Clean(string(sourceFile.FileName())) == filepath.Clean(inputPath) {
 			inputSource = sourceFile
 			break
 		}

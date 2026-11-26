@@ -57,7 +57,7 @@ func isLmaoContextType(chk *shimchecker.Checker, t *shimchecker.Type) bool {
 	}
 	if sym := shimchecker.Type_getTypeNameSymbol(t); sym != nil {
 		for _, w := range lmaoContextTypeNames {
-			if sym.Name == w {
+			if shimast.SymbolNameOf(sym) == w {
 				return true
 			}
 		}

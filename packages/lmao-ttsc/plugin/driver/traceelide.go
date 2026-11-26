@@ -130,7 +130,7 @@ func (t *fileTransformer) traceStatementAt(access *shimast.Node) (traceStatement
 
 func (t *fileTransformer) reportTraceNotStatement(node *shimast.Node, message string) {
 	if t.vocabulary != nil {
-		t.vocabulary.addDiagnostic("LMAO_TRACE_NOT_STATEMENT", t.file.FileName(), node.Pos(), message)
+		t.vocabulary.addDiagnostic("LMAO_TRACE_NOT_STATEMENT", string(t.file.FileName()), node.Pos(), message)
 	}
 }
 

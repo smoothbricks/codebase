@@ -177,7 +177,7 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions) (*
 		collected.transformer.staticSpanNameIDs = staticSpans
 		collected.transformer.vocabularySize = len(catalog.Entries)
 		collected.hintRewrites = collected.transformer.collectOptimizations(sf.AsNode(), true)
-		collected.registrationEntries = catalogEntriesForFile(catalog, collector.fileKeys[sf.FileName()])
+		collected.registrationEntries = catalogEntriesForFile(catalog, collector.fileKeys[string(sf.FileName())])
 		collected.transformer.vocabularyOrdinals = vocabularyOrdinals(collected.registrationEntries)
 		collected.tagInlines, collected.logInlines, collected.resultInlines = collected.transformer.collectTagInlines(sf.AsNode())
 	}
@@ -380,7 +380,7 @@ func (t *fileTransformer) tryDefineModuleMetadata(call *shimast.CallExpression) 
 		// host — and every sibling's emit — without a word on any channel the
 		// host can report through.
 		panic(fmt.Sprintf("%s: invariant violation: %s contains multiple defineModule() declarations",
-			PluginName, t.file.FileName()))
+			PluginName, string(t.file.FileName())))
 	}
 	t.seenDefineModule = true
 	for _, prop := range obj.Properties.Nodes {
@@ -390,8 +390,8 @@ func (t *fileTransformer) tryDefineModuleMetadata(call *shimast.CallExpression) 
 		}
 	}
 
-	gitSha := gitLastCommit(t.file.FileName(), t.cwd)
-	pkgName, pkgFile := nearestPackage(t.file.FileName())
+	gitSha := gitLastCommit(string(t.file.FileName()), t.cwd)
+	pkgName, pkgFile := nearestPackage(string(t.file.FileName()))
 
 	metaProps := []*shimast.Node{
 		factory.NewPropertyAssignment(nil, ident("git_sha"), nil, nil, str(gitSha)),

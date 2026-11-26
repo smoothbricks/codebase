@@ -94,7 +94,7 @@ func isTypeNamedAmong(chk *shimchecker.Checker, t *shimchecker.Type, names []str
 	}
 	if sym := shimchecker.Type_getTypeNameSymbol(t); sym != nil {
 		for _, w := range names {
-			if sym.Name == w {
+			if shimast.SymbolNameOf(sym) == w {
 				return true
 			}
 		}
@@ -325,7 +325,7 @@ func extractLogSchema(chk *shimchecker.Checker, logType *shimchecker.Type) map[s
 	// extractSchema intentionally recognizes only all-literal unions, so
 	// recover the precise enum dictionary here while ignoring nullable members.
 	for _, symbol := range shimchecker.Checker_getPropertiesOfType(chk, logType) {
-		name := symbol.Name
+		name := shimast.SymbolNameOf(symbol)
 		if name == "with" || strings.HasPrefix(name, "_") || logMethods[name] || name == "line" {
 			continue
 		}

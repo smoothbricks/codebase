@@ -97,7 +97,7 @@ func generatedBindingName(sf *shimast.SourceFile, base string, taken map[string]
 		if taken[candidate] {
 			continue
 		}
-		if _, declared := sf.Identifiers[candidate]; declared {
+		if sourceFileHasIdentifier(sf, candidate) {
 			continue
 		}
 		taken[candidate] = true

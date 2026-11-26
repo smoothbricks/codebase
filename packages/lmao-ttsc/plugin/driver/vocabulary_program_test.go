@@ -94,7 +94,7 @@ func compileWholeProgramFixture(t *testing.T, sources []wholeProgramSource) whol
 		}
 		collected := compilation.files[sourceFile]
 		if collected == nil {
-			t.Fatalf("%s was absent from whole-program compilation", sourceFile.FileName())
+			t.Fatalf("%s was absent from whole-program compilation", string(sourceFile.FileName()))
 		}
 		entries := append([]vocabularyCatalogEntry(nil), collected.registrationEntries...)
 		for _, entry := range entries {
@@ -107,14 +107,14 @@ func compileWholeProgramFixture(t *testing.T, sources []wholeProgramSource) whol
 		emitContext := shimprinter.NewEmitContext()
 		transformed := transform(emitContext, sourceFile)
 		if transformed == nil {
-			t.Fatalf("whole-program transform returned nil for %s", sourceFile.FileName())
+			t.Fatalf("whole-program transform returned nil for %s", string(sourceFile.FileName()))
 		}
 		printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, emitContext)
 		ordinals := make(map[globalVocabularyID]int, len(collected.transformer.vocabularyOrdinals))
 		for id, ordinal := range collected.transformer.vocabularyOrdinals {
 			ordinals[id] = ordinal
 		}
-		result.files[filepath.Base(sourceFile.FileName())] = wholeProgramFileResult{
+		result.files[filepath.Base(string(sourceFile.FileName()))] = wholeProgramFileResult{
 			entries:  entries,
 			ordinals: ordinals,
 			output:   shimprinter.EmitSourceFile(printer, transformed),

@@ -153,7 +153,7 @@ func isTagWriterType(chk *shimchecker.Checker, t *shimchecker.Type) bool {
 	}
 	if sym := shimchecker.Type_getTypeNameSymbol(t); sym != nil {
 		for _, w := range tagWriterTypeNames {
-			if sym.Name == w {
+			if shimast.SymbolNameOf(sym) == w {
 				return true
 			}
 		}
@@ -219,7 +219,7 @@ func schemaFieldFromProperty(chk *shimchecker.Checker, sym *shimast.Symbol) (sch
 func extractOrderedSchema(chk *shimchecker.Checker, tagType *shimchecker.Type) ([]namedSchemaField, bool) {
 	fields := []namedSchemaField{}
 	for _, sym := range shimchecker.Checker_getPropertiesOfType(chk, tagType) {
-		name := sym.Name
+		name := shimast.SymbolNameOf(sym)
 		if name == "with" || strings.HasPrefix(name, "_") {
 			continue
 		}

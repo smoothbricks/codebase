@@ -70,7 +70,7 @@ func parseStructuredTemplate(text string) (string, []string, bool) {
 
 func (t *fileTransformer) addLogDiagnostic(code string, call *shimast.CallExpression, message string) {
 	if t.vocabulary != nil {
-		t.vocabulary.addDiagnostic(code, t.file.FileName(), call.AsNode().Pos(), message)
+		t.vocabulary.addDiagnostic(code, string(t.file.FileName()), call.AsNode().Pos(), message)
 	}
 }
 
@@ -144,7 +144,7 @@ type logTemplate struct {
 // collectLogVocabulary validates and registers one direct logger call.
 func (t *fileTransformer) collectLogVocabulary(call *shimast.CallExpression) {
 	if template, ok := t.logTemplateOf(call); ok {
-		t.vocabulary.addRecord(vocabularyLogTemplate, template.text, template.fields, call, t.file.FileName())
+		t.vocabulary.addRecord(vocabularyLogTemplate, template.text, template.fields, call, string(t.file.FileName()))
 	}
 }
 

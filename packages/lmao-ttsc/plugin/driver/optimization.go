@@ -801,7 +801,7 @@ func isLmaoDeclarationNode(declaration *shimast.Node) bool {
 		return false
 	}
 	if source := shimast.GetSourceFileOfNode(declaration); source != nil {
-		fileName := strings.ReplaceAll(source.FileName(), "\\", "/")
+		fileName := strings.ReplaceAll(string(source.FileName()), "\\", "/")
 		if strings.HasPrefix(fileName, "packages/lmao/") || strings.Contains(fileName, "/packages/lmao/") || strings.Contains(fileName, "/node_modules/@smoothbricks/lmao/") {
 			return true
 		}
@@ -819,7 +819,7 @@ func isNamedType(chk *shimchecker.Checker, node *shimast.Node, name string) bool
 	if typ == nil {
 		return false
 	}
-	if sym := shimchecker.Type_getTypeNameSymbol(typ); sym != nil && sym.Name == name {
+	if sym := shimchecker.Type_getTypeNameSymbol(typ); sym != nil && shimast.SymbolNameOf(sym) == name {
 		return true
 	}
 	return strings.HasPrefix(chk.TypeToString(typ), name+"<")
@@ -831,10 +831,10 @@ func isNamedLmaoType(chk *shimchecker.Checker, node *shimast.Node, name string) 
 		return false
 	}
 	sym := shimchecker.Type_getTypeNameSymbol(typ)
-	if sym == nil || sym.Name != name {
+	if sym == nil || shimast.SymbolNameOf(sym) != name {
 		return false
 	}
-	for _, declaration := range sym.Declarations {
+	for _, declaration := range shimast.SymbolDeclarationsOf(sym) {
 		if isLmaoDeclarationNode(declaration) {
 			return true
 		}
@@ -913,7 +913,7 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node, emitHints boo
 					}
 					if provenContext && (plainFunction || provenOp) && t.vocabulary != nil {
 						if text, literal := literalVocabularyValue(call.Arguments.Nodes[0]); literal {
-							t.vocabulary.add(vocabularySpanName, text, call, t.file.FileName())
+							t.vocabulary.add(vocabularySpanName, text, call, string(t.file.FileName()))
 						}
 					}
 				}
@@ -934,7 +934,7 @@ func isOpType(chk *shimchecker.Checker, typ *shimchecker.Type) bool {
 		return true
 	}
 	sym := shimchecker.Type_getTypeNameSymbol(typ)
-	return sym != nil && sym.Name == "Op"
+	return sym != nil && shimast.SymbolNameOf(sym) == "Op"
 }
 
 func (t *fileTransformer) spanContextApproved(node *shimast.Node) bool {
