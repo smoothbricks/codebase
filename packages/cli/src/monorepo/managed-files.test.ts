@@ -299,11 +299,15 @@ describe('managed raw files', () => {
     // own, so the caches that ttsc-env.sh names land under temp rather than in the checkout and HOME the suite runs in.
     const home = join(temp, 'home');
     const checkout = join(temp, 'checkout');
-    await mkdir(join(checkout, 'tooling', 'direnv'), { recursive: true });
+    const storeSource = join(temp, 'store-tsc');
+    await mkdir(storeSource, { recursive: true });
+    await mkdir(join(checkout, 'tooling', 'direnv', '.devenv', 'profile', 'bin'), { recursive: true });
     await copyFile(
       join(REPO_ROOT, 'tooling', 'direnv', 'ttsc-env.sh'),
       join(checkout, 'tooling', 'direnv', 'ttsc-env.sh'),
     );
+    await symlink(process.execPath, join(checkout, 'tooling', 'direnv', '.devenv', 'profile', 'bin', 'tsc'));
+    await symlink(storeSource, join(checkout, 'tooling', 'direnv', '.devenv', 'profile', 'tsc'));
     const devenv = join(bin, 'devenv');
     // Emulates `devenv shell [flags] -- cmd...` the way devenv.smoo.nix's
     // enterShell behaves: cd to the workspace root, source ttsc-env.sh, which

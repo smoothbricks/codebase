@@ -4,11 +4,14 @@
 #
 #   . tooling/direnv/ttsc-env.sh
 #
-# Exports ttsc's environment for this workspace: TTSC_TSGO_BINARY, the native
-# TypeScript compiler (ttsc resolves only the unscoped "typescript" package by
-# default, which here is the JavaScript compiler API), TTSC_CACHE_DIR, where ttsc
-# keeps the plugin binaries it compiles (<checkout>/.cache/ttsc-plugins, the path
-# a repository's ttsc plugin build target declares as its output), and
+# Exports ttsc's environment for this workspace: TTSC_TSGO_BINARY and
+# TTSC_TSGO_SOURCE, the pinned native TypeScript compiler and its Go module
+# source that devenv.smoo.nix places in this checkout's devenv profile
+# (<checkout>/tooling/direnv/.devenv/profile/bin/tsc and .../profile/tsc), so
+# shells and git hooks outside the shell always select this checkout's own
+# compiler without reading inherited SMOO_* variables; TTSC_CACHE_DIR, where
+# ttsc keeps the plugin binaries it compiles (<checkout>/.cache/ttsc-plugins,
+# the path a repository's ttsc plugin build target declares as its output); and
 # TTSC_GO_CACHE_DIR, the Go build cache that compiles them.
 #
 # The Go build cache is the host's, $HOME/.cache/ttsc/go-build, not the
@@ -49,14 +52,15 @@ if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
   unset TTSC_CACHE_DIR TTSC_GO_CACHE_DIR
 fi
 unset smoo_ttsc_checkout
-if [ -f "$PWD/tooling/direnv/typescript-go.nix" ]; then
-  export TTSC_TSGO_BINARY="$PWD/tooling/direnv/.devenv/profile/bin/tsgo"
-  if [ ! -x "$TTSC_TSGO_BINARY" ]; then
-    echo "ttsc-env.sh: native TypeScript producer is declared, but checkout profile/bin/tsgo is unavailable: $TTSC_TSGO_BINARY" >&2
-    return 1
-  fi
-else
-  export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
+export TTSC_TSGO_BINARY="$PWD/tooling/direnv/.devenv/profile/bin/tsc"
+if [ ! -x "$TTSC_TSGO_BINARY" ]; then
+  echo "ttsc-env.sh: checkout profile/bin/tsc is unavailable: $TTSC_TSGO_BINARY" >&2
+  return 1
+fi
+export TTSC_TSGO_SOURCE="$PWD/tooling/direnv/.devenv/profile/tsc"
+if [ ! -d "$TTSC_TSGO_SOURCE" ]; then
+  echo "ttsc-env.sh: checkout profile/tsc is unavailable: $TTSC_TSGO_SOURCE" >&2
+  return 1
 fi
 export TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-$PWD/.cache/ttsc-plugins}"
 if [ -z "${TTSC_GO_CACHE_DIR:-}" ]; then

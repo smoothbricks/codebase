@@ -350,7 +350,6 @@ jobs:
       id-token: write
     env:
       LMAO_GIT_REVISION: ${{ github.sha }}
-      TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${{ github.token }}
       NX_SELF_HOSTED_REMOTE_CACHE_SERVER: ${{ vars.NX_REMOTE_CACHE_SERVER }}
       NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: ${{ secrets.NX_REMOTE_CACHE_TOKEN }}

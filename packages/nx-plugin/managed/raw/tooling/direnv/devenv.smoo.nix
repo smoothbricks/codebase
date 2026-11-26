@@ -22,29 +22,33 @@
   # The nixpkgs the Go pin below comes from (devenv.yaml `nixpkgs-go`).
   goPkgs = import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;};
 
-  # The native TypeScript compiler typecheck targets run, built from a pinned
-  # source revision rather than taken from the npm `@typescript/native` binary
-  # that emit, editors and ttsc plugins keep using. The Nx plugin's inferred
-  # `typecheck` and `typecheck-tests` run it directly (not through ttsc, whose
-  # auto-loaded typia host checks with its own compiler) and hash this path as
-  # an input, so a revision bump is a cache miss.
+  # The native TypeScript compiler that typecheck, emit and the ttsc plugin
+  # hosts all run, built from one pinned source revision. Inferred `typecheck`
+  # and `typecheck-tests` run it directly via SMOO_TYPECHECK_TSC (keyed on
+  # this store path, so a revision bump is a cache miss), while `ttsc` runs it
+  # as TTSC_TSGO_BINARY and compiles its plugin hosts against the same source
+  # via TTSC_TSGO_SOURCE.
   #
-  # The revision is can1357/TypeScript perf/checker-speedups-v3: 36 checker,
-  # arena and scheduler commits on microsoft/TypeScript main 6ad8c56f9b5a,
-  # while they are upstreamed. Its Go module (tsc/, Go 1.27) builds with the
-  # nixpkgs-go input's go_1_27 inside this derivation, the same Go the shell
-  # provides because ttsc vendors that line. The sparse checkout keeps the ~61k test baselines out of
-  # the store, and GOWORK=off keeps the repository's go.work (tools/) out of
-  # the module build.
+  # The revision is can1357's perf/checker-speedups-v3 rebased onto
+  # microsoft/TypeScript 28534d760906, the revision ttsc 0.38.1's 7.1 target
+  # pins, so the ttsc plugin hosts build from the same source as the binary.
+  # The source also provides `internal/batch`, the collector pacing of a batch
+  # compilation, which ttsc's one-shot plugin hosts call so a host paces the
+  # collector as `tsc` does. Its Go module (tsc/, Go 1.27) builds with the
+  # nixpkgs-go input's go_1_27
+  # inside this derivation, the same Go the shell provides because ttsc vendors
+  # that line. The sparse checkout keeps the ~61k test baselines out of the
+  # store, and GOWORK=off keeps the repository's go.work (tools/) out of the
+  # module build.
   typecheckTsc = goPkgs.buildGo127Module {
     pname = "tsc";
-    version = "7.1.0-dev-c1ae0cde";
+    version = "7.1.0-dev-45abdae3";
     src = pkgs.fetchFromGitHub {
-      owner = "can1357";
+      owner = "vizanto";
       repo = "TypeScript";
-      rev = "c1ae0cde041b8aa08600198fad014d869c83b602";
+      rev = "45abdae3c0318aeb0344389fade330ecc0ff0468";
       sparseCheckout = ["tsc/cmd" "tsc/internal"];
-      hash = "sha256-X4wKd/+b4EGMGwXGpfQ5YHkgfqqtPgfyf3x1maEuE+4=";
+      hash = "sha256-oqhnxIy4TsQ/vE0SzFsRoUqOjTMlQVMr+WqPyA4o2F4=";
     };
     modRoot = "tsc";
     subPackages = ["cmd/tsc"];
@@ -58,6 +62,14 @@
     # sparse source omits; the revision is the tested artifact.
     doCheck = false;
   };
+
+  # Expose the compiler's Go module directory (holding go.mod) at `profile/tsc`
+  # from the same `typecheckTsc.src`, so ttsc-env.sh names both the binary and
+  # its source by checkout profile path in shells and in git hooks alike.
+  typecheckTscSource = pkgs.runCommandLocal "tsc-source-${typecheckTsc.version}" {} ''
+    mkdir -p "$out"
+    ln -s ${typecheckTsc.src}/tsc "$out/tsc"
+  '';
 
   # A repository that enables uv under languages.python gets its uv workspace
   # synced and activated by this contract (enterShell item 5), never by
@@ -462,6 +474,11 @@ in {
   packages =
     [
       goPkgs.go_1_27
+      # The pinned native TypeScript compiler and its Go module source enter the
+      # devenv profile (profile/bin/tsc and profile/tsc) so ttsc-env.sh can name
+      # both by checkout path inside the shell and from git hooks outside it.
+      typecheckTsc
+      typecheckTscSource
       pkgs.nodejs_26
       pkgs.binaryen
       # The managed Bun of the overlay above: shell entry, the git hooks and

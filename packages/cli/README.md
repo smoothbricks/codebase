@@ -394,16 +394,16 @@ Nx-backed CLI fixtures declare `cacheDirectory: ".nx/cache"` in their own `nx.js
 workspace-data database under the temporary workspace even when caller environment overrides are cleared. Their teardown
 stops the fixture daemon and removes that workspace; it must not leave one `~/.nx/<repoKey>` per fixture run.
 
-The root `@typescript/native` dependency follows TypeScript's documented side-by-side pattern: it aliases TypeScript 7
-and supplies the native compiler used by `ttsc`. Because `ttsc` resolves only the unscoped package by default, the
-managed devenv shell selects `node_modules/@typescript/native/bin/tsc` by default. A repository declaring
-`tooling/direnv/typescript-go.nix` instead requires its own `tooling/direnv/.devenv/profile/bin/tsgo`; a missing
-executable is a named refusal, never a stock-compiler fallback. The GitHub setup action persists that absolute path
-through `GITHUB_ENV`. Nx and other JavaScript tooling still require the full TypeScript compiler API, so workspace
-`typescript` stays on TypeScript 6. After install, setup-environment forces Bun's shared `.bun/node_modules/typescript`
-hoist onto that API package so Nx does not load `@typescript/native` (TS7) via the store
-([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)). Both dependencies and the environment binding are
-required: TypeScript 7 under the unscoped name breaks Nx API calls such as `readConfigFile`.
+`devenv.smoo.nix` builds one pinned native TypeScript 7 compiler and links its Go module source into the checkout's
+devenv profile (`tooling/direnv/.devenv/profile/bin/tsc` and `tooling/direnv/.devenv/profile/tsc`) for typecheck, emit,
+and the `ttsc` plugin hosts. `tooling/direnv/ttsc-env.sh` always exports `TTSC_TSGO_BINARY` and `TTSC_TSGO_SOURCE` from
+those checkout profile paths (never from inherited `SMOO_*` variables) and refuses by name when either entry is absent;
+the GitHub setup action persists both through `GITHUB_ENV`. Nx and other JavaScript tooling require the full TypeScript
+compiler API, so workspace `typescript` stays on TypeScript 6. Because the root manifest still carries the
+`@typescript/native` (`npm:typescript@^7`) alias alongside it, `setup-environment` forces Bun's shared
+`.bun/node_modules/typescript` hoist onto the TypeScript 6 API package so Nx does not load TypeScript 7 via the store
+([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)): TypeScript 7 under the unscoped name breaks Nx API
+calls such as `readConfigFile`.
 
 For `ttsc@0.38.1`, smoo temporarily distributes `patches/ttsc@0.38.1.patch` and registers it in the root
 `patchedDependencies` before `smoo monorepo update` runs Bun installation; it removes every other `ttsc@` registration.
@@ -715,14 +715,17 @@ nothing when nothing changed:
   deadline that kills the group, and git's low-speed limits end a stalled HTTP(S) transfer after about a minute. A fetch
   that is killed fails the task like any failed fetch (the Nx plugin README, "Cargo closure input", has the mechanism).
 - Shell secrets resolve only for an entry that installs; see below.
-- `tooling/direnv/ttsc-env.sh`, sourced by shell entry and by the git hooks, names the checkout's own native compiler in
-  `TTSC_TSGO_BINARY`, caches ttsc's plugin binaries in the checkout's `.cache/ttsc-plugins` (the output a repository's
-  plugin build target declares) and keeps ttsc's Go build cache in the host's `$HOME/.cache/ttsc/go-build`: one cache
-  serves every checkout's shared Go dependencies while each plugin host's own packages still compile per checkout, and
-  `ttsc clean` empties that directory and never the host's `GOCACHE`. A repository shares it into its cowshed sandboxes
-  with `[caches] home = [".cache/ttsc"]` in main's `.cowshed.toml`. `smoo monorepo check` and `smoo monorepo validate`
-  refuse `tooling/direnv/ttsc-env.sh` beside a `.cowshed.toml` that does not share `.cache/ttsc`; a repository cowshed
-  adopts without a `.cowshed.toml` is not judged and gets a per-workspace cold Go build cache for ttsc until it adds
+- `tooling/direnv/ttsc-env.sh`, sourced by shell entry and by the git hooks, always exports this checkout's own pinned
+  native compiler and Go module source from the checkout's devenv profile (`TTSC_TSGO_BINARY` at
+  `tooling/direnv/.devenv/profile/bin/tsc` and `TTSC_TSGO_SOURCE` at `tooling/direnv/.devenv/profile/tsc`), never
+  reading inherited `SMOO_*` variables and refusing by name when either entry is absent. It caches ttsc's plugin
+  binaries in the checkout's `.cache/ttsc-plugins` (the output a repository's plugin build target declares) and keeps
+  ttsc's Go build cache in the host's `$HOME/.cache/ttsc/go-build`: one cache serves every checkout's shared Go
+  dependencies while each plugin host's own packages still compile per checkout, and `ttsc clean` empties that directory
+  and never the host's `GOCACHE`. A repository shares it into its cowshed sandboxes with
+  `[caches] home = [".cache/ttsc"]` in main's `.cowshed.toml`. `smoo monorepo check` and `smoo monorepo validate` refuse
+  `tooling/direnv/ttsc-env.sh` beside a `.cowshed.toml` that does not share `.cache/ttsc`; a repository cowshed adopts
+  without a `.cowshed.toml` is not judged and gets a per-workspace cold Go build cache for ttsc until it adds
   `[caches] home = [".cache/ttsc"]`. `GOFLAGS` carries `-trimpath`. `CGO_ENABLED` defaults to `0` because the plugins
   ttsc builds are pure Go, and with cgo off neither ttsc's key nor the build asks the C toolchain; an inherited value
   wins. A cache the caller already exported wins, so a host or a sandbox that places these caches elsewhere sets them
@@ -730,15 +733,17 @@ nothing when nothing changed:
   directory): that workspace's caches are dropped. Go's own caches keep Go's defaults. Sourced from a directory that is
   not a workspace root, it refuses rather than cache beside that directory, and with neither `HOME` nor
   `TTSC_GO_CACHE_DIR` it refuses rather than guess the host's.
-- `SMOO_TYPECHECK_TSC` names the native compiler the inferred `typecheck` and `typecheck-tests` targets run.
-  `devenv.smoo.nix` builds it from one pinned TypeScript source revision with `go_1_27` from the `nixpkgs-go` input. The
-  targets run it directly rather than through ttsc, whose auto-loaded transform plugins (typia) check inside their own
-  host with ttsc's compiler. Transform diagnostics stay enforced where the transform runs: `tsc-js` for the lib program,
-  the test runner's transform for executed test files. The variable is a hashed input, so a revision bump misses the
-  cache. Emit, editors and ttsc plugins keep the npm `@typescript/native` compiler. A target run outside the devenv
-  shell fails on the unset variable rather than checking with another compiler under the same key. The module publishes
-  that one `nixpkgs-go` package set as the module argument `goPkgs`. A repository's `devenv.nix` takes Go from it
-  instead of importing the same Go inputs again, so both producers use one evaluated package set.
+- `SMOO_TYPECHECK_TSC` names the one pinned native TypeScript compiler that `devenv.smoo.nix` builds from a single
+  TypeScript source revision with `go_1_27` from the `nixpkgs-go` input for typecheck, emit, and the `ttsc` plugin
+  hosts. The module also places that binary (`profile/bin/tsc`) and its Go module source (`profile/tsc`) in the devenv
+  profile so `ttsc-env.sh` selects the same compiler and source in shells and git hooks alike. Inferred `typecheck` and
+  `typecheck-tests` run `SMOO_TYPECHECK_TSC` directly rather than through ttsc (except dialect-declaring dependencies,
+  which route through `ttsc`). Transform diagnostics stay enforced where the transform runs: `tsc-js` for the lib
+  program, the test runner's transform for executed test files. `SMOO_TYPECHECK_TSC` is keyed as an environment input,
+  so a revision bump misses the cache, and a target run outside the devenv shell fails on the unset variable rather than
+  checking with another compiler under the same key. The module publishes that one `nixpkgs-go` package set as the
+  module argument `goPkgs`. A repository's `devenv.nix` takes Go from it instead of importing the same Go inputs again,
+  so both producers use one evaluated package set.
 - `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
   dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed workspace
   (`.cowshed/workspace.json`) uses `<link>/nx`, where `<link>` is the `COWSHED_RUNTIME_LINK` its `.cowshed/env` names:

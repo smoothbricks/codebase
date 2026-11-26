@@ -93,8 +93,9 @@ const rootDevDependencies: RequiredDependency[] = [
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Emit is delegated to ttsc by the Nx plugin targets; typecheck runs SMOO_TYPECHECK_TSC.
   { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
-  // TS7 native compiler for ttsc (TTSC_TSGO_BINARY). Not the unscoped API package.
-  // npm alias form required — Bun cannot install @typescript/typescript6 cleanly (bun#33834).
+  // Typecheck, emit, and ttsc plugin hosts run the pinned compiler from devenv.smoo.nix;
+  // @typescript/native stays declared under the npm alias form (never unscoped "typescript")
+  // so Bun does not shadow the TS6 compiler API package (bun#33834).
   { name: '@typescript/native', fallbackVersion: 'npm:typescript@^7.0.2' },
 ];
 

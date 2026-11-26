@@ -23,7 +23,8 @@ echo "Installing dependencies..."
 echo "enterShell noise on stdout"
 export PATH="/nix/store/test-linker/bin:/nix/store/test-rust/bin:$PATH"
 export LD_LIBRARY_PATH="/nix/store/test-gcc-lib/lib"
-export TTSC_TSGO_BINARY="/repo/node_modules/@typescript/native/bin/tsc"
+export TTSC_TSGO_BINARY="/repo/tooling/direnv/.devenv/profile/bin/tsc"
+export TTSC_TSGO_SOURCE="/repo/tooling/direnv/.devenv/profile/tsc"
 export TTSC_CACHE_DIR="/home/runner/.cowshed/caches/ttsc"
 export MULTI_LINE_VALUE="first line
 second line"
@@ -91,7 +92,8 @@ describe('github-actions-bootstrap build-shell environment persistence', () => {
     // Added by the shell → persisted (the LD_LIBRARY_PATH case is the class
     // this exists for: Bun-spawned native bindings need it on NixOS runners).
     expect(run.githubEnv).toContain('LD_LIBRARY_PATH=/nix/store/test-gcc-lib/lib\n');
-    expect(run.githubEnv).toContain('TTSC_TSGO_BINARY=/repo/node_modules/@typescript/native/bin/tsc\n');
+    expect(run.githubEnv).toContain('TTSC_TSGO_BINARY=/repo/tooling/direnv/.devenv/profile/bin/tsc\n');
+    expect(run.githubEnv).toContain('TTSC_TSGO_SOURCE=/repo/tooling/direnv/.devenv/profile/tsc\n');
     expect(run.githubEnv).toContain('TTSC_CACHE_DIR=/home/runner/.cowshed/caches/ttsc\n');
 
     // The shell Python's package path is an interpreter input, not bookkeeping: without it a later

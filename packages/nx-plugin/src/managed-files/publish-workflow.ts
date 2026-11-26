@@ -982,7 +982,6 @@ ${publishJobRunsOnLine(options)}
       id-token: write
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
-      TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, publisherReach(options))}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}

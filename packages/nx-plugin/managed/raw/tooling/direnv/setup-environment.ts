@@ -172,8 +172,9 @@ const projectRoot = rootResult.root;
 // AND 1.4.0 — the #33834 alias-resolution fix did not cover it), so packages resolved
 // from the .bun store (nx) sometimes get version.cjs without readConfigFile.
 // After every install, force both unscoped typescript slots onto typescript@6.0.3.
-// Keep @typescript/native for ttsc via TTSC_TSGO_BINARY. Do not retire this on a bun
-// bump until https://github.com/oven-sh/bun/issues/40355 is fixed and re-verified.
+// Typecheck, emit, and ttsc plugin hosts run the pinned compiler from devenv.smoo.nix;
+// while @typescript/native remains declared in package.json, keep this hoist repair
+// across Bun bumps until https://github.com/oven-sh/bun/issues/40355 is fixed and re-verified.
 const TYPESCRIPT_API_VERSION = '6.0.3';
 
 // post-commit is the one hook slot smoo shares. Tools that nudge a backup or a

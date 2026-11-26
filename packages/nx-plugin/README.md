@@ -1377,18 +1377,21 @@ Concrete targets come from concrete files:
   `scriptc-<arch>-<family>` for the host, so the executable exists before it runs; an installed tool package carries
   every platform's executable already. A host no scriptc platform covers has no executable to run, and inference names
   it.
-
+- `devenv.smoo.nix` builds one native TypeScript compiler from a single pinned source revision for `typecheck`,
+  `typecheck-tests`, `tsc-js` emit, and the `ttsc` plugin hosts. It exports `SMOO_TYPECHECK_TSC` in the shell and places
+  both the compiler (`profile/bin/tsc`) and its Go module source (`profile/tsc`) into the checkout's devenv profile;
+  `tooling/direnv/ttsc-env.sh` exports `TTSC_TSGO_BINARY` and `TTSC_TSGO_SOURCE` from those checkout profile paths and
+  never reads inherited `SMOO_*` variables, so git hooks running outside the devenv shell resolve this checkout's own
+  compiler and source rather than another workspace's.
 - `typecheck` is inferred from `tsconfig.lib.json`. Where the inferred `tsc-js` runs, `typecheck` is
   `{ "executor": "nx:noop", "dependsOn": ["tsc-js"] }` with no inputs or command of its own: running it runs `tsc-js`,
   which already checks `tsconfig.lib.json` (transform plugins included) and fails on type errors, so library sources are
   type-checked once. A `tsc-js` declaration in `package.json#nx.targets` that only adds `dependsOn` or `inputs` keeps
   the inferred emit, as Nx merges the two. Where a declaration replaces it (another executor, a top-level `command`,
-  `options.command`/`options.commands`, or `options.tsConfig` naming another tsconfig), `typecheck` runs the native
-  compiler `SMOO_TYPECHECK_TSC` names (built by `devenv.smoo.nix` from a
-
-  pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through `ttsc`. Every TypeScript
-  source file of a project belongs to at most one inferred checking target: graph inference resolves `tsconfig.lib.json`
-  and `tsconfig.test.json` through TypeScript's config loader and refuses any project whose two configs include the same
+  `options.command`/`options.commands`, or `options.tsConfig` naming another tsconfig), `typecheck` runs
+  `SMOO_TYPECHECK_TSC` as `-p tsconfig.lib.json --noEmit`, directly rather than through `ttsc`. Every TypeScript source
+  file of a project belongs to at most one inferred checking target: graph inference resolves `tsconfig.lib.json` and
+  `tsconfig.test.json` through TypeScript's config loader and refuses any project whose two configs include the same
   file, naming the project, each shared file, both configs, and the fix. `src/test-suite-tracer.ts` is test-only and
   excluded from `tsconfig.lib.json`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them. A project
   whose direct dependency (`dependencies` or `devDependencies`, the ones ttsc discovers plugins on) declares a dialect
@@ -1404,14 +1407,14 @@ Concrete targets come from concrete files:
   utility host only, not from typia's): no withdrawn refusal and no error of a reference that is not built yet comes
   back after the real error. A host that printed none (a panic, or a hook or write error after a program that came out
   clean once its refusals were withdrawn) still gets the pass, and there the host's record of what it withdrew, in the
-  file `TTSC_WITHDRAWN_DIAGNOSTICS_PATH` names, keeps the refusal out of it. The pinned compiler cannot judge such a
-  project. The declaring package says so in its manifest,
+  file `TTSC_WITHDRAWN_DIAGNOSTICS_PATH` names, keeps the refusal out of it. The standalone compiler cannot judge such a
+  project without the plugin. The declaring package says so in its manifest,
   `"smoo": { "typecheck": { "compiler": "ttsc", "dependsOn": ["<project>:<target>"] } }`, where `dependsOn` names the
   targets that prepare the plugin binaries ttsc loads. The routed typecheck depends on them, so it loads built plugins
   and never compiles one, and the inference guesses no workspace target. A declaration of another shape refuses the
-  inference by its manifest path. Its compiler is the installed ttsc, which `bun.lock` and the patches in the check
-  inputs already key. A project that depends only on typia stays on the pinned compiler.
-
+  inference by its manifest path. The routed `ttsc` runs the same pinned native compiler and builds its plugin hosts
+  against the same compiler source (`TTSC_TSGO_BINARY` and `TTSC_TSGO_SOURCE`), alongside `ttsc` in `bun.lock` and the
+  managed patch. A project that depends only on typia stays on the direct `SMOO_TYPECHECK_TSC` invocation.
 - A project whose inferred `typecheck` runs the native compiler (a project with `tsconfig.lib.json`, a declaration that
   replaces `tsc-js`, and no dialect dependency) defines the named input `typecheckCompiler` as
   `[{ "env": "SMOO_TYPECHECK_TSC" }]`; a noop `typecheck` delegating to `tsc-js`, a ttsc-routed project, and one whose

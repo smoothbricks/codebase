@@ -1,7 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Assertions cover literal GitHub Actions expressions. */
 
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -28,6 +28,7 @@ import {
   PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import typia from 'typia';
+import { withDevenvEnv } from '../../lib/devenv.js';
 
 const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..', '..');
@@ -520,6 +521,128 @@ describe('publish workflow definition', () => {
       },
     });
     expect(Bun.YAML.parse(single)).toMatchObject({ jobs: { publish: { env: provenanceEnv } } });
+  });
+
+  it('carries TTSC_TSGO_BINARY and TTSC_TSGO_SOURCE from the checked-out shell and updates them across repair-pending checkouts', async () => {
+    const platform = renderPublishWorkflowYaml(codebaseWorkflowOptions);
+    const single = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
+    const parsedPlatform = typia.assert<{
+      jobs: Record<string, { env?: Record<string, string>; steps: Array<{ name?: string; uses?: string }> }>;
+    }>(Bun.YAML.parse(platform));
+    const parsedSingle = typia.assert<{
+      jobs: Record<string, { env?: Record<string, string>; steps: Array<{ name?: string; uses?: string }> }>;
+    }>(Bun.YAML.parse(single));
+
+    // No job overrides the native compiler with the npm binary; Setup Nix/devenv captures both variables from the shell.
+    expect(platform).not.toContain('node_modules/@typescript/native/bin/tsc');
+    for (const [name, job] of [...Object.entries(parsedPlatform.jobs), ...Object.entries(parsedSingle.jobs)]) {
+      expect({ job: name, binary: job.env?.TTSC_TSGO_BINARY, source: job.env?.TTSC_TSGO_SOURCE }).toEqual({
+        job: name,
+        binary: undefined,
+        source: undefined,
+      });
+    }
+    const publishOnLinux = parsedPlatform.jobs['publish-on-linux'];
+    const steps = publishOnLinux?.steps ?? [];
+    const setupIndex = steps.findIndex((step) => step.uses === './.github/actions/setup-devenv');
+    const bootstrapIndex = steps.findIndex((step) => step.name === '🏗️ Build smoo Nx version actions');
+    const repairIndex = steps.findIndex((step) => step.name === '🧯 Repair pending releases');
+    expect(setupIndex).toBeGreaterThan(-1);
+    expect(setupIndex).toBeLessThan(bootstrapIndex);
+    expect(setupIndex).toBeLessThan(repairIndex);
+
+    // persist_devenv_environment captures both values from the dispatch shell, and repair-pending's withDevenvEnv
+    // replaces both with the checked-out ref's shell values before restoring the dispatch values.
+    const scratch = await mkdtemp(join(tmpdir(), 'smoo-publish-ttsc-env-'));
+    const savedEnv = { ...process.env };
+    try {
+      const bin = join(scratch, 'bin');
+      const dispatchRoot = join(scratch, 'dispatch');
+      const repairRoot = join(scratch, 'repair');
+      for (const dir of [bin, join(dispatchRoot, 'tooling/direnv'), join(repairRoot, 'tooling/direnv')]) {
+        await mkdir(dir, { recursive: true });
+      }
+      const dispatchBinary = join(dispatchRoot, 'tooling/direnv/.devenv/profile/bin/tsc');
+      const dispatchSource = join(dispatchRoot, 'tooling/direnv/.devenv/profile/tsc');
+      const repairBinary = join(repairRoot, 'tooling/direnv/.devenv/profile/bin/tsc');
+      const repairSource = join(repairRoot, 'tooling/direnv/.devenv/profile/tsc');
+      await writeFile(
+        join(bin, 'devenv'),
+        [
+          '#!/usr/bin/env bash',
+          'set -euo pipefail',
+          '[ "${1:-}" = tasks ] && exit 0',
+          'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done',
+          'shift',
+          'export TTSC_TSGO_BINARY="$SMOO_TEST_TTSC_BINARY"',
+          'if [ -n "${SMOO_TEST_TTSC_SOURCE:-}" ]; then export TTSC_TSGO_SOURCE="$SMOO_TEST_TTSC_SOURCE"; fi',
+          'exec "$@"',
+          '',
+        ].join('\n'),
+      );
+      await chmod(join(bin, 'devenv'), 0o755);
+
+      const githubEnv = join(scratch, 'github_env');
+      const githubPath = join(scratch, 'github_path');
+      await writeFile(githubEnv, '');
+      await writeFile(githubPath, '');
+      const bootstrap = Bun.spawn(
+        ['bash', join(REPO_ROOT, 'tooling/direnv/github-actions-bootstrap.sh'), 'build-shell'],
+        {
+          cwd: join(REPO_ROOT, 'tooling/direnv'),
+          env: {
+            PATH: `${bin}:${savedEnv.PATH ?? ''}`,
+            HOME: scratch,
+            TMPDIR: scratch,
+            GITHUB_ENV: githubEnv,
+            GITHUB_PATH: githubPath,
+            ...(publishOnLinux?.env ?? {}),
+            SMOO_TEST_TTSC_BINARY: dispatchBinary,
+            SMOO_TEST_TTSC_SOURCE: dispatchSource,
+          },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
+      const [stderr, exitCode] = await Promise.all([new Response(bootstrap.stderr).text(), bootstrap.exited]);
+      expect({ stderr, exitCode }).toEqual({ stderr: '', exitCode: 0 });
+      const persisted = await readFile(githubEnv, 'utf8');
+      expect(persisted).toContain(`TTSC_TSGO_BINARY=${dispatchBinary}\n`);
+      expect(persisted).toContain(`TTSC_TSGO_SOURCE=${dispatchSource}\n`);
+
+      process.env.PATH = `${bin}:${savedEnv.PATH ?? '/usr/bin:/bin'}`;
+      process.env.TTSC_TSGO_BINARY = dispatchBinary;
+      process.env.TTSC_TSGO_SOURCE = dispatchSource;
+      process.env.SMOO_TEST_TTSC_BINARY = repairBinary;
+      process.env.SMOO_TEST_TTSC_SOURCE = repairSource;
+      delete process.env.BASH_ENV;
+
+      const observed = await withDevenvEnv(repairRoot, async () => ({
+        binary: process.env.TTSC_TSGO_BINARY,
+        source: process.env.TTSC_TSGO_SOURCE,
+      }));
+      expect(observed).toEqual({ binary: repairBinary, source: repairSource });
+      expect(process.env.TTSC_TSGO_BINARY).toBe(dispatchBinary);
+      expect(process.env.TTSC_TSGO_SOURCE).toBe(dispatchSource);
+
+      // A historical ref whose ttsc-env.sh exports only TTSC_TSGO_BINARY must not inherit the dispatch ref's
+      // TTSC_TSGO_SOURCE across withDevenvEnv.
+      const historicalBinary = join(repairRoot, 'legacy-ts70/bin/tsc');
+      process.env.SMOO_TEST_TTSC_BINARY = historicalBinary;
+      delete process.env.SMOO_TEST_TTSC_SOURCE;
+
+      const historicalObserved = await withDevenvEnv(repairRoot, async () => ({
+        binary: process.env.TTSC_TSGO_BINARY,
+        source: process.env.TTSC_TSGO_SOURCE,
+      }));
+      expect(historicalObserved).toEqual({ binary: historicalBinary, source: undefined });
+      expect(process.env.TTSC_TSGO_BINARY).toBe(dispatchBinary);
+      expect(process.env.TTSC_TSGO_SOURCE).toBe(dispatchSource);
+    } finally {
+      for (const key of Object.keys(process.env)) delete process.env[key];
+      Object.assign(process.env, savedEnv);
+      await rm(scratch, { recursive: true, force: true });
+    }
   });
 
   it('passes the projects selector to the version and platform-output steps', async () => {

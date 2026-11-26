@@ -24,6 +24,7 @@ const checkoutScript = 'tooling/direnv/ttsc-env.sh';
 
 interface TtscEnv {
   readonly TTSC_TSGO_BINARY: string;
+  readonly TTSC_TSGO_SOURCE: string;
   readonly TTSC_CACHE_DIR: string;
   readonly TTSC_GO_CACHE_DIR: string;
   readonly CGO_ENABLED: string;
@@ -52,7 +53,7 @@ function enter(checkout: string, inherited: Record<string, string>): TtscEnv {
     '/bin/sh',
     [
       '-c',
-      `. "$0" && printf '%s\\n' "$TTSC_TSGO_BINARY" "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR" "\${CGO_ENABLED-unset}"`,
+      `. "$0" && printf '%s\\n' "$TTSC_TSGO_BINARY" "$TTSC_TSGO_SOURCE" "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR" "\${CGO_ENABLED-unset}"`,
       checkoutScript,
     ],
     {
@@ -63,9 +64,10 @@ function enter(checkout: string, inherited: Record<string, string>): TtscEnv {
   );
   if (result.status !== 0) printCommandOutput(result.stdout ?? '', result.stderr ?? '');
   expect(result.status).toBe(0);
-  const [binary, cache, goCache, cgoEnabled] = result.stdout.split('\n');
+  const [binary, source, cache, goCache, cgoEnabled] = result.stdout.split('\n');
   return {
     TTSC_TSGO_BINARY: binary ?? '',
+    TTSC_TSGO_SOURCE: source ?? '',
     TTSC_CACHE_DIR: cache ?? '',
     TTSC_GO_CACHE_DIR: goCache ?? '',
     CGO_ENABLED: cgoEnabled ?? '',
@@ -77,9 +79,13 @@ function withCheckouts(run: (checkout: string, other: string, scratch: string) =
   try {
     const checkout = join(scratch, 'checkout');
     const other = join(scratch, 'other');
+    const storeSource = join(scratch, 'store-tsc');
+    mkdirSync(storeSource, { recursive: true });
     for (const path of [checkout, other]) {
-      mkdirSync(join(path, 'tooling/direnv'), { recursive: true });
+      mkdirSync(join(path, 'tooling/direnv/.devenv/profile/bin'), { recursive: true });
       copyFileSync(script, join(path, checkoutScript));
+      symlinkSync(process.execPath, join(path, 'tooling/direnv/.devenv/profile/bin/tsc'));
+      symlinkSync(storeSource, join(path, 'tooling/direnv/.devenv/profile/tsc'));
     }
     run(checkout, other, scratch);
   } finally {
@@ -91,40 +97,50 @@ function withCheckouts(run: (checkout: string, other: string, scratch: string) =
 function boundFor(other: string): Record<string, string> {
   return {
     NX_WORKSPACE_ROOT_PATH: other,
-    TTSC_TSGO_BINARY: join(other, 'node_modules/@typescript/native/bin/tsc'),
+    SMOO_TYPECHECK_TSC: join(other, 'store/bin/tsc'),
+    TTSC_TSGO_BINARY: join(other, 'tooling/direnv/.devenv/profile/bin/tsc'),
+    TTSC_TSGO_SOURCE: join(other, 'tooling/direnv/.devenv/profile/tsc'),
     TTSC_CACHE_DIR: join(other, '.cache/ttsc-plugins'),
     TTSC_GO_CACHE_DIR: join(other, '.cache/ttsc/go-build'),
   };
 }
 
-it('selects this checkout profile when the repository declares its native producer', () => {
-  withCheckouts((checkout, other) => {
-    mkdirSync(join(checkout, 'tooling/direnv'), { recursive: true });
-    writeFileSync(join(checkout, 'tooling/direnv/typescript-go.nix'), '{ pkgs }: pkgs.typescript\n');
-    mkdirSync(join(checkout, 'tooling/direnv/.devenv/profile/bin'), { recursive: true });
-    symlinkSync(process.execPath, join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'));
-    expect(enter(checkout, boundFor(other))).toEqual({
-      TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'),
-      ...ownCaches(checkout),
-      CGO_ENABLED: '0',
-    });
-  });
-});
-
-it('refuses a declared producer with no executable profile output instead of selecting the stock compiler', () => {
+it('refuses a checkout whose profile lacks bin/tsc instead of reading inherited compiler variables', () => {
   withCheckouts((checkout) => {
-    mkdirSync(join(checkout, 'tooling/direnv'), { recursive: true });
-    writeFileSync(join(checkout, 'tooling/direnv/typescript-go.nix'), '{ pkgs }: pkgs.typescript\n');
+    rmSync(join(checkout, 'tooling/direnv/.devenv/profile/bin/tsc'));
     const result = spawnSync('/bin/sh', ['-c', '. "$0"', checkoutScript], {
       cwd: checkout,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TTSC_TSGO_BINARY: '/old/compiler' },
+      env: {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        HOME: homeOf(checkout),
+        SMOO_TYPECHECK_TSC: '/other/store/bin/tsc',
+        TTSC_TSGO_BINARY: '/old/compiler',
+      },
       encoding: 'utf8',
     });
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('native TypeScript producer is declared');
-    expect(result.stderr).toContain(join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'));
+    expect(result.stderr).toContain(join(checkout, 'tooling/direnv/.devenv/profile/bin/tsc'));
   });
 });
+
+it('refuses a checkout whose profile lacks tsc source instead of reading inherited compiler variables', () => {
+  withCheckouts((checkout) => {
+    rmSync(join(checkout, 'tooling/direnv/.devenv/profile/tsc'));
+    const result = spawnSync('/bin/sh', ['-c', '. "$0"', checkoutScript], {
+      cwd: checkout,
+      env: {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        HOME: homeOf(checkout),
+        SMOO_TYPECHECK_TSC: '/other/store/bin/tsc',
+        TTSC_TSGO_SOURCE: '/old/source',
+      },
+      encoding: 'utf8',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(join(checkout, 'tooling/direnv/.devenv/profile/tsc'));
+  });
+});
+
 it('refuses a directory that is not a workspace root instead of caching beside it', () => {
   withCheckouts((checkout, _other, scratch) => {
     const home = join(scratch, 'home');
@@ -145,7 +161,8 @@ describe('ttsc-env.sh', () => {
   it("names this checkout's compiler and plugin store and the host's Go build cache when nothing is inherited", () => {
     withCheckouts((checkout) => {
       expect(enter(checkout, {})).toEqual({
-        TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
+        TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsc'),
+        TTSC_TSGO_SOURCE: join(checkout, 'tooling/direnv/.devenv/profile/tsc'),
         ...ownCaches(checkout),
         CGO_ENABLED: '0',
       });
@@ -166,7 +183,8 @@ describe('ttsc-env.sh', () => {
   it("drops another workspace's compiler and caches that a shell bound for it left behind", () => {
     withCheckouts((checkout, other) => {
       expect(enter(checkout, boundFor(other))).toEqual({
-        TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
+        TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsc'),
+        TTSC_TSGO_SOURCE: join(checkout, 'tooling/direnv/.devenv/profile/tsc'),
         ...ownCaches(checkout),
         CGO_ENABLED: '0',
       });
@@ -174,15 +192,18 @@ describe('ttsc-env.sh', () => {
   });
 
   it("keeps a plugin store the host chose, with no workspace bound or with this one, beside the host's Go build cache", () => {
-    withCheckouts((checkout, _other, scratch) => {
+    withCheckouts((checkout, other, scratch) => {
       const shared = join(scratch, 'shared-ttsc');
       const expected = {
-        TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
+        TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsc'),
+        TTSC_TSGO_SOURCE: join(checkout, 'tooling/direnv/.devenv/profile/tsc'),
         TTSC_CACHE_DIR: shared,
         TTSC_GO_CACHE_DIR: ownCaches(checkout).TTSC_GO_CACHE_DIR,
         CGO_ENABLED: '0',
       };
-      expect(enter(checkout, { TTSC_CACHE_DIR: shared })).toEqual(expected);
+      expect(enter(checkout, { SMOO_TYPECHECK_TSC: join(other, 'store/bin/tsc'), TTSC_CACHE_DIR: shared })).toEqual(
+        expected,
+      );
       expect(enter(checkout, { NX_WORKSPACE_ROOT_PATH: checkout, TTSC_CACHE_DIR: shared })).toEqual(expected);
     });
   });

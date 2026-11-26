@@ -2,9 +2,18 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { decode, printCommandOutput } from './run.js';
+import { decode, mergeEnv, printCommandOutput } from './run.js';
 
 type EnvSnapshot = Record<string, string>;
+
+/**
+ * Compiler environment variables owned by each checked-out ref's devenv shell.
+ * A historical ref whose `ttsc-env.sh` exports only `TTSC_TSGO_BINARY` must not
+ * inherit the dispatch ref's `TTSC_TSGO_SOURCE`, so both names are withheld
+ * when entering the checked-out shell and dropped from the base environment
+ * before merging its exports.
+ */
+const CHECKOUT_OWNED_TTSC_VARS = ['TTSC_TSGO_BINARY', 'TTSC_TSGO_SOURCE'] as const;
 
 export async function withDevenvEnv<T>(root: string, runWithEnv: () => Promise<T>): Promise<T> {
   const snapshot = snapshotProcessEnv();
@@ -24,6 +33,7 @@ async function loadDevenvEnv(root: string): Promise<EnvSnapshot> {
     // A login shell reloads host profiles and can replace the selected Nix toolchain in PATH.
     const result = await $`devenv shell -- bash -c ${'env -0 > "$1"'} bash ${envPath}`
       .cwd(join(root, 'tooling', 'direnv'))
+      .env(mergeEnv(undefined, CHECKOUT_OWNED_TTSC_VARS))
       .quiet()
       .nothrow();
     if (result.exitCode !== 0) {
@@ -61,7 +71,11 @@ export function parseNulEnv(bytes: Uint8Array): EnvSnapshot {
 }
 
 export function mergeDevenvEnv(baseEnv: EnvSnapshot, devenvEnv: EnvSnapshot): EnvSnapshot {
-  return { ...baseEnv, ...devenvEnv };
+  const merged: EnvSnapshot = { ...baseEnv };
+  for (const name of CHECKOUT_OWNED_TTSC_VARS) {
+    delete merged[name];
+  }
+  return { ...merged, ...devenvEnv };
 }
 
 function snapshotProcessEnv(): EnvSnapshot {
