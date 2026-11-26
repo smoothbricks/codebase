@@ -237,6 +237,7 @@ impl Workspace {
             build_volume_released: None,
             memory_pressure: calm_pressure::calm(),
             nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+            scratch: None,
             host_job_path: cowshed_core::runtime::HostJobPath::Host,
         };
         let artifacts = ArtifactStoreSink::open(
@@ -261,6 +262,53 @@ impl Workspace {
             Box::new(DiscardedCommitments),
         )
         .expect("start supervisor")
+    }
+
+    fn supervisor_with_scratch(
+        &self,
+        prewarm: bool,
+        scratch: cowshed_core::runtime::scratch::ScratchProviderConfig,
+    ) -> WorkspaceSupervisorHandle {
+        let config = WorkspaceSupervisorConfig {
+            census: census(),
+            authority: authority(1),
+            owned_repo_ids: OwnedRepoIds::sole(authority(1).repo_id),
+            workspace_root: self.sandbox.workspace_mount.clone(),
+            default_cwd: None,
+            sandbox: self.sandbox.clone(),
+            build_volume_layout: None,
+            artifacts: ArtifactConfig::default(),
+            term_grace: Duration::from_millis(300),
+            actor_capacity: 16,
+            event_capacity: 16,
+            credential_env_names: std::collections::BTreeSet::new(),
+            shell_host: Some(
+                ShellHostProgram::dedicated(shell_host()).expect("the shell host binary"),
+            ),
+            shell_pool: ShellPoolConfig {
+                prewarm,
+                ..ShellPoolConfig::default()
+            },
+            group_ledger: None,
+            group_ledger_lease: None,
+            membership_socket: None,
+            telemetry_root: None,
+            inherited_groups: Vec::new(),
+            volume_labels: None,
+            workspace_volume: None,
+            job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
+            build_volume_released: None,
+            memory_pressure: calm_pressure::calm(),
+            nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+            scratch: Some(scratch),
+            host_job_path: cowshed_core::runtime::HostJobPath::Host,
+        };
+        let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+            Box::new(cowshed_core::storage::audit::NullAuditSink),
+            8,
+        )
+        .expect("commitment publisher");
+        WorkspaceSupervisor::start(config, commitments).expect("start supervisor")
     }
 }
 
@@ -2988,4 +3036,143 @@ fn census() -> cowshed_core::census::CensusScope {
         cowshed_os::namespace::HostNamespace::Test(namespace),
         std::sync::Arc::from(std::path::Path::new("/var/empty")),
     )
+}
+
+/// Warm exec hosts receive their per-host scratch directory via the per-command `TMPDIR` overlay,
+/// enforce parent/sibling isolation, keep `inherited_baseline` keyed by the store `TMPDIR` so a
+/// second supervisor adopts `activation.json` without re-evaluating, and settle the provider on
+/// retirement.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_warm_exec_host_uses_scratch_provider_without_rekeying_activation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let workspace = Workspace::new("warm-scratch", 49_280);
+    workspace.envrc("export WARM_MARK=activated\n");
+
+    let main = workspace.root.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+
+    // Isolated parent outside HOME/store/mount_root so sibling isolation relies on cowshed's rules.
+    struct RemoveDir(PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let raw_parent = std::fs::canonicalize("/tmp")
+        .unwrap()
+        .join(format!("cowshed-warm-sp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&raw_parent).unwrap();
+    let parent = std::fs::canonicalize(&raw_parent).unwrap();
+    let _cleanup = RemoveDir(parent.clone());
+    let sibling = parent.join("sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(sibling.join("secret"), b"nope\n").unwrap();
+
+    let counter = parent.join("counter");
+    std::fs::write(&counter, b"0").unwrap();
+    let provider_script = main.join("provider.sh");
+    std::fs::write(
+        &provider_script,
+        format!(
+            "#!/bin/sh\nset -eu\nn=$(($(/bin/cat \"{counter}\") + 1))\nprintf '%s' \"$n\" > \"{counter}\"\ndir=\"{parent}/h0000$n\"\nmkdir -m 0700 \"$dir\"\nprintf '{{\"directory\":\"%s\"}}\\n' \"$dir\"\n/bin/cat >/dev/null\n/bin/rm -rf \"$dir\"\n",
+            counter = counter.display(),
+            parent = parent.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&provider_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let scratch_config = cowshed_core::runtime::scratch::ScratchProviderConfig::new(
+        vec!["/bin/sh".into(), "provider.sh".into()],
+        main.clone(),
+        "main".into(),
+        None,
+        None,
+    );
+
+    let handle = workspace.supervisor_with_scratch(false, scratch_config.clone());
+    let probe = format!(
+        "printf 'MARK=%s TMPDIR=%s\\n' \"$WARM_MARK\" \"$TMPDIR\" && printf ok > \"$TMPDIR/f\" && if /bin/cat \"{}/secret\" >/dev/null 2>&1; then printf 'SIB=allowed\\n'; else printf 'SIB=denied\\n'; fi",
+        sibling.display()
+    );
+    let first = handle
+        .exec(None, None, sh(&probe), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let first_info = handle.wait(first).await.unwrap();
+    let first_out =
+        String::from_utf8_lossy(&read_stream(&handle, &first_info, StreamKind::Stdout).await)
+            .into_owned();
+    let first_err =
+        String::from_utf8_lossy(&read_stream(&handle, &first_info, StreamKind::Stderr).await)
+            .into_owned();
+    assert_eq!(
+        first_info.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "stdout={first_out} stderr={first_err}"
+    );
+    let first_dir = parent.join("h00001");
+    assert!(
+        first_out.contains(&format!("MARK=activated TMPDIR={}\n", first_dir.display())),
+        "stdout={first_out} stderr={first_err}"
+    );
+    assert!(first_out.contains("SIB=denied\n"), "{first_out}");
+    assert!(
+        !first_err.contains("scratch provider"),
+        "unexpected scratch fallback on stderr: {first_err}"
+    );
+    assert_eq!(workspace.activations(), 1);
+
+    // Second command reuses the same warm host and same scratch directory.
+    let second = handle
+        .exec(
+            None,
+            None,
+            sh("printf '%s' \"$TMPDIR\""),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let second_info = handle.wait(second).await.unwrap();
+    let second_out =
+        String::from_utf8_lossy(&read_stream(&handle, &second_info, StreamKind::Stdout).await)
+            .into_owned();
+    assert_eq!(second_out, first_dir.display().to_string());
+    assert_eq!(workspace.activations(), 1);
+
+    handle
+        .retire(cowshed_core::runtime::supervisor::NxDaemonRetirement::Recorded)
+        .await
+        .unwrap();
+
+    // A second supervisor with a fresh host lease adopts `activation.json` without re-evaluating
+    // `.envrc`, proving the per-host scratch path never entered `inherited_baseline`.
+    let second_supervisor = workspace.supervisor_with_scratch(false, scratch_config);
+    let third = second_supervisor
+        .exec(None, None, sh(&probe), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let third_info = second_supervisor.wait(third).await.unwrap();
+    let third_out = String::from_utf8_lossy(
+        &read_stream(&second_supervisor, &third_info, StreamKind::Stdout).await,
+    )
+    .into_owned();
+    let second_dir = parent.join("h00002");
+    assert!(
+        third_out.contains(&format!("MARK=activated TMPDIR={}\n", second_dir.display())),
+        "{third_out}"
+    );
+    assert!(third_out.contains("SIB=denied\n"), "{third_out}");
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "second supervisor must adopt activation.json without re-evaluating"
+    );
+    second_supervisor
+        .retire(cowshed_core::runtime::supervisor::NxDaemonRetirement::Recorded)
+        .await
+        .unwrap();
 }

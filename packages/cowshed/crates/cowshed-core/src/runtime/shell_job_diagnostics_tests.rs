@@ -194,6 +194,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                     "",
                     &std::env::temp_dir().join("cowshed-diagnostics-profiles"),
                 ),
+                scratch: None,
                 read_only: false,
                 environment: BTreeMap::new(),
                 shared_daemons: Vec::new(),

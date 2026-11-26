@@ -314,6 +314,11 @@ impl<A: Activator> ShellPool<A> {
         }
     }
 
+    /// The activator this pool spawns and activates hosts with.
+    pub(super) fn activator(&self) -> &A {
+        &self.activator
+    }
+
     /// How this pool's acquires were answered so far.
     pub fn counts(&self) -> PoolCounts {
         PoolCounts {

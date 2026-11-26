@@ -46,8 +46,18 @@ const EXIT_SYSTEM: i32 = 71;
 pub(super) struct Invocation {
     pub(super) profile: PathBuf,
     pub(super) build_volume: Option<PathBuf>,
+    pub(super) scratch_dir: Option<PathBuf>,
+    pub(super) scratch_parent: Option<PathBuf>,
     /// The command and its arguments: never empty.
     pub(super) command: Vec<OsString>,
+}
+
+/// The parameter names a launcher accepts with `-D NAME=<path>`.
+#[derive(Clone, Copy)]
+pub(in crate::sandbox) struct Parameters<'a> {
+    pub(in crate::sandbox) build_volume: &'a str,
+    pub(in crate::sandbox) scratch_dir: &'a str,
+    pub(in crate::sandbox) scratch_parent: &'a str,
 }
 
 /// A command line that is not a launch.
@@ -65,14 +75,15 @@ impl fmt::Display for Usage {
 }
 
 /// The launch `arguments` name: a launcher's whole command line, a binary's after [`VERB`].
-/// `parameter` is the one name a `-D` may bind.
 pub(super) fn parse(
     arguments: impl IntoIterator<Item = OsString>,
-    parameter: &str,
+    parameters: Parameters<'_>,
 ) -> Result<Invocation, Usage> {
     let mut arguments = arguments.into_iter();
     let mut profile = None;
     let mut build_volume = None;
+    let mut scratch_dir = None;
+    let mut scratch_parent = None;
     loop {
         let Some(option) = arguments.next() else {
             return Err(Usage("no `--` before the command"));
@@ -89,17 +100,26 @@ pub(super) fn parse(
             }
         } else if option == "-D" {
             let binding = value.as_bytes();
-            let Some(name) = binding
-                .strip_prefix(parameter.as_bytes())
-                .and_then(|rest| rest.strip_prefix(b"="))
-            else {
-                return Err(Usage("a parameter the profile format does not know"));
+            let strip = |name: &str| {
+                binding
+                    .strip_prefix(name.as_bytes())
+                    .and_then(|rest| rest.strip_prefix(b"="))
+                    .map(|rest| PathBuf::from(OsString::from_vec(rest.to_vec())))
             };
-            if build_volume
-                .replace(PathBuf::from(OsString::from_vec(name.to_vec())))
-                .is_some()
-            {
-                return Err(Usage("a parameter bound twice"));
+            if let Some(path) = strip(parameters.build_volume) {
+                if build_volume.replace(path).is_some() {
+                    return Err(Usage("a parameter bound twice"));
+                }
+            } else if let Some(path) = strip(parameters.scratch_dir) {
+                if scratch_dir.replace(path).is_some() {
+                    return Err(Usage("a parameter bound twice"));
+                }
+            } else if let Some(path) = strip(parameters.scratch_parent) {
+                if scratch_parent.replace(path).is_some() {
+                    return Err(Usage("a parameter bound twice"));
+                }
+            } else {
+                return Err(Usage("a parameter the profile format does not know"));
             }
         } else {
             return Err(Usage("an option this launcher does not know"));
@@ -115,6 +135,8 @@ pub(super) fn parse(
     Ok(Invocation {
         profile,
         build_volume,
+        scratch_dir,
+        scratch_parent,
         command,
     })
 }
@@ -122,22 +144,22 @@ pub(super) fn parse(
 /// Run this process as a launcher when its first argument is [`VERB`]: the exit code of a
 /// launch that failed, or `None` when this process is not a launcher. A launch that succeeds
 /// never returns.
-pub(in crate::sandbox) fn dispatch(parameter: &str) -> Option<i32> {
+pub(in crate::sandbox) fn dispatch(parameters: Parameters<'_>) -> Option<i32> {
     let mut arguments = std::env::args_os().skip(1);
     if arguments.next()? != VERB {
         return None;
     }
-    Some(run(arguments, parameter))
+    Some(run(arguments, parameters))
 }
 
 /// Run this process, which is a launcher and nothing else: the exit code of a launch that
 /// failed. A launch that succeeds never returns.
-pub(in crate::sandbox) fn main(parameter: &str) -> i32 {
-    run(std::env::args_os().skip(1), parameter)
+pub(in crate::sandbox) fn main(parameters: Parameters<'_>) -> i32 {
+    run(std::env::args_os().skip(1), parameters)
 }
 
-fn run(arguments: impl Iterator<Item = OsString>, parameter: &str) -> i32 {
-    let invocation = match parse(arguments, parameter) {
+fn run(arguments: impl Iterator<Item = OsString>, parameters: Parameters<'_>) -> i32 {
+    let invocation = match parse(arguments, parameters) {
         Ok(invocation) => invocation,
         Err(usage) => {
             cowshed_os::eprintln!("cowshed: {usage}");
@@ -160,7 +182,14 @@ fn run(arguments: impl Iterator<Item = OsString>, parameter: &str) -> i32 {
     };
     if profile.build_volume && invocation.build_volume.is_none() {
         return refused(&format_args!(
-            "it names a build volume and the launch binds none (-D {parameter}=<path>)"
+            "it names a build volume and the launch binds none (-D {}=<path>)",
+            parameters.build_volume
+        ));
+    }
+    if profile.scratch_dir && invocation.scratch_dir.is_none() {
+        return refused(&format_args!(
+            "it names a scratch directory and the launch binds none (-D {}=<path>)",
+            parameters.scratch_dir
         ));
     }
     let failure = enter(&profile, &invocation);
@@ -238,6 +267,7 @@ fn confine(profile: &Profile, invocation: &Invocation) -> Result<Command, Launch
         .chain(profile.sockets.iter().map(PathBuf::from))
         .collect();
     reachable.extend(invocation.build_volume.clone());
+    reachable.extend(invocation.scratch_dir.clone());
     let mut hidden: Vec<PathBuf> = profile.masks.iter().map(PathBuf::from).collect();
     hidden.push(mounts::user_runtime_directory(uid));
     mounts::enter(&mounts::masks(&hidden, &reachable))?;
@@ -265,6 +295,18 @@ fn confine(profile: &Profile, invocation: &Invocation) -> Result<Command, Launch
             &ruleset,
             abi,
             volume,
+            Scope::Subtree,
+            Access::ReadWrite,
+            exec,
+        )?;
+    }
+    if profile.scratch_dir
+        && let Some(scratch) = &invocation.scratch_dir
+    {
+        allow(
+            &ruleset,
+            abi,
+            scratch,
             Scope::Subtree,
             Access::ReadWrite,
             exec,
@@ -495,7 +537,11 @@ pub(super) fn elf_interpreter(
 mod tests {
     use super::*;
 
-    const PARAMETER: &str = "BUILD_VOLUME";
+    const PARAMETERS: Parameters<'static> = Parameters {
+        build_volume: "BUILD_VOLUME",
+        scratch_dir: "SCRATCH_DIR",
+        scratch_parent: "SCRATCH_PARENT",
+    };
 
     fn arguments(arguments: &[&str]) -> Vec<OsString> {
         arguments.iter().map(OsString::from).collect()
@@ -506,11 +552,13 @@ mod tests {
         assert_eq!(
             parse(
                 arguments(&["-f", "/s/run/profiles/a.sb", "--", "true"]),
-                PARAMETER
+                PARAMETERS
             ),
             Ok(Invocation {
                 profile: PathBuf::from("/s/run/profiles/a.sb"),
                 build_volume: None,
+                scratch_dir: None,
+                scratch_parent: None,
                 command: arguments(&["true"]),
             })
         );
@@ -519,6 +567,10 @@ mod tests {
                 arguments(&[
                     "-D",
                     "BUILD_VOLUME=/m/.build/o/r/01=23",
+                    "-D",
+                    "SCRATCH_DIR=/s/h00001",
+                    "-D",
+                    "SCRATCH_PARENT=/s",
                     "-f",
                     "a.sb",
                     "--",
@@ -527,11 +579,13 @@ mod tests {
                     "echo -- -f",
                     "--",
                 ]),
-                PARAMETER
+                PARAMETERS
             ),
             Ok(Invocation {
                 profile: PathBuf::from("a.sb"),
                 build_volume: Some(PathBuf::from("/m/.build/o/r/01=23")),
+                scratch_dir: Some(PathBuf::from("/s/h00001")),
+                scratch_parent: Some(PathBuf::from("/s")),
                 command: arguments(&["sh", "-c", "echo -- -f", "--"]),
             }),
             "everything after the first `--` is the command's"
@@ -578,7 +632,7 @@ mod tests {
             ),
             (&["true"][..], "an option without its value"),
         ] {
-            let usage = parse(arguments(line), PARAMETER).unwrap_err();
+            let usage = parse(arguments(line), PARAMETERS).unwrap_err();
             assert_eq!(usage, Usage(why), "{line:?}");
             assert!(usage.to_string().contains("-f <profile> --"), "{usage}");
         }

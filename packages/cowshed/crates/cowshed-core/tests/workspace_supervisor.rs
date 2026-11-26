@@ -565,6 +565,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+        scratch: None,
         host_job_path: cowshed_core::runtime::HostJobPath::Host,
     }
 }
@@ -15154,6 +15155,17 @@ async fn host_controller_scratch_provider_supplies_isolated_tmpdir() {
     write_main_scratch_toml(&main, &["/bin/sh", "provider.sh"]);
 
     supervisor_config.sandbox.main_mount = Some(main.clone());
+    let main_config = cowshed_core::storage::bootstrap::main_cowshed_config(&main).unwrap();
+    let scratch_decl = main_config
+        .scratch()
+        .expect("[scratch] parsed from main's .cowshed.toml");
+    supervisor_config.scratch = Some(cowshed_core::runtime::scratch::ScratchProviderConfig::new(
+        scratch_decl.provider().to_vec(),
+        main.clone(),
+        supervisor_config.authority.workspace.as_str().to_owned(),
+        None,
+        None,
+    ));
     std::fs::create_dir_all(&supervisor_config.sandbox.home).unwrap();
     std::fs::create_dir_all(&supervisor_config.sandbox.exec_temp_dir).unwrap();
     std::fs::create_dir_all(supervisor_config.workspace_root.join(".cowshed/bin")).unwrap();
@@ -15263,6 +15275,18 @@ async fn host_controller_scratch_provider_fallback_reports_reason_once() {
         write_main_scratch_toml(&main, &["/bin/sh", "provider.sh"]);
 
         supervisor_config.sandbox.main_mount = Some(main.clone());
+        let main_config = cowshed_core::storage::bootstrap::main_cowshed_config(&main).unwrap();
+        let scratch_decl = main_config
+            .scratch()
+            .expect("[scratch] parsed from main's .cowshed.toml");
+        supervisor_config.scratch =
+            Some(cowshed_core::runtime::scratch::ScratchProviderConfig::new(
+                scratch_decl.provider().to_vec(),
+                main.clone(),
+                supervisor_config.authority.workspace.as_str().to_owned(),
+                None,
+                None,
+            ));
         std::fs::create_dir_all(&supervisor_config.sandbox.home).unwrap();
         std::fs::create_dir_all(&supervisor_config.sandbox.exec_temp_dir).unwrap();
         std::fs::create_dir_all(supervisor_config.workspace_root.join(".cowshed/bin")).unwrap();

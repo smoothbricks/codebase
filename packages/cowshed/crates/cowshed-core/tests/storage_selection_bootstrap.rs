@@ -1925,3 +1925,30 @@ fn land_and_doc_declare_the_route_and_refuse_what_it_could_not_run() {
         assert!(error.contains(expected), "{input:?}: {error}");
     }
 }
+
+#[test]
+fn scratch_provider_declaration_accepts_literal_argv_and_refuses_slots_or_empty() {
+    let config = parse_cowshed_config(
+        "[scratch]\nprovider = [\"bun\", \"packages/tool/scratch-provider.js\"]\n",
+    )
+    .unwrap();
+    let scratch = config.scratch().expect("[scratch] parsed");
+    assert_eq!(
+        scratch.provider(),
+        ["bun", "packages/tool/scratch-provider.js"]
+    );
+    assert!(parse_cowshed_config("").unwrap().scratch().is_none());
+
+    for (input, expected) in [
+        ("[scratch]\nprovider = []\n", "at least its program"),
+        ("[scratch]\nprovider = [\"\"]\n", "must not be empty"),
+        (
+            "[scratch]\nprovider = [\"sh\", \"{workspace}\"]\n",
+            "takes no slots",
+        ),
+        ("[scratch]\nunknown = 1\n", "unknown field `unknown`"),
+    ] {
+        let error = parse_cowshed_config(input).expect_err(input).to_string();
+        assert!(error.contains(expected), "{input:?}: {error}");
+    }
+}

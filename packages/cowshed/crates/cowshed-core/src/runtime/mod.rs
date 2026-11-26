@@ -35,6 +35,7 @@ pub mod project;
 pub mod ref_lock;
 pub mod ref_turn;
 mod retirement_refusal;
+pub mod scratch;
 pub mod shell_host;
 pub mod shell_inherit;
 mod shell_job;

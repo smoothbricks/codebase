@@ -150,6 +150,9 @@ pub(super) struct Profile {
     pub(super) rules: Vec<Rule>,
     /// Whether the launch binds a build volume, read-write as a subtree.
     pub(super) build_volume: bool,
+    /// Whether the launch binds a per-host scratch directory, read-write as a subtree.
+    #[serde(default)]
+    pub(super) scratch_dir: bool,
     /// Directories hidden behind an empty read-only tmpfs in the launch's mount namespace: what
     /// lies there is controller sockets no job may connect to. Landlock at ABI 7 does not decide
     /// `connect(2)` on a pathname socket, so hiding the name is what closes it. Every rule path
@@ -225,6 +228,7 @@ mod tests {
                 },
             ],
             build_volume: true,
+            scratch_dir: false,
             masks: vec!["/store/run".into()],
             sockets: vec!["/nix/var/nix/daemon-socket/socket".into()],
             gateway: Some("/store/run/gateway/0123.sock".into()),

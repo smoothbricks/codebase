@@ -237,6 +237,9 @@ pub struct WorkspaceSupervisorConfig {
     /// How long the shed may go unused before the keeper stops its Nx daemon: main's
     /// `.cowshed.toml` `[nx] daemon_idle` (04_sandbox.md, "The Nx daemon stays on").
     pub nx_daemon_idle: NxDaemonIdle,
+    /// Host-side scratch provider declared in main's `.cowshed.toml` `[scratch]`
+    /// (04_sandbox.md, 06_cli.md). `None` keeps the store `TMPDIR`.
+    pub scratch: Option<super::scratch::ScratchProviderConfig>,
     /// The host directories appended to a shell-less job's bootstrap `PATH`.
     pub host_job_path: HostJobPath,
 }
@@ -434,6 +437,7 @@ impl Default for WorkspaceSupervisorConfig {
             build_volume_released: None,
             memory_pressure: crate::calm_pressure::calm(),
             nx_daemon_idle: NxDaemonIdle::DEFAULT,
+            scratch: None,
             host_job_path: HostJobPath::Host,
         }
     }
@@ -520,6 +524,10 @@ struct RenderedPolicy {
 #[derive(Clone, Debug)]
 pub struct ChildProfile {
     profile: SeatbeltProfile,
+    /// Second profile variant per revision carrying the `-D SCRATCH_DIR` / `-D SCRATCH_PARENT`
+    /// rules; only written to disk when a host or one-shot child actually acquires a scratch
+    /// directory.
+    scratch_profile: SeatbeltProfile,
     directory: PathBuf,
     /// The launch this profile makes, digested once when it is rendered: a warm command is
     /// keyed by it and launches nothing, so it writes no file (11_shell.md, "One spare and a
@@ -528,11 +536,16 @@ pub struct ChildProfile {
 }
 
 impl ChildProfile {
-    fn new(profile: SeatbeltProfile, sandbox: &SandboxConfig) -> Self {
+    fn new(
+        profile: SeatbeltProfile,
+        scratch_profile: SeatbeltProfile,
+        sandbox: &SandboxConfig,
+    ) -> Self {
         let directory = sandbox.profile_directory();
         Self {
             planned: ProfileLaunch::planned(&directory, &profile),
             profile,
+            scratch_profile,
             directory,
         }
     }
@@ -543,6 +556,7 @@ impl ChildProfile {
         let profile = SeatbeltProfile::unparameterized(text);
         Self {
             planned: ProfileLaunch::planned(directory, &profile),
+            scratch_profile: profile.clone(),
             profile,
             directory: directory.to_owned(),
         }
@@ -571,6 +585,21 @@ impl ChildProfile {
             )
         })
     }
+
+    /// How a launch with a provider-supplied scratch directory is told the scratch profile
+    /// variant, binding `-D SCRATCH_DIR` and `-D SCRATCH_PARENT` at launch.
+    pub(super) fn launch_with_scratch(&self, scratch_dir: &Path) -> Result<ProfileLaunch> {
+        ProfileLaunch::write_with_scratch(&self.directory, &self.scratch_profile, scratch_dir)
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot write the sandbox profile into {}: {error}",
+                        self.directory.display()
+                    ),
+                    "check the store's run directory exists and is yours",
+                )
+            })
+    }
 }
 
 impl SandboxPolicy {
@@ -589,16 +618,21 @@ impl SandboxPolicy {
         let render = |sandbox: &SandboxConfig, role| {
             seatbelt_profile(sandbox, role).map_err(map_sandbox_error)
         };
+        let render_scratch = |sandbox: &SandboxConfig, role| {
+            crate::sandbox::seatbelt_profile_with_scratch(sandbox, role).map_err(map_sandbox_error)
+        };
         // The trusted-supervisor role runs nothing, but a sandbox that cannot compile in it is
         // not one this supervisor may hold.
         render(&ceiling, SandboxProfileRole::TrustedSupervisor)?;
         Ok(Self(std::sync::Arc::new(RenderedPolicy {
             ceiling_child: ChildProfile::new(
                 render(&ceiling, SandboxProfileRole::ExecutedChild)?,
+                render_scratch(&ceiling, SandboxProfileRole::ExecutedChild)?,
                 &ceiling,
             ),
             read_only_child: ChildProfile::new(
                 render(&read_only, SandboxProfileRole::ExecutedChild)?,
+                render_scratch(&read_only, SandboxProfileRole::ExecutedChild)?,
                 &read_only,
             ),
             ceiling,
@@ -1641,6 +1675,16 @@ fn one_shot_plan(
     cwd: PathBuf,
     argv: Vec<OsString>,
 ) -> Result<SpawnPlan> {
+    one_shot_plan_with_scratch(sandbox, profile, None, cwd, argv)
+}
+
+fn one_shot_plan_with_scratch(
+    sandbox: &SandboxConfig,
+    profile: &ChildProfile,
+    scratch_dir: Option<&Path>,
+    cwd: PathBuf,
+    argv: Vec<OsString>,
+) -> Result<SpawnPlan> {
     if sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly
         && let Some(shell) = &sandbox.capabilities.contribution.shell
     {
@@ -1652,12 +1696,12 @@ fn one_shot_plan(
             "configure shell_host or run read-only commands through the cowshed CLI",
         ));
     }
-    let mut plan = plan_exec_under(
-        SandboxExecRequest { argv, cwd },
-        sandbox,
-        &profile.launch()?,
-    )
-    .map_err(map_exec_error)?;
+    let launch = match scratch_dir {
+        Some(directory) => profile.launch_with_scratch(directory)?,
+        None => profile.launch()?,
+    };
+    let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, &launch)
+        .map_err(map_exec_error)?;
     if let Some(shell) = &sandbox.capabilities.contribution.shell {
         wrap_one_shot(&mut plan, shell);
     }
@@ -2816,6 +2860,9 @@ fn sandboxed_command(
 #[derive(Default)]
 pub struct SystemSpawnSink {
     shells: Option<super::shell_job::WorkspaceShells>,
+    /// Per-supervisor scratch provider, if `[scratch] provider` is declared in main's
+    /// `.cowshed.toml`.
+    scratch: Option<std::sync::Arc<super::scratch::ScratchClient>>,
     /// What the platform admits each job's kernel membership from.
     memberships: platform::MembershipAdmissions,
 }
@@ -2826,8 +2873,28 @@ impl SystemSpawnSink {
         program: super::shell_host::ShellHostProgram,
         config: super::shell_pool::ShellPoolConfig,
     ) -> Self {
+        Self::with_shell_host_and_scratch(program, config, None)
+    }
+
+    fn with_shell_host_and_scratch(
+        program: super::shell_host::ShellHostProgram,
+        config: super::shell_pool::ShellPoolConfig,
+        scratch: Option<std::sync::Arc<super::scratch::ScratchClient>>,
+    ) -> Self {
         Self {
-            shells: Some(super::shell_job::WorkspaceShells::new(program, config)),
+            shells: Some(super::shell_job::WorkspaceShells::new(
+                program,
+                config,
+                scratch.clone(),
+            )),
+            scratch,
+            ..Self::default()
+        }
+    }
+
+    fn with_scratch(scratch: Option<std::sync::Arc<super::scratch::ScratchClient>>) -> Self {
+        Self {
+            scratch,
             ..Self::default()
         }
     }
@@ -2860,6 +2927,7 @@ impl SpawnSink for SystemSpawnSink {
             request.clone(),
             placement.clone(),
             self.shells.is_some(),
+            self.scratch.clone(),
         ))
         .await?;
         match prepared {
@@ -2887,6 +2955,7 @@ impl SpawnSink for SystemSpawnSink {
                         command,
                         cwd,
                         profile,
+                        sandbox: sandbox.clone(),
                         read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
                         workspace_mount: sandbox.workspace_mount.clone(),
                         envrc_directory: shell_directory(sandbox),
@@ -2919,8 +2988,44 @@ impl SpawnSink for SystemSpawnSink {
                 )
                 .await
             }
+            PreparedSpawn::DeferredOneShot(deferred) => {
+                let PreparedDeferredOneShot {
+                    sandbox,
+                    profile,
+                    cwd,
+                    argv,
+                    environment,
+                    monitor,
+                    scratch,
+                } = *deferred;
+                Ok(spawn_deferred_one_shot(
+                    DeferredOneShot {
+                        job_id: request.job_id,
+                        sandbox,
+                        profile,
+                        cwd,
+                        argv,
+                        environment,
+                        placement,
+                        monitor,
+                        scratch,
+                    },
+                    events,
+                ))
+            }
         }
     }
+}
+
+/// Boxed payload of [`PreparedSpawn::DeferredOneShot`] so the enum stays compact.
+struct PreparedDeferredOneShot {
+    sandbox: SandboxConfig,
+    profile: ChildProfile,
+    cwd: PathBuf,
+    argv: Vec<OsString>,
+    environment: BTreeMap<OsString, OsString>,
+    monitor: ProcessMonitor,
+    scratch: std::sync::Arc<super::scratch::ScratchClient>,
 }
 
 /// A spawn as [`prepare_spawn`] made it ready.
@@ -2945,6 +3050,9 @@ enum PreparedSpawn {
         environment: BTreeMap<OsString, OsString>,
         monitor: ProcessMonitor,
     },
+    /// A sandboxed one-shot child that asks the scratch provider off the supervisor actor before
+    /// launching, so a slow or hung provider never blocks the actor or other jobs.
+    DeferredOneShot(Box<PreparedDeferredOneShot>),
 }
 
 /// Prepare `request`'s spawn host-side, all but the spawn itself: the contained cwd, the
@@ -2958,6 +3066,7 @@ async fn prepare_spawn(
     request: ProcessSpawnRequest,
     placement: CommandPlacement,
     warm: bool,
+    scratch: Option<std::sync::Arc<super::scratch::ScratchClient>>,
 ) -> Result<PreparedSpawn> {
     let cwd = crate::exec::contained_cwd(&request.policy.ceiling().workspace_mount, &request.cwd)
         .map_err(map_exec_error)?;
@@ -3037,6 +3146,19 @@ async fn prepare_spawn(
             .then(|| environment.get(OsStr::new("PATH")))
             .flatten();
         refuse_unstartable(program, &cwd, path.map(OsString::as_os_str))?;
+    }
+    if let Some(scratch) = scratch {
+        return Ok(PreparedSpawn::DeferredOneShot(Box::new(
+            PreparedDeferredOneShot {
+                sandbox: sandbox.clone(),
+                profile: profile.clone(),
+                cwd,
+                argv,
+                environment,
+                monitor,
+                scratch,
+            },
+        )));
     }
     let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
     Ok(PreparedSpawn::OneShot {
@@ -3126,12 +3248,56 @@ fn refuse_unstartable(program: &OsStr, cwd: &Path, path: Option<&OsStr>) -> Resu
 /// `placement` has placed it: at its class's nice, or in the job's cgroup, which it enters before
 /// the hold.
 async fn spawn_fenced(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     job_id: JobId,
     placement: CommandPlacement,
     monitor: ProcessMonitor,
     events: mpsc::Sender<ProcessEvent>,
 ) -> Result<Box<dyn RunningProcess>> {
+    let (stdin_sender, stdin_receiver) = mpsc::channel(1);
+    let (fence, process, nice) = spawn_fenced_child(
+        command,
+        job_id,
+        &placement,
+        &monitor,
+        stdin_receiver,
+        None,
+        events.clone(),
+    )
+    .await?;
+    let watcher = fence.clone();
+    tokio::spawn(async move {
+        let event = match watcher.exited().await {
+            Ok(exit) => ProcessEvent::Exited { job_id, exit },
+            Err(error) => {
+                // The child's end was not observed, so it may still be running. Kill the
+                // group before reporting: a job that cannot be observed must not be left
+                // alive behind a terminal record.
+                let _ = watcher.signal(libc::SIGKILL);
+                ProcessEvent::WaitFailed { job_id, error }
+            }
+        };
+        let _ = events.send(event).await;
+    });
+    Ok(Box::new(SystemRunningProcess {
+        fence,
+        process,
+        stdin: StdinLane::new(stdin_sender),
+        nice,
+        placement,
+        monitor,
+    }))
+}
+
+async fn spawn_fenced_child(
+    mut command: tokio::process::Command,
+    job_id: JobId,
+    placement: &CommandPlacement,
+    monitor: &ProcessMonitor,
+    stdin_receiver: mpsc::Receiver<SystemStdin>,
+    stderr_prefix: Option<Bytes>,
+    events: mpsc::Sender<ProcessEvent>,
+) -> Result<(ChildFence, OwnedProcess, Option<i32>)> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3215,7 +3381,6 @@ async fn spawn_fenced(
         .ok_or_else(|| CowshedError::internal("spawned process has no stderr pipe"))
         .and_then(|stderr| tokio::process::ChildStderr::from_std(stderr).map_err(pipe))?;
     let fence = spawned.adopt();
-    let (stdin_sender, stdin_receiver) = mpsc::channel(1);
     tokio::spawn(run_system_stdin(
         job_id,
         stdin,
@@ -3228,34 +3393,345 @@ async fn spawn_fenced(
         stdout,
         events.clone(),
     ));
-    tokio::spawn(run_system_output(
+    tokio::spawn(run_system_output_with_prefix(
         job_id,
         StreamKind::Stderr,
         stderr,
-        events.clone(),
+        stderr_prefix,
+        events,
     ));
-    let watcher = fence.clone();
-    tokio::spawn(async move {
-        let event = match watcher.exited().await {
-            Ok(exit) => ProcessEvent::Exited { job_id, exit },
-            Err(error) => {
-                // The child's end was not observed, so it may still be running. Kill the
-                // group before reporting: a job that cannot be observed must not be left
-                // alive behind a terminal record.
-                let _ = watcher.signal(libc::SIGKILL);
-                ProcessEvent::WaitFailed { job_id, error }
+    Ok((fence, process, nice))
+}
+
+struct DeferredOneShot {
+    job_id: JobId,
+    sandbox: SandboxConfig,
+    profile: ChildProfile,
+    cwd: PathBuf,
+    argv: Vec<OsString>,
+    environment: BTreeMap<OsString, OsString>,
+    placement: CommandPlacement,
+    monitor: ProcessMonitor,
+    scratch: std::sync::Arc<super::scratch::ScratchClient>,
+}
+
+enum DeferredControlState {
+    Pending { pending_signals: Vec<ProcessSignal> },
+    Running { fence: ChildFence },
+    Finished,
+}
+
+struct DeferredOneShotControl {
+    state: std::sync::Mutex<DeferredControlState>,
+    signalled: tokio::sync::Notify,
+}
+
+impl DeferredOneShotControl {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(DeferredControlState::Pending {
+                pending_signals: Vec::new(),
+            }),
+            signalled: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn signal(&self, placement: &CommandPlacement, signal: ProcessSignal) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &mut *state {
+            DeferredControlState::Pending { pending_signals } => {
+                pending_signals.push(signal);
+                self.signalled.notify_waiters();
+                Ok(())
+            }
+            DeferredControlState::Running { fence } => placement.signal(fence, signal),
+            DeferredControlState::Finished => Ok(()),
+        }
+    }
+
+    fn publish(&self, fence: ChildFence, placement: &CommandPlacement) -> Result<()> {
+        let pending = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match std::mem::replace(
+                &mut *state,
+                DeferredControlState::Running {
+                    fence: fence.clone(),
+                },
+            ) {
+                DeferredControlState::Pending { pending_signals } => pending_signals,
+                other => {
+                    *state = other;
+                    Vec::new()
+                }
             }
         };
-        let _ = events.send(event).await;
-    });
-    Ok(Box::new(SystemRunningProcess {
-        fence,
-        process,
+        for signal in pending {
+            placement.signal(&fence, signal)?;
+        }
+        Ok(())
+    }
+
+    fn has_pending_signal(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        matches!(
+            &*state,
+            DeferredControlState::Pending { pending_signals } if !pending_signals.is_empty()
+        )
+    }
+
+    fn finish(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = DeferredControlState::Finished;
+    }
+}
+
+struct DeferredOneShotProcess {
+    stdin: StdinLane,
+    control: std::sync::Arc<DeferredOneShotControl>,
+    _release: oneshot::Sender<()>,
+    placement: CommandPlacement,
+    monitor: ProcessMonitor,
+}
+
+impl RunningProcess for DeferredOneShotProcess {
+    fn membership(&self) -> Option<&JobMembership> {
+        self.placement.membership()
+    }
+
+    fn process(&self) -> Option<&OwnedProcess> {
+        None
+    }
+
+    fn nice(&self) -> Option<i32> {
+        None
+    }
+
+    fn observations(&self) -> Option<&ProcessMonitor> {
+        Some(&self.monitor)
+    }
+
+    fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
+        self.stdin.try_write(bytes)
+    }
+
+    fn close_stdin(&mut self) -> bool {
+        self.stdin.close()
+    }
+
+    fn end_stdin(&mut self) {
+        self.stdin.end();
+    }
+
+    fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
+        self.control.signal(&self.placement, signal)
+    }
+}
+
+fn spawn_deferred_one_shot(
+    deferred: DeferredOneShot,
+    events: mpsc::Sender<ProcessEvent>,
+) -> Box<dyn RunningProcess> {
+    let (stdin_sender, stdin_receiver) = mpsc::channel(1);
+    let control = std::sync::Arc::new(DeferredOneShotControl::new());
+    let (release, released) = oneshot::channel();
+    let placement = deferred.placement.clone();
+    let monitor = deferred.monitor.clone();
+    tokio::spawn(run_deferred_one_shot(
+        deferred,
+        stdin_receiver,
+        std::sync::Arc::clone(&control),
+        released,
+        events,
+    ));
+    Box::new(DeferredOneShotProcess {
         stdin: StdinLane::new(stdin_sender),
-        nice,
+        control,
+        _release: release,
         placement,
         monitor,
-    }))
+    })
+}
+
+async fn run_deferred_one_shot(
+    mut deferred: DeferredOneShot,
+    stdin_receiver: mpsc::Receiver<SystemStdin>,
+    control: std::sync::Arc<DeferredOneShotControl>,
+    mut released: oneshot::Receiver<()>,
+    events: mpsc::Sender<ProcessEvent>,
+) {
+    let job_id = deferred.job_id;
+    let cancelled = control.signalled.notified();
+    let acquired = if control.has_pending_signal() {
+        None
+    } else {
+        tokio::select! {
+            outcome = deferred.scratch.acquire(&deferred.sandbox) => Some(outcome),
+            _ = cancelled => None,
+        }
+    };
+    let Some(acquired) = acquired else {
+        control.finish();
+        for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+            let _ = events
+                .send(ProcessEvent::OutputEof { job_id, stream })
+                .await;
+        }
+        let _ = events
+            .send(ProcessEvent::LaunchFailed {
+                job_id,
+                error: CowshedError::conflict(
+                    "job cancelled before scratch provider answered",
+                    "retry the command",
+                ),
+            })
+            .await;
+        return;
+    };
+
+    let (scratch_lease, stderr_prefix) = match acquired {
+        super::scratch::ScratchOutcome::Lease(lease) => {
+            deferred.environment.insert(
+                OsString::from("TMPDIR"),
+                lease.directory().as_os_str().to_owned(),
+            );
+            (Some(lease), None)
+        }
+        super::scratch::ScratchOutcome::Fallback { reason } => {
+            let prefix = deferred
+                .scratch
+                .take_notice(&reason, &deferred.sandbox.exec_temp_dir)
+                .map(|line| Bytes::from(format!("{line}\n")));
+            (None, prefix)
+        }
+    };
+
+    let scratch_dir = scratch_lease
+        .as_ref()
+        .map(|lease| lease.directory().to_path_buf());
+    let sandbox = deferred.sandbox;
+    let profile = deferred.profile;
+    let cwd = deferred.cwd;
+    let argv = deferred.argv;
+    let plan = off_actor::run(move || {
+        one_shot_plan_with_scratch(&sandbox, &profile, scratch_dir.as_deref(), cwd, argv)
+    })
+    .await;
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            control.finish();
+            if let Some(bytes) = stderr_prefix {
+                let _ = events
+                    .send(ProcessEvent::Output {
+                        job_id,
+                        stream: StreamKind::Stderr,
+                        bytes,
+                    })
+                    .await;
+            }
+            for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+                let _ = events
+                    .send(ProcessEvent::OutputEof { job_id, stream })
+                    .await;
+            }
+            let _ = events
+                .send(ProcessEvent::LaunchFailed { job_id, error })
+                .await;
+            if let Some(lease) = scratch_lease {
+                lease.settle().await;
+            }
+            return;
+        }
+    };
+
+    let spawned = spawn_fenced_child(
+        tokio::process::Command::from(sandboxed_command(&plan, &deferred.environment)),
+        job_id,
+        &deferred.placement,
+        &deferred.monitor,
+        stdin_receiver,
+        stderr_prefix,
+        events.clone(),
+    )
+    .await;
+    let (fence, process, nice) = match spawned {
+        Ok(parts) => parts,
+        Err(error) => {
+            control.finish();
+            for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+                let _ = events
+                    .send(ProcessEvent::OutputEof { job_id, stream })
+                    .await;
+            }
+            let _ = events
+                .send(ProcessEvent::LaunchFailed { job_id, error })
+                .await;
+            if let Some(lease) = scratch_lease {
+                lease.settle().await;
+            }
+            return;
+        }
+    };
+
+    if let Err(error) = control.publish(fence.clone(), &deferred.placement) {
+        let _ = events
+            .send(ProcessEvent::SignalFailed { job_id, error })
+            .await;
+    }
+    let _ = events
+        .send(ProcessEvent::Started {
+            job_id,
+            process,
+            nice,
+        })
+        .await;
+
+    let exited = tokio::select! {
+        result = fence.exited() => {
+            let event = match result {
+                Ok(exit) => ProcessEvent::Exited { job_id, exit },
+                Err(error) => {
+                    let _ = fence.signal(libc::SIGKILL);
+                    ProcessEvent::WaitFailed { job_id, error }
+                }
+            };
+            let _ = events.send(event).await;
+            true
+        }
+        _ = &mut released => false,
+    };
+
+    if exited {
+        // Wait until the actor finishes retiring any remaining descendants and drops the job's
+        // RunningProcess handle before releasing the leader and settling scratch.
+        let _ = released.await;
+    } else {
+        // Supervisor dropped while the child was still running; wait for it to finish before
+        // settling the scratch provider.
+        let _ = fence.wait().await;
+    }
+    control.finish();
+    if let Err(error) = fence.release() {
+        cowshed_os::eprintln!(
+            "cowshed: cannot reap the sandbox process {}: {error}",
+            fence.birth().pid()
+        );
+    }
+    if let Some(lease) = scratch_lease {
+        lease.settle().await;
+    }
 }
 
 /// Why a held one-shot spawn did not release a command.
@@ -3547,11 +4023,35 @@ pub(super) async fn run_system_stdin<W>(
 pub(super) async fn run_system_output<R>(
     job_id: JobId,
     stream: StreamKind,
-    mut reader: R,
+    reader: R,
     events: mpsc::Sender<ProcessEvent>,
 ) where
     R: AsyncRead + Unpin,
 {
+    run_system_output_with_prefix(job_id, stream, reader, None, events).await;
+}
+
+async fn run_system_output_with_prefix<R>(
+    job_id: JobId,
+    stream: StreamKind,
+    mut reader: R,
+    prefix: Option<Bytes>,
+    events: mpsc::Sender<ProcessEvent>,
+) where
+    R: AsyncRead + Unpin,
+{
+    if let Some(bytes) = prefix
+        && events
+            .send(ProcessEvent::Output {
+                job_id,
+                stream,
+                bytes,
+            })
+            .await
+            .is_err()
+    {
+        return;
+    }
     let mut buffer = vec![0_u8; PROCESS_IO_CHUNK];
     loop {
         match reader.read(&mut buffer).await {
@@ -4239,9 +4739,15 @@ impl WorkspaceSupervisor {
             config.artifacts.clone(),
             config.census.clone(),
         )?;
+        let scratch = config
+            .scratch
+            .clone()
+            .map(|scratch| std::sync::Arc::new(super::scratch::ScratchClient::new(scratch)));
         let spawner = match config.shell_host.clone() {
-            Some(program) => SystemSpawnSink::with_shell_host(program, config.shell_pool),
-            None => SystemSpawnSink::default(),
+            Some(program) => {
+                SystemSpawnSink::with_shell_host_and_scratch(program, config.shell_pool, scratch)
+            }
+            None => SystemSpawnSink::with_scratch(scratch),
         };
         Self::start_with_sinks(
             config,
@@ -13058,6 +13564,7 @@ mod lifecycle_commitment_tests {
             build_volume_released: None,
             memory_pressure: crate::calm_pressure::calm(),
             nx_daemon_idle: defaults.nx_daemon_idle,
+            scratch: None,
             host_job_path: defaults.host_job_path,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's

@@ -112,6 +112,8 @@ fn pool_key(
 pub(super) struct WorkspaceShells {
     program: ShellHostProgram,
     config: ShellPoolConfig,
+    /// Per-supervisor scratch provider, if declared in main's `.cowshed.toml`.
+    scratch: Option<Arc<super::scratch::ScratchClient>>,
     /// Cold hosts share publication, not command execution or mutable shell state; waiters see
     /// the holder's evaluation, and one that stalls is ended.
     activation: Arc<ActivationGate>,
@@ -169,6 +171,9 @@ pub(super) struct PooledSpawn<'a> {
     pub cwd: PathBuf,
     /// The executed-child profile the supervisor rendered once for its authority.
     pub profile: &'a super::supervisor::ChildProfile,
+    /// The effective sandbox configuration (used to validate a scratch provider's directory and
+    /// format the store `TMPDIR` fallback notice).
+    pub sandbox: crate::sandbox::SandboxConfig,
     pub read_only: bool,
     pub workspace_mount: PathBuf,
     /// The `.envrc` a host activates, or `None` for a workspace with no shell configuration.
@@ -185,10 +190,15 @@ pub(super) struct PooledSpawn<'a> {
 }
 
 impl WorkspaceShells {
-    pub(super) fn new(program: ShellHostProgram, config: ShellPoolConfig) -> Self {
+    pub(super) fn new(
+        program: ShellHostProgram,
+        config: ShellPoolConfig,
+        scratch: Option<Arc<super::scratch::ScratchClient>>,
+    ) -> Self {
         Self {
             program,
             config,
+            scratch,
             activation: Arc::new(ActivationGate::system()),
             pools: BTreeMap::new(),
             retired: PoolCounts::default(),
@@ -213,6 +223,7 @@ impl WorkspaceShells {
             command,
             cwd,
             profile,
+            sandbox,
             read_only,
             workspace_mount,
             envrc_directory,
@@ -251,6 +262,7 @@ impl WorkspaceShells {
                         program: self.program.clone(),
                         workspace_mount,
                         profile: profile.clone(),
+                        scratch: self.scratch.clone().map(|client| (client, sandbox)),
                         read_only,
                         environment: base,
                         shared_daemons: environment.shared_daemons.clone(),
@@ -690,10 +702,17 @@ async fn run_pooled(
         Err(error) => return Outcome::NotLaunched(error),
     };
     let mut checkout = match acquired {
-        Acquired::Warm(checkout) => checkout,
+        Acquired::Warm(mut checkout) => {
+            if let Some(reason) = checkout.host_mut().fallback_reason.take() {
+                pool.activator()
+                    .report_fallback(&reason, diagnostics.as_ref())
+                    .await;
+            }
+            checkout
+        }
         Acquired::Activate(ticket) => {
             let activator = ticket.activator();
-            let mut host = match activator.spawn_host().await {
+            let mut host = match activator.spawn_host(diagnostics.as_ref()).await {
                 Ok(host) => host,
                 Err(error) => return Outcome::NotLaunched(error),
             };
@@ -847,6 +866,11 @@ pub(super) struct ExecHost {
     control: tokio::net::UnixStream,
     /// Set once the host closed its end of the control socket, or announced that it exits.
     closed: bool,
+    /// Scratch directory lease owned by this host; settled only after `fence` exits and is reaped.
+    scratch: Option<super::scratch::ScratchLease>,
+    /// Unreported fallback reason from a spare host whose scratch provider failed; reported once
+    /// on the first job served by this host if this supervisor has not yet reported that reason.
+    fallback_reason: Option<String>,
 }
 
 /// A dropped host's control socket closes with it. An idle host then exits; one activating ends
@@ -859,8 +883,12 @@ pub(super) struct ExecHost {
 /// ([`super::shell_host::DroppedHostEnd`]).
 impl Drop for ExecHost {
     fn drop(&mut self) {
+        let scratch = self.scratch.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             if self.fence.reaped() {
+                if let Some(scratch) = scratch {
+                    runtime.spawn(scratch.settle());
+                }
                 return;
             }
             let fence = self.fence.clone();
@@ -885,6 +913,11 @@ impl Drop for ExecHost {
                             "cowshed: cannot reap dropped exec host {pid}: {error}"
                         );
                     }
+                }
+                // Settle the host's scratch lease only after the host (and its process group) has
+                // exited and been reaped.
+                if let Some(scratch) = scratch {
+                    scratch.settle().await;
                 }
             });
         }
@@ -980,12 +1013,13 @@ impl ExecHost {
             }
             HostCommand::Script(script) => script_request(script),
         };
+        let mut overlay = command.overlay.clone();
+        super::scratch::push_tmpdir_overlay(&mut overlay, self.scratch.as_ref());
         let frame = frame
             .and_then(|frame| frame.bytes(command.cwd.as_os_str().as_bytes()))
             .and_then(|frame| {
                 frame.list(
-                    command
-                        .overlay
+                    overlay
                         .iter()
                         .flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()])
                         .collect::<Vec<_>>()
@@ -1249,6 +1283,12 @@ pub(super) struct HostActivator {
     workspace_mount: PathBuf,
     /// Made sure of at each host start: `cowshed gc` may have removed its file since the last.
     profile: super::supervisor::ChildProfile,
+    /// Per-supervisor scratch provider and the effective sandbox configuration for validation and
+    /// fallback notices, if `[scratch] provider` is declared in main's `.cowshed.toml`.
+    scratch: Option<(
+        Arc<super::scratch::ScratchClient>,
+        crate::sandbox::SandboxConfig,
+    )>,
     read_only: bool,
     environment: BTreeMap<OsString, OsString>,
     shared_daemons: Vec<PathBuf>,
@@ -1287,7 +1327,38 @@ impl HostActivator {
             .unwrap_or(&self.workspace_mount)
     }
 
-    async fn spawn_host(&self) -> Result<ExecHost> {
+    /// Report a scratch provider fallback reason to `stderr_lane` if this supervisor has not yet
+    /// reported it to any job.
+    async fn report_fallback(&self, reason: &str, stderr_lane: Option<&JobStderr>) {
+        if let (Some((client, sandbox)), Some(stderr)) = (&self.scratch, stderr_lane)
+            && let Some(notice) = client.take_notice(reason, &sandbox.exec_temp_dir)
+        {
+            stderr.write_line(&notice).await;
+        }
+    }
+
+    async fn spawn_host(&self, stderr_lane: Option<&JobStderr>) -> Result<ExecHost> {
+        let (scratch_lease, fallback_reason) = match &self.scratch {
+            Some((client, sandbox)) => match client.acquire(sandbox).await {
+                super::scratch::ScratchOutcome::Lease(lease) => (Some(lease), None),
+                super::scratch::ScratchOutcome::Fallback { reason } => {
+                    if let Some(stderr) = stderr_lane {
+                        if let Some(notice) = client.take_notice(&reason, &sandbox.exec_temp_dir) {
+                            stderr.write_line(&notice).await;
+                        }
+                        (None, None)
+                    } else {
+                        // A spare host has no job stderr yet; carry the reason so the first job it
+                        // serves prints the notice if this supervisor has not reported it yet.
+                        (None, Some(reason))
+                    }
+                }
+            },
+            None => (None, None),
+        };
+        let scratch_dir = scratch_lease
+            .as_ref()
+            .map(|lease| lease.directory().to_path_buf());
         let mount = self.workspace_mount.clone();
         let program = self.program.clone();
         let profile = self.profile.clone();
@@ -1298,9 +1369,13 @@ impl HostActivator {
             let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(pipe_error)?;
             let theirs_raw = theirs.as_raw_fd();
             let launcher = crate::sandbox::launcher().map_err(|error| error.report())?;
+            let launch = match scratch_dir.as_deref() {
+                Some(directory) => profile.launch_with_scratch(directory)?,
+                None => profile.launch()?,
+            };
             let mut command = std::process::Command::new(launcher.program());
             command
-                .args(profile.launch()?.args(launcher))
+                .args(launch.args(launcher))
                 .arg(&staged)
                 .args(program.arguments())
                 .env_clear()
@@ -1360,6 +1435,8 @@ impl HostActivator {
             process,
             control,
             closed: false,
+            scratch: scratch_lease,
+            fallback_reason,
         })
     }
 
@@ -1733,7 +1810,7 @@ impl Activator for HostActivator {
                 }
             },
         };
-        let mut host = match self.spawn_host().await {
+        let mut host = match self.spawn_host(stderr_lane.as_ref()).await {
             Ok(host) => host,
             Err(error) => return Activation::Broken { error },
         };

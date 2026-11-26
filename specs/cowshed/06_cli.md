@@ -837,13 +837,18 @@ after = [["sh", "tooling/land-install.sh", "{before}", "{head}"]]  # run in orde
 [doc]                          # main's copy only: `cowshed doc-commit` (02_workspaces.md)
 paths = ["*.md"]               # documentation: `*` matches any run of characters, `/` included; `?` one
 check = ["prettier", "--write"]  # optional; run with the admitted paths appended
+[scratch]                      # main's copy only: an exec host's scratch directory (04_sandbox.md)
+provider = ["tool", "scratch-provider"]  # literal argv, no `{…}` slots; offloads sandboxed scratch from SSD
 ```
 
-`[land]` and `[doc]` are read from main's checkout alone, as `[sandbox]` is: a workspace's copy is the agent's to edit.
-`turn` is a land-turn queue name (1 to 60 of `A-Z a-z 0-9 . _ -`, not starting with `.` or ending in `.ref`, so
-`<turn>.ref` is one too). `gate` and each `after` command are argv lists whose program is literal: a word spelled `{…}`
-must be one of that command's slots (`{workspace}` for the gate; `{before}` and `{head}` for an after command), and any
-other word is passed as it is. `[doc]` needs `[land]`, whose turn names the ref turn it holds.
+`[land]`, `[doc]` and `[scratch]` are read from main's checkout alone, as `[sandbox]` is: a workspace's copy is the
+agent's to edit, so the supervisor still runs no workspace code. `turn` is a land-turn queue name (1 to 60 of
+`A-Z a-z 0-9 . _ -`, not starting with `.` or ending in `.ref`, so `<turn>.ref` is one too). `gate` and each `after`
+command are argv lists whose program is literal: a word spelled `{…}` must be one of that command's slots (`{workspace}`
+for the gate; `{before}` and `{head}` for an after command), and any other word is passed as it is. `[doc]` needs
+`[land]`, whose turn names the ref turn it holds. `[scratch] provider` is a literal argv list with no `{…}` slots;
+sandboxed scratch was the bulk of host SSD write traffic, and the provider lets the repository supply a per-host scratch
+directory on storage it manages while falling back to the store `TMPDIR` on any refusal or failure (04_sandbox.md).
 
 macOS port allocation is not a configuration setting. Fixture stores allocate from a reserved fixture partition of the
 validation range; the host never assigns there. The partition bounds are defined once in code. Allocation, growth, and

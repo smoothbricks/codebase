@@ -10761,6 +10761,18 @@ self.finish_retire_intent(&workspace).await?;
         } else {
             None
         };
+        // Main's `.cowshed.toml`, the operator's, as for the sandbox's repository policy.
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let main_config = crate::storage::bootstrap::main_cowshed_config(&main_mount)?;
+        let scratch = main_config.scratch().map(|declaration| {
+            super::scratch::ScratchProviderConfig::new(
+                declaration.provider().to_vec(),
+                main_mount,
+                name.as_str().to_owned(),
+                Some(socket.clone()),
+                Some(self.layout.project().project_root.clone()),
+            )
+        });
         let mut config = super::supervisor::WorkspaceSupervisorConfig {
             authority: needed,
             owned_repo_ids: self.owned_repo_ids()?,
@@ -10860,11 +10872,8 @@ self.finish_retire_intent(&workspace).await?;
                     }
                 })
             }),
-            // Main's `.cowshed.toml`, the operator's, as for the sandbox's repository policy.
-            nx_daemon_idle: crate::storage::bootstrap::main_cowshed_config(
-                &self.workspace_mount_path(&main_name())?,
-            )?
-            .nx_daemon_idle(),
+            nx_daemon_idle: main_config.nx_daemon_idle(),
+            scratch,
             host_job_path: super::supervisor::HostJobPath::Host,
         };
         // A workspace has one supervisor, its one job allocator: when another controller

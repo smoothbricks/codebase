@@ -32,8 +32,9 @@ use std::sync::OnceLock;
 
 use super::{
     BUILD_VOLUME_PARAM, Launcher, LauncherError, MainSnapshotStore, ProfilePolicy, RunSandboxMode,
-    SandboxConfig, SandboxError, SandboxProfileRole, SeatbeltProfile, cowshed_root,
-    main_snapshot_store, shared_daemon_runtime_dir, shared_daemon_runtime_link, validate_path,
+    SCRATCH_DIR_PARAM, SCRATCH_PARENT_PARAM, SandboxConfig, SandboxError, SandboxProfileRole,
+    SeatbeltProfile, cowshed_root, main_snapshot_store, shared_daemon_runtime_dir,
+    shared_daemon_runtime_link, validate_path,
 };
 use crate::capabilities::{GrantAccess, GrantScope};
 use cowshed_gateway_types::WorkspaceEndpoint;
@@ -213,6 +214,7 @@ fn gateway_socket(config: &SandboxConfig) -> Option<PathBuf> {
 fn compile(
     policy: &ProfilePolicy<'_>,
     snapshot: &MainSnapshotStore,
+    scratch: bool,
 ) -> Result<Profile, SandboxError> {
     let config = policy.config;
     if let Some(relative) = config
@@ -367,6 +369,7 @@ fn compile(
         },
         rules,
         build_volume: config.build_volume_mount.is_some(),
+        scratch_dir: scratch,
         // Where the store's supervisors and their manager listen.
         masks: vec![utf8(&config.store_root.join("run"))?],
         sockets: policy
@@ -392,10 +395,19 @@ fn granted(access: GrantAccess) -> Option<Access> {
 /// Refuse what [`compile`] refuses, before a grant snapshot is published. Main's snapshot store
 /// only ever adds reads, so it is left unresolved here.
 pub(super) fn validate(policy: &ProfilePolicy<'_>) -> Result<(), SandboxError> {
-    compile(policy, &MainSnapshotStore::Absent).map(drop)
+    compile(policy, &MainSnapshotStore::Absent, false).map(drop)
 }
 
-pub(super) fn render(policy: ProfilePolicy<'_>) -> Result<SeatbeltProfile, SandboxError> {
+const LAUNCHER_PARAMETERS: launcher::Parameters<'static> = launcher::Parameters {
+    build_volume: BUILD_VOLUME_PARAM,
+    scratch_dir: SCRATCH_DIR_PARAM,
+    scratch_parent: SCRATCH_PARENT_PARAM,
+};
+
+pub(super) fn render(
+    policy: ProfilePolicy<'_>,
+    scratch: bool,
+) -> Result<SeatbeltProfile, SandboxError> {
     let config = policy.config;
     let snapshot = config
         .main_mount
@@ -406,7 +418,7 @@ pub(super) fn render(policy: ProfilePolicy<'_>) -> Result<SeatbeltProfile, Sandb
     if let MainSnapshotStore::Refused(warning) = &snapshot {
         cowshed_os::eprintln!("{warning}");
     }
-    let text = compile(&policy, &snapshot)?
+    let text = compile(&policy, &snapshot, scratch)?
         .to_text()
         .map_err(|_| SandboxError::InvalidPath {
             path: config.workspace_mount.clone(),
@@ -415,11 +427,12 @@ pub(super) fn render(policy: ProfilePolicy<'_>) -> Result<SeatbeltProfile, Sandb
     Ok(SeatbeltProfile {
         text,
         build_volume: config.build_volume_mount.clone(),
+        scratch,
     })
 }
 
 pub(super) fn dispatch_launcher() -> Option<i32> {
-    let code = launcher::dispatch(BUILD_VOLUME_PARAM);
+    let code = launcher::dispatch(LAUNCHER_PARAMETERS);
     if code.is_none() {
         // The first naming stands: a program that named another launcher before this keeps it.
         NAMED.get_or_init(own_launcher);
@@ -428,7 +441,7 @@ pub(super) fn dispatch_launcher() -> Option<i32> {
 }
 
 pub(super) fn launcher_main() -> i32 {
-    launcher::main(BUILD_VOLUME_PARAM)
+    launcher::main(LAUNCHER_PARAMETERS)
 }
 
 #[cfg(test)]
@@ -444,6 +457,7 @@ mod tests {
         compile(
             &profile_policy(config, role).unwrap(),
             &MainSnapshotStore::Absent,
+            false,
         )
         .unwrap()
     }
@@ -452,6 +466,7 @@ mod tests {
         compile(
             &profile_policy(config, SandboxProfileRole::ExecutedChild).unwrap(),
             &MainSnapshotStore::Absent,
+            false,
         )
         .unwrap_err()
     }
@@ -525,11 +540,11 @@ mod tests {
         assert_eq!(own.program(), Path::new("/proc/self/exe"));
         let file = Path::new("/s/run/profiles/a.sb");
         assert_eq!(
-            own.launch_arguments(file, None),
+            own.launch_arguments(file, None, None),
             ["__sandbox-exec", "-f", "/s/run/profiles/a.sb", "--"]
         );
         assert_eq!(
-            named.launch_arguments(file, None),
+            named.launch_arguments(file, None, None),
             ["-f", "/s/run/profiles/a.sb", "--"]
         );
     }
@@ -911,6 +926,7 @@ mod tests {
                 store: PathBuf::from("/Users/tester/src/widget/.cache/linked-snapshots"),
                 resolved: PathBuf::from("/volumes/build/declared/.cache/linked-snapshots"),
             },
+            false,
         )
         .unwrap();
         for path in [
@@ -920,7 +936,8 @@ mod tests {
             assert_eq!(at(&readable, path), [(Scope::Subtree, Access::Read)]);
         }
         assert!(!covered(&readable, "/Users/tester/src/widget/.cache/nx"));
-        let refused = compile(&policy, &MainSnapshotStore::Refused("warned".into())).unwrap();
+        let refused =
+            compile(&policy, &MainSnapshotStore::Refused("warned".into()), false).unwrap();
         assert!(!covered(
             &refused,
             "/Users/tester/src/widget/.cache/linked-snapshots"

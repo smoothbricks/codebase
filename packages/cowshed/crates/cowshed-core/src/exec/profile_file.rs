@@ -194,6 +194,7 @@ fn oldest_live_supervisor(run: &Path) -> io::Result<Option<SystemTime>> {
 pub struct ProfileLaunch {
     file: ProfileFile,
     build_volume: Option<PathBuf>,
+    scratch_dir: Option<PathBuf>,
 }
 
 impl ProfileLaunch {
@@ -203,6 +204,21 @@ impl ProfileLaunch {
         Ok(Self {
             file: ProfileFile::write(directory, profile.text())?,
             build_volume: profile.build_volume().map(Path::to_path_buf),
+            scratch_dir: None,
+        })
+    }
+
+    /// A launch of a scratch-enabled `profile`: bound to its build volume (if any) and to
+    /// `scratch_dir` (plus its parent) via `-D`.
+    pub(crate) fn write_with_scratch(
+        directory: &Path,
+        profile: &SeatbeltProfile,
+        scratch_dir: &Path,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            file: ProfileFile::write(directory, profile.text())?,
+            build_volume: profile.build_volume().map(Path::to_path_buf),
+            scratch_dir: Some(scratch_dir.to_path_buf()),
         })
     }
 
@@ -212,6 +228,7 @@ impl ProfileLaunch {
         Self {
             file: ProfileFile::at(directory, profile.text()),
             build_volume: profile.build_volume().map(Path::to_path_buf),
+            scratch_dir: None,
         }
     }
 
@@ -223,13 +240,18 @@ impl ProfileLaunch {
     /// it a launcher, each parameter's `-D NAME=value`, then `-f <file> --`. The profile travels
     /// in its file, never as an argument.
     pub fn args(&self, launcher: &Launcher) -> Vec<OsString> {
-        launcher.launch_arguments(&self.file.path, self.build_volume.as_deref())
+        launcher.launch_arguments(
+            &self.file.path,
+            self.build_volume.as_deref(),
+            self.scratch_dir.as_deref(),
+        )
     }
 
     /// What tells one launch's sandbox from another's: the profile and every binding.
     pub fn identity(&self) -> Vec<&OsStr> {
         let mut identity = vec![self.file.path.as_os_str()];
         identity.extend(self.build_volume.iter().map(|volume| volume.as_os_str()));
+        identity.extend(self.scratch_dir.iter().map(|dir| dir.as_os_str()));
         identity
     }
 }
@@ -400,6 +422,7 @@ mod tests {
         let launch = |volume: Option<&str>| ProfileLaunch {
             file: file.clone(),
             build_volume: volume.map(PathBuf::from),
+            scratch_dir: None,
         };
         assert_eq!(
             launch(Some("/m/.build/o/r/0123")).file(),

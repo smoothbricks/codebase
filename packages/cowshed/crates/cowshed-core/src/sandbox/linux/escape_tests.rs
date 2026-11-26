@@ -452,7 +452,7 @@ fn a_profile_of_another_build_is_refused_and_starts_nothing() {
         let file = ProfileFile::write(&workspace.config.profile_directory(), profile)
             .expect("the profile's file");
         Command::new(launcher.program())
-            .args(launcher.launch_arguments(file.path(), None))
+            .args(launcher.launch_arguments(file.path(), None, None))
             .args(["touch", "started"])
             .current_dir(&workspace.config.workspace_mount)
             .output_bounded()

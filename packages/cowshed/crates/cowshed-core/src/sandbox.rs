@@ -16,7 +16,7 @@ use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
 
-fn cowshed_root() -> &'static Path {
+pub(crate) fn cowshed_root() -> &'static Path {
     Path::new(STORE_ROOT)
         .parent()
         .expect("STORE_ROOT is a child of the machine-global cowshed root")
@@ -725,6 +725,7 @@ fn profile_policy(
 pub struct SeatbeltProfile {
     text: String,
     build_volume: Option<PathBuf>,
+    scratch: bool,
 }
 
 impl SeatbeltProfile {
@@ -734,6 +735,7 @@ impl SeatbeltProfile {
         Self {
             text: text.to_owned(),
             build_volume: None,
+            scratch: false,
         }
     }
 
@@ -766,7 +768,17 @@ pub fn seatbelt_profile(
     config: &SandboxConfig,
     role: SandboxProfileRole,
 ) -> Result<SeatbeltProfile, SandboxError> {
-    platform::render(profile_policy(config, role)?)
+    platform::render(profile_policy(config, role)?, false)
+}
+
+/// Render the scratch-enabled variant of [`seatbelt_profile`] for a host or one-shot child that
+/// received a directory from `[scratch] provider`: its rules bind [`SCRATCH_DIR_PARAM`] and
+/// [`SCRATCH_PARENT_PARAM`] via `-D` at launch, keeping at most two profile files per revision.
+pub(crate) fn seatbelt_profile_with_scratch(
+    config: &SandboxConfig,
+    role: SandboxProfileRole,
+) -> Result<SeatbeltProfile, SandboxError> {
+    platform::render(profile_policy(config, role)?, true)
 }
 
 /// The program a process's sandboxed launches start as, and what makes that program a launcher.
@@ -794,13 +806,23 @@ impl Launcher {
         &self,
         file: &Path,
         build_volume: Option<&Path>,
+        scratch_dir: Option<&Path>,
     ) -> Vec<OsString> {
         let mut args: Vec<OsString> = self.verb.map(OsString::from).into_iter().collect();
-        if let Some(volume) = build_volume {
-            let mut binding = OsString::from(BUILD_VOLUME_PARAM);
+        let mut bind = |name: &str, value: &Path| {
+            let mut binding = OsString::from(name);
             binding.push("=");
-            binding.push(volume);
+            binding.push(value);
             args.extend([OsString::from("-D"), binding]);
+        };
+        if let Some(volume) = build_volume {
+            bind(BUILD_VOLUME_PARAM, volume);
+        }
+        if let Some(directory) = scratch_dir {
+            bind(SCRATCH_DIR_PARAM, directory);
+            if let Some(parent) = directory.parent() {
+                bind(SCRATCH_PARENT_PARAM, parent);
+            }
         }
         args.extend([
             OsString::from("-f"),
@@ -1066,6 +1088,12 @@ pub const GIT_DEVELOPER_DIR: &str = "/var/select/developer_dir";
 /// (04_sandbox.md, "Exec pipeline" step 4).
 pub const BUILD_VOLUME_PARAM: &str = "BUILD_VOLUME";
 
+/// The parameter a scratch-enabled profile variant names its host's scratch directory by.
+pub const SCRATCH_DIR_PARAM: &str = "SCRATCH_DIR";
+
+/// The parameter a scratch-enabled profile variant names its host's scratch parent directory by.
+pub const SCRATCH_PARENT_PARAM: &str = "SCRATCH_PARENT";
+
 #[cfg(test)]
 pub(crate) mod tests {
     #[cfg(target_os = "macos")]
@@ -1156,12 +1184,12 @@ pub(crate) mod tests {
                 lead.iter().chain(tail).map(OsString::from).collect()
             };
             assert_eq!(
-                launcher.launch_arguments(file, None),
+                launcher.launch_arguments(file, None, None),
                 expected(&["-f", "/private/cowshed/store/run/profiles/a.sb", "--"]),
                 "{verb:?}"
             );
             assert_eq!(
-                launcher.launch_arguments(file, Some(volume)),
+                launcher.launch_arguments(file, Some(volume), None),
                 expected(&[
                     "-D",
                     "BUILD_VOLUME=/m/.build/o/r/0123",
@@ -4173,6 +4201,69 @@ if ({writable}) {{
             fstat.status.success(),
             "fstat on a write-only /dev/null stdout: {}",
             String::from_utf8_lossy(&fstat.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scratch_profile_variant_emits_parameterized_parent_deny_dir_allow_parent_metadata_and_sockets()
+     {
+        let store = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-sp-prof",
+        );
+        let mut sandbox = config(RunSandboxMode::ReadWrite);
+        sandbox.store_root = std::fs::canonicalize(&*store).unwrap();
+        let plain = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(
+            !plain.text().contains(SCRATCH_DIR_PARAM)
+                && !plain.text().contains(SCRATCH_PARENT_PARAM),
+            "plain profile must not reference scratch parameters"
+        );
+
+        let with_scratch =
+            seatbelt_profile_with_scratch(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let text = with_scratch.text();
+        let deny_parent =
+            format!("(deny file-read* file-write* (subpath (param \"{SCRATCH_PARENT_PARAM}\")))");
+        let allow_dir =
+            format!("(allow file-read* file-write* (subpath (param \"{SCRATCH_DIR_PARAM}\")))");
+        let allow_parent_meta =
+            format!("(allow file-read-metadata (literal (param \"{SCRATCH_PARENT_PARAM}\")))");
+        let socket_rule = format!(
+            "(local unix-socket (path-prefix (string-append (param \"{SCRATCH_DIR_PARAM}\") \"/\")))"
+        );
+        let deny_pos = text.find(&deny_parent).expect("parent deny emitted");
+        let allow_pos = text.find(&allow_dir).expect("scratch dir allow emitted");
+        let meta_pos = text
+            .find(&allow_parent_meta)
+            .expect("parent metadata literal emitted");
+        assert!(
+            deny_pos < allow_pos && allow_pos < meta_pos,
+            "parent deny must precede scratch dir allow and parent metadata literal"
+        );
+        assert!(text.contains(&socket_rule), "scratch socket prefix emitted");
+        assert!(
+            !text.contains(&format!(
+                "(allow file-read-data (literal (param \"{SCRATCH_PARENT_PARAM}\")))"
+            )),
+            "parent metadata literal must not grant directory listing"
+        );
+
+        let launch = crate::exec::ProfileLaunch::write_with_scratch(
+            &sandbox.profile_directory(),
+            &with_scratch,
+            Path::new("/Volumes/scratch/h00001"),
+        )
+        .unwrap();
+        let args = launch.args(launcher().unwrap());
+        assert!(
+            args.contains(&OsString::from("SCRATCH_DIR=/Volumes/scratch/h00001")),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&OsString::from("SCRATCH_PARENT=/Volumes/scratch")),
+            "{args:?}"
         );
     }
 }

@@ -357,6 +357,9 @@ pub struct CowshedConfig {
     /// `[doc]`: what `cowshed doc-commit` may commit (02_workspaces.md "`cowshed doc-commit`");
     /// declared only beside `[land]`, whose turn names its ref turn.
     doc: Option<crate::declared_land::DocDeclaration>,
+    /// `[scratch]`: host-side provider command supplying an exec host's scratch directory
+    /// (04_sandbox.md, 06_cli.md). Trusted only from main's checkout, like `[land]` and `[doc]`.
+    scratch: Option<ScratchDeclaration>,
 }
 
 impl CowshedConfig {
@@ -410,6 +413,25 @@ impl CowshedConfig {
     pub fn doc(&self) -> Option<&crate::declared_land::DocDeclaration> {
         self.doc.as_ref()
     }
+
+    /// The declared scratch provider, `None` for a repository that declares none.
+    pub fn scratch(&self) -> Option<&ScratchDeclaration> {
+        self.scratch.as_ref()
+    }
+}
+
+/// `[scratch]`: a project-declared host command supplying a scratch directory per exec host and
+/// per sandboxed one-shot child (04_sandbox.md, 06_cli.md). Read from main's checkout alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScratchDeclaration {
+    provider: Vec<String>,
+}
+
+impl ScratchDeclaration {
+    /// The literal argv of the provider command; never empty and never contains `{…}` slots.
+    pub fn provider(&self) -> &[String] {
+        &self.provider
+    }
 }
 
 /// `[substrate] kind = "zfs"`: the dataset whose `cowshed` child is the host's root dataset.
@@ -452,8 +474,15 @@ struct ConfigFile {
     nx: Option<NxSection>,
     land: Option<LandSection>,
     doc: Option<DocSection>,
+    scratch: Option<ScratchSection>,
     #[serde(default)]
     capabilities: BTreeMap<CapabilityId, CapabilitySection>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScratchSection {
+    provider: Spanned<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -628,6 +657,10 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     if doc.is_some() && land.is_none() {
         return Err(ConfigError::DocWithoutLand);
     }
+    let scratch = file
+        .scratch
+        .map(|section| scratch_declaration(input, section))
+        .transpose()?;
     Ok(CowshedConfig {
         substrate,
         sandbox_deny,
@@ -638,7 +671,38 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         nx_daemon_idle,
         land,
         doc,
+        scratch,
     })
+}
+
+/// `[scratch]`: a literal provider argv list with at least its program and no `{…}` slots.
+fn scratch_declaration(
+    input: &str,
+    section: ScratchSection,
+) -> Result<ScratchDeclaration, ConfigError> {
+    let line = line_of(input, &section.provider);
+    let invalid = |reason: String| ConfigError::InvalidDeclaration {
+        section: "scratch",
+        key: "provider",
+        line,
+        reason,
+    };
+    let provider = section.provider.into_inner();
+    let Some(program) = provider.first() else {
+        return Err(invalid("provider needs at least its program".to_owned()));
+    };
+    if program.is_empty() {
+        return Err(invalid("provider program must not be empty".to_owned()));
+    }
+    for word in &provider {
+        if word.contains('\0') {
+            return Err(invalid("provider words must not contain NUL".to_owned()));
+        }
+        if word.len() > 2 && word.starts_with('{') && word.ends_with('}') {
+            return Err(invalid(format!("provider takes no slots, found {word:?}")));
+        }
+    }
+    Ok(ScratchDeclaration { provider })
 }
 
 /// `[land]`: a turn whose ref turn is a queue too, a gate and after commands whose programs are

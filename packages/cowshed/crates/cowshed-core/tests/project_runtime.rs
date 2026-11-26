@@ -2772,6 +2772,7 @@ fn supervisor_config_of(
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+        scratch: None,
         host_job_path: cowshed_core::runtime::HostJobPath::Host,
     }
 }

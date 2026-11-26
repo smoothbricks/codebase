@@ -227,12 +227,20 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; Core bootstrap: exact installed cowshed link/target reads only, metadata-only ancestors.
 (allow file-read* file-read-data (literal "<installed cowshed executable>"))
 (allow file-read* file-read-data file-write* (subpath "<workspace mount>")) ;; own mount ONLY
-;; TMPDIR: the workspace's own directory in its project's store directory,
+;; TMPDIR: by default, the workspace's own directory in its project's store directory,
 ;; <store>/<owner>/<repo>/tmp/<workspace> (01_storage.md). Outside every checkout,
 ;; so a tool that must keep scratch files outside the project it builds finds a
 ;; writable place; inside the store, so the deny above keeps every sibling's out of
 ;; reach. Emitted after the project-root policy deny too, or last-match-wins
 ;; re-denies it and every `mktemp` fails on a path the child never chose.
+;; When main's `.cowshed.toml` declares `[scratch] provider`, a host or one-shot
+;; child that receives a directory launches a second profile variant per revision
+;; binding `-D SCRATCH_DIR=<dir>` and `-D SCRATCH_PARENT=<parent>` (at most two
+;; profile files per revision): it denies `(subpath (param "SCRATCH_PARENT"))`,
+;; carves back `(subpath (param "SCRATCH_DIR"))` and its Unix-socket prefix
+;; `(path-prefix (string-append (param "SCRATCH_DIR") "/"))`, and admits metadata
+;; only on `(literal (param "SCRATCH_PARENT"))` so siblings remain unreachable
+;; regardless of where the provider places the directory.
 (allow file-read* file-read-data file-write* (subpath "<exec temp dir>"))
 
 ;; Fixture roots, the one world-shared /tmp area a job may write ("Fixture roots under /tmp"): a fixture's
@@ -1071,18 +1079,35 @@ same child profile, independently of shell environment values. The bare-command 
 remains unchanged: `just verify` runs through this activation without a caller-provided wrapper.
 
 Devenv resolves runtime state beneath `XDG_RUNTIME_DIR`, independently of `TMPDIR`. Cowshed provides a short
-workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the workspace's writable temporary
-directory, `<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md). Both are prepared before activation, for every job
-the supervisor starts — an `exec`, a named session's command, a land check. The temporary directory lies outside every
-checkout, because a tool may need scratch space outside the project it builds (a transform whose scratch directory must
-not sit under the project root), and outside the image, so a clone starts with an empty one and never copies another
-workspace's scratch. It is keyed by the workspace's name and goes when the retired image is reclaimed (`rm`, or `gc` for
-a retirement a crash stranded). The child may write these scoped directories, but the baseline still denies writes to
-the world-shared `/private/tmp`, apart from the fixture roots of [Fixture roots under /tmp](#fixture-roots-under-tmp),
-and to the host user's own temporary directory under `/private/var/folders`; shell activation does not require a blanket
-temporary-directory grant. A process that reaches a temporary directory by any other route than `TMPDIR` finds none it
-can write: `xcrun`, for one, then fails to create its cache, prints its `mkstemp` path, and resolves every lookup the
-slow way.
+workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names either the directory supplied by main's
+declared `[scratch] provider` (06_cli.md, "Configuration") when one is configured and answers, or the workspace's
+writable store temporary directory, `<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md), as its fallback. Sandboxed
+scratch was the bulk of host SSD write traffic, so the provider hook lets a repository place each exec host's and
+sandboxed one-shot child's scratch directory on storage it manages without hard-coding any volume policy into cowshed.
+`[scratch]` is read from main's copy of `.cowshed.toml` alone — the same operator trust boundary as `[land]` and `[doc]`
+— so the supervisor still runs no workspace code. The provider runs on the host outside every sandbox with main's
+checkout as its cwd, the declared-command host bootstrap `PATH` (`declared_land::bootstrap_path`), and
+`COWSHED_SCRATCH_WORKSPACE` and `COWSHED_SUPERVISOR_SOCKET`; it answers one JSON line (`{"directory": …}` or
+`{"unavailable": …}`) within `SCRATCH_PROVIDER_BOUND` (5 s) and holds the directory until EOF on its stdin after the
+host or one-shot child retires, reaped off the supervisor actor within `SCRATCH_SETTLE_BOUND`. Cowshed validates the
+directory (canonical, no symlink in any component, 0700 directory owned by the supervisor's uid, outside protected
+roots, and its parent enclosing no granted or system root) and launches that host under a second per-revision profile
+variant parameterized with `-D SCRATCH_DIR` and `-D SCRATCH_PARENT` (parent subpath denied, scratch directory subpath
+and Unix-socket prefix allowed, parent literal metadata-only). On warm hosts `TMPDIR` is laid over each command's
+environment rather than placed in the activation baseline, so shell activation reuse (`inherited_baseline`) and pool
+keys stay unchanged. Any provider refusal, timeout, exit, or invalid directory falls back silently to the store `TMPDIR`
+after reporting `cowshed: scratch provider <reason>; TMPDIR stays <store tmp dir>` once per supervisor per distinct
+reason on a job's stderr; a provider failure never fails a job. Both `XDG_RUNTIME_DIR` and the store `TMPDIR` are
+prepared before activation, for every job the supervisor starts — an `exec`, a named session's command, a land check.
+The store temporary directory lies outside every checkout, because a tool may need scratch space outside the project it
+builds (a transform whose scratch directory must not sit under the project root), and outside the image, so a clone
+starts with an empty one and never copies another workspace's scratch. It is keyed by the workspace's name and goes when
+the retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these scoped
+directories, but the baseline still denies writes to the world-shared `/private/tmp`, apart from the fixture roots of
+[Fixture roots under /tmp](#fixture-roots-under-tmp), and to the host user's own temporary directory under
+`/private/var/folders`; shell activation does not require a blanket temporary-directory grant. A process that reaches a
+temporary directory by any other route than `TMPDIR` finds none it can write: `xcrun`, for one, then fails to create its
+cache, prints its `mkstemp` path, and resolves every lookup the slow way.
 
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use

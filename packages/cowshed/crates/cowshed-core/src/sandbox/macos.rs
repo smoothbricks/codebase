@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use super::{
     BUILD_VOLUME_PARAM, GIT_DEVELOPER_DIR, Launcher, LauncherError, MainSnapshotStore,
-    ProfilePolicy, RunSandboxMode, SandboxConfig, SandboxError, SandboxProfileRole,
-    SeatbeltProfile, cowshed_root, held_port_blocks, main_snapshot_store, paths_intersect,
-    sandbox_runtime_link, shared_daemon_runtime_dir, shared_daemon_runtime_link, validate_path,
+    ProfilePolicy, RunSandboxMode, SCRATCH_DIR_PARAM, SCRATCH_PARENT_PARAM, SandboxConfig,
+    SandboxError, SandboxProfileRole, SeatbeltProfile, cowshed_root, held_port_blocks,
+    main_snapshot_store, paths_intersect, sandbox_runtime_link, shared_daemon_runtime_dir,
+    shared_daemon_runtime_link, validate_path,
 };
 use crate::capabilities::{CapabilityGrant, GrantAccess, GrantScope};
 
@@ -108,7 +109,10 @@ fn push_fixture_root_rules(profile: &mut ProfileText) {
 /// Paths must already be canonical controller data. Child argv, environment,
 /// output, and repository-controlled grants are deliberately absent from the
 /// role selection and therefore cannot remove the executed-child narrowing.
-pub(super) fn render(policy: ProfilePolicy<'_>) -> Result<SeatbeltProfile, SandboxError> {
+pub(super) fn render(
+    policy: ProfilePolicy<'_>,
+    scratch: bool,
+) -> Result<SeatbeltProfile, SandboxError> {
     let ProfilePolicy {
         config,
         role,
@@ -263,6 +267,14 @@ pub(super) fn render(policy: ProfilePolicy<'_>) -> Result<SeatbeltProfile, Sandb
             &format!(
                 "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix \"{0}/\")) (remote unix-socket (path-prefix \"{0}/\")))",
                 sbpl_path(tree)?
+            ),
+        );
+    }
+    if scratch {
+        push_line(
+            &mut profile,
+            &format!(
+                "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix (string-append (param \"{SCRATCH_DIR_PARAM}\") \"/\"))) (remote unix-socket (path-prefix (string-append (param \"{SCRATCH_DIR_PARAM}\") \"/\"))))"
             ),
         );
     }
@@ -551,6 +563,24 @@ pub(super) fn render(policy: ProfilePolicy<'_>) -> Result<SeatbeltProfile, Sandb
         Path::new("/dev/fd"),
     )?;
     push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
+    if scratch {
+        // Scratch provider directory for this host, bound via `-D SCRATCH_DIR` and
+        // `-D SCRATCH_PARENT`. Deny the parent subtree first so sibling directories stay out of
+        // reach even outside HOME/store, then carve back only this host's directory and allow
+        // metadata-only lookup (no listing) on the parent literal.
+        push_line(
+            &mut profile,
+            &format!("(deny file-read* file-write* (subpath (param \"{SCRATCH_PARENT_PARAM}\")))"),
+        );
+        push_line(
+            &mut profile,
+            &format!("(allow file-read* file-write* (subpath (param \"{SCRATCH_DIR_PARAM}\")))"),
+        );
+        push_line(
+            &mut profile,
+            &format!("(allow file-read-metadata (literal (param \"{SCRATCH_PARENT_PARAM}\")))"),
+        );
+    }
     // A contributed daemon leaf (Nx's run/nx) is shared across modes, never the surrounding
     // generic runtime directory. The rest of a read-only job's rendezvous state stays private.
     let shared_alias = shared_daemon_runtime_link(config);
@@ -674,6 +704,7 @@ pub(super) fn render(policy: ProfilePolicy<'_>) -> Result<SeatbeltProfile, Sandb
     Ok(SeatbeltProfile {
         text: profile.text,
         build_volume: config.build_volume_mount.clone(),
+        scratch,
     })
 }
 

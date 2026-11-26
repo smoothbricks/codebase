@@ -93,6 +93,7 @@ impl Workspace {
                 "",
                 &self.0.join("profiles"),
             ),
+            scratch: None,
             read_only: false,
             environment: BTreeMap::new(),
             shared_daemons: Vec::new(),
@@ -141,6 +142,8 @@ impl FakeHost {
             },
             control: tokio::net::UnixStream::from_std(ours).unwrap(),
             closed: false,
+            scratch: None,
+            fallback_reason: None,
         };
         (
             host,
