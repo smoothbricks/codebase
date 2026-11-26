@@ -17,7 +17,8 @@ async function runFixture(name: string) {
     const command = Bun.spawn(
       [
         process.execPath,
-        fileURLToPath(new URL('../vitest.mjs', import.meta.resolve('vitest'))),
+        // Under `bun test`, bare 'vitest' resolves to built-in 'bun:test/vitest' (no file URL).
+        fileURLToPath(new URL('./vitest.mjs', import.meta.resolve('vitest/package.json'))),
         'run',
         '--root',
         root,
