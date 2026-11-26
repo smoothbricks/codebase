@@ -139,9 +139,10 @@
       "lint-disk-commands": {
         "executor": "nx:run-commands",
         "cache": true,
-        "//": "Cached on the files it scans: every file git lists that is not ignored, the same set the {workspaceRoot} fileset hashes, the policy script among them.",
+        "//": "Cached on the files it scans: every file git lists that is not ignored, the same set the {workspaceRoot} fileset hashes, the policy script among them, but Markdown, whose prose the policy never reads (disk-command-policy.ts checks code, scripts and manifests).",
         "inputs": [
           "{workspaceRoot}/**/*",
+          "!{workspaceRoot}/**/*.md",
           {
             "externalDependencies": []
           }

@@ -30,9 +30,13 @@
  *
  * Run with: `nx run cowshed:release-check`
  *
- * With `--digest` it prints, instead of judging, a SHA-256 over what it judges: this host's family and every file under
- * `dist/bin` and `dist/native` with its mode and the SHA-256 of its bytes (`absent` for a missing tree). That is
- * the runtime input `release-check` is cached on, so a cached verdict stands for exactly these bytes and bits.
+
+ * With `--digest` it prints, instead of judging, a SHA-256 over what it judges: this host's family and every judged file
+ * under `dist/bin` and `dist/native` with its mode and the SHA-256 of its bytes (`absent` for a missing tree). That is
+ * the runtime input `release-check` is cached on, so a cached verdict stands for exactly these bytes and bits. The build
+ * inputs and release records beside a binary are data the judgement skips (`judged`), so they key nothing: a release
+ * record names HEAD and changes with every commit, docs-only ones included.
+
  */
 
 import { createHash } from 'node:crypto';
@@ -60,13 +64,18 @@ function listFilesRecursively(directory: string): string[] {
   });
 }
 
+/** Whether the judgement reads `path`: every packaged file but the data written beside a binary. */
+function judged(path: string): boolean {
+  return basename(path) !== BUILD_INPUTS_FILE && !path.endsWith(RELEASE_RECORD_SUFFIX);
+}
+
 if (process.argv.slice(2).join(' ') === '--digest') {
   const packageRoot = new URL('..', import.meta.url).pathname;
   const digest = createHash('sha256').update(`${process.platform}-${process.arch}\n`);
   for (const tree of ['dist/bin', 'dist/native']) {
     let files: string[];
     try {
-      files = listFilesRecursively(join(packageRoot, tree)).sort();
+      files = listFilesRecursively(join(packageRoot, tree)).filter(judged).sort();
     } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
       digest.update(`${tree} absent\n`);
@@ -93,9 +102,7 @@ if (!stat.isDirectory()) {
   process.exit(1);
 }
 
-const files = listFilesRecursively(BIN_ROOT).filter(
-  (path) => basename(path) !== BUILD_INPUTS_FILE && !path.endsWith(RELEASE_RECORD_SUFFIX),
-);
+const files = listFilesRecursively(BIN_ROOT).filter(judged);
 if (files.length === 0) {
   console.error(`${BIN_ROOT} holds no files, so no packaged binary was checked`);
   process.exit(1);

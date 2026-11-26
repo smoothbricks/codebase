@@ -700,6 +700,7 @@
       "test-host": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
+        "//": "Keyed on every upstream output but the cowshed release record (<binary>.build), which names HEAD and moves with every commit; no host test reads it.",
         "inputs": [
           "...",
           "default",
@@ -709,7 +710,7 @@
           "{workspaceRoot}/tooling/direnv/devenv.lock",
           "{workspaceRoot}/packages/cowshed/bin/**/*",
           {
-            "dependentTasksOutputFiles": "**/*",
+            "dependentTasksOutputFiles": "**/!(*.build)",
             "transitive": true
           }
         ],
