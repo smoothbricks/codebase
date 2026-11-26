@@ -26,6 +26,7 @@
     "src/nx-daemon-ignore-files.test.ts": 5301,
     "src/task-results.test.ts": 5007,
     "src/nx-daemon-start-never.test.ts": 4832,
+    "src/cargo-fetched-input.test.ts": 4671,
     "src/nx-dot-input-policy.test.ts": 4565,
     "src/serial-group-wiring.test.ts": 4482,
     "src/cargo-workspace.test.ts": 4063,
