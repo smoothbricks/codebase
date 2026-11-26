@@ -218,7 +218,10 @@
         },
         "inputs": [
           "verifyPackages",
-          "^dependencyDefault"
+          "^dependencyDefault",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "outputs": [
           "{workspaceRoot}/.cache/statebus-packages/"

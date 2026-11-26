@@ -158,7 +158,10 @@
           "{workspaceRoot}/packages/nx-plugin/src/test-clock-policy.ts",
           "{workspaceRoot}/packages/nx-plugin/src/bounded-test-policy.ts",
           "{workspaceRoot}/packages/nx-plugin/src/bin/smoo-nx-test-clocks.ts",
-          "{workspaceRoot}/packages/validation/src/bun/preload.ts"
+          "{workspaceRoot}/packages/validation/src/bun/preload.ts",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "options": {
           "commands": [

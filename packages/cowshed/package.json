@@ -1191,7 +1191,10 @@
             "transitive": true
           },
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "//": "The public declaration IR runs its source lint before the real admission oracle, using the actual prebuilt owner generator and one Typia world. It needs no N-API wire corpus or native runtime fixture. Its typia plugin warmth is the fixture segment below, shared with wire-test.",
         "options": {
@@ -1216,7 +1219,10 @@
           "default",
           "^dependencyDefault",
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "dependsOn": [
           "...",

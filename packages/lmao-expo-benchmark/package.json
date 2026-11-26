@@ -55,7 +55,10 @@
           "default",
           "pluginScenarioSources",
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "options": {
           "command": "ttsc --noEmit -p tsconfig.json",
@@ -74,7 +77,10 @@
           "default",
           "pluginScenarioSources",
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ]
       },
       "test": {
@@ -166,7 +172,10 @@
             "env": "NODE_ENV"
           },
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "dependsOn": [
           "...",
@@ -242,7 +251,10 @@
             "env": "NODE_ENV"
           },
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "dependsOn": [
           "...",

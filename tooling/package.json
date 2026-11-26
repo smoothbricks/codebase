@@ -27,7 +27,10 @@
             "transitive": true
           },
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          {
+            "env": "SMOO_TYPECHECK_TSC"
+          }
         ],
         "outputs": [
           "{workspaceRoot}/.cache/nx-daemon-idle-proof/"
