@@ -163,6 +163,18 @@ describe('what shell entry fetches for a Cargo workspace', () => {
         expect(cargoRuns().slice(6)).toEqual(bothWorkspaces);
         expect(await enter(CARGO)).toEqual(HEALTHY);
         expect(cargoRuns()).toHaveLength(8);
+
+        // The Nx plugin's registry input asks about one workspace: current where its fetch is stamped for this
+        // CARGO_HOME, and not once what the fetch reads changed, nor for a directory no fetch was stamped for.
+        const ROOT = { ...CHECK, workspace: '.' } as const;
+        const NATIVE = { ...CHECK, workspace: 'packages/native' } as const;
+        expect(await enter(ROOT)).toEqual(HEALTHY);
+        expect(await enter(NATIVE)).toEqual(HEALTHY);
+        expect((await enter({ ...CHECK, workspace: 'packages/plain' })).exitCode).toBe(1);
+        await edit(join(root, 'packages/native/Cargo.lock'), 'version = 4\n\n[[package]]\nname = "syn"\n');
+        expect(await enter(ROOT)).toEqual(HEALTHY);
+        expect((await enter(NATIVE)).exitCode).toBe(1);
+        expect(cargoRuns()).toHaveLength(8);
       },
     );
   });

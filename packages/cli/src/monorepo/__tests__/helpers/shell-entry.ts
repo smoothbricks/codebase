@@ -66,6 +66,8 @@ export type EntryOptions = {
   /** devenv's smoo:developer-links task: `--links`, and its `status`, `--links --check`. */
   readonly links?: boolean;
   readonly check?: boolean;
+  /** With `cargo` and `check`: the one workspace directory the status is asked about, `--workspace`. */
+  readonly workspace?: string;
   /** The prologue's question about the declared links, asked after the tasks: `--links --refusal`. */
   readonly refusal?: boolean;
 } & (
@@ -361,6 +363,7 @@ export function startShell(root: string, state: string, bin: string, options: En
       ...(options.cargo === true ? ['--cargo'] : []),
       ...(options.links === true ? ['--links'] : []),
       ...(options.check === true ? ['--check'] : []),
+      ...(options.workspace === undefined ? [] : ['--workspace', options.workspace]),
       ...(options.refusal === true ? ['--refusal'] : []),
     ],
     cwd: root,

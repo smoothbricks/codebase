@@ -207,6 +207,8 @@ const POST_COMMIT_BLOCK = [
 // CARGO_HOME (cargo-fetch-bound.ts). Their stamps (cargoFetcher) live in smoo's
 // user cache and count only while CARGO_HOME names the directory they were
 // fetched into, which no checkout-relative change detection can see.
+// `--cargo --check --workspace <dir>` is the same question about one workspace, whether shell entry lists it or not:
+// the Nx plugin's cargo-fetch registry input asks it on every hash instead of running an offline fetch.
 // `--links` repairs stale install links (including external Nx aliases and
 // store links whose install-cache entry is gone), then
 // points the packages `smoo.developerLinks` declares at their local checkouts.
@@ -222,6 +224,7 @@ const { values: flags } = parseArgs({
     cargo: { type: 'boolean' },
     links: { type: 'boolean' },
     check: { type: 'boolean' },
+    workspace: { type: 'string' },
     refusal: { type: 'boolean' },
     'repair-missing-payload': { type: 'string' },
   },
@@ -311,6 +314,9 @@ try {
   // and package resolution/Typia transforms are not available yet.
   const bunInputs = bunInstallInputs();
   const cargoFetches = cargoMode ? cargoWorkspaces(bunInputs).map(cargoFetcher) : [];
+  if (flags.check === true && cargoMode && flags.workspace !== undefined) {
+    process.exit(cargoFetcher(path.posix.normalize(flags.workspace)).isCurrent() ? 0 : 1);
+  }
   if (flags.check === true && cargoMode) {
     process.exit(cargoFetches.every((fetch) => fetch.isCurrent()) ? 0 : 1);
   }

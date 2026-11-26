@@ -48,6 +48,7 @@ import {
   isCargoLockInput,
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
+import { cargoFetchCommand, cargoFetchedInput } from './cargo-fetched-input.js';
 import { CARGO_PRODUCER_METADATA, postTasksExecution as postCargoRetention } from './cargo-retention-hook.js';
 import { readCargoTestGeneratedInputs } from './cargo-test-generated-inputs.js';
 import { CARGO_TOOLCHAIN_NAMED_INPUT, cargoRuntimeInput, cargoToolchainInputs } from './cargo-toolchain-policy.js';
@@ -78,7 +79,6 @@ import { compileEnvironment } from './compile-environment.js';
 import {
   CARGO_CROSS_LINT_COMMAND,
   CARGO_CROSS_LINT_TARGET,
-  CARGO_FETCH_COMMAND,
   CARGO_FETCH_TARGET,
   CARGO_LINT_CLIPPY_COMMAND,
   cargoCrossTestArchiveFile,
@@ -645,24 +645,6 @@ const UNRESOLVED_CARGO_LOCK_INPUT = '{projectRoot}/**/Cargo.lock';
 function cargoFetchInputs(projectRoot: string): string[] {
   const base = projectRoot === '.' ? '{workspaceRoot}' : '{projectRoot}';
   return [`${base}/**/Cargo.toml`, `${base}/**/Cargo.lock`, `${base}/**/.cargo/config.toml`, `!${base}/**/target/**`];
-}
-/** The locked fetch of one manifest, relative to the project it runs in. */
-function cargoFetchCommand(manifestPath: string): string {
-  return manifestPath === 'Cargo.toml' ? CARGO_FETCH_COMMAND : `${CARGO_FETCH_COMMAND} --manifest-path ${manifestPath}`;
-}
-/**
- * Whether the registry holds every manifest's locked graph, as the runtime input that brings CARGO_HOME into
- * `cargo-fetch`'s key: the download lands outside the workspace, so no output can stand for it. `fetched` when an
- * offline fetch of each manifest succeeds, which asks no network and fails on any crate the registry lacks. A registry
- * that lacks one gives a value of its own run (the shell's pid and the time), which no cached run matches, so the fetch
- * runs; a registry that holds them all keys an unchanged lock to its cached run.
- */
-function cargoFetchedInput(projectRoot: string, manifests: readonly string[]): { runtime: string } {
-  const offline = manifests.map((manifest) => `${cargoFetchCommand(manifest)} --offline --quiet`).join(' && ');
-  return cargoRuntimeInput(
-    projectRoot,
-    `if { ${offline}; } >/dev/null 2>&1; then echo fetched; else echo "unfetched $$ $(date +%s)"; fi`,
-  );
 }
 /** A full cargo-mutants sweep's wall-clock backstop: a sweep takes hours, and a hung one must still end. */
 const MUTATION_TIMEOUT_MS = 6 * 60 * 60 * 1000;

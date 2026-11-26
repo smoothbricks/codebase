@@ -391,12 +391,16 @@ workspace's cached test build hashes that variable too, because it compiles the 
 
 Every inferred cargo target that runs work is cached, `cargo-fetch` included. Its download lands in `CARGO_HOME`,
 outside Nx outputs, so its key names the registry's state instead: the manifests, the lock and the Cargo configuration
-it reads, and a runtime input that is `fetched` when an offline `cargo fetch --locked` of each manifest succeeds. A
-registry missing a locked crate gives a value of its own run, which no cached run matches, so the fetch runs; a complete
-one makes an unchanged lock a cache hit. Native tests compile selected packages in their separately bounded fixture only
-when their test result misses Nx. Cargo and mbx reuse unchanged units. Nx never restores or collects shared Cargo build
-directories; lint and test **results**, and dedicated Wasm/N-API **outputs**, remain cacheable. `mutation` and `bench`
-key on the workspace's crates and toolchain like `cargo-lint`, `mutation` also on `.cargo/mutants.toml` and
+it reads, and a runtime input that is `fetched` when an offline `cargo fetch --locked` of each manifest succeeds. The
+input reads `CARGO_HOME` of the environment, and `XDG_CACHE_HOME` or `HOME` for where the stamp lies. Where the managed
+shell's fetch stamp for the workspace is current (below), the input answers `fetched` from the stamp and starts no
+Cargo, because an offline fetch takes Cargo's package-cache lock and every checkout's hash would queue on it; a crate
+deleted from an unchanged `CARGO_HOME` is then found by the offline build that needs it, which names it, and not by the
+hash. A registry missing a locked crate gives a value of its own run, which no cached run matches, so the fetch runs; a
+complete one makes an unchanged lock a cache hit. Native tests compile selected packages in their separately bounded
+fixture only when their test result misses Nx. Cargo and mbx reuse unchanged units. Nx never restores or collects shared
+Cargo build directories; lint and test **results**, and dedicated Wasm/N-API **outputs**, remain cacheable. `mutation`
+and `bench` key on the workspace's crates and toolchain like `cargo-lint`, `mutation` also on `.cargo/mutants.toml` and
 `cargo mutants --version` with `mutants.out` as its output: an unchanged tree measures nothing new. A cross-triple test
 runner keys on its archive's own bytes, the binaries it runs, since the machine that runs it did not build them.
 
