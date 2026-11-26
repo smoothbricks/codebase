@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import typia, { type tags } from 'typia';
+import { CARGO_TEST_EXCEPTIONS_SUFFIX, cargoTestPackageTargetName } from './cargo-workspace.js';
 
 /**
  * Measured per-test durations that place a sharded crate's slow tests by time rather than by
@@ -79,6 +80,177 @@ export function timedShardMembers(tests: Readonly<Record<string, number>>, shard
 /** Exactly the named tests, as one filterset; `none()` for no name. */
 export function namedTestsFilter(names: readonly string[]): string {
   return names.length === 0 ? 'none()' : names.map((name) => `test(=${name})`).join(' or ');
+}
+
+/** A nextest hash partition `hash:index/total` (1-based `index` in `1..total`). */
+export interface HashPartition {
+  readonly index: number;
+  readonly total: number;
+}
+
+/**
+ * Structured plan of one per-crate test piece before rendering to nextest filterset syntax.
+ * Every piece is scoped to `packageName` and excludes `serialFilters` (the workspace's active
+ * serial test groups, empty off macOS or when none are declared).
+ *
+ * - `ordinary`: non-serial tests not pinned to the exception shards (neither `excludeExceptional`
+ *   nor `excludeNamed`), hash-partitioned when `partition` is set (unsharded crates omit it).
+ * - `exceptional-hash`: non-serial exceptional tests (`exceptional`), hash-partitioned when no
+ *   timing manifest names tests for this crate.
+ * - `exceptional-timed`: non-serial tests explicitly dealt to this shard (`timedMembers`), plus
+ *   any unnamed exceptional tests (`unnamedExceptional` on the last shard when `exceptional` exists).
+ */
+export type StructuredCargoTestPiece =
+  | {
+      readonly kind: 'ordinary';
+      readonly packageName: string;
+      readonly targetName: string;
+      readonly partition?: HashPartition;
+      readonly excludeExceptional: string | null;
+      readonly excludeNamed: readonly string[];
+      readonly serialFilters: readonly string[];
+    }
+  | {
+      readonly kind: 'exceptional-hash';
+      readonly packageName: string;
+      readonly targetName: string;
+      readonly shardIndex: number;
+      readonly partition: HashPartition;
+      readonly exceptional: string;
+      readonly serialFilters: readonly string[];
+    }
+  | {
+      readonly kind: 'exceptional-timed';
+      readonly packageName: string;
+      readonly targetName: string;
+      readonly shardIndex: number;
+      readonly timedMembers: readonly string[];
+      readonly unnamedExceptional: { readonly exceptional: string; readonly allNamed: readonly string[] } | null;
+      readonly serialFilters: readonly string[];
+    };
+
+/** Rendered per-crate piece handed to target construction: its target name, `-E` filterset and optional `--partition`. */
+export interface CargoTestPiece {
+  readonly partition?: string;
+  readonly selector: string;
+  readonly targetName: string;
+}
+
+/**
+ * Plan the per-crate test pieces for `pkgName`.
+ *
+ * Unsharded crates (`testShards <= 1`) receive one ordinary piece covering all non-serial tests.
+ * Sharded crates (`testShards > 1`) lift `exceptional` overrides and `timings`-named slow tests
+ * out of the ordinary hash shards into `exceptions-shard1..N`: by time when `timings` names any
+ * test (with the last shard also taking every unnamed exceptional test), or by hash otherwise.
+ * `specs/cowshed/laws/nextest_pieces.bend` proves that these pieces plus the active serial group
+ * runners cover every test of the package exactly once.
+ */
+export function cargoTestPieces(
+  pkgName: string,
+  testShards: number,
+  exceptional: string | null,
+  serialFilters: readonly string[],
+  timings: Readonly<Record<string, number>>,
+): StructuredCargoTestPiece[] {
+  const pieces: StructuredCargoTestPiece[] = [];
+  const sharded = testShards > 1;
+  const timed = sharded ? timings : {};
+  const named = Object.keys(timed);
+  const exceptionalHere = sharded ? exceptional : null;
+  for (let index = 1; index <= testShards; index += 1) {
+    const targetName = cargoTestPackageTargetName(pkgName, sharded ? `shard${index}` : undefined);
+    pieces.push({
+      kind: 'ordinary',
+      packageName: pkgName,
+      targetName,
+      ...(sharded ? { partition: { index, total: testShards } } : {}),
+      excludeExceptional: exceptionalHere,
+      excludeNamed: named,
+      serialFilters,
+    });
+  }
+  if (exceptionalHere !== null || named.length > 0) {
+    // Measured tests are dealt by time; the last shard also takes every exceptional test the
+    // manifest does not name, so the exception shards stay an exact cover of the pin.
+    const members = named.length === 0 ? null : timedShardMembers(timed, testShards);
+    for (let index = 1; index <= testShards; index += 1) {
+      const targetName = cargoTestPackageTargetName(pkgName, `${CARGO_TEST_EXCEPTIONS_SUFFIX}-shard${index}`);
+      const own = members?.[index - 1];
+      if (own === undefined) {
+        if (exceptionalHere === null) continue;
+        pieces.push({
+          kind: 'exceptional-hash',
+          packageName: pkgName,
+          targetName,
+          shardIndex: index,
+          partition: { index, total: testShards },
+          exceptional: exceptionalHere,
+          serialFilters,
+        });
+      } else {
+        pieces.push({
+          kind: 'exceptional-timed',
+          packageName: pkgName,
+          targetName,
+          shardIndex: index,
+          timedMembers: own,
+          unnamedExceptional:
+            exceptionalHere !== null && index === testShards ? { exceptional: exceptionalHere, allNamed: named } : null,
+          serialFilters,
+        });
+      }
+    }
+  }
+  return pieces;
+}
+
+/**
+ * Render a structured piece to the exact nextest `-E` filterset string and optional `--partition`
+ * flag that go into the inferred Nx target (and therefore its Nx cache key).
+ */
+export function renderCargoTestPiece(piece: StructuredCargoTestPiece): CargoTestPiece {
+  const serialExclusion = piece.serialFilters.length === 0 ? null : piece.serialFilters.join(' or ');
+  const notSerial = serialExclusion === null ? [] : [`not (${serialExclusion})`];
+  switch (piece.kind) {
+    case 'ordinary': {
+      // The tests the hash does not place: nextest.toml's exceptional class and the measured slow tests.
+      const pin =
+        piece.excludeNamed.length === 0
+          ? piece.excludeExceptional
+          : piece.excludeExceptional === null
+            ? namedTestsFilter(piece.excludeNamed)
+            : `(${piece.excludeExceptional}) or (${namedTestsFilter(piece.excludeNamed)})`;
+      return {
+        ...(piece.partition === undefined
+          ? {}
+          : { partition: `hash:${piece.partition.index}/${piece.partition.total}` }),
+        selector: [`package(${piece.packageName})`, ...(pin === null ? [] : [`not (${pin})`]), ...notSerial].join(
+          ' and ',
+        ),
+        targetName: piece.targetName,
+      };
+    }
+    case 'exceptional-hash':
+      return {
+        partition: `hash:${piece.partition.index}/${piece.partition.total}`,
+        selector: [`package(${piece.packageName}) and (${piece.exceptional})`, ...notSerial].join(' and '),
+        targetName: piece.targetName,
+      };
+    case 'exceptional-timed': {
+      const unnamed =
+        piece.unnamedExceptional === null
+          ? ''
+          : ` or ((${piece.unnamedExceptional.exceptional}) and not (${namedTestsFilter(piece.unnamedExceptional.allNamed)}))`;
+      return {
+        selector: [
+          `package(${piece.packageName}) and ((${namedTestsFilter(piece.timedMembers)})${unnamed})`,
+          ...notSerial,
+        ].join(' and '),
+        targetName: piece.targetName,
+      };
+    }
+  }
 }
 
 /** A test the manifest names: at least this long in the reports a refresh reads. */

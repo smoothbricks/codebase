@@ -10,7 +10,7 @@ import { fixtureNxEnv, nxFixtureRoot } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { SERIAL_TEST_GROUP_PLATFORM } from './cargo-workspace.js';
 import type { NxTaskContext } from './executors/bounded-exec/executor.js';
-import { type BoundedExecOptions, type NativeBoundedExecOptions } from './executors/bounded-exec/schema.js';
+import type { BoundedExecOptions, NativeBoundedExecOptions } from './executors/bounded-exec/schema.js';
 import {
   type BoundedExecRecord,
   JUNIT_FILE,
@@ -286,66 +286,83 @@ function groupDirectory(root: string): string {
 
 /**
  * The group's options as the plan infers them, run from the fixture root: the inferred cwd is the cargo root, which
- * is the fixture root. `command` replaces the run's command, which stays the plan's byte-identical one otherwise.
+ * is the fixture root.
  */
-function groupOptions(
-  targets: Readonly<Record<string, TargetConfiguration>>,
-  root: string,
-  selectionArgs?: string[],
-): NativeBoundedExecOptions {
+function groupOptions(targets: Readonly<Record<string, TargetConfiguration>>, root: string): NativeBoundedExecOptions {
   const options = nativeOptions(targets, GROUP_TARGET);
   expect(options.parallelism).toBe(1);
   return {
     ...options,
     cwd: root,
-    nativeTest: { ...options.nativeTest, ...(selectionArgs === undefined ? {} : { selectionArgs }) },
   };
 }
 
 /**
- * Every built test runs exactly once, in the runner that owns its class, and the serial group lists exactly
- * its probes. The runners are independent, so they run side by side exactly as Nx fans them out.
+ * Real nextest evaluation smoke: ask `cargo nextest list` to evaluate each inferred piece's rendered
+ * `-E` filterset and `--partition` flag against the compiled fixture in parallel, and assert the lists
+ * are pairwise disjoint and cover the fixture's runnable tests exactly once in the expected class.
+ * Exact cover across all input shapes is proven by `specs/cowshed/laws/nextest_pieces.bend` and bound
+ * in `nextest-pieces-laws.test.ts`.
  */
-async function executesEveryTestOnce(): Promise<void> {
+async function listsEveryTestOnce(): Promise<void> {
   const { root, targets } = fixture();
   // macOS gives the serial probes their own runner; off macOS the ordinary pieces own them.
   // Deterministic per-platform inference is covered separately in index.test.ts.
   const hasGroup = targets[GROUP_TARGET] !== undefined;
-  const serialLog = join(root, 'serial.log');
-  const partitions = [
-    { kind: 'shard', log: join(root, 'ordinary.log'), tests: hasGroup ? ordinary : [...ordinary, ...serial] },
-    { kind: 'exceptions-shard', log: join(root, 'exceptional.log'), tests: exceptional },
-  ];
-  await Promise.all([
-    ...partitions.flatMap(({ kind, log }) =>
-      [1, 2, 3].map(async (index) => {
-        const name = `cargo-test-partition-probe-${kind}${index}`;
-        const result = await runGroupExecutor(
-          root,
-          nativeOptions(targets, name),
-          { root },
-          { PARTITION_EXECUTIONS: log },
-        );
-        expect(result.code, result.output).toBe(0);
-      }),
-    ),
-    ...(hasGroup ? [groupSucceeds()] : []),
+  const listTarget = async (targetName: string): Promise<string[]> => {
+    const { cargoArgs, selectionArgs = [] } = nativeOptions(targets, targetName).nativeTest;
+    const result = await runTracked(root, [
+      'cargo',
+      '--frozen',
+      'nextest',
+      'list',
+      ...cargoArgs,
+      ...selectionArgs,
+      '-T',
+      'oneline',
+      '--user-config-file',
+      'none',
+      '--color',
+      'never',
+    ]);
+    expect(result.code, `${targetName}\n${result.output}`).toBe(0);
+    return result.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('partition-probe'));
+  };
+
+  const ordinaryNames = [1, 2, 3].map((index) => `cargo-test-partition-probe-shard${index}`);
+  const exceptionalNames = [1, 2, 3].map((index) => `cargo-test-partition-probe-exceptions-shard${index}`);
+  const [ordinaryLists, exceptionalLists, groupList] = await Promise.all([
+    Promise.all(ordinaryNames.map(listTarget)),
+    Promise.all(exceptionalNames.map(listTarget)),
+    hasGroup ? listTarget(GROUP_TARGET) : Promise.resolve<string[]>([]),
   ]);
+
+  const toLibTest = (name: string): string => `partition-probe tests::${name}`;
+  const expectedOrdinary = [
+    ...(hasGroup ? ordinary : [...ordinary, ...serial]).map(toLibTest),
+    'partition-probe::fixture_bin fixture_binary_is_available',
+  ].sort();
+  const expectedExceptional = exceptional.map(toLibTest).sort();
+  const expectedSerial = hasGroup ? serial.map(toLibTest).sort() : [];
+
+  const observedOrdinary = ordinaryLists.flat();
+  const observedExceptional = exceptionalLists.flat();
+  expect([...observedOrdinary].sort()).toEqual(expectedOrdinary);
+  expect([...observedExceptional].sort()).toEqual(expectedExceptional);
   if (hasGroup) {
-    await writeFile(serialLog, await readFile(join(root, 'group-success.log')));
+    expect([...groupList].sort()).toEqual(expectedSerial);
+    expect(groupOptions(targets, root).nativeTest.selectionArgs).not.toContain('--partition');
   }
-  for (const { log, tests } of [...partitions, ...(hasGroup ? [{ log: serialLog, tests: serial }] : [])]) {
-    const observed = (await readFile(log, 'utf8')).trim().split('\n').sort();
-    expect(observed).toEqual([...tests].sort());
-  }
-  await expect(readdir(join(root, '.cache/nextest'))).rejects.toMatchObject({ code: 'ENOENT' });
-  expect(await readdir(join(root, 'target'))).not.toContain('nextest-extracted');
-  if (hasGroup) expect(groupOptions(targets, root).nativeTest.selectionArgs).not.toContain('--partition');
+  const allListed = [...observedOrdinary, ...observedExceptional, ...groupList];
+  expect(new Set(allListed).size).toBe(allListed.length);
 }
 
 /**
  * The real default executor, run for real on this fixture's group in a driver process. Its verdict is typed
- * passed and returned to its caller, which can replay it before a failing case.
+ * passed and returned to its caller.
  */
 async function groupSucceeds(source: Pick<SharedFixture, 'root' | 'targets'> = fixture()): Promise<BoundedExecRecord> {
   const { root, targets } = source;
@@ -368,40 +385,25 @@ async function groupSucceeds(source: Pick<SharedFixture, 'root' | 'targets'> = f
     expect(passed.cpu).toMatchObject({ tokens: 1, want: 1 });
   }
   expect((await readFile(successLog, 'utf8')).trim().split('\n').sort()).toEqual([...serial].sort());
+  await expect(readdir(join(root, '.cache/nextest'))).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await readdir(join(root, 'target'))).not.toContain('nextest-extracted');
   return passed;
 }
 
 /**
- * A group whose filter selects nothing fails rather than passing a run that ran no test. The fixture's real passing
- * run seeds the stale verdict and report the run must replace; the marker log proves no probe ran.
+ * Continuation past failure and stale-verdict replacement: seeds a stale passing verdict and JUnit report,
+ * then runs the serial group with PARTITION_FAIL_SERIAL set. The group must replace the stale verdict and
+ * report, continue past each failing probe via `--no-fail-fast`, and report all four. Empty-selection
+ * command/verdict decisions (`--no-tests=fail`, exit 4 -> `failed`) are covered purely in `nextest-timings.test.ts`.
  */
-async function emptySelectionFails(): Promise<void> {
+async function continuesPastFailuresAndReplacesVerdict(): Promise<void> {
   const { root, targets } = fixture();
-  const passingSeed = await groupSucceeds();
   const directory = groupDirectory(root);
-  await writeRecord(directory, passingSeed);
+  await mkdir(directory, { recursive: true });
+  await writeRecord(directory, { task: GROUP_ID, hash: GROUP_HASH, verdict: { outcome: 'passed' }, peakBytes: null });
   await writeFile(join(directory, JUNIT_FILE), 'stale report\n');
-  const emptyLog = join(root, 'group-empty.log');
-  await rm(emptyLog, { force: true });
-  const empty = await runGroupExecutor(root, groupOptions(targets, root, ['-E', 'none()']), groupContext(root), {
-    PARTITION_EXECUTIONS: emptyLog,
-  });
-  expect(empty.code, empty.output).toBe(2);
-  const record = await readRecord(directory);
-  expect(record).toMatchObject({ task: GROUP_ID, hash: GROUP_HASH, verdict: { outcome: 'failed' } });
-  await expect(readFile(join(directory, JUNIT_FILE), 'utf8')).resolves.not.toBe('stale report\n');
-  await expect(readFile(emptyLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
-}
-
-/**
- * Continuation past failure: each serial probe records, then fails through `fail_when_forced` because
- * PARTITION_FAIL_SERIAL is set. The group must still run and report all four. This is the observed
- * continuation, not a mutant count, and it says nothing about serialization: the override is macOS-only.
- */
-async function continuesPastFailures(): Promise<void> {
-  const { root, targets } = fixture();
-  const directory = groupDirectory(root);
   const failureLog = join(root, 'group-failure.log');
+  await rm(failureLog, { force: true });
   const failed = await runGroupExecutor(root, groupOptions(targets, root), groupContext(root), {
     PARTITION_EXECUTIONS: failureLog,
     PARTITION_FAIL_SERIAL: '1',
@@ -412,6 +414,7 @@ async function continuesPastFailures(): Promise<void> {
   if (failedRecord.verdict.outcome !== 'failed') {
     throw new Error(`a failing group wrote verdict ${failedRecord.verdict.outcome}, not failed`);
   }
+  expect(failedRecord).toMatchObject({ task: GROUP_ID, hash: GROUP_HASH, verdict: { outcome: 'failed' } });
   expect(failedRecord.verdict.tests).toHaveLength(serial.length);
   for (const name of serial) {
     expect(
@@ -419,10 +422,11 @@ async function continuesPastFailures(): Promise<void> {
       name,
     ).toBe(true);
   }
+  await expect(readFile(join(directory, JUNIT_FILE), 'utf8')).resolves.not.toBe('stale report\n');
   expect((await readFile(failureLog, 'utf8')).trim().split('\n').sort()).toEqual([...serial].sort());
 }
 
-it('executes every built test once across the actual host runners', caseBody(executesEveryTestOnce));
+it('lists every built test once across the rendered piece selectors and partitions', caseBody(listsEveryTestOnce));
 
 //#region smoo/cowshed!n/native-test-verdicts
 it(
@@ -475,26 +479,22 @@ it(
   }),
 );
 it(
-  'starts cargo metadata once across repeated and sibling native test tasks on unchanged inputs',
+  'starts cargo metadata once across sibling native test tasks on unchanged inputs',
   caseBody(async () => {
     const { root, targets } = fixture();
     const countedRoot = await mkdtemp(join(root, 'counted-metadata-'));
     const cargo = await countedCargo(countedRoot);
-    const log = join(countedRoot, 'executions.log');
     try {
-      const overlay = {
-        PATH: `${cargo.bin}${delimiter}${process.env.PATH ?? ''}`,
-        PARTITION_EXECUTIONS: log,
-      };
-      const shard1 = nativeOptions(targets, 'cargo-test-partition-probe-shard1');
-      const shard2 = nativeOptions(targets, 'cargo-test-partition-probe-shard2');
+      const overlay = { PATH: `${cargo.bin}${delimiter}${process.env.PATH ?? ''}` };
+      const checkMetadata = 'test -s "$BOUNDED_EXEC_FIXTURE_DIR/cargo-metadata.json"';
+      const shard1 = { ...nativeOptions(targets, 'cargo-test-partition-probe-shard1'), command: checkMetadata };
+      const shard2 = { ...nativeOptions(targets, 'cargo-test-partition-probe-shard2'), command: checkMetadata };
 
+      // One real cold flight populates bounded-exec's shared fixture store; sibling tasks reuse it
+      // (key purity and input invalidation are proven by cache_key.bend `key_is_pure` and
+      // `native-fixture-metadata.test.ts`).
       const first = await runGroupExecutor(root, shard1, { root }, overlay);
       expect(first.code, first.output).toBe(0);
-      expect((await cargo.runs()).spawned).toBe(1);
-
-      const second = await runGroupExecutor(root, shard1, { root }, overlay);
-      expect(second.code, second.output).toBe(0);
       expect((await cargo.runs()).spawned).toBe(1);
 
       const sibling = await runGroupExecutor(root, shard2, { root }, overlay);
@@ -509,7 +509,7 @@ it(
 //#endregion smoo/cowshed!n/native-test-verdicts
 
 // Serial groups are a macOS capability, not a simulated Darwin plan to execute on another host.
-// Every host still executes all fixture tests above through its real inferred partition.
+// Every host still checks all fixture tests above through its real inferred partition.
 if (process.platform === 'darwin') {
   it(
     'runs the serial group through the real default executor and keeps its passing verdict',
@@ -518,10 +518,9 @@ if (process.platform === 'darwin') {
     }),
   );
   it(
-    'fails a serial group whose filter selects no test, replacing the previous verdict',
-    caseBody(emptySelectionFails),
+    'runs the serial group past failing probes, replacing the previous verdict and reporting all four',
+    caseBody(continuesPastFailuresAndReplacesVerdict),
   );
-  it('runs the serial group past failing probes and reports all four', caseBody(continuesPastFailures));
 }
 
 function nativeOptions(targets: Readonly<Record<string, TargetConfiguration>>, name: string): NativeBoundedExecOptions {
