@@ -115,9 +115,11 @@ typed config added, removed or moved nearer re-keys the lints it applies to, and
 nothing else. The pass itself is keyed by the workspace files its config loads and the lock scopes of the packages it
 loads by name, on the projects it applies to and no other. A lint that runs `bun lint` is also keyed by
 `{ "env": "SMOO_LINT_BUN" }` (the store path): the linter and its built-in rules are that pinned Bun binary, which no
-lockfile names, so moving the pin re-runs every lint without coupling to the repository's runtime Bun. A typed config
-applies only in a workspace whose root ESLint configuration enables the lint, and two typed configs in one directory are
-refused.
+lockfile names, so moving the pin re-runs every lint without coupling to the repository's runtime Bun. Because
+`bun lint --type-aware` types each linted file with the nearest `tsconfig.json` above it, a lint also keys every
+`tsconfig.json` path outside the project root from each linted file's directory up to and including its nearest existing
+one, plus the `extends` chain of each such existing config. A typed config applies only in a workspace whose root ESLint
+configuration enables the lint, and two typed configs in one directory are refused.
 
 The lint inputs key the same program without naming each file: the test declaration and its existing `extends` chain,
 one glob over the JavaScript and TypeScript kinds for each directory the declaration's include patterns walk (none for a

@@ -2580,6 +2580,63 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   });
+
+  it('keys external nearest tsconfig.json files and their extends chains for bun lint type-aware runs', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('eslint.config.mjs', 'export default [{ files: ["**/*.ts"] }];\n');
+      await workspace.write('tsconfig.shared.json', '{}\n');
+      await workspace.write('tsconfig.base.json', '{"extends":"./tsconfig.shared.json"}\n');
+      await workspace.write('tsconfig.json', '{"extends":"./tsconfig.base.json"}\n');
+
+      // (1) Project with no tsconfig.json of its own: falls through to workspace root tsconfig.json and its chain.
+      await workspace.write('packages/no-tsconfig/package.json', '{"name":"no-tsconfig"}\n');
+      await workspace.write('packages/no-tsconfig/src/index.ts', 'export const value = 1;\n');
+
+      // (2) Project whose tsconfig.test.json includes a file in a sibling directory with its own tsconfig.json.
+      await workspace.write('packages/sibling/tsconfig.json', '{}\n');
+      await workspace.write('packages/sibling/tests/shared.ts', 'export const shared = 1;\n');
+      await workspace.write('packages/consumer/package.json', '{"name":"consumer"}\n');
+      await workspace.write('packages/consumer/tsconfig.json', '{}\n');
+      await workspace.write('packages/consumer/tsconfig.test.json', '{"include":["../sibling/tests/**/*.ts"]}\n');
+      await workspace.write('packages/consumer/src/index.ts', 'export const value = 1;\n');
+
+      // (3) Project with its own tsconfig.json extending ../../tsconfig.base.json and only src files: selfDefault
+      // covers its own tsconfig.json so no external tsconfig.json candidate is added, while its extends chain is keyed.
+      await workspace.write('packages/own/package.json', '{"name":"own"}\n');
+      await workspace.write('packages/own/tsconfig.json', '{"extends":"../../tsconfig.base.json"}\n');
+      await workspace.write('packages/own/src/index.ts', 'export const value = 1;\n');
+
+      const noTsconfig = await inferProjectTargets(workspace, 'packages/no-tsconfig/package.json');
+      expect(noTsconfig.lint?.inputs).toEqual(
+        expect.arrayContaining([
+          '{workspaceRoot}/packages/tsconfig.json',
+          '{workspaceRoot}/tsconfig.json',
+          '{workspaceRoot}/tsconfig.base.json',
+          '{workspaceRoot}/tsconfig.shared.json',
+        ]),
+      );
+
+      const consumer = await inferProjectTargets(workspace, 'packages/consumer/package.json');
+      expect(consumer.lint?.inputs).toContain('{workspaceRoot}/packages/sibling/tsconfig.json');
+      expect(consumer.lint?.inputs).toContain('{workspaceRoot}/packages/sibling/tests/tsconfig.json');
+      expect(consumer.lint?.inputs).not.toContain('{workspaceRoot}/tsconfig.json');
+
+      const own = await inferProjectTargets(workspace, 'packages/own/package.json');
+      expect(own.lint?.inputs).toEqual(
+        expect.arrayContaining(['{workspaceRoot}/tsconfig.base.json', '{workspaceRoot}/tsconfig.shared.json']),
+      );
+      const ownTsconfigInputs = (own.lint?.inputs ?? []).filter(
+        (input): input is string =>
+          typeof input === 'string' &&
+          input.startsWith('{workspaceRoot}/') &&
+          (input === '{workspaceRoot}/tsconfig.json' || input.endsWith('/tsconfig.json')),
+      );
+      expect(ownTsconfigInputs).toEqual([]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   it('keys exactly the workspace files jiti loads for a TypeScript ESLint config', async () => {
     const workspace = await createWorkspace();
     try {

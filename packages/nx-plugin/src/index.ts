@@ -534,6 +534,8 @@ interface EslintWorkspace {
   readonly configScopes: readonly string[];
   /** The typed config each directory asked about holds, `null` for none: each closure is walked once per graph. */
   readonly typedConfigs: Map<string, TypedEslintConfig | null>;
+  /** Nearest existing `tsconfig.json` at or above each directory asked about, workspace-relative, or `null` for none. */
+  readonly nearestTsconfigs: Map<string, string | null>;
 }
 
 /**
@@ -567,6 +569,7 @@ async function eslintWorkspace(workspaceRoot: string): Promise<EslintWorkspace |
     configImports: closure.files,
     configScopes: bunLoadScopes(workspaceRoot, closure.packageLoads),
     typedConfigs: new Map(),
+    nearestTsconfigs: new Map(),
   };
 }
 
@@ -612,13 +615,77 @@ function typedConfigDirectories(projectRoot: string): string[] {
   }
 }
 
+/** Nearest existing `tsconfig.json` at or above `directory` in `eslint.indexed`, or `null` when none exists. */
+function nearestTsconfig(directory: string, eslint: EslintWorkspace): string | null {
+  const normalized = posix.normalize(directory);
+  const cached = eslint.nearestTsconfigs.get(normalized);
+  if (cached !== undefined) return cached;
+  const candidate = posix.join(normalized, 'tsconfig.json');
+  const resolved = eslint.indexed.has(candidate)
+    ? candidate
+    : normalized === '.'
+      ? null
+      : nearestTsconfig(posix.dirname(normalized), eslint);
+  eslint.nearestTsconfigs.set(normalized, resolved);
+  return resolved;
+}
+
+/** True when workspace-relative `path` lies outside `projectRoot` (so the project's own default input does not key it). */
+function isOutsideProjectRoot(path: string, projectRoot: string): boolean {
+  const root = posix.normalize(projectRoot);
+  if (root === '.') return false;
+  return path !== root && !path.startsWith(`${root}/`);
+}
+
+/**
+ * Inputs for the `tsconfig.json` files the lint Bun's type-aware rules read for `files`: every candidate path outside
+ * `projectRoot` from each file's directory up to and including its nearest existing `tsconfig.json`, plus the
+ * `extends` chain of every resolved nearest `tsconfig.json` (inside or outside `projectRoot`).
+ */
+function lintTsconfigInputs(
+  files: readonly string[],
+  projectRoot: string,
+  workspaceRoot: string,
+  eslint: EslintWorkspace,
+): string[] {
+  const candidates = new Set<string>();
+  const resolvedConfigs = new Set<string>();
+  for (const file of files) {
+    const directory = posix.dirname(file);
+    const nearest = nearestTsconfig(directory, eslint);
+    for (const ancestor of typedConfigDirectories(directory)) {
+      const candidate = posix.join(ancestor, 'tsconfig.json');
+      if (isOutsideProjectRoot(candidate, projectRoot)) {
+        candidates.add(`{workspaceRoot}/${candidate}`);
+      }
+      if (candidate === nearest) break;
+    }
+    if (nearest !== null) {
+      resolvedConfigs.add(join(workspaceRoot, nearest));
+    }
+  }
+  const sortedCandidates = [...candidates].sort();
+  if (resolvedConfigs.size === 0) return sortedCandidates;
+  const chainInputs = typescriptConfigChainInputs([...resolvedConfigs], workspaceRoot).inputs.filter(
+    (input) => !candidates.has(input),
+  );
+  return [...sortedCandidates, ...chainInputs];
+}
+
 function projectLintCommands(
   projectRoot: string,
   workspaceRoot: string,
   eslint: EslintWorkspace | null,
-): { commands: string[]; inputs: string[]; eslintFileSet: EslintFileSet | null; typed: TypedEslintConfig | null } {
+): {
+  commands: string[];
+  inputs: string[];
+  tsconfigInputs: string[];
+  eslintFileSet: EslintFileSet | null;
+  typed: TypedEslintConfig | null;
+} {
   const commands: string[] = [];
   const inputs: string[] = [];
+  let tsconfigInputs: string[] = [];
   let eslintFileSet: EslintFileSet | null = null;
   let typed: TypedEslintConfig | null = null;
   const quote = (path: string) => `'${path.replaceAll("'", "'\"'\"'")}'`;
@@ -640,6 +707,7 @@ function projectLintCommands(
         files: sources.files,
       };
       commands.push(eslintFileSet.command);
+      tsconfigInputs = lintTsconfigInputs(eslintFileSet.files, projectRoot, workspaceRoot, eslint);
       // The sources include files no typed block matches, which ESLint would otherwise warn it ignored.
       typed = nearestTypedConfig(workspaceRoot, projectRoot, eslint);
       if (typed !== null) {
@@ -647,7 +715,7 @@ function projectLintCommands(
       }
     }
   }
-  return { commands, inputs, eslintFileSet, typed };
+  return { commands, inputs, tsconfigInputs, eslintFileSet, typed };
 }
 
 type NapiArchitecture = 'arm64' | 'x64';
@@ -2518,6 +2586,7 @@ async function createProjectTargets(
   const {
     commands: lintCommands,
     inputs: lintProgramInputs,
+    tsconfigInputs: lintTsconfig,
     eslintFileSet,
     typed: typedLint,
   } = projectLintCommands(projectRoot, workspaceRoot, eslint);
@@ -2562,6 +2631,8 @@ async function createProjectTargets(
         ...(lintScopes.length > 0 ? [bunScopeInput(projectRoot, lintScopes)] : []),
         // The linter and its built-in rules are the lint Bun binary, keyed by its store path.
         ...(eslintFileSet === null ? [] : [LINT_BUN_INPUT]),
+        // The lint Bun's type-aware rules read the nearest tsconfig.json above each linted file and its `extends` chain.
+        ...lintTsconfig,
       ],
       ...(lintCommands.length > 0
         ? {
