@@ -2,6 +2,7 @@ import { describe, expect, it, jest } from 'bun:test';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { createProcessTreeKiller, runBoundedExec } from './executor.js';
@@ -22,6 +23,11 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 `;
+
+// The fixtures are path-only and run offline, so their Cargo needs nothing from the host's home, but it would still take
+// that home's package-cache lock, which any other checkout's Cargo may hold for minutes: a wait no bound of the case
+// under test should see. Each case's Cargo runs under this file's own empty home.
+useFixtureCargoHome();
 
 /** Real Cargo/rustc/test processes; IPC, not compiler speed, determines every clock step. */
 describe('Cargo test progress host proofs', () => {
