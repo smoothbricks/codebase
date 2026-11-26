@@ -17,6 +17,13 @@
 # Nx output on the same footing; its consumer lockfiles name tarballs workspace-relatively.
 state = [".cache/ttsc-plugins", ".cache/ttsc"]
 
+[scratch]
+# Each exec host's TMPDIR (specs/cowshed/04_sandbox.md, TMPDIR; 06_cli.md "Configuration"): a host lease on the RAM
+# temp volume that nx-plugin's provider takes and settles (packages/nx-plugin/README.md, RAM temp), instead of the
+# store directory on the SSD, where sandboxed scratch was the bulk of the host's write traffic. Main's built copy, which
+# `[land] after` rebuilds; a provider that fails or refuses leaves the store TMPDIR, said once.
+provider = ["bun", "packages/nx-plugin/dist/executors/bounded-exec/scratch-provider.js"]
+
 [land]
 # The declared land (specs/cowshed/02_workspaces.md "A declared land"): `cowshed land <ws>` takes this land turn,
 # rebases <ws> onto main, runs the gate below on the host in main's pure environment, fast-forwards main under the ref
