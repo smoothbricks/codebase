@@ -234,6 +234,43 @@ describe('a planted runtime input failure through real Nx', () => {
 });
 
 /**
+ * WHY this test is permanent. Under cowshed each exec host and the kept Nx
+ * daemon run in their own sandboxes with distinct scratch directories
+ * (`TMPDIR`), each granted only to its own host's profile. Nx 24.0.6 hashes a
+ * task in the daemon using the client's environment verbatim, so a `runtime:`
+ * input that writes under `$TMPDIR` fails inside the daemon's sandbox with
+ * EPERM and poisons the hash. The carried Nx patch substitutes the daemon's
+ * own `TMPDIR` when hashing for a client. Drop the patch hunk, and keep this
+ * test, once upstream Nx runs a client's runtime inputs with the daemon's
+ * temporary directory.
+ */
+describe('a runtime input hashed by the Nx daemon', () => {
+  it("uses the daemon's own TMPDIR rather than the client's", async () => {
+    await withNxFixture(
+      'runtime-input-tmpdir-',
+      async ({ root, workspace, socketDirectory }) => {
+        const scratchCommand = `sh -c ${shellWord('f=$(mktemp "$TMPDIR/probe.XXXXXX") && rm -f "$f" && echo scratch-ok')}`;
+        await writeProbeWorkspace(workspace, { scratch: scratchCommand });
+        const daemonTmp = join(root, 'daemon-tmp');
+        await mkdir(daemonTmp, { recursive: true });
+        const clientTmp = join(root, 'missing-client-tmp');
+        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+
+        const first = nx(workspace, { ...env, TMPDIR: daemonTmp }, 'probe:good');
+        expect(first.status, first.output).toBe(0);
+        expect(existsSync(join(workspace, 'good.ran'))).toBe(true);
+
+        const second = nx(workspace, { ...env, TMPDIR: clientTmp }, 'probe:scratch');
+        expect(second.status, second.output).toBe(0);
+        expect(second.output).not.toContain('Could not hash');
+        expect(existsSync(join(workspace, 'scratch.ran'))).toBe(true);
+      },
+      'workspace',
+    );
+  });
+});
+
+/**
  * Guards the hash-failure hunk of patches/nx@24.0.6.patch. Nx 24.0.3's native hasher fails a runtime input whose output
  * is not UTF-8 with `invalid utf-8 sequence of 1 bytes from index 0`, naming no task and no input. The patched hasher
  * rethrows a failure of each native hash call (`hashPlans`, Nx 24's up-front `hashPlansUpfront`, and `hashPlansFor`
@@ -575,7 +612,7 @@ describe('retained runtime input failure reports', () => {
   });
 });
 
-async function writeProbeWorkspace(workspace: string): Promise<void> {
+async function writeProbeWorkspace(workspace: string, extraTargets: Record<string, string> = {}): Promise<void> {
   expect(spawnSync('git', ['init', '--quiet', workspace]).status).toBe(0);
   await mkdir(join(workspace, 'probe'), { recursive: true });
   // The repository's own node_modules: the Nx under test, and the wrapper at the path inputs name it by.
@@ -587,16 +624,14 @@ async function writeProbeWorkspace(workspace: string): Promise<void> {
     inputs: [runtimeInput(command)],
     options: { command: `touch ${name}.ran` },
   });
-  await writeFile(
-    join(workspace, 'probe', 'project.json'),
-    JSON.stringify({
-      name: 'probe',
-      targets: {
-        good: target('good', `sh -c ${shellWord('echo value; echo noise >&2')}`),
-        planted: target('planted', plantedCommand),
-      },
-    }),
-  );
+  const targets: Record<string, ReturnType<typeof target>> = {
+    good: target('good', `sh -c ${shellWord('echo value; echo noise >&2')}`),
+    planted: target('planted', plantedCommand),
+  };
+  for (const [name, command] of Object.entries(extraTargets)) {
+    targets[name] = target(name, command);
+  }
+  await writeFile(join(workspace, 'probe', 'project.json'), JSON.stringify({ name: 'probe', targets }));
 }
 
 function nx(workspace: string, env: Record<string, string>, target: string): { status: number | null; output: string } {

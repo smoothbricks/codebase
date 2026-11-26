@@ -1669,6 +1669,59 @@ index 0000000000000000000000000000000000000000..a3020e12bc219b7cbedb441a0a049ca8
 +    (0, node_fs_1.rmSync)(probePath, { force: true });
 +  }
 +}
+diff --git a/dist/src/daemon/server/handle-hash-tasks.js b/dist/src/daemon/server/handle-hash-tasks.js
+index b05967a1a6fc2e726db31dbfb958999354c7c8a8..72a323fd82886ce222b4036ba3483e797e54dc8f 100644
+--- a/dist/src/daemon/server/handle-hash-tasks.js
++++ b/dist/src/daemon/server/handle-hash-tasks.js
+@@ -25,9 +25,38 @@ async function getHasher(runnerOptions) {
+     }
+     return storedHasher;
+ }
++/**
++ * A client's scratch directory (`TMPDIR`) is granted to the client's sandbox
++ * alone, so a command the daemon runs for a client (such as a `runtime:` input)
++ * gets the daemon's own `TMPDIR`, or none when the daemon has none so the
++ * command takes the platform default as the daemon itself does. Every other
++ * variable stays the client's.
++ */
++function withDaemonScratch(perTaskEnvs) {
++    if (!perTaskEnvs) {
++        return perTaskEnvs;
++    }
++    const daemonTmpDir = process.env.TMPDIR;
++    const result = {};
++    for (const [taskId, env] of Object.entries(perTaskEnvs)) {
++        if (!env || typeof env !== 'object') {
++            result[taskId] = env;
++            continue;
++        }
++        const copy = { ...env };
++        if (daemonTmpDir === undefined) {
++            delete copy.TMPDIR;
++        }
++        else {
++            copy.TMPDIR = daemonTmpDir;
++        }
++        result[taskId] = copy;
++    }
++    return result;
++}
+ async function handleHashTasks(payload) {
+     const hasher = await getHasher(payload.runnerOptions);
+-    const response = await hasher.hashTasks(payload.tasks, payload.taskGraph, payload.perTaskEnvs, payload.cwd, payload.collectInputs, (0, ultracache_configuration_state_1.getUltracacheConfigurationsForVersion)(payload.ultracacheConfigurationsVersion));
++    const response = await hasher.hashTasks(payload.tasks, payload.taskGraph, withDaemonScratch(payload.perTaskEnvs), payload.cwd, payload.collectInputs, (0, ultracache_configuration_state_1.getUltracacheConfigurationsForVersion)(payload.ultracacheConfigurationsVersion));
+     return {
+         response,
+         description: 'handleHashTasks',
+@@ -35,7 +64,7 @@ async function handleHashTasks(payload) {
+ }
+ async function handleHashTasksUpfront(payload) {
+     const hasher = await getHasher(payload.runnerOptions);
+-    const response = await hasher.hashTasksUpfront(payload.tasks, payload.taskGraph, payload.perTaskEnvs, payload.cwd, payload.collectInputs, (0, ultracache_configuration_state_1.getUltracacheConfigurationsForVersion)(payload.ultracacheConfigurationsVersion));
++    const response = await hasher.hashTasksUpfront(payload.tasks, payload.taskGraph, withDaemonScratch(payload.perTaskEnvs), payload.cwd, payload.collectInputs, (0, ultracache_configuration_state_1.getUltracacheConfigurationsForVersion)(payload.ultracacheConfigurationsVersion));
+     return {
+         response,
+         description: 'handleHashTasksUpfront',
 diff --git a/dist/src/daemon/server/handle-task-history.d.ts b/dist/src/daemon/server/handle-task-history.d.ts
 deleted file mode 100644
 index 70e1f4db2d37af99bfea24cebca2cdf49f71406d..0000000000000000000000000000000000000000

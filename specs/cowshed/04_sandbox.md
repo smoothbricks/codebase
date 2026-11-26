@@ -1263,12 +1263,14 @@ mount stops the keeper's starts first and ends the start it has in flight unless
 (02_workspaces.md, "Holders cowshed does not run"); the keeper then answers `Stopped`, says so once on stderr, and
 counts the ended start as no failure, until the shed's next job or named session opening resumes it. A stop of an idle
 shed's live daemon that fails is likewise tried at most 3 times in a row, and again only after a probe finds it gone. A
-host client finds the daemon through the shared record and connects to it instead of starting one outside the sandbox.
-Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon is the host's. A fork deletes the
-record from the build volume; a land deletes the landing workspace's and gives the adopted volume the target's record of
-a live unsandboxed daemon in its place (16_build_volumes.md). A repository shell that exports either directory
-unconditionally replaces the checkout's, like any export, and splits the state again; a repository shell that sets them
-keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
+host client finds the daemon through the shared record and connects to it instead of starting one outside the sandbox. A
+command the daemon runs for a client, such as a runtime input it hashes, gets the daemon's own scratch, never the
+client's: a scratch directory is granted to its own host's sandbox alone. Main's supervisor keeps no daemon: main is the
+operator's checkout, and its daemon is the host's. A fork deletes the record from the build volume; a land deletes the
+landing workspace's and gives the adopted volume the target's record of a live unsandboxed daemon in its place
+(16_build_volumes.md). A repository shell that exports either directory unconditionally replaces the checkout's, like
+any export, and splits the state again; a repository shell that sets them keeps a value already present
+(`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
 
 A kept daemon costs its host a resident Node process (about 0.65 GB RSS in a 56-project consumer's shed, its plugins
 loaded in it rather than in workers) and a file watcher that recomputes the project graph on every change in the tree,

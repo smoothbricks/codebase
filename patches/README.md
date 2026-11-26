@@ -763,6 +763,27 @@ invocations in one process whose local plugin's pre hook publishes the run's id 
 hunk the second run replayed the first's cache entry (`local-cache-kept-existing`, saw `run-one`). Drop the hunk, and
 keep the test, once the Nx in use scopes the memo to a run.
 
+## A daemon runs a client's runtime inputs with its own scratch
+
+A client sends the daemon its own per-task environment (`perTaskEnvs`, `tasks-runner/task-env.js` and
+`daemon/client/client.js`), and the daemon hands it straight to the hasher (`daemon/server/handle-hash-tasks.js`,
+`handleHashTasks` and `handleHashTasksUpfront`). A `runtime:` input therefore runs inside the daemon's process and
+sandbox with the client's `TMPDIR`. Under cowshed, each exec host and the kept daemon have distinct scratch directories,
+each granted only to its own host's sandbox (`specs/cowshed/04_sandbox.md`): in a consumer's shed, a first run with no
+daemon passed and the second, hashed by the daemon, failed with `EPERM` when a runtime input called `mktemp` under
+`$TMPDIR`, so the wrapper emitted its `0xFF` sentinel and the client failed with
+`Could not hash <task>: invalid utf-8 sequence of 1 bytes from index 0`.
+
+Both `handleHashTasks` and `handleHashTasksUpfront` now pass each task a copy of its environment whose `TMPDIR` is the
+daemon's own `process.env.TMPDIR` (deleting `TMPDIR` when the daemon has none, so the command takes the platform default
+as the daemon itself does), leaving every other variable the client's. The in-process (no-daemon) path is unchanged:
+there the client runs the input in its own sandbox with its own `TMPDIR`. `packages/nx-plugin/src/runtime-input.test.ts`
+("a runtime input hashed by the Nx daemon") starts a real fixture daemon with a writable `TMPDIR`, then hashes a probe
+task whose `runtime:` input creates and removes a temporary file under `$TMPDIR` from a client whose `TMPDIR` does not
+exist; before the hunk the second run fails with
+`Could not hash probe:scratch: invalid utf-8 sequence of 1 bytes from index 0`, and with it the task runs. Drop the
+hunk, and keep the test, once Nx runs a client's runtime inputs with the daemon's temporary directory.
+
 ## Local plugin paths
 
 A plugin nx.json names by a relative path (`./tools/plugin.js`) is that file under the workspace root, and
