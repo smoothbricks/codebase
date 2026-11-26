@@ -1866,6 +1866,69 @@ index 22ef5cb..e6aae92 100644
 +}
  //# sourceMappingURL=collectPluginSourceFiles.js.map
 \ No newline at end of file
+diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
+index 9a33d59..d76a0f1 100644
+--- a/lib/plugin/internal/source/hashPluginBuildEnvironment.js
++++ b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
+@@ -13,6 +13,7 @@ const GoSourceInputs_1 = require("./GoSourceInputs");
+ const GoToolResolution_1 = require("./GoToolResolution");
+ const PluginBuildEnvironmentWitness_1 = require("./PluginBuildEnvironmentWitness");
+ const PluginContentIdentities_1 = require("./PluginContentIdentities");
++const resolveGoCompiler_1 = require("./resolveGoCompiler");
+ const spawnGoTool_1 = require("./spawnGoTool");
+ /**
+  * Hash the environment a plugin build is keyed on into `hash`: the Go
+@@ -341,6 +342,9 @@ function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identiti
+         // nested content changes that do not move the root or VERSION metadata.
+         PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.add(witness, value);
+         PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.add(witness, node_path_1.default.join(value, "VERSION"));
++        const bundled = bundledGoRootIdentity(value, env, witness);
++        if (bundled !== undefined)
++            return bundled;
+         return resolveGoRootCacheIdentity(value, filesystem, witness, identities);
+     }
+     if (key === "GOFLAGS") {
+@@ -355,6 +359,40 @@ function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identiti
+     }
+     return value;
+ }
++// The toolchain ttsc bundles is the published content of its platform package (`@ttsc/<platform>-<arch>`), fixed by
++// that package's name and version: an installed package is never rewritten in place, and another toolchain arrives as
++// another version at another path. Its identity is therefore that name and version with the SDK's VERSION line, read
++// from two files, and the witness re-checks those two. The per-file SDK walk below (about 3,900 files, statted again
++// by every witness check: 71,847 lookups per plugin load, samchon/ttsc#1878) stays for a GOROOT the project or the
++// host supplies, whose content no package version pins.
++function bundledGoRootIdentity(goRoot, env, witness) {
++    const compiler = (0, resolveGoCompiler_1.resolveGoCompiler)(env);
++    if (!compiler.bundled)
++        return undefined;
++    let root;
++    let bundledRoot;
++    try {
++        root = node_fs_1.default.realpathSync.native(goRoot);
++        bundledRoot = node_fs_1.default.realpathSync.native(node_path_1.default.dirname(node_path_1.default.dirname(compiler.binary)));
++    }
++    catch {
++        return undefined;
++    }
++    if (root !== bundledRoot)
++        return undefined;
++    const manifestPath = node_path_1.default.join(node_path_1.default.dirname(node_path_1.default.dirname(root)), "package.json");
++    PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.add(witness, manifestPath);
++    try {
++        const manifest = JSON.parse(node_fs_1.default.readFileSync(manifestPath, "utf8"));
++        const version = node_fs_1.default.readFileSync(node_path_1.default.join(root, "VERSION"), "utf8").split("\n")[0];
++        if (typeof manifest.name !== "string" || typeof manifest.version !== "string")
++            return undefined;
++        return `bundled:${manifest.name}@${manifest.version}:${version}`;
++    }
++    catch {
++        return undefined;
++    }
++}
+ /**
+  * The content identity of a C toolchain command such as `CC`, split as Go
+  * splits it, with every token that names an executable file hashed.
 diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/internal/source/inspectPluginBuildLock.js
 index 1d9fba4..63d7ba0 100644
 --- a/lib/plugin/internal/source/inspectPluginBuildLock.js

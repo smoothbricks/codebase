@@ -447,6 +447,16 @@ contributor's files at `contrib/<name>`; the answer is recorded only when the mo
 keyed digests after Go ran. A proposal, a contributor holding a nested `go.mod`, or a host entry under a link or a
 pruned directory is still observed in a copy.
 
+A plugin build's key names the Go SDK it builds with. For a `GOROOT` that is the toolchain ttsc bundles
+(`resolveGoCompiler` reports it `bundled`), the patch keys it by the platform package's `name@version` and the SDK's
+`VERSION` line, witnessing only those two files (`bundledGoRootIdentity` in
+`lib/plugin/internal/source/hashPluginBuildEnvironment.js`,
+[samchon/ttsc#1878](https://github.com/samchon/ttsc/issues/1878)). An installed package is never rewritten in place, and
+another toolchain is another version at another path. Stock ttsc walked and statted all of the bundled SDK's ~3,900
+files to guard its recorded identity, and its witness statted them again at each check: 71,847 lookups of the platform
+package per plugin load (3,681 distinct paths), which is the largest vnode churn ttsc puts on a busy host. With the
+patch it is about 660 (17 distinct paths). A `GOROOT` the project or host supplies keeps the full walk.
+
 A resident `driver.Session` whose `Session.Apply` installs a new program generation looks up the changed file directly
 on `TSProgram` (`TSProgram.GetSourceFile`) and resets `pluginsApplied`, `pluginsApplyErr` and the per-generation plugin
 ledgers (`declarations`, `inputs`, `outputs` via `linkedPluginState.resetGeneration` in `driver/session.go` and
