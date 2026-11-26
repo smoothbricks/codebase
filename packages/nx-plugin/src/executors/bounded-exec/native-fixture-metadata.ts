@@ -351,9 +351,22 @@ function allOlderThan(inputs: MetadataInputs, startedNs: bigint): boolean {
       if (!isAbsent(error)) throw error;
     }
   }
+  const checkedDirs = new Set<string>();
   for (const path of inputs.listings) {
+    checkedDirs.add(path);
     try {
       if (statSync(path, { bigint: true }).mtimeNs >= startedNs) return false;
+    } catch (error) {
+      if (!isAbsent(error)) throw error;
+    }
+  }
+  // Creating or removing an `exists` entry moves its parent directory's mtime.
+  for (const path of inputs.exists) {
+    const parent = dirname(path);
+    if (checkedDirs.has(parent)) continue;
+    checkedDirs.add(parent);
+    try {
+      if (statSync(parent, { bigint: true }).mtimeNs >= startedNs) return false;
     } catch (error) {
       if (!isAbsent(error)) throw error;
     }

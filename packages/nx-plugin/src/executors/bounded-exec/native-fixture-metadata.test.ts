@@ -125,9 +125,13 @@ async function withWorkspace(body: (fixture: FixtureWorkspace) => Promise<void>)
     await backdate(
       join(workspace, 'Cargo.lock'),
       join(workspace, 'Cargo.toml'),
+      join(workspace, 'alpha'),
       join(workspace, 'alpha/Cargo.toml'),
-      join(workspace, 'beta/Cargo.toml'),
+      join(workspace, 'alpha/src'),
       join(workspace, 'alpha/tests'),
+      join(workspace, 'beta'),
+      join(workspace, 'beta/Cargo.toml'),
+      join(workspace, 'beta/src'),
       join(workspace, 'beta/src/bin'),
     );
 
@@ -400,6 +404,39 @@ it('answers without storing when an input changes while Cargo is in flight', asy
 
     const third = await runLayout(['-p', 'alpha']);
     expect(third.code, third.stderr).toBe(0);
+    expect((await cargo.runs()).spawned).toBe(2);
+  });
+});
+
+it('answers without storing when a target source is created while Cargo is in flight', async () => {
+  await withWorkspace(async ({ workspace, storeAnswer, cargo, spawnLayout, runLayout }) => {
+    await cargo.beforeAnswer.close();
+    const inflight = await spawnLayout(['-p', 'alpha']);
+    await cargo.waitForRuns((runs) => runs.read === 1, 'the in-flight metadata child to read');
+    const main = join(workspace, 'alpha/src/main.rs');
+    await writeFile(main, 'fn main() {}\n');
+    await cargo.beforeAnswer.open();
+
+    const first = await inflight.done;
+    expect(first.code, first.stderr).toBe(0);
+    expect(first.stdout).toBe('shared');
+    expect((await readFile(join(first.fixtureDir, 'cargo-metadata.json'), 'utf8')).length).toBeGreaterThan(0);
+    await expect(readFile(storeAnswer, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await backdate(main, dirname(main));
+    const second = await runLayout(['-p', 'alpha']);
+    expect(second.code, second.stderr).toBe(0);
+    expect(second.stdout).toBe('private');
+    expect((await cargo.runs()).spawned).toBe(2);
+    const written: unknown = JSON.parse(await readFile(join(second.fixtureDir, 'cargo-metadata.json'), 'utf8'));
+    const real: unknown = JSON.parse(
+      realCargoMetadata(workspace, ['--config', join(second.fixtureDir, 'layout.toml')]),
+    );
+    expect(sortJsonKeys(written)).toEqual(sortJsonKeys(real));
+
+    const third = await runLayout(['-p', 'alpha']);
+    expect(third.code, third.stderr).toBe(0);
+    expect(third.stdout).toBe('private');
     expect((await cargo.runs()).spawned).toBe(2);
   });
 });
