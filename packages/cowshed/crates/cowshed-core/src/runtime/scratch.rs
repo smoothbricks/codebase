@@ -27,8 +27,12 @@ use crate::sandbox::{
     shared_daemon_runtime_dir, shared_daemon_runtime_link,
 };
 
-/// Bound on the provider's first JSON line on stdout.
-pub const SCRATCH_PROVIDER_BOUND: Duration = Duration::from_secs(5);
+/// Bound on the provider's first JSON line on stdout. A provider may create its storage before it
+/// answers: the RAM provider's cold create (`diskutil apfs createContainer`, then `addVolume`)
+/// answered after 7.4, 7.4, 7.4 and 13.6 s at load 11-13 (2026-11-26). A bound below that abandons
+/// every cold start, whose provider then creates the volume and detaches it again on EOF, so the
+/// bound is 30 s: twice the slowest cold create measured, while a warm provider answers in ~0.1 s.
+pub const SCRATCH_PROVIDER_BOUND: Duration = Duration::from_secs(30);
 
 /// Bound on the provider settling and exiting after stdin EOF.
 pub const SCRATCH_SETTLE_BOUND: Duration = Duration::from_secs(5);

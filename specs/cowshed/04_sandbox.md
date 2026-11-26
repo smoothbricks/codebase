@@ -1088,23 +1088,24 @@ sandboxed one-shot child's scratch directory on storage it manages without hard-
 — so the supervisor still runs no workspace code. The provider runs on the host outside every sandbox with main's
 checkout as its cwd, the declared-command host bootstrap `PATH` (`declared_land::bootstrap_path`), and
 `COWSHED_SCRATCH_WORKSPACE` and `COWSHED_SUPERVISOR_SOCKET`; it answers one JSON line (`{"directory": …}` or
-`{"unavailable": …}`) within `SCRATCH_PROVIDER_BOUND` (5 s) and holds the directory until EOF on its stdin after the
-host or one-shot child retires, reaped off the supervisor actor within `SCRATCH_SETTLE_BOUND`. Cowshed validates the
-directory (canonical, no symlink in any component, 0700 directory owned by the supervisor's uid, outside protected
-roots, and its parent enclosing no granted or system root) and launches that host under a second per-revision profile
-variant parameterized with `-D SCRATCH_DIR` and `-D SCRATCH_PARENT` (parent subpath denied, scratch directory subpath
-and Unix-socket prefix allowed, parent literal metadata-only). On warm hosts `TMPDIR` is laid over each command's
-environment rather than placed in the activation baseline, so shell activation reuse (`inherited_baseline`) and pool
-keys stay unchanged. Any provider refusal, timeout, exit, or invalid directory falls back silently to the store `TMPDIR`
-after reporting `cowshed: scratch provider <reason>; TMPDIR stays <store tmp dir>` once per supervisor per distinct
-reason on a job's stderr; a provider failure never fails a job. Both `XDG_RUNTIME_DIR` and the store `TMPDIR` are
-prepared before activation, for every job the supervisor starts — an `exec`, a named session's command, a land check.
-The store temporary directory lies outside every checkout, because a tool may need scratch space outside the project it
-builds (a transform whose scratch directory must not sit under the project root), and outside the image, so a clone
-starts with an empty one and never copies another workspace's scratch. It is keyed by the workspace's name and goes when
-the retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these scoped
-directories, but the baseline still denies writes to the world-shared `/private/tmp`, apart from the fixture roots of
-[Fixture roots under /tmp](#fixture-roots-under-tmp), and to the host user's own temporary directory under
+`{"unavailable": …}`) within `SCRATCH_PROVIDER_BOUND` (30 s, sized to a provider that creates its storage first: the RAM
+provider's cold create answered in 7-14 s, a warm one in about 0.1 s) and holds the directory until EOF on its stdin
+after the host or one-shot child retires, reaped off the supervisor actor within `SCRATCH_SETTLE_BOUND`. Cowshed
+validates the directory (canonical, no symlink in any component, 0700 directory owned by the supervisor's uid, outside
+protected roots, and its parent enclosing no granted or system root) and launches that host under a second per-revision
+profile variant parameterized with `-D SCRATCH_DIR` and `-D SCRATCH_PARENT` (parent subpath denied, scratch directory
+subpath and Unix-socket prefix allowed, parent literal metadata-only). On warm hosts `TMPDIR` is laid over each
+command's environment rather than placed in the activation baseline, so shell activation reuse (`inherited_baseline`)
+and pool keys stay unchanged. Any provider refusal, timeout, exit, or invalid directory falls back silently to the store
+`TMPDIR` after reporting `cowshed: scratch provider <reason>; TMPDIR stays <store tmp dir>` once per supervisor per
+distinct reason on a job's stderr; a provider failure never fails a job. Both `XDG_RUNTIME_DIR` and the store `TMPDIR`
+are prepared before activation, for every job the supervisor starts — an `exec`, a named session's command, a land
+check. The store temporary directory lies outside every checkout, because a tool may need scratch space outside the
+project it builds (a transform whose scratch directory must not sit under the project root), and outside the image, so a
+clone starts with an empty one and never copies another workspace's scratch. It is keyed by the workspace's name and
+goes when the retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these
+scoped directories, but the baseline still denies writes to the world-shared `/private/tmp`, apart from the fixture
+roots of [Fixture roots under /tmp](#fixture-roots-under-tmp), and to the host user's own temporary directory under
 `/private/var/folders`; shell activation does not require a blanket temporary-directory grant. A process that reaches a
 temporary directory by any other route than `TMPDIR` finds none it can write: `xcrun`, for one, then fails to create its
 cache, prints its `mkstemp` path, and resolves every lookup the slow way.
