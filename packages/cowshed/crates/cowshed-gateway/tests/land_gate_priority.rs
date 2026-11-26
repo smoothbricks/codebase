@@ -217,6 +217,7 @@ fn start_supervisor(
         build_volume_released: None,
         memory_pressure: calm_pressure::calm(),
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+        scratch: None,
     };
     let commitments =
         CommitmentPublisher::start(Box::new(cowshed_core::storage::audit::NullAuditSink), 8)
