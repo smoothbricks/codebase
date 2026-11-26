@@ -249,12 +249,15 @@ Each detector returns data through one `CapabilityContribution`:
   `.cowshed/bin` that targets the store, with or without a Nix project; a host with no store gets none. Independently of
   detected project capabilities, core contributes the installed `cowshed` executable as the `cowshed` command in the
   mode's private `tools/bin`. This bootstrap entry admits executables, never controller state: only the stable program
-  link and its resolved executable receive literal read grants; ancestors receive metadata-only lookup. It permits no
-  directory listing, adjacent controller data, write authority or controller-socket access, and does not relax the
-  filesystem-grant prohibition above. Consuming-repository lint can therefore run `cowshed build-state --json` against
-  its checkout's build-volume record without duplicating its reader. The contribution merge records core ownership of
-  the program name; a conflicting detector contribution returns a typed conflict naming core and the detector, never a
-  missing-owner panic.
+  link and its resolved executable receive literal read grants; ancestors receive metadata-only lookup. The job's
+  private HOME carries the same stable link at the install's own place relative to a home,
+  `Library/Application Support/dev.cowshed/bin/cowshed`, reconciled with these links, so a launcher that looks for the
+  install under `~` (06_cli.md, "Launcher") runs it inside a job as it does outside one rather than a package's own
+  older build. It permits no directory listing, adjacent controller data, write authority or controller-socket access,
+  and does not relax the filesystem-grant prohibition above. Consuming-repository lint can therefore run
+  `cowshed build-state --json` against its checkout's build-volume record without duplicating its reader. The
+  contribution merge records core ownership of the program name; a conflicting detector contribution returns a typed
+  conflict naming core and the detector, never a missing-owner panic.
 
   Core also contributes one `bash` the same way a detector resolves its tool: the first executable `bash` in the host's
   conventional installation directories (the user's and system Nix profiles, `/run/current-system/sw/bin`, Homebrew,

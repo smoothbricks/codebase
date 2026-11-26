@@ -792,7 +792,10 @@ check but a separate closed request grammar: exactly `subtreeHandle` and `retire
 refused by name. Only this membership endpoint is granted to job sandboxes and exported as `COWSHED_SUPERVISOR_SOCKET`;
 the privileged coordinator endpoint remains inaccessible. Caller-provided values cannot redirect the exported endpoint.
 Initial policy and grant advancement use the same endpoint grant. Retirement closes both listeners before acknowledging
-the supervisor's retirement.
+the supervisor's retirement. Both endpoints decode a request strictly, and a client reads the supervisor's answers and
+heartbeats by Reader projection (07_api.md): a member its declaration does not name is dropped at every depth, and a
+missing required field, a retyped value or an unknown variant still refuses. So a client of an earlier build reads a
+newer supervisor's frames.
 
 A spawn copies every descriptor of the spawning process into the child, which holds the copies until its `exec` closes
 the close-on-exec ones; a listener or lease closed meanwhile by another thread is not released — the socket stays
