@@ -56,7 +56,14 @@
     },
     "test": {
       "cache": true,
-      "inputs": ["...", "default", "^dependencyDefault", "bunToolchain", { "env": "NODE_ENV" }]
+      "inputs": [
+        "...",
+        "default",
+        "^dependencyDefault",
+        "bunToolchain",
+        { "env": "NODE_ENV" },
+        { "env": "SMOO_TYPECHECK_TSC" }
+      ]
     },
     "cargo-test": {
       "inputs": ["default", "^dependencyDefault", { "externalDependencies": [] }]
