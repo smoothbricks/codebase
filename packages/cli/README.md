@@ -401,7 +401,7 @@ hoist onto that API package so Nx does not load `@typescript/native` (TS7) via t
 ([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)). Both dependencies and the environment binding are
 required: TypeScript 7 under the unscoped name breaks Nx API calls such as `readConfigFile`.
 
-For `ttsc@0.37.1`, smoo temporarily distributes `patches/ttsc@0.37.1.patch` and registers it in the root
+For `ttsc@0.38.1`, smoo temporarily distributes `patches/ttsc@0.38.1.patch` and registers it in the root
 `patchedDependencies` before `smoo monorepo update` runs Bun installation; it removes every other `ttsc@` registration.
 The patch repairs import-extension handling during the compiler's internal forced-emission diagnostic pass; user
 `--noEmit` still writes no output. It also makes a source-plugin build lock waiter inspect the holder before it reports
@@ -435,17 +435,21 @@ file beside the compiler's outputs (a census in outDir) reports it with `PluginC
 each emit then hands the file's bytes to the host's writer after the compiler's own outputs (`driver/plugins.go`,
 `driver/rewrite.go`, `driver/emit_plugin.go`), so ttsc's build lane, its utility host and a plugin's own host such as
 typia's list it, and the executor keeps it. An unreported one is pruned as a file this emit did not produce. When a
-transform host fails after printing an error diagnostic of its own, ttsc skips its plain `tsgo --noEmit` recheck
-(`PluginFailureDiagnostics.transformHostReported`): that host has reported its program, and the recheck loads no plugin
-and reads each referenced project from its declaration outputs, so it could only add false errors. A host that printed
-none keeps the recheck, which leaves out the refusals a `DiagnosticPlugin` withdrew (`TTSC_WITHDRAWN_DIAGNOSTICS_PATH`).
-A load's package selection for a linked plugin host (`NativeSourcePackages.inspect`) copied the host's whole Go module
-into scratch before one `go list -find`: for the installed `ttsc` module about 2,600 files written, read and removed per
-cold selection, to answer from the manifests and two package directories. When the record store's identity proves the
-module, the patch lists it where it lies, under a generated `go.work` (`GOWORK`) and a Go `-overlay` that presents each
-contributor's files at `contrib/<name>`; the answer is recorded only when the module and contributors still hold their
-keyed digests after Go ran. A proposal, a contributor holding a nested `go.mod`, or a host entry under a link or a
-pruned directory is still observed in a copy.
+transform host fails, stock ttsc 0.38 skips its plain `tsgo --noEmit` recheck only for a host that acknowledged its
+complete Program report (`TTSC_DIAGNOSTICS_COMPLETION_TOKEN`, which its utility host answers;
+[samchon/ttsc#1862](https://github.com/samchon/ttsc/pull/1862), [#1863](https://github.com/samchon/ttsc/pull/1863)). A
+host that prints through the driver itself, typia's among them, sends no acknowledgement, so the patch also skips the
+recheck after a host that printed an error diagnostic of its own (`PluginFailureDiagnostics.transformHostReported`):
+that host has reported its program, and the recheck loads no plugin and reads each referenced project from its
+declaration outputs, so it could only add false errors. A host that did neither keeps the recheck, which leaves out the
+refusals a `DiagnosticPlugin` withdrew (`TTSC_WITHDRAWN_DIAGNOSTICS_PATH`). A load's package selection for a linked
+plugin host (`NativeSourcePackages.inspect`) copied the host's whole Go module into scratch before one `go list -find`:
+for the installed `ttsc` module about 2,600 files written, read and removed per cold selection, to answer from the
+manifests and two package directories. When the record store's identity proves the module, the patch lists it where it
+lies, under a generated `go.work` (`GOWORK`) and a Go `-overlay` that presents each contributor's files at
+`contrib/<name>`; the answer is recorded only when the module and contributors still hold their keyed digests after Go
+ran. A proposal, a contributor holding a nested `go.mod`, or a host entry under a link or a pruned directory is still
+observed in a copy.
 
 A plugin build's key names the Go SDK it builds with. For a `GOROOT` that is the toolchain ttsc bundles
 (`resolveGoCompiler` reports it `bundled`), the patch keys it by the platform package's `name@version` and the SDK's
@@ -457,12 +461,14 @@ files to guard its recorded identity, and its witness statted them again at each
 package per plugin load (3,681 distinct paths), which is the largest vnode churn ttsc puts on a busy host. With the
 patch it is about 660 (17 distinct paths). A `GOROOT` the project or host supplies keeps the full walk.
 
-A resident `driver.Session` whose `Session.Apply` installs a new program generation looks up the changed file directly
-on `TSProgram` (`TSProgram.GetSourceFile`) and resets `pluginsApplied`, `pluginsApplyErr` and the per-generation plugin
-ledgers (`declarations`, `inputs`, `outputs` via `linkedPluginState.resetGeneration` in `driver/session.go` and
-`driver/plugins.go`, [samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)): stock ttsc left the generation-1
-latch and ledgers set across `Session.Apply`, so reusing one session across edits skipped linked `ProgramPlugin` hooks
-on every later generation.
+A resident `driver.Session` whose `Session.Apply` installs a new program generation resets `pluginsApplied`,
+`pluginsApplyErr` and the per-generation plugin ledgers (`declarations`, `inputs`, `outputs` via
+`linkedPluginState.resetGeneration` in `driver/session.go` and `driver/plugins.go`,
+[samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255)): stock ttsc leaves the generation-1 latch and ledgers
+set across `Session.Apply`, so reusing one session across edits skipped linked `ProgramPlugin` hooks on every later
+generation. The direct `TSProgram.GetSourceFile` lookup of the changed file, which the 0.37.1 patch carried beside it,
+is upstream in 0.38.1 ([samchon/ttsc#1868](https://github.com/samchon/ttsc/pull/1868)), which also added
+`linkedPluginState.check`; the patch passes its hooks the `Program` like every other generation-bound hook.
 
 `PluginContext.Program` exposes the active `*Program` to every generation-bound linked hook (`ProgramPlugin`,
 `EmitTransformPlugin`, `DiagnosticPlugin`; `nil` for pre-load `SourcePreamblePlugin`), and

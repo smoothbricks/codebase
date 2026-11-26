@@ -1354,11 +1354,12 @@ Concrete targets come from concrete files:
   checks the project again with the stock compiler, which loads no plugin and reads each referenced project's
   declaration outputs where the host read its sources, and appends whatever the host had not printed. The managed patch
   limits that pass in two ways. A host that printed an error diagnostic of its own has reported its program, so ttsc
-  skips the pass (`PluginFailureDiagnostics.transformHostReported`): no withdrawn refusal and no error of a reference
-  that is not built yet comes back after the real error. A host that printed none (a panic, or a hook or write error
-  after a program that came out clean once its refusals were withdrawn) still gets the pass, and there the host's record
-  of what it withdrew, in the file `TTSC_WITHDRAWN_DIAGNOSTICS_PATH` names, keeps the refusal out of it. The pinned
-  compiler cannot judge such a project. The declaring package says so in its manifest,
+  skips the pass (`PluginFailureDiagnostics.transformHostReported`; ttsc 0.38's own acknowledgement of a complete report
+  comes from its utility host only, not from typia's): no withdrawn refusal and no error of a reference that is not
+  built yet comes back after the real error. A host that printed none (a panic, or a hook or write error after a program
+  that came out clean once its refusals were withdrawn) still gets the pass, and there the host's record of what it
+  withdrew, in the file `TTSC_WITHDRAWN_DIAGNOSTICS_PATH` names, keeps the refusal out of it. The pinned compiler cannot
+  judge such a project. The declaring package says so in its manifest,
   `"smoo": { "typecheck": { "compiler": "ttsc", "dependsOn": ["<project>:<target>"] } }`, where `dependsOn` names the
   targets that prepare the plugin binaries ttsc loads. The routed typecheck depends on them, so it loads built plugins
   and never compiles one, and the inference guesses no workspace target. A declaration of another shape refuses the

@@ -203,7 +203,7 @@ index 0000000..97d1522
 +	}
 +}
 diff --git a/driver/plugins.go b/driver/plugins.go
-index 3224cea..122e0cb 100644
+index 1990ac3..442aa85 100644
 --- a/driver/plugins.go
 +++ b/driver/plugins.go
 @@ -9,6 +9,8 @@ import (
@@ -260,7 +260,7 @@ index 3224cea..122e0cb 100644
  // ReportHostInputHash declares the exact file state consumed by a native
  // plugin. hash is a lowercase SHA-256 digest for an observed file and nil for
  // a missing candidate. Conflicting observations are retained as host inputs
-@@ -544,11 +570,29 @@ type EmitTransformPlugin interface {
+@@ -575,11 +601,29 @@ type EmitTransformPlugin interface {
    EmitTransform(PluginContext) (PluginTransform, error)
  }
  
@@ -290,7 +290,7 @@ index 3224cea..122e0cb 100644
    tsconfig     string
  }
  
-@@ -885,28 +929,37 @@ func RegisterPlugin(plugin any) {
+@@ -916,28 +960,37 @@ func RegisterPlugin(plugin any) {
    pluginRegistry = append(pluginRegistry, plugin)
  }
  
@@ -334,7 +334,7 @@ index 3224cea..122e0cb 100644
      tsconfig:     tsconfigPath,
    }, nil
  }
-@@ -925,7 +978,7 @@ func (state linkedPluginState) sourcePreamble() (string, error) {
+@@ -956,7 +1009,7 @@ func (state linkedPluginState) sourcePreamble() (string, error) {
      if !ok {
        continue
      }
@@ -343,7 +343,7 @@ index 3224cea..122e0cb 100644
      if err != nil {
        return "", err
      }
-@@ -946,7 +999,7 @@ func (state linkedPluginState) apply(prog *Program) error {
+@@ -977,7 +1030,7 @@ func (state linkedPluginState) apply(prog *Program) error {
      if !ok {
        continue
      }
@@ -352,7 +352,25 @@ index 3224cea..122e0cb 100644
        return err
      }
    }
-@@ -969,7 +1022,7 @@ func (state linkedPluginState) hasProgramPlugins() bool {
+@@ -994,7 +1047,7 @@ func (state linkedPluginState) check(prog *Program) error {
+       return fmt.Errorf("ttsc driver: linked plugin entry %d was requested but no linked plugin registered at that position", index)
+     }
+     if checking, ok := plugin.(CheckingProgramPlugin); ok {
+-      if err := checking.CheckProgram(prog, state.contextAt(index, entry)); err != nil {
++      if err := checking.CheckProgram(prog, state.contextAt(index, entry, prog)); err != nil {
+         return err
+       }
+       continue
+@@ -1003,7 +1056,7 @@ func (state linkedPluginState) check(prog *Program) error {
+     if !ok {
+       continue
+     }
+-    if err := transform.ApplyProgram(prog, state.contextAt(index, entry)); err != nil {
++    if err := transform.ApplyProgram(prog, state.contextAt(index, entry, prog)); err != nil {
+       return err
+     }
+   }
+@@ -1044,7 +1097,7 @@ func (state linkedPluginState) hasProgramPlugins() bool {
  // emitTransforms collects an emit-phase PluginTransform from every registered
  // EmitTransformPlugin, in registration order. Entries that do not implement
  // EmitTransformPlugin, or whose transform is nil, are skipped.
@@ -361,7 +379,7 @@ index 3224cea..122e0cb 100644
    var out []PluginTransform
    for index, entry := range state.entries {
      plugin, ok := registeredPlugin(index)
-@@ -980,7 +1033,7 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+@@ -1055,7 +1108,7 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
      if !ok {
        continue
      }
@@ -370,7 +388,7 @@ index 3224cea..122e0cb 100644
      if err != nil {
        return nil, err
      }
-@@ -991,6 +1044,46 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+@@ -1066,6 +1119,46 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
    return out, nil
  }
  
@@ -417,7 +435,7 @@ index 3224cea..122e0cb 100644
  // registeredPlugin returns the plugin registered at position index, or
  // (nil, false) when the index is out of range. Registration order matches
  // the order of linked Go init() calls.
-@@ -1010,12 +1103,19 @@ func registeredPlugin(index int) (any, bool) {
+@@ -1085,12 +1178,19 @@ func registeredPlugin(index int) (any, bool) {
  // and program hooks are the same plugin's claim and must not be attributed
  // separately. Environment reads go to the generation ledger, which fixes one
  // value per name for every hook.
@@ -438,7 +456,7 @@ index 3224cea..122e0cb 100644
      Tsconfig:                       state.tsconfig,
      reportHostInput:                inputs.add,
      reportHostInputHash:            inputs.addHash,
-@@ -1028,7 +1128,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
+@@ -1103,7 +1203,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
      reportFileComplete:             declaration.addComplete,
      reportEveryFileComplete:        declaration.completeEveryFile,
      readEnvironment:                state.inputs.readEnvironment,
@@ -483,7 +501,7 @@ index 3224cea..122e0cb 100644
  
  // hostInputs returns the exact native configuration inputs reported in this
 diff --git a/driver/program.go b/driver/program.go
-index 8dc486a..a338703 100644
+index d498146..3c7f650 100644
 --- a/driver/program.go
 +++ b/driver/program.go
 @@ -401,6 +401,11 @@ type LoadProgramOptions struct {
@@ -520,7 +538,7 @@ index 8dc486a..a338703 100644
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
-@@ -1019,6 +1030,18 @@ func (p *Program) HasLinkedProgramPlugins() bool {
+@@ -1057,6 +1068,18 @@ func (p *Program) HasLinkedProgramPlugins() bool {
    return p != nil && p.plugins.hasProgramPlugins()
  }
  
@@ -539,7 +557,7 @@ index 8dc486a..a338703 100644
  // PluginHostInputs returns the union of native file paths reported by linked
  // hooks while this Program was loaded or transformed. Each scope is copied
  // separately; this is not an atomic snapshot across concurrently reporting hooks
-@@ -1246,6 +1269,13 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
+@@ -1284,6 +1307,13 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
      }
    }
    raw = filterDiagnostics(raw)
@@ -554,7 +572,7 @@ index 8dc486a..a338703 100644
    // tsgo recorded, which only makes sense against the tree tsgo parsed. The
    // preamble correction happens inside convertProgramDiagnostics, once the
 diff --git a/driver/rewrite.go b/driver/rewrite.go
-index 79be74d..6db9ddd 100644
+index 79be74d..b050c9b 100644
 --- a/driver/rewrite.go
 +++ b/driver/rewrite.go
 @@ -204,6 +204,9 @@ func (p *Program) EmitAllRaw(writeFile shimcompiler.WriteFile) (*shimcompiler.Em
@@ -567,7 +585,7 @@ index 79be74d..6db9ddd 100644
    return result, p.convertProgramDiagnostics(result.Diagnostics), nil
  }
  
-@@ -271,9 +274,52 @@ func (p *Program) emit(rs *RewriteSet, target *ast.SourceFile, writeFile shimcom
+@@ -271,9 +274,56 @@ func (p *Program) emit(rs *RewriteSet, target *ast.SourceFile, writeFile shimcom
    }
  
    result := p.emitProgram(shimcompiler.TargetedEmitOptions(target, wf))
@@ -588,7 +606,11 @@ index 79be74d..6db9ddd 100644
 +    return nil
 +  }
 +  handed, err := p.writeHostOutputs(writeFile)
-+  result.EmittedFiles = append(result.EmittedFiles, handed...)
++  // EmittedFiles holds the compiler's rooted paths: a string on TypeScript 7.0
++  // and a typed path on 7.1, so each handed name is converted through the shim.
++  for _, file := range handed {
++    result.EmittedFiles = append(result.EmittedFiles, shimtspath.RootedFilePathFromAbsolute(file))
++  }
 +  return err
 +}
 +
@@ -620,7 +642,7 @@ index 79be74d..6db9ddd 100644
  // emitProgram runs one whole-program or single-file emit, taking tsgo's
  // incremental lane when the resolved compiler options ask for build
  // information.
-@@ -317,22 +363,28 @@ func (p *Program) emitsBuildInfo() bool {
+@@ -317,22 +367,28 @@ func (p *Program) emitsBuildInfo() bool {
  }
  
  // DefaultWriteFile is the default disk writer used when EmitAll's caller does not
@@ -659,23 +681,10 @@ index 79be74d..6db9ddd 100644
  
  func defaultWriteFile(fileName, text string) error {
 diff --git a/driver/session.go b/driver/session.go
-index 6d4b492..b7128ae 100644
+index ef223d6..1fcb718 100644
 --- a/driver/session.go
 +++ b/driver/session.go
-@@ -84,8 +84,10 @@ func NewSession(cwd, tsconfig string, options LoadProgramOptions) (*Session, []D
- func (s *Session) Apply(absPath, content string) bool {
-   s.overlay.Set(absPath, content)
-   name := absPath
--  if file := s.prog.SourceFile(absPath); file != nil {
--    name = string(file.FileName())
-+  if s.prog != nil && s.prog.TSProgram != nil && absPath != "" {
-+    if file := s.prog.TSProgram.GetSourceFile(shimtspath.ToRootedFilePath(absPath, s.prog.TSProgram.GetCurrentDirectory())); file != nil {
-+      name = string(file.FileName())
-+    }
-   }
-   changed := shimcompiler.ProgramPathKey(s.prog.TSProgram, shimtspath.ToRootedFilePath(name, s.prog.TSProgram.GetCurrentDirectory()))
-   // The new host keeps the Program's content mappers, so a mapped file is
-@@ -104,6 +106,9 @@ func (s *Session) Apply(absPath, content string) bool {
+@@ -126,6 +126,9 @@ func (s *Session) Apply(absPath, content string) bool {
      s.prog.Checker = checker
      s.prog.checkerRelease = release
      s.prog.Host = newHost
@@ -1011,7 +1020,7 @@ index 0000000..e0c2f19
 +}
 diff --git a/driver/withdrawn_diagnostics.go b/driver/withdrawn_diagnostics.go
 new file mode 100644
-index 0000000..cccf3d0
+index 0000000..6d0e66a
 --- /dev/null
 +++ b/driver/withdrawn_diagnostics.go
 @@ -0,0 +1,50 @@
@@ -1054,7 +1063,7 @@ index 0000000..cccf3d0
 +    return fmt.Errorf("withdrawn diagnostics path must be absolute: %q", path)
 +  }
 +  var rendered bytes.Buffer
-+  WritePrettyDiagnostics(&rendered, p.convertProgramDiagnostics(shimcompiler.SortAndDeduplicateDiagnostics(withdrawn)), p.TSProgram.GetCurrentDirectory())
++  WritePrettyDiagnostics(&rendered, p.convertProgramDiagnostics(shimcompiler.SortAndDeduplicateDiagnostics(withdrawn)), string(p.TSProgram.GetCurrentDirectory()))
 +  file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 +  if err != nil {
 +    return fmt.Errorf("withdrawn diagnostics: %w", err)
@@ -1066,44 +1075,75 @@ index 0000000..cccf3d0
 +  return nil
 +}
 diff --git a/lib/compiler/internal/build/BuildExecution.js b/lib/compiler/internal/build/BuildExecution.js
-index 9386a16..f5f9f54 100644
+index 1283a53..be11571 100644
 --- a/lib/compiler/internal/build/BuildExecution.js
 +++ b/lib/compiler/internal/build/BuildExecution.js
-@@ -352,7 +352,8 @@ var BuildExecution;
-                     (0, assertSharedHostCompatibility_1.assertSharedHostCompatibility)(compilers, "emit");
-                     const compiled = buildWithNativeCompilerPlugins(buildOptions, execution, compilers, timing);
-                     const result = (0, appendBuildOutput_1.appendBuildOutput)(checked, compiled);
--                    return compiled.status === 0
-+                    return compiled.status === 0 ||
-+                        PluginFailureDiagnostics_1.PluginFailureDiagnostics.transformHostReported(compiled)
-                         ? result
-                         : appendTypeScriptDiagnosticsAfterPluginFailure(result, buildOptions, execution);
-                 }
-@@ -366,7 +367,8 @@ var BuildExecution;
-                 (0, assertSharedHostCompatibility_1.assertSharedHostCompatibility)(compilers, "emit");
+@@ -369,7 +369,8 @@ var BuildExecution;
                  const compiled = buildWithNativeCompilerPlugins(buildOptions, execution, compilers, timing);
                  result = (0, appendBuildOutput_1.appendBuildOutput)(checked, compiled);
--                if (compiled.status !== 0) {
-+                if (compiled.status !== 0 &&
+                 if (compiled.status !== 0 &&
+-                    compiled.typeScriptDiagnosticsReported !== true) {
++                    compiled.typeScriptDiagnosticsReported !== true &&
 +                    !PluginFailureDiagnostics_1.PluginFailureDiagnostics.transformHostReported(compiled)) {
                      result = appendTypeScriptDiagnosticsAfterPluginFailure(result, buildOptions, execution);
                  }
              }
-@@ -548,6 +550,13 @@ var BuildExecution;
+@@ -429,17 +430,18 @@ var BuildExecution;
+      * A transform host's `check` verb is the only producer of its own findings
+      * (an invalid typia call site, for example), so an analysis build still runs
+      * it once. Its output follows the check plugins' output, and a failed host
+-     * that did not acknowledge a complete TypeScript report gets the independent
+-     * no-emit recovery pass. The one-shot build and the resident check watch both
++     * that neither acknowledged a complete TypeScript report nor printed an error
++     * diagnostic of its own (`PluginFailureDiagnostics.transformHostReported`)
++     * gets the independent no-emit recovery pass. The one-shot build and the resident check watch both
+      * use this, so a watch cycle reports what a one-shot `ttsc --noEmit` reports
+      * for the same files (#1864).
+      *
+      * @evidence contracts/common.md#principled-implementation The selected transform-stage plugins share one host verified by assertSharedHostCompatibility, and the established check verb, diagnostic acknowledgement and failure recovery decide the result.
+      * @evidence contracts/common.md#clear-and-simple-design One operation owns the analysis transform phase for both callers, so the one-shot and resident lanes cannot drift apart.
+-     * @evidence contracts/common.md#prohibited-implementation-shortcuts A failed host never becomes success, and its unacknowledged report never suppresses the recovery pass.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts A failed host never becomes success, and only its acknowledged report or its own printed error diagnostics suppress the recovery pass.
+      * @evidence contracts/common.md#meaningful-documentation Native paragraphs state why the host still runs, how its output is ordered, and which callers share the phase.
+      * @evidence contracts/portability.md#os-neutral-implementation Execution is delegated to runNativePluginCommand, which keeps the native binary, argv and cwd separate.
+-     * @evidence contracts/performance.md#efficient-algorithms One filter over the selected plugins and, when any is a transform, one host run plus output merging; the recovery pass runs only after an unacknowledged failure.
++     * @evidence contracts/performance.md#efficient-algorithms One filter over the selected plugins and, when any is a transform, one host run plus output merging; the recovery pass runs only after a failure the host neither acknowledged nor reported.
+      * @evidenceExclude contracts/performance.md#reuse-equivalent-work A transform host loads its own Program per run; nothing here is retained between runs.
+      * @evidence contracts/performance.md#bound-retention-and-release-resources The returned result transfers to the caller; no process or buffer is retained.
+      */
+@@ -451,7 +453,8 @@ var BuildExecution;
+         const compiled = buildWithNativeCompilerPlugins(buildOptions, execution, compilers, timing);
+         const result = (0, appendBuildOutput_1.appendBuildOutput)(checked, compiled);
+         return compiled.status === 0 ||
+-            compiled.typeScriptDiagnosticsReported === true
++            compiled.typeScriptDiagnosticsReported === true ||
++            PluginFailureDiagnostics_1.PluginFailureDiagnostics.transformHostReported(compiled)
+             ? result
+             : appendTypeScriptDiagnosticsAfterPluginFailure(result, buildOptions, execution);
+     }
+@@ -585,11 +588,16 @@ var BuildExecution;
       * can propagate before that result merge. NoEmit prevents compiler emission,
       * not unrelated native/cache effects or incremental metadata writes.
       *
-+     * The transform-host build sites skip this pass when the failed host printed
-+     * error diagnostics of its own
-+     * (`PluginFailureDiagnostics.transformHostReported`): that host already
-+     * checked the build's Program, and this pass would check a different one,
-+     * without linked plugins and with each referenced project read from its
-+     * declaration outputs.
-+     *
+-     * Transform-host sites skip this pass only after the host acknowledges its
+-     * complete Program report with this invocation's private token. Error output
+-     * alone can precede Program loading. The acknowledgement avoids checking a
+-     * different Program without linked plugins and with each referenced project
+-     * read from its declaration outputs. Legacy hosts keep recovery.
++     * Transform-host sites skip this pass in two cases. A host that acknowledges
++     * its complete Program report with this invocation's private token (the
++     * utility host) skips it whatever it printed: the acknowledgement avoids
++     * checking a different Program without linked plugins and with each
++     * referenced project read from its declaration outputs. A host that sends
++     * no acknowledgement (one built on the driver without the utility host's
++     * report writer, typia's among them) skips it when it printed error
++     * diagnostics of its own (`PluginFailureDiagnostics.transformHostReported`):
++     * it reported them from the build's Program. A host that did neither keeps
++     * recovery.
+      *
       * @evidence contracts/common.md#principled-implementation An independent no-emit pass adds only unreported diagnostics, seeds an otherwise unstructured plugin failure when needed and restores the original failure status after output merging.
       * @evidence contracts/common.md#clear-and-simple-design Recovery policy, compiler execution and diagnostic identity comparison are separate shared operations, with one result merge preserving the failed producer's ownership.
-      * @evidence contracts/common.md#prohibited-implementation-shortcuts The second pass addresses a supported failed-sidecar reporting gap; it never retries emission or converts the plugin failure into a successful build.
-@@ -1051,16 +1060,22 @@ var BuildExecution;
+@@ -1169,16 +1177,22 @@ var BuildExecution;
              cwd: execution.projectRoot,
              env,
              encoding: "utf8",
@@ -1117,15 +1157,15 @@ index 9386a16..f5f9f54 100644
 +        // renders what it prints, so one parser reads both and the recovery
 +        // pass after a failure compares them by one identity.
 +        const withdrawnDiagnostics = (0, normalizeBuildOutput_1.parseCompilerDiagnostics)({ stderr: "", stdout: res.withdrawn }, execution.projectRoot);
-         return (0, normalizeBuildOutput_1.normalizeBuildOutput)({
+         const captured = {
              processCompletedNormally: res.status !== null && res.signal === null,
              status: res.status ?? 1,
              stdout: (0, outputText_1.outputText)(res.stdout),
              stderr: (0, outputText_1.outputText)(res.stderr),
 +            ...(withdrawnDiagnostics.length === 0 ? {} : { withdrawnDiagnostics }),
-         }, execution.projectRoot);
-     }
-     BuildExecution.runNativePluginCommand = runNativePluginCommand;
+         };
+         const result = diagnosticsToken === undefined
+             ? captured
 diff --git a/lib/compiler/internal/build/CompilerDiagnostics.js b/lib/compiler/internal/build/CompilerDiagnostics.js
 index 4101758..3ddaba4 100644
 --- a/lib/compiler/internal/build/CompilerDiagnostics.js
@@ -1152,7 +1192,7 @@ index 4101758..3ddaba4 100644
          if (diagnostics.length === 0)
              return null;
 diff --git a/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts b/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts
-index 7e0c116..16b43ec 100644
+index 5ef0d61..0eda655 100644
 --- a/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts
 +++ b/lib/compiler/internal/build/PluginFailureDiagnostics.d.ts
 @@ -30,6 +30,27 @@ export declare namespace PluginFailureDiagnostics {
@@ -1181,13 +1221,13 @@ index 7e0c116..16b43ec 100644
 +     */
 +    function transformHostReported(host: TtscBuildResult): boolean;
      /**
-      * Keep the original failure when no new diagnostic batch remains. Otherwise
-      * seed its unparsed process failure before the recovered reports and retain
+      * Remove this transform invocation's completion token from captured output. A
+      * host frames the token and JSON receipt with a leading and trailing newline
 diff --git a/lib/compiler/internal/build/PluginFailureDiagnostics.js b/lib/compiler/internal/build/PluginFailureDiagnostics.js
-index d2863a9..b7c9547 100644
+index db9175d..baca542 100644
 --- a/lib/compiler/internal/build/PluginFailureDiagnostics.js
 +++ b/lib/compiler/internal/build/PluginFailureDiagnostics.js
-@@ -40,6 +40,30 @@ var PluginFailureDiagnostics;
+@@ -41,6 +41,30 @@ var PluginFailureDiagnostics;
              PassthroughFlags_1.PassthroughFlags.forwardsTerminalTsgoFlag(options));
      }
      PluginFailureDiagnostics.shouldCollect = shouldCollect;
@@ -1216,10 +1256,10 @@ index d2863a9..b7c9547 100644
 +    }
 +    PluginFailureDiagnostics.transformHostReported = transformHostReported;
      /**
-      * Keep the original failure when no new diagnostic batch remains. Otherwise
-      * seed its unparsed process failure before the recovered reports and retain
+      * Remove this transform invocation's completion token from captured output. A
+      * host frames the token and JSON receipt with a leading and trailing newline
 diff --git a/lib/compiler/internal/build/appendBuildOutput.js b/lib/compiler/internal/build/appendBuildOutput.js
-index 96c8d4e..435a311 100644
+index 84e1479..4276ae8 100644
 --- a/lib/compiler/internal/build/appendBuildOutput.js
 +++ b/lib/compiler/internal/build/appendBuildOutput.js
 @@ -9,6 +9,8 @@ const normalizeBuildOutput_1 = require("./normalizeBuildOutput");
@@ -1231,7 +1271,7 @@ index 96c8d4e..435a311 100644
   * - `emittedFiles`: right wins when present, otherwise left is kept.
   * - `emittedSources`: only the right phase's proof survives. An unknown later
   *   producer must not inherit an earlier phase's source ownership.
-@@ -39,6 +41,15 @@ function appendBuildOutput(left, right) {
+@@ -43,6 +45,15 @@ function appendBuildOutput(left, right) {
      return (0, normalizeBuildOutput_1.normalizeBuildOutput)({
          graph: mergeCheckGraphs(left.graph, right.graph),
          diagnostics: [...left.diagnostics, ...right.diagnostics],
@@ -1975,7 +2015,7 @@ index 1d9fba4..63d7ba0 100644
   * Whether a path lookup proves absence. Permission and sharing failures are
   * inconclusive, never evidence of a released or old abandoned generation.
 diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/internal/source/waitForPluginBinary.js
-index 191b99e..a741af5 100644
+index f80e1cd..0ae792f 100644
 --- a/lib/plugin/internal/source/waitForPluginBinary.js
 +++ b/lib/plugin/internal/source/waitForPluginBinary.js
 @@ -25,6 +25,12 @@ const inspectPluginBuildLock_1 = require("./inspectPluginBuildLock");
@@ -1991,7 +2031,7 @@ index 191b99e..a741af5 100644
   * @evidence contracts/common.md#principled-implementation Polling first refuses unknown/malformed native guards, suppresses publication while pending and rechecks after observed release; actual abandoned-owner observations retain their exact generation, while budget expiry fails without revoking a possibly active payload task.
   * @evidence contracts/common.md#clear-and-simple-design The loop separates publication, release, retirement and periodic status reporting; generation interpretation belongs to inspectPluginBuildLock.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts Budget expiry throws instead of retiring a live-looking generation and compensating for concurrent callbacks; status output never substitutes for ownership evidence.
-@@ -43,22 +49,9 @@ function waitForPluginBinary(opts) {
+@@ -43,25 +49,9 @@ function waitForPluginBinary(opts) {
          OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
          SourceNativeRetirement_1.SourceNativeRetirement.assertAvailable(protocolDir);
          const protectedNativeInputs = SourceNativeRetirement_1.SourceNativeRetirement.isProtected(protocolDir);
@@ -2006,15 +2046,18 @@ index 191b99e..a741af5 100644
 -            // The holder retired its generation between the binary check above and
 -            // this observation. That is a normal release, not abandonment: prefer the
 -            // binary when it landed inside that window, otherwise hand the free key
--            // back to the caller.
--            return !protectedNativeInputs && node_fs_1.default.existsSync(opts.binaryPath)
+-            // back to the caller. A holder settles its pending native readers before
+-            // it releases, so the protection read before the release is stale here;
+-            // reading it again adopts the binary instead of building the key again.
+-            return !SourceNativeRetirement_1.SourceNativeRetirement.isProtected(protocolDir) &&
+-                node_fs_1.default.existsSync(opts.binaryPath)
 -                ? { outcome: "published" }
 -                : { outcome: "released" };
 -        }
          if (lock.state === "abandoned") {
              return {
                  outcome: "abandoned",
-@@ -66,6 +59,12 @@ function waitForPluginBinary(opts) {
+@@ -69,6 +59,18 @@ function waitForPluginBinary(opts) {
                  fence: lock.fence,
              };
          }
@@ -2022,7 +2065,13 @@ index 191b99e..a741af5 100644
 +            return { outcome: "published" };
 +        }
 +        if (lock.state === "released") {
-+            return { outcome: "released" };
++            // A holder settles its pending native readers before it releases, so
++            // the protection read before the release is stale here; reading it
++            // again adopts the binary instead of building the key again.
++            return !SourceNativeRetirement_1.SourceNativeRetirement.isProtected(protocolDir) &&
++                node_fs_1.default.existsSync(opts.binaryPath)
++                ? { outcome: "published" }
++                : { outcome: "released" };
 +        }
          if (clock - startedAt >= opts.timeoutMs) {
              throw new Error(`ttsc: timed out after ${(0, formatDuration_1.formatDuration)(clock - startedAt)} waiting for ` +
@@ -2222,10 +2271,10 @@ index 0000000..73ebec9
 +	})
 +}
 diff --git a/utility/host.go b/utility/host.go
-index ce42de4..2f07583 100644
+index 79da234..8ec18dd 100644
 --- a/utility/host.go
 +++ b/utility/host.go
-@@ -7,8 +7,10 @@ import (
+@@ -9,8 +9,10 @@ import (
    "io"
    "os"
    "path/filepath"
@@ -2236,7 +2285,7 @@ index ce42de4..2f07583 100644
    shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
    shimprinter "github.com/microsoft/typescript-go/shim/printer"
    shimtspath "github.com/microsoft/typescript-go/shim/tspath"
-@@ -260,7 +262,10 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+@@ -279,7 +281,10 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
      opts.quiet = false // --verbose overrides the default --quiet=true
    }
    if !opts.quiet {
@@ -2248,7 +2297,7 @@ index ce42de4..2f07583 100644
    }
    writeFile, finishPreamble := makeSourcePreambleWriteFile(prog)
    var snapshot func() map[string][]string
-@@ -310,6 +315,18 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+@@ -329,6 +334,18 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
    }
    if !opts.quiet {
      fmt.Fprintf(opts.stdout, "// ttsc utility: emitted=%d files\n", len(emittedFiles))
@@ -2267,7 +2316,7 @@ index ce42de4..2f07583 100644
      driver.WriteEnvironmentInputsSummary(opts.stdout, "// ttsc utility: ", prog)
    }
    return 0
-@@ -375,16 +392,33 @@ func RunTransformWithIO(args []string, stdout, stderr io.Writer) int {
+@@ -462,16 +479,33 @@ func RunTransformWithIO(args []string, stdout, stderr io.Writer) int {
      if err := prog.ApplyLinkedPlugins(); err != nil {
        fmt.Fprintln(opts.stderr, err)
        diags = append(diags, driver.Diagnostic{Message: err.Error()})

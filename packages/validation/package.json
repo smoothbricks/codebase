@@ -9,9 +9,9 @@
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "dependencies": {
-    "@ttsc/unplugin": "0.37.1",
+    "@ttsc/unplugin": "0.38.1",
     "tslib": "^2.8.1",
-    "ttsc": "0.37.1",
+    "ttsc": "0.38.1",
     "typescript": "^6.0.3",
     "typia": "15.4.1"
   },
