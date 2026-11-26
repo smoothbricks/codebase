@@ -20,8 +20,8 @@ func init() {
 type plugin struct{}
 
 func (plugin) ApplyProgram(prog *driver.Program, ctx driver.PluginContext) error {
-	root := filepath.Dir(filepath.FromSlash(prog.ParsedConfig.ConfigName()))
-	outDir := prog.ParsedConfig.CompilerOptions().OutDir
+	root := filepath.Dir(filepath.FromSlash(string(prog.ParsedConfig.ConfigName())))
+	outDir := string(prog.ParsedConfig.CompilerOptions().OutDir)
 	if outDir == "" {
 		return fmt.Errorf("side-output-plugin: %s names no outDir", ctx.Tsconfig)
 	}
