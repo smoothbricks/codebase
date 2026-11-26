@@ -346,7 +346,7 @@ describe('pre-expiry hang diagnostics', () => {
     const capture = await captureHangDiagnostics(request(), warned.host);
     expect(capture.outcome, capture.text).toBe('holders');
     expect(capture.text).not.toContain('lsof privileged stderr');
-    expect(capture.text).toContain("lsof took 2 mounts' devices from the mount table instead of stat() (-b)");
+    expect(capture.text).toContain("The open-file probe took 2 mounts' devices from the mount table instead of stat()");
     expect(capture.text).toContain('omits no descriptor of the selected processes');
     expect(warned.calls.map((call) => call.file)).toEqual(['sudo']);
     const empty = scriptedHost([[root]], [exited('', 1, fallback)]);

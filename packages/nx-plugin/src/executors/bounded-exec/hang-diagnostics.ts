@@ -325,9 +325,17 @@ export function captureHangDiagnostics(
           // file on a hung mount is still listed with its path. lsof then needs no helper processes to step around such a
           // mount, and `-O` stops it forking them: under load those forks cost 0.8-2.5 s, past this probe's 1.5 s
           // deadline, where the same census with `-O` took 0.08-0.22 s (load 71).
-          const args = ['-b', '-O', '-nP', '-p', before.map((entry) => entry.pid).join(',')];
+          const options = ['-b', '-O', '-nP'];
+          const pids = before.map((entry) => entry.pid).join(',');
           // Bare `sudo`/`lsof` through PATH, like `ps` above: NixOS provides neither /usr/bin/sudo nor /usr/sbin/lsof.
-          let resources = await probe('lsof privileged', 'sudo', ['-n', 'lsof', ...args], 1_500, lsofFaults);
+          // `-p` stays spelled on each call line, so a reader (and the census rule) sees the pid scope there.
+          let resources = await probe(
+            'lsof privileged',
+            'sudo',
+            ['-n', 'lsof', ...options, '-p', pids],
+            1_500,
+            lsofFaults,
+          );
           if (finished) return;
           const answered = (result: HangProbeResult): boolean =>
             result.status === 'exited' &&
@@ -339,7 +347,7 @@ export function captureHangDiagnostics(
             lines.push(
               'Privileged resource census unavailable; fallback is ordinary-user visibility only, not proof of no holders.',
             );
-            resources = await probe('lsof user-scoped fallback', 'lsof', args, 1_000, lsofFaults);
+            resources = await probe('lsof user-scoped fallback', 'lsof', [...options, '-p', pids], 1_000, lsofFaults);
             if (finished) return;
           }
           if (resources.stdout.trim() !== '')
@@ -348,7 +356,7 @@ export function captureHangDiagnostics(
           else if (resources.stderr.trim() !== '') {
             const mounts = resources.stderr.match(LSOF_MOUNT_FALLBACK)?.length ?? 0;
             lines.push(
-              `lsof took ${mounts} mounts' devices from the mount table instead of stat() (-b), which omits no descriptor of the selected processes.`,
+              `The open-file probe took ${mounts} mounts' devices from the mount table instead of stat() (its -b option), which omits no descriptor of the selected processes.`,
             );
           }
           observed = resources.stdout.trim() !== '';
