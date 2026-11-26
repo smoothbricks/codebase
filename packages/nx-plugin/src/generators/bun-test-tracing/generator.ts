@@ -34,6 +34,7 @@ interface TsConfigJson extends JsonObject {
   extends?: string;
   files?: string[];
   include?: string[];
+  exclude?: string[];
   references?: Array<{ path: string }>;
   compilerOptions?: Record<string, unknown>;
 }
@@ -70,7 +71,15 @@ export default async function generator(tree: Tree, schema: BunTestTracingGenera
   updatePackageJson(tree, packageJsonPath, resolved.name);
   writeBunfig(tree, resolved.root);
   tree.write(joinPathFragments(resolved.root, 'src/test-suite-tracer.ts'), renderSuiteTracer(options));
+  updateTsconfigLib(tree, libTsconfigPath);
   updateTsconfigTest(tree, resolved.root, packageJsonPath, tsconfigPath, libTsconfigPath);
+}
+
+function updateTsconfigLib(tree: Tree, libTsconfigPath: string): void {
+  updateJson<TsConfigJson>(tree, libTsconfigPath, (tsconfigLib: TsConfigJson) => {
+    tsconfigLib.exclude = mergeStringArray(tsconfigLib.exclude, ['src/test-suite-tracer.ts']);
+    return tsconfigLib;
+  });
 }
 
 function normalizeOptions(schema: BunTestTracingGeneratorSchema): Required<BunTestTracingGeneratorSchema> {

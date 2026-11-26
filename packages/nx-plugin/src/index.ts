@@ -126,6 +126,7 @@ import {
   pluginBuildDependsOn,
   resolveNativeTools,
 } from './tool-bins.js';
+import { refuseOverlappingTsconfigFiles, resolveTsconfigFileNames } from './tsconfig-overlap.js';
 import { typecheckRoute } from './typecheck-route.js';
 import {
   isBuildOutputTargetName,
@@ -1854,6 +1855,18 @@ async function createProjectTargets(
     [...(hasLibTsconfig ? [libTsconfigPath] : []), ...(hasTestTsconfig ? [testTsconfigPath] : [])],
     workspaceRoot,
   );
+  // Every source file belongs to at most one inferred checking target: resolve both tsconfigs once at inference
+  // and refuse any file included by both tsconfig.lib.json and tsconfig.test.json.
+  if (hasLibTsconfig && hasTestTsconfig) {
+    refuseOverlappingTsconfigFiles({
+      projectName,
+      projectRoot: absoluteProjectRoot,
+      libConfig: 'tsconfig.lib.json',
+      testConfig: 'tsconfig.test.json',
+      libFiles: resolveTsconfigFileNames(libTsconfigPath),
+      testFiles: resolveTsconfigFileNames(testTsconfigPath),
+    });
+  }
   // The packages a TypeScript task loads by name beyond its sources' imports, each keyed by the lock scope that
   // declares it where it loads (bun-lock-scope.ts): the project's own node keys its own declarations, and a root
   // declaration is named by itself, so no task is keyed on root tooling it never loads. A check reads the @types and
@@ -1937,23 +1950,32 @@ async function createProjectTargets(
         cwd: projectRoot,
       },
     };
-    targets.typecheck = {
-      executor: 'nx:run-commands',
-      cache: true,
-      inputs: [
-        selfProduction,
-        dependencyProduction,
-        ...checkInputs,
-        ...typecheck.inputs,
-        '{projectRoot}/tsconfig.lib.json',
-      ],
-      outputs: [],
-      dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : []), ...typecheck.dependsOn],
-      options: {
-        command: typecheck.command('-p tsconfig.lib.json --noEmit'),
-        cwd: projectRoot,
-      },
-    };
+    targets.typecheck = replacesInferredCommand(
+      declaredTargets['tsc-js'],
+      '@smoothbricks/nx-plugin:typescript-emit',
+      'tsConfig',
+    )
+      ? {
+          executor: 'nx:run-commands',
+          cache: true,
+          inputs: [
+            selfProduction,
+            dependencyProduction,
+            ...checkInputs,
+            ...typecheck.inputs,
+            '{projectRoot}/tsconfig.lib.json',
+          ],
+          outputs: [],
+          dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : []), ...typecheck.dependsOn],
+          options: {
+            command: typecheck.command('-p tsconfig.lib.json --noEmit'),
+            cwd: projectRoot,
+          },
+        }
+      : {
+          executor: 'nx:noop',
+          dependsOn: ['tsc-js'],
+        };
     Object.assign(
       targets,
       scriptcPlatformTargets(packageJson, packageJsonPath, projectRoot, libTsconfigPath, [
@@ -2742,18 +2764,11 @@ async function createProjectTargets(
   }
 
   // The inferred typecheck's compiler, named only where its command is the one inferred here: a declared typecheck
-  // that runs another command runs something this inference does not know. Nx keeps the inferred command under a
-  // declaration that names the same executor and no command, and replaces it under any other executor, under a
-  // top-level `command` (its run-commands shorthand) or under `options.command`/`options.commands`.
-  const declaredTypecheck = declaredTargets.typecheck;
-  const declaredTypecheckOptions = isRecord(declaredTypecheck) ? declaredTypecheck.options : undefined;
+  // that runs another command runs something this inference does not know.
   const typecheckCompilerInputs =
     targets.typecheck === undefined ||
-    (isRecord(declaredTypecheck) &&
-      ((declaredTypecheck.executor !== undefined && declaredTypecheck.executor !== targets.typecheck.executor) ||
-        declaredTypecheck.command !== undefined)) ||
-    (isRecord(declaredTypecheckOptions) &&
-      (declaredTypecheckOptions.command !== undefined || declaredTypecheckOptions.commands !== undefined))
+    targets.typecheck.executor !== 'nx:run-commands' ||
+    replacesInferredCommand(declaredTargets.typecheck, targets.typecheck.executor)
       ? []
       : typecheck.inputs;
   // A declared target REPLACES the inferred input list, pin included, so a
@@ -3344,6 +3359,30 @@ function parseEnvPrefixedCommand(command: string): { command: string; envPrefix:
     return { command, envPrefix: '' };
   }
   return { command: command.slice(match[0].length), envPrefix: match[0] };
+}
+
+/**
+ * Whether a target the project declares replaces the command inferred for it, as Nx merges the two: Nx keeps the
+ * inferred command under a declaration that names the same executor and no command (one that only adds `dependsOn`
+ * or `inputs`), and replaces it under any other executor, a top-level `command` (its run-commands shorthand), or
+ * `options.command`/`options.commands`. `configOption` names an option that points the inferred executor at another
+ * tsconfig, which replaces the program it checks just as well.
+ */
+function replacesInferredCommand(
+  declared: unknown,
+  inferredExecutor: string | undefined,
+  configOption?: string,
+): boolean {
+  if (!isRecord(declared)) return false;
+  if (declared.executor !== undefined && declared.executor !== inferredExecutor) return true;
+  if (declared.command !== undefined) return true;
+  const options = declared.options;
+  return (
+    isRecord(options) &&
+    (options.command !== undefined ||
+      options.commands !== undefined ||
+      (configOption !== undefined && options[configOption] !== undefined))
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -13,7 +13,7 @@
     "moduleResolution": "bundler"
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"],
-  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test-suite-tracer.ts"],
   "references": [
     {
       "path": "../validation/tsconfig.lib.json"

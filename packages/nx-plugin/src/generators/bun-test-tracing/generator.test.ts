@@ -114,6 +114,9 @@ describe('bun-test-tracing generator', () => {
     expect(tsconfigTest.include).toContain('src/test-suite-tracer.ts');
     expect(referencePaths(tsconfigTest.references)).toContain('./tsconfig.lib.json');
 
+    const tsconfigLib = readJson(tree, 'packages/example/tsconfig.lib.json') as { exclude?: string[] };
+    expect(tsconfigLib.exclude).toContain('src/test-suite-tracer.ts');
+
     const projectTsconfig = readJson(tree, 'packages/example/tsconfig.json') as {
       references?: Array<{ path: string }>;
     };
@@ -231,6 +234,9 @@ describe('bun-test-tracing generator', () => {
     expect(tsconfigTest.compilerOptions?.outDir).toBeUndefined();
     expect(tsconfigTest.include).toContain('src/test-suite-tracer.ts');
     expect(referencePaths(tsconfigTest.references)).toContain('./tsconfig.lib.json');
+
+    const tsconfigLib = readJson(tree, 'packages/example/tsconfig.lib.json') as { exclude?: string[] };
+    expect(tsconfigLib.exclude).toContain('src/test-suite-tracer.ts');
   });
 });
 

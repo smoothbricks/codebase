@@ -9,7 +9,7 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"]
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"],
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**", "src/test-suite-tracer.ts"],
   "references": [
     {
       "path": "../statebus-navigation-core/tsconfig.lib.json"

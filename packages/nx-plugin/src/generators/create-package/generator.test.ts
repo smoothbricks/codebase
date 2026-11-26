@@ -70,7 +70,7 @@ describe('create-package generator', () => {
       expect(tsconfigLib.compilerOptions.outDir).toBe('dist');
       expect(tsconfigLib.compilerOptions.types).toEqual([]);
       expect(tsconfigLib.include).toEqual(['src/**/*.ts']);
-      expect(tsconfigLib.exclude).toEqual(['src/**/*.test.ts', 'src/**/__tests__/**']);
+      expect(tsconfigLib.exclude).toEqual(['src/**/*.test.ts', 'src/**/__tests__/**', 'src/test-suite-tracer.ts']);
 
       // tsconfig.test.json
       const tsconfigTest = readJson(tree, 'packages/duration/tsconfig.test.json');

@@ -9,7 +9,7 @@
     "types": []
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/__tests__/**", "src/**/*.test.ts", "src/**/*.spec.ts"],
+  "exclude": ["src/**/__tests__/**", "src/**/*.test.ts", "src/**/*.spec.ts", "src/test-suite-tracer.ts"],
   "references": [
     {
       "path": "../validation/tsconfig.lib.json"

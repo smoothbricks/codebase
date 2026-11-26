@@ -23,6 +23,7 @@ import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { findCycles } from 'nx/src/tasks-runner/task-graph-utils.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
+import { parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
 import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
@@ -214,7 +215,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         workspace.context.workspaceRoot,
         join(workspace.context.workspaceRoot, '.nx/patch-input-context'),
       );
-      for (const name of ['tsc-js', 'typecheck', 'typecheck-tests', 'lint']) {
+      for (const name of ['tsc-js', 'typecheck-tests', 'lint']) {
         const inputs = targets[name]?.inputs ?? [];
         const patchInputs = inputs.filter(
           (input): input is string => typeof input === 'string' && input.includes('{workspaceRoot}/patches/'),
@@ -288,15 +289,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']);
-      // Typecheck runs the compiler devenv.smoo.nix pins (SMOO_TYPECHECK_TSC) itself, not through
+      // Where `tsc-js` is inferred, `typecheck` delegates to it without re-checking the lib program.
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      // `typecheck-tests` runs the compiler devenv.smoo.nix pins (SMOO_TYPECHECK_TSC) itself, not through
       // ttsc, whose auto-loaded transform plugins would check with their own compiler; and it refuses
       // to fall back to another when the shell does not provide it.
       const typecheckCompiler =
         '"${SMOO_TYPECHECK_TSC:?is unset, enter the devenv shell (devenv.smoo.nix builds the typecheck compiler)}"';
-      expect(targets.typecheck?.options).toMatchObject({
-        command: `${typecheckCompiler} -p tsconfig.lib.json --noEmit`,
-        cwd: 'packages/example',
-      });
       const checkToolchainInputs = [
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
@@ -323,14 +322,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
         { externalDependencies: ['bun-lock:packages/example'] },
       ];
-      // The compiler's store path names its pinned revision, so a compiler bump misses the cache.
-      expect(targets.typecheck?.inputs).toEqual([
-        'versionlessProduction',
-        '^production',
-        ...checkToolchainInputs,
-        { env: 'SMOO_TYPECHECK_TSC' },
-        '{projectRoot}/tsconfig.lib.json',
-      ]);
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
       expect(targets.build?.dependsOn).toEqual(['^build', 'tsc-js']);
@@ -409,7 +400,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(externalDependencies(targets['tsc-js'])).toEqual([
         [own, '@types/bun', '@typescript/native', 'tslib', 'ttsc'],
       ]);
-      for (const name of ['typecheck', 'typecheck-tests', 'lint']) {
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      for (const name of ['typecheck-tests', 'lint']) {
         expect(externalDependencies(targets[name])).toEqual([[own, '@types/bun', 'tslib']]);
       }
     } finally {
@@ -471,9 +463,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const project = await inferProject(workspace, 'packages/example/package.json');
       const targets = project?.targets ?? {};
 
-      expect(targets.typecheck?.options).toMatchObject({ command: 'ttsc -p tsconfig.lib.json --noEmit' });
-      expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'tools:plugins']);
-      expect(targets.typecheck?.inputs).not.toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+      // When `tsc-js` is inferred, `typecheck` delegates to `tsc-js` (which already runs the dialect plugins).
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
       // ttsc is the workspace's to key: the project names no native compiler identity.
       expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
       expect(targets['typecheck-tests']?.options).toMatchObject({ command: 'ttsc -p tsconfig.test.json --noEmit' });
@@ -481,6 +472,23 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['typecheck-tests:watch']?.options).toMatchObject({
         command: 'ttsc -p tsconfig.test.json --noEmit --watch',
       });
+
+      // When the project declares its own `tsc-js`, `typecheck` stays on the dialect ttsc route.
+      await workspace.write(
+        'packages/example/package.json',
+        JSON.stringify({
+          name: 'example',
+          dependencies: { dialect: '1.0.0' },
+          devDependencies: { plain: '1.0.0' },
+          nx: { targets: { 'tsc-js': { executor: 'nx:noop' } } },
+        }),
+      );
+      const customProject = await inferProject(workspace, 'packages/example/package.json');
+      const customTargets = customProject?.targets ?? {};
+      expect(customTargets.typecheck?.options).toMatchObject({ command: 'ttsc -p tsconfig.lib.json --noEmit' });
+      expect(customTargets.typecheck?.dependsOn).toEqual(['^*-js', 'tools:plugins']);
+      expect(customTargets.typecheck?.inputs).not.toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+      expect(customProject?.namedInputs).not.toHaveProperty('typecheckCompiler');
     } finally {
       await workspace.cleanup();
     }
@@ -500,7 +508,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       try {
         await workspace.write(
           'packages/example/package.json',
-          `${JSON.stringify({ name: 'example', nx: { targets: { typecheck: declared } } })}\n`,
+          `${JSON.stringify({ name: 'example', nx: { targets: { 'tsc-js': { executor: 'nx:noop' }, typecheck: declared } } })}\n`,
         );
         await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
 
@@ -557,7 +565,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const environment = targets['tsc-js']?.inputs?.filter((input) => typeof input === 'object' && 'env' in input);
       expect(environment).toEqual([{ env: 'NODE_ENV' }, { env: 'LOWERING_MODE' }]);
-      expect(targets.typecheck?.inputs).not.toContainEqual({ env: 'NODE_ENV' });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
     } finally {
       await workspace.cleanup();
     }
@@ -955,8 +963,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(project?.namedInputs).toEqual({
         // Every package.json project names its own lock scope for workspace-wide inputs.
         bunLockScope: [{ externalDependencies: ['bun-lock:packages/example'] }],
-        // Its typecheck runs the native compiler, so it names that compiler for a workspace default that replaces inputs.
-        typecheckCompiler: [{ env: 'SMOO_TYPECHECK_TSC' }],
         versionlessProduction: [
           'production',
           '!{projectRoot}/package.json',
@@ -968,13 +974,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           { json: '{projectRoot}/package.json', excludeFields: ['version'] },
         ],
       });
-      expect(targets.typecheck?.inputs).toEqual([
-        'versionlessProduction',
-        { input: 'versionlessProduction', dependencies: true },
-        ...checkToolchain,
-        { env: 'SMOO_TYPECHECK_TSC' },
-        '{projectRoot}/tsconfig.lib.json',
-      ]);
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
       expect(targets['typecheck-tests']?.inputs).toEqual([
         'versionlessDefault',
         { input: 'versionlessProduction', dependencies: true },
@@ -1048,7 +1048,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const readByChecks = ['type', 'imports', 'exports', 'workspaces', 'workspaces.packages', 'packageManager'];
       for (const path of ['package.json', 'packages/example/package.json']) {
         const project = await inferProjectWithNxJson(workspace, path, {});
-        for (const name of ['lint', 'typecheck', 'typecheck-tests']) {
+        for (const name of ['lint', 'typecheck-tests']) {
           const inputs = project?.targets?.[name]?.inputs ?? [];
           expect(inputs).not.toContain('{workspaceRoot}/package.json');
           const manifest = inputs.find(
@@ -1087,7 +1087,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The root's {projectRoot} is the whole workspace, so its versionless
       // inputs would reach the lockfiles the lock-scope nodes already key on.
       // A member's {projectRoot} holds no lockfile, so it names none.
-      await workspace.write('package.json', '{"name":"root"}\n');
+      await workspace.write('package.json', '{"name":"root","nx":{"targets":{"tsc-js":{"executor":"nx:noop"}}}}\n');
       await workspace.write('tsconfig.lib.json', '{}\n');
       await workspace.write('packages/example/package.json', '{"name":"example"}\n');
       await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
@@ -1150,7 +1150,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('keeps the dependency half raw until the workspace defines the named input', async () => {
     const workspace = await createWorkspace();
     try {
-      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","nx":{"targets":{"tsc-js":{"executor":"nx:noop"}}}}\n',
+      );
       await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
 
       // `{ input, dependencies: true }` resolves the name in each dependency's
@@ -1245,13 +1248,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
         { externalDependencies: ['bun-lock:packages/example'] },
       ];
-      expect(targets.typecheck?.inputs).toEqual([
-        'versionlessProduction',
-        '^production',
-        ...checkToolchain,
-        { env: 'SMOO_TYPECHECK_TSC' },
-        '{projectRoot}/tsconfig.lib.json',
-      ]);
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
       expect(targets['typecheck-tests']?.inputs).toEqual([
         'versionlessDefault',
         '^production',
@@ -1309,7 +1306,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     const store = await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-store-'));
     try {
       await workspace.write('tsconfig.base.json', '{"compilerOptions":{"strict":true}}\n');
-      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","nx":{"targets":{"tsc-js":{"executor":"nx:noop"}}}}\n',
+      );
       // TypeScript rejects a cycle; this walk must terminate on one anyway,
       // with both files hashed.
       await workspace.write('packages/example/tsconfig.lib.json', '{"extends":"./tsconfig.cycle.json"}\n');
@@ -1384,7 +1384,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       await mkdir(join(root, 'node_modules/@fixture'), { recursive: true });
       await symlink(join(root, 'packages/tsconfig'), join(root, 'node_modules/@fixture/tsconfig'), 'dir');
-      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","nx":{"targets":{"tsc-js":{"executor":"nx:noop"}}}}\n',
+      );
       await workspace.write('packages/example/tsconfig.lib.json', '{"extends":"@fixture/tsconfig/base.json"}\n');
 
       const { result: targets, stderr } = await withCapturedStderr(() =>
@@ -1433,7 +1436,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     const outside = await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-outside-'));
     try {
       await writeFile(join(outside, 'tsconfig.base.json'), '{"compilerOptions":{"noUnusedLocals":true}}\n');
-      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","nx":{"targets":{"tsc-js":{"executor":"nx:noop"}}}}\n',
+      );
       await workspace.write(
         'packages/example/tsconfig.lib.json',
         `${JSON.stringify({ extends: join(outside, 'tsconfig.base.json') })}\n`,
@@ -1825,7 +1831,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The plugin's compile and typecheck reach procinfo's tsc-js through the package edge alone: they take neither
       // the addon nor a producer of their own.
       expect(plugin['tsc-js']?.dependsOn).toContain('^*-js');
-      expect(plugin.typecheck?.dependsOn).toContain('^*-js');
+      expect(plugin.typecheck?.dependsOn).toEqual(['tsc-js']);
       for (const name of ['tsc-js', 'typecheck', 'typecheck-tests']) {
         expect(plugin[name]?.dependsOn ?? [], name).not.toContainEqual(addon);
         expect(JSON.stringify(plugin[name]?.dependsOn ?? []), name).not.toMatch(/lineage/);
@@ -3489,7 +3495,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/git-do',
       });
       expect(targets['tsc-js']?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
-      expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
+      expect(targets.typecheck?.dependsOn).toEqual(['tsc-js']);
       expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-wasm', 'tsc-js']);
       // A nested crate manifest is enough for output inference, but not for
       // workspace-wide cargo-test/lint policy.
@@ -4875,6 +4881,193 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
       }
       expect(failure.errors[0]?.[1]?.message).toMatch(/cross-targets entries must be target triples like/);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('checks every TypeScript source file under exactly one inferred target when both lib and test configs exist', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/example/tsconfig.lib.json',
+        JSON.stringify({
+          compilerOptions: { rootDir: 'src', outDir: 'dist', types: [] },
+          include: ['src/**/*.ts'],
+          exclude: ['src/**/*.test.ts', 'src/**/__tests__/**', 'src/test-suite-tracer.ts'],
+        }),
+      );
+      await workspace.write(
+        'packages/example/tsconfig.test.json',
+        JSON.stringify({
+          compilerOptions: { noEmit: true, types: [] },
+          include: ['src/**/*.test.ts', 'src/test-suite-tracer.ts'],
+          references: [{ path: './tsconfig.lib.json' }],
+        }),
+      );
+      const sourceFiles = ['src/index.ts', 'src/helper.ts', 'src/index.test.ts', 'src/test-suite-tracer.ts'];
+      for (const file of sourceFiles) {
+        await workspace.write(`packages/example/${file}`, 'export const ok = 1;\n');
+      }
+
+      const project = await inferProject(workspace, 'packages/example/package.json');
+      const targets = project?.targets ?? {};
+
+      // `typecheck` delegates to `tsc-js` with no inputs or command of its own.
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck?.inputs).toBeUndefined();
+      expect(targets.typecheck?.options).toBeUndefined();
+      expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
+
+      // Map every non-noop checking target to the file set its tsconfig resolves.
+      const projectDir = join(workspace.context.workspaceRoot, 'packages/example');
+      const resolveConfigFiles = (configName: string): string[] => {
+        const configPath = join(projectDir, configName);
+        const readResult = readConfigFile(configPath, typescriptSys.readFile);
+        const parsed = parseJsonConfigFileContent(readResult.config, typescriptSys, projectDir);
+        return parsed.fileNames.map((file) => relative(projectDir, file)).sort();
+      };
+
+      const checkedByTarget = new Map<string, string[]>();
+      for (const [name, target] of Object.entries(targets)) {
+        if (target.executor === 'nx:noop') continue;
+        if (name === 'tsc-js') {
+          const tsConfig = typeof target.options?.tsConfig === 'string' ? target.options.tsConfig : '';
+          checkedByTarget.set(name, resolveConfigFiles(tsConfig));
+        } else if (name === 'typecheck' || name === 'typecheck-tests') {
+          const command = typeof target.options?.command === 'string' ? target.options.command : '';
+          const match = /-p\s+(\S+)/.exec(command);
+          if (match?.[1]) checkedByTarget.set(name, resolveConfigFiles(match[1]));
+        }
+      }
+
+      expect([...checkedByTarget.keys()].sort()).toEqual(['tsc-js', 'typecheck-tests']);
+      const seen = new Map<string, string[]>();
+      for (const [targetName, files] of checkedByTarget) {
+        for (const file of files) {
+          const owners = seen.get(file) ?? [];
+          owners.push(targetName);
+          seen.set(file, owners);
+        }
+      }
+      // Disjoint: every file belongs to at most one checking target.
+      for (const [file, owners] of seen) {
+        expect(owners, file).toHaveLength(1);
+      }
+      // Complete: every `.ts` file in the project is checked by one target.
+      expect([...seen.keys()].sort()).toEqual([...sourceFiles].sort());
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keeps real typecheck for an emit-less project and for a project that declares its own tsc-js', async () => {
+    const workspace = await createWorkspace();
+    try {
+      // Emit-less project: test config only, no tsconfig.lib.json.
+      await workspace.write('packages/emitless/package.json', '{"name":"emitless"}\n');
+      await workspace.write(
+        'packages/emitless/tsconfig.test.json',
+        JSON.stringify({ compilerOptions: { noEmit: true, types: [] }, include: ['src/**/*.test.ts'] }),
+      );
+      await workspace.write('packages/emitless/src/index.test.ts', 'export const ok = 1;\n');
+
+      const emitless = await inferProject(workspace, 'packages/emitless/package.json');
+      expect(emitless?.targets?.['tsc-js']).toBeUndefined();
+      expect(emitless?.targets?.typecheck).toBeUndefined();
+      expect(emitless?.targets?.['typecheck-tests']?.executor).toBe('nx:run-commands');
+      expect(emitless?.targets?.['typecheck-tests']?.options?.command).toContain('-p tsconfig.test.json --noEmit');
+
+      // Project with tsconfig.lib.json that declares its own tsc-js keeps the real inferred typecheck.
+      await workspace.write(
+        'packages/custom-emit/package.json',
+        JSON.stringify({
+          name: 'custom-emit',
+          nx: { targets: { 'tsc-js': { executor: 'nx:run-commands', options: { command: 'true' } } } },
+        }),
+      );
+      await workspace.write(
+        'packages/custom-emit/tsconfig.lib.json',
+        JSON.stringify({ compilerOptions: { rootDir: 'src', outDir: 'dist', types: [] }, include: ['src/**/*.ts'] }),
+      );
+      await workspace.write('packages/custom-emit/src/index.ts', 'export const ok = 1;\n');
+
+      const custom = await inferProject(workspace, 'packages/custom-emit/package.json');
+      expect(custom?.targets?.typecheck?.executor).toBe('nx:run-commands');
+      expect(custom?.targets?.typecheck?.options?.command).toContain('-p tsconfig.lib.json --noEmit');
+      expect(custom?.targets?.typecheck?.inputs).toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+      expect(custom?.namedInputs?.typecheckCompiler).toEqual([{ env: 'SMOO_TYPECHECK_TSC' }]);
+
+      // A tsc-js declaration that only adds dependsOn keeps the inferred emit (Nx merges it), so typecheck defers to it.
+      await workspace.write(
+        'packages/extends-emit/package.json',
+        JSON.stringify({ name: 'extends-emit', nx: { targets: { 'tsc-js': { dependsOn: ['...', 'prepare'] } } } }),
+      );
+      await workspace.write(
+        'packages/extends-emit/tsconfig.lib.json',
+        JSON.stringify({ compilerOptions: { rootDir: 'src', outDir: 'dist', types: [] }, include: ['src/**/*.ts'] }),
+      );
+      await workspace.write('packages/extends-emit/src/index.ts', 'export const ok = 1;\n');
+      const extending = await inferProject(workspace, 'packages/extends-emit/package.json');
+      expect(extending?.targets?.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+
+      // One that points the inferred emit at another tsconfig checks another program, so the real typecheck stays.
+      await workspace.write(
+        'packages/other-config/package.json',
+        JSON.stringify({
+          name: 'other-config',
+          nx: { targets: { 'tsc-js': { options: { tsConfig: 'tsconfig.build.json' } } } },
+        }),
+      );
+      await workspace.write(
+        'packages/other-config/tsconfig.lib.json',
+        JSON.stringify({ compilerOptions: { rootDir: 'src', outDir: 'dist', types: [] }, include: ['src/**/*.ts'] }),
+      );
+      await workspace.write('packages/other-config/src/index.ts', 'export const ok = 1;\n');
+      const otherConfig = await inferProject(workspace, 'packages/other-config/package.json');
+      expect(otherConfig?.targets?.typecheck?.options?.command).toContain('-p tsconfig.lib.json --noEmit');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('refuses a project whose tsconfig.lib.json and tsconfig.test.json include the same file', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/overlap/package.json', '{"name":"overlap"}\n');
+      await workspace.write(
+        'packages/overlap/tsconfig.lib.json',
+        JSON.stringify({
+          compilerOptions: { rootDir: 'src', outDir: 'dist', types: [] },
+          include: ['src/**/*.ts'],
+          exclude: ['src/**/*.test.ts'],
+        }),
+      );
+      await workspace.write(
+        'packages/overlap/tsconfig.test.json',
+        JSON.stringify({
+          compilerOptions: { noEmit: true, types: [] },
+          include: ['src/**/*.test.ts', 'src/test-suite-tracer.ts'],
+        }),
+      );
+      await workspace.write('packages/overlap/src/index.ts', 'export const ok = 1;\n');
+      await workspace.write('packages/overlap/src/index.test.ts', 'export const ok = 1;\n');
+      await workspace.write('packages/overlap/src/test-suite-tracer.ts', 'export const tracer = 1;\n');
+
+      const failure = await inferProjectTargets(workspace, 'packages/overlap/package.json').then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (!(failure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+      }
+      const message = failure.errors[0]?.[1]?.message ?? '';
+      expect(message).toContain('overlap');
+      expect(message).toContain('src/test-suite-tracer.ts');
+      expect(message).toContain('tsconfig.lib.json');
+      expect(message).toContain('tsconfig.test.json');
+      expect(message).toMatch(/exclude/i);
     } finally {
       await workspace.cleanup();
     }

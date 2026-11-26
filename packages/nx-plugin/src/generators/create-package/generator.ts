@@ -64,7 +64,7 @@ function writeTypeScriptFiles(
       types: [],
     },
     include: ['src/**/*.ts'],
-    exclude: ['src/**/*.test.ts', 'src/**/__tests__/**'],
+    exclude: ['src/**/*.test.ts', 'src/**/__tests__/**', 'src/test-suite-tracer.ts'],
   });
 
   writeJson(tree, `${projectRoot}/tsconfig.test.json`, {

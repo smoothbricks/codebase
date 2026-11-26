@@ -18,7 +18,8 @@
     "src/**/*.disabled.ts",
     "src/**/*.test.ts",
     "src/**/*.bench.ts",
-    "src/**/__tests__/**"
+    "src/**/__tests__/**",
+    "src/test-suite-tracer.ts"
   ],
   "references": [
     {
