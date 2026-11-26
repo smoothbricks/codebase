@@ -403,6 +403,20 @@ function cargoExecutable(): string {
   return '<cargo-not-on-PATH>';
 }
 
+/**
+ * The rustup home in effect, as the resolution key reads it. `RUSTUP_HOME` unset or empty selects the default,
+ * `~/.rustup`, as rustup reads it, so naming the default and leaving it unset are one selection and one key: a
+ * sandbox lends the host's home through the variable (its own HOME is private) while a host job sets nothing. With
+ * the default selected and no such home on disk there is no rustup home to key, wherever HOME points. Any other
+ * selected home is a distinct input whether or not it exists yet: rustup may create and use it.
+ */
+function rustupHome(): string {
+  const home = join(homedir(), '.rustup');
+  const selected = process.env.RUSTUP_HOME;
+  if (selected && resolve(selected) !== home) return resolve(selected);
+  return existsSync(home) ? home : '';
+}
+
 function resolutionKey(
   root: string,
   manifest: string,
@@ -412,7 +426,7 @@ function resolutionKey(
   const cargoHome = resolve(process.env.CARGO_HOME ?? join(homedir(), '.cargo'));
   const executable = cargoExecutable();
   const hash = createHash('sha256').update(
-    `${RESOLVE_CACHE_SCHEMA}\0${root}\0${manifest}\0${cargoHome}\0${executable}\0${process.env.RUSTUP_TOOLCHAIN ?? ''}\0${process.env.RUSTUP_HOME ?? ''}\0`,
+    `${RESOLVE_CACHE_SCHEMA}\0${root}\0${manifest}\0${cargoHome}\0${executable}\0${process.env.RUSTUP_TOOLCHAIN ?? ''}\0${rustupHome()}\0`,
   );
   for (const file of [...resolutionFiles(root, manifest, cargo, indexed)].sort()) {
     hash.update(file).update('\0');

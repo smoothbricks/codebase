@@ -536,8 +536,10 @@ access may consequently wait on Cargo's package-cache lock, which Cargo arbitrat
 Graph inference persists locked, offline Cargo resolution in Nx's workspace-data directory. Its content key includes the
 canonical workspace and manifest paths, the complete indexed manifest set, local path-dependency and governing
 manifests, lockfiles, Cargo configuration (including ancestor and `CARGO_HOME` configuration), toolchain pins, the
-resolved Cargo executable, and explicit rustup toolchain selection. Changing only Rust sources, other files, or file
-timestamps reuses the resolved closure without starting Cargo. The configuration identity here is a local
+resolved Cargo executable, and explicit rustup toolchain selection. The rustup home is keyed as the home in effect:
+`RUSTUP_HOME` unset, empty or naming `~/.rustup` is one selection, so a host job and a sandbox lent the same home share
+the entry; any other selected home is a distinct input, existing or not. Changing only Rust sources, other files, or
+file timestamps reuses the resolved closure without starting Cargo. The configuration identity here is a local
 resolution-cache key, not a machine-specific task input.
 
 Concurrent graph computations share one in-flight resolution per workspace. A native Nx file lock serializes workers;
@@ -1093,17 +1095,19 @@ configuration, output, and contributed path. Keep cacheable artifacts under sour
 
 `refuseOverlappingOutputs(graph, workspaceRoot)` from the same module gives each output path one producing task. The
 plugin calls it during its final-graph `createMetadata` hook, so every Nx command, including `nx show project`, refuses
-an overlap without additional workspace configuration. Two configurations of one target are distinct producers too. It
-refuses an output at, under or above another task's output: Nx restores a directory output as one tree, so a second
-target writing inside it leaves the first target's tree unlike its cache artifact after every build, and the two restore
-over each other without either ever being a cache hit. Each declaration states its kind: one ending in `/` names a
-directory, any other a file (`{projectRoot}/dist/`, `{options.out}/`). A pattern conflicts with a path at or above its
-static prefix (it writes beneath that path, so a file there collides by kind), a path it matches, or a directory it can
-reach inside under Nx's own minimatch, which expands brace alternatives before splitting segments; a file below its
-prefix that it does not match is not written by it. Identical patterns from distinct producing tasks are the same claim
-and are refused; different patterns are not judged, since only a file both match collides. `OutputOverlapError.overlaps`
-names both task/configuration identities and outputs. Both validators interpolate the declarations themselves, so a
-declaration Nx refuses to interpolate raises `OutputDeclarationError` naming its target.
+an overlap without additional workspace configuration. The hook judges final graphs only: when this plugin's own node
+pass failed, Nx keeps a partial graph whose targets take Nx's fallback outputs, and the hook leaves that pass's error as
+the only report. Two configurations of one target are distinct producers too. It refuses an output at, under or above
+another task's output: Nx restores a directory output as one tree, so a second target writing inside it leaves the first
+target's tree unlike its cache artifact after every build, and the two restore over each other without either ever being
+a cache hit. Each declaration states its kind: one ending in `/` names a directory, any other a file
+(`{projectRoot}/dist/`, `{options.out}/`). A pattern conflicts with a path at or above its static prefix (it writes
+beneath that path, so a file there collides by kind), a path it matches, or a directory it can reach inside under Nx's
+own minimatch, which expands brace alternatives before splitting segments; a file below its prefix that it does not
+match is not written by it. Identical patterns from distinct producing tasks are the same claim and are refused;
+different patterns are not judged, since only a file both match collides. `OutputOverlapError.overlaps` names both
+task/configuration identities and outputs. Both validators interpolate the declarations themselves, so a declaration Nx
+refuses to interpolate raises `OutputDeclarationError` naming its target.
 
 Raw project output declarations, including collect/apply fixtures, retain the directory suffix. Already-resolved Nx
 `Task.outputs` paths are normalized paths, not declarations, and need no trailing `/`.

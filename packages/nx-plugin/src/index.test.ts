@@ -26,7 +26,7 @@ import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
-import { refuseOverlappingOutputs } from './build-state-output-policy.js';
+import { OutputOverlapError, refuseOverlappingOutputs } from './build-state-output-policy.js';
 import { CARGO_CLOSURE_INPUT, isCargoLockInput } from './cargo-closure-input.js';
 import { CARGO_PRODUCER_METADATA } from './cargo-retention-hook.js';
 import { NIX_STORE_ROOT } from './cargo-toolchain-paths.js';
@@ -37,6 +37,7 @@ import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import {
   arrivedFileHashInput,
   cargoCommandNpmPackages,
+  createMetadata,
   createNodesV2,
   createNodesV2ForPlatform,
   pluginInstalledIn,
@@ -1948,6 +1949,46 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
       const results = await inferFixture(infer, files, undefined, workspace.context);
       expect(results.find(([file]) => file === 'app/package.json')?.[1].projects?.app?.targets?.check).toBeUndefined();
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('a failed node pass leaves its own error as the only report, and the next clean pass judges overlaps again', async () => {
+    const workspace = await createWorkspace();
+    const graph: ProjectGraph = {
+      nodes: {
+        a: {
+          name: 'a',
+          type: 'lib',
+          data: {
+            root: 'packages/a',
+            targets: {
+              build: {},
+              bundle: { outputs: ['{projectRoot}/dist/a.js'] },
+            },
+          },
+        },
+      },
+      dependencies: {},
+    };
+    const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
+    const metadataContext = { workspaceRoot: workspace.context.workspaceRoot, nxJsonConfiguration: {} };
+    try {
+      let failure: unknown;
+      try {
+        await infer([], { cargoTestGeneratedBy: 42 }, workspace.context);
+      } catch (error) {
+        failure = error;
+      }
+      if (!(failure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+      }
+      expect(failure.errors[0]?.[1]?.message).toBe('cargoTestGeneratedBy must name an existing project:target');
+      expect(createMetadata(graph, undefined, metadataContext)).toEqual({});
+
+      await infer([], undefined, workspace.context);
+      expect(() => createMetadata(graph, undefined, metadataContext)).toThrow(OutputOverlapError);
     } finally {
       await workspace.cleanup();
     }

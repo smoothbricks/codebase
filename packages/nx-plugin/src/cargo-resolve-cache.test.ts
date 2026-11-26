@@ -14,7 +14,7 @@ import {
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
@@ -558,6 +558,16 @@ it("resolves again exactly once when an input Cargo's answer keys on changes, an
     expect(await resolvesAs('rustup home', selected), selects).toEqual(['rustup home']);
     runs += 1;
     expect(await spawned(cargo), selects).toBe(runs);
+
+    // The default home is one selection, named or not, as a host job (unset) and a sandbox lent it (named) select it.
+    const homes = 'the default rustup home is one selection whether RUSTUP_HOME names it or is unset';
+    const unset = { RUSTUP_TOOLCHAIN: 'fixture-b', RUSTUP_HOME: '' };
+    expect(await resolvesAs('default home unset', unset), homes).toEqual(['default home unset']);
+    runs += 1;
+    expect(await spawned(cargo), homes).toBe(runs);
+    const named = { RUSTUP_TOOLCHAIN: 'fixture-b', RUSTUP_HOME: join(homedir(), '.rustup') };
+    expect(await resolvesAs('default home named', named), homes).toEqual(['default home unset']);
+    expect(await spawned(cargo), homes).toBe(runs);
 
     // The same bytes of Cargo, found elsewhere, are not the same Cargo: a toolchain proxy is a path.
     const other = join(root, 'other-bin');

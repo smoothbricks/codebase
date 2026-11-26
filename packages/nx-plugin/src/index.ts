@@ -1168,8 +1168,16 @@ function supportsJsonInputs(): boolean {
 
 type CreateNodesHandler = CreateNodesV2[1];
 
+/**
+ * Whether this plugin's latest node pass in this process threw. Nx then keeps a partial graph, reports the pass's
+ * error and still calls `createMetadata`, with no sign that the graph is partial. The graph policies judge final
+ * graphs: on a partial one, targets this plugin never inferred take Nx's fallback outputs and edges, and a refusal
+ * there names faults the workspace does not have, after the error that caused them.
+ */
+let nodePassFailed = false;
+
 function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandler {
-  return async (projectConfigurationFiles, options, context) => {
+  const infer: CreateNodesHandler = async (projectConfigurationFiles, options, context) => {
     const results: CreateNodesResultV2 = [];
     const errors: Array<[file: string | null, error: Error]> = [];
     let cargoWorkspaces: CargoWorkspace[];
@@ -1254,6 +1262,17 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
 
     return results;
   };
+
+  return async (...args) => {
+    try {
+      const results = await infer(...args);
+      nodePassFailed = false;
+      return results;
+    } catch (error) {
+      nodePassFailed = true;
+      throw error;
+    }
+  };
 }
 
 export function createNodesV2ForPlatform(platform: NodeJS.Platform, architecture: string): CreateNodesV2 {
@@ -1314,8 +1333,13 @@ export const createDependencies: CreateDependencies = (options, context) => [
   ...bunVersionAliasDependencies(context.externalNodes ?? {}),
 ];
 
-/** Nx invokes this only after merging inferred/declarative targets and every plugin's project dependencies. */
+/**
+ * Nx invokes this only after merging inferred/declarative targets and every plugin's project dependencies.
+ * When this plugin's own node pass failed, Nx keeps a partial graph whose targets take Nx's fallback outputs,
+ * so the hook leaves that pass's error as the only report.
+ */
 export const createMetadata: CreateMetadata = (graph, _options, context) => {
+  if (nodePassFailed) return {};
   refuseOverlappingOutputs(graph, context.workspaceRoot);
   refuseBuildTestDependencies(graph, context.workspaceRoot);
   refuseUndeclaredImports(graph);
