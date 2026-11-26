@@ -16,7 +16,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { describeRemoteHttpTimeout, remoteChild } from '../lib/remote-http.js';
+import { describeRemoteHttpTimeout, type RemoteHttpTimers, remoteChild, SYSTEM_TIMERS } from '../lib/remote-http.js';
 import { getWorkspacePackages } from '../lib/workspace.js';
 import {
   fetchLocalSecret,
@@ -88,6 +88,7 @@ export function describeNeed(row: SecretRow): string {
 export async function readRepositorySecrets(
   repo: string | undefined,
   environment?: string,
+  timers: RemoteHttpTimers = SYSTEM_TIMERS,
 ): Promise<{ ok: true; names: string[] } | { ok: false; reason: string }> {
   const args = ['secret', 'list', '--json', 'name'];
   if (repo) args.push('--repo', repo);
@@ -102,7 +103,7 @@ export async function readRepositorySecrets(
     stderr += chunk;
   });
   // One GitHub API request through gh: the remote-http bound ends a stalled one (05_gateway.md, "Deadlines").
-  const closed = await remoteChild(`gh ${args.join(' ')}`, child);
+  const closed = await remoteChild(`gh ${args.join(' ')}`, child, timers);
   if (!closed.ok) return { ok: false, reason: describeRemoteHttpTimeout(closed.error) };
   if (closed.value.code !== 0) {
     return {
@@ -197,11 +198,12 @@ function describe(row: SecretRow, scopeWidth: number): string {
 async function gatherSecretsStatus(
   root: string,
   options: { repo?: string; env?: string },
+  timers: RemoteHttpTimers = SYSTEM_TIMERS,
 ): Promise<{ ok: true; document: SecretsStatusDocument } | { ok: false; reason: string }> {
   const resolved = resolveRepository(root, options.repo);
   if (!resolved.ok) return resolved;
   const { repo, source } = resolved.choice;
-  const repositorySecrets = await readRepositorySecrets(repo);
+  const repositorySecrets = await readRepositorySecrets(repo, undefined, timers);
   if (!repositorySecrets.ok) return repositorySecrets;
   // The workflows decide which environments a job reads; an explicitly asked
   // for one is shown too, so an operator can inspect a scope before a workflow
@@ -212,7 +214,7 @@ async function gatherSecretsStatus(
   const environments: SecretsStatusEnvironment[] = [];
   for (const name of [...boundEnvironments, ...asked]) {
     const bound = boundEnvironments.includes(name);
-    const held = await readRepositorySecrets(repo, name);
+    const held = await readRepositorySecrets(repo, name, timers);
     // An environment that cannot be read is reported, never assumed empty:
     // guessing produces a refusal about a value that may well be set.
     if (!held.ok) {
@@ -255,8 +257,9 @@ async function gatherSecretsStatus(
 export async function secretsStatus(
   root: string,
   options: { repo?: string; env?: string; json?: boolean },
+  timers: RemoteHttpTimers = SYSTEM_TIMERS,
 ): Promise<number> {
-  const gathered = await gatherSecretsStatus(root, options);
+  const gathered = await gatherSecretsStatus(root, options, timers);
   if (!gathered.ok) {
     console.error(gathered.reason);
     return 1;

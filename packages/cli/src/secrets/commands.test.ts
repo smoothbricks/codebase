@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { RemoteHttpTimers } from '../lib/remote-http.js';
 import { secretsMissingInEnvironment, secretsStatus } from './commands.js';
 import { parseSecretsStatusDocument, reconcileSecrets } from './status.js';
 
@@ -126,6 +127,9 @@ esac
     await rm(root, { recursive: true, force: true });
   });
 
+  // A local stand-in `gh` is not a remote service; the deadline is remote-http.test.ts's subject.
+  const neverFiringTimers: RemoteHttpTimers = { now: () => performance.now(), after: () => () => {} };
+
   async function run(options: { repo?: string; env?: string; json?: boolean }): Promise<{
     code: number;
     out: string[];
@@ -137,7 +141,7 @@ esac
     console.log = (...args: unknown[]) => out.push(args.map(String).join(' '));
     console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
     try {
-      return { code: await secretsStatus(root, options), out, errors };
+      return { code: await secretsStatus(root, options, neverFiringTimers), out, errors };
     } finally {
       [console.log, console.error] = [log, error];
     }
