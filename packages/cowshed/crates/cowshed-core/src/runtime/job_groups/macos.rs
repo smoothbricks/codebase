@@ -39,6 +39,7 @@ pub(super) fn recorded_life(life: ProcessIdentity) -> io::Result<Option<Process>
         .map(|identity| Process {
             pid,
             version: identity.id_version.cast_unsigned(),
+            unique_id: Some(identity.unique_id),
         }))
 }
 
@@ -112,11 +113,14 @@ pub(super) fn end_recorded_members(groups: &[Group], grace: Duration) -> io::Res
 }
 
 /// A process held by an identity the kernel never gives another: its pid and that pid's version,
-/// as an audit token carries them. Signalling it reaches that process or nothing.
+/// as an audit token carries them, plus its immutable life token (`p_uniqueid`) when read from
+/// libproc. Signalling it reaches that process or nothing; census reads fence by `unique_id` so
+/// an exec of the same life stays one life while any later process given the pid is rejected.
 #[derive(Debug)]
 pub struct Process {
     pid: i32,
     version: u32,
+    unique_id: Option<u64>,
 }
 
 /// What a signal `proc_signal_with_audittoken` refused with `EPERM` means ([`Process::signal`]).
@@ -207,6 +211,7 @@ pub(super) fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
         .map(|life| Process {
             pid: life.record.pid.cast_signed(),
             version: life.version,
+            unique_id: Some(life.record.unique_id),
         })
         .collect())
 }
@@ -241,7 +246,13 @@ pub(crate) fn signal_life(pid: u32, unique_id: u64, signal: libc::c_int) -> io::
         match signal_step(running_identity(pid), unique_id, refused)? {
             SignalStep::Gone => return Ok(false),
             SignalStep::Send(version) => {
-                if (Process { pid, version }).signal(signal)? {
+                if (Process {
+                    pid,
+                    version,
+                    unique_id: Some(unique_id),
+                })
+                .signal(signal)?
+                {
                     return Ok(true);
                 }
                 refused = Some(version);
@@ -395,6 +406,19 @@ impl Process {
             .map(|life| life.record))
     }
 
+    /// This process's record and current pid version, read now through its immutable life
+    /// identity (`p_uniqueid`) when known -- surviving an exec of the same life while rejecting
+    /// any later process given the pid -- or through its pid version when only an audit token
+    /// identified it. `None` once the life has exited or its pid names another.
+    pub(crate) fn life_record(&self) -> io::Result<Option<(ProcessRecord, u32)>> {
+        Ok(running_life(self.pid)?
+            .filter(|life| match self.unique_id {
+                Some(unique_id) => life.record.unique_id == unique_id,
+                None => life.version == self.version,
+            })
+            .map(|life| (life.record, life.version)))
+    }
+
     /// The process at the other end of a connected Unix socket, as the kernel recorded it when
     /// the connection was made: whatever happens to its pid later, the handle names only it.
     pub fn of_socket_peer(socket: &impl std::os::fd::AsRawFd) -> io::Result<Self> {
@@ -417,6 +441,7 @@ impl Process {
         Ok(Self {
             pid: token.val[5].cast_signed(),
             version: token.val[7],
+            unique_id: None,
         })
     }
 
@@ -432,6 +457,7 @@ impl Process {
         Ok(running_identity(pid)?.map(|identity| Self {
             pid,
             version: identity.id_version.cast_unsigned(),
+            unique_id: Some(identity.unique_id),
         }))
     }
 
@@ -566,6 +592,7 @@ impl Life {
             .map(|identity| Process {
                 pid: self.pid,
                 version: identity.id_version.cast_unsigned(),
+                unique_id: Some(identity.unique_id),
             }))
     }
 
@@ -1122,6 +1149,7 @@ mod tests {
         let other_incarnation = super::Process {
             pid: leader.pid,
             version: leader.version.wrapping_add(1),
+            unique_id: leader.unique_id.map(|id| id.wrapping_add(1)),
         };
         assert!(!other_incarnation.signal(libc::SIGKILL).unwrap());
         assert!(
@@ -1197,9 +1225,9 @@ mod tests {
         );
     }
 
-    /// A member's record is read only through the identity it was found with: under any other
-    /// version of its pid -- the shape a reused pid takes -- the census finds no process, so a
-    /// stranger is never charged the job's CPU or named its leaf.
+    /// A member's record is read only through the identity it was found with: under another
+    /// unique id and version of its pid -- the shape a reused pid takes -- the census finds no
+    /// process, so a stranger is never charged the job's CPU or named its leaf.
     #[test]
     fn a_census_reads_only_the_member_its_identity_names() {
         use crate::api::process::JobLeafAttribution;
@@ -1217,10 +1245,16 @@ mod tests {
         let stranger = super::Process {
             pid: leader.pid,
             version: leader.version.wrapping_add(1),
+            unique_id: leader.unique_id.map(|id| id.wrapping_add(1)),
         };
         assert_eq!(stranger.record().unwrap(), None);
+        assert_eq!(stranger.life_record().unwrap(), None);
         assert_eq!(
             leader.record().unwrap().map(|record| record.pid),
+            Some(leader.pid.cast_unsigned())
+        );
+        assert_eq!(
+            leader.life_record().unwrap().map(|(record, _)| record.pid),
             Some(leader.pid.cast_unsigned())
         );
         // One microsecond accounted: any own CPU of an identified member covers all of it.
