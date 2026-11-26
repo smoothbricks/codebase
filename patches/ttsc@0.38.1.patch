@@ -129,10 +129,10 @@ index 7ea3ab9..b4fd6b8 100644
      return diagnostics, nil
 diff --git a/driver/force_emit_analysis_options_test.go b/driver/force_emit_analysis_options_test.go
 new file mode 100644
-index 0000000..97d1522
+index 0000000..e44b7fe
 --- /dev/null
 +++ b/driver/force_emit_analysis_options_test.go
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,70 @@
 +package driver
 +
 +import (
@@ -144,6 +144,7 @@ index 0000000..97d1522
 +	shimast "github.com/microsoft/typescript-go/shim/ast"
 +	shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
 +	shimprinter "github.com/microsoft/typescript-go/shim/printer"
++	shimtspath "github.com/microsoft/typescript-go/shim/tspath"
 +)
 +
 +func TestForceEmitRewritesAnalysisOnlyImports(t *testing.T) {
@@ -174,7 +175,7 @@ index 0000000..97d1522
 +			t.Fatal("analysis-only program ran a JavaScript emit hook")
 +			return source
 +		},
-+		func(name, text string, _ *shimcompiler.WriteFileData) error {
++		func(name shimtspath.RootedFilePath, text string, _ *shimcompiler.WriteFileData) error {
 +			t.Fatalf("analysis-only program wrote %s", name)
 +			return nil
 +		},
@@ -190,8 +191,8 @@ index 0000000..97d1522
 +	output := make(map[string]string)
 +	diagnostics, err = emitting.EmitWithPluginTransformer(
 +		func(_ *shimprinter.EmitContext, source *shimast.SourceFile) *shimast.SourceFile { return source },
-+		func(name, text string, _ *shimcompiler.WriteFileData) error {
-+			output[filepath.Base(name)] = text
++		func(name shimtspath.RootedFilePath, text string, _ *shimcompiler.WriteFileData) error {
++			output[filepath.Base(string(name))] = text
 +			return nil
 +		},
 +	)
@@ -571,6 +572,98 @@ index d498146..3c7f650 100644
    // filterDiagnostics runs first because it resolves a node from the position
    // tsgo recorded, which only makes sense against the tree tsgo parsed. The
    // preamble correction happens inside convertProgramDiagnostics, once the
+diff --git a/driver/resolve_module_name_test.go b/driver/resolve_module_name_test.go
+new file mode 100644
+index 0000000..8dc8d3b
+--- /dev/null
++++ b/driver/resolve_module_name_test.go
+@@ -0,0 +1,86 @@
++package driver
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
++)
++
++// A plugin resolves specifiers no file of the Program wrote: a package its
++// transform introduces, a module the checker printed. The neutral pair answers
++// them on both compiler targets, where the Program's cached resolutions cannot.
++func TestNeutralResolveModuleNameResolvesSpecifiersNoFileImports(t *testing.T) {
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	files := map[string]string{
++		"tsconfig.json":                  `{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","types":[],"strict":true,"noEmit":true,"paths":{"@scope/mapped":["./loaded.ts"]}},"files":["index.ts","loaded.ts"]}`,
++		"package.json":                   `{"type":"module"}`,
++		"index.ts":                       `export const index = 1;`,
++		"loaded.ts":                      `export const loaded = 2;`,
++		"unloaded.ts":                    `export const unloaded = 3;`,
++		"node_modules/pkg/package.json":  `{"name":"pkg","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts","default":"./index.js"}}}`,
++		"node_modules/pkg/index.d.ts":    `export declare const pkg: number;`,
++		"node_modules/pkg/index.js":      `export const pkg = 4;`,
++	}
++	for name, text := range files {
++		path := filepath.Join(root, filepath.FromSlash(name))
++		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	prog, diagnostics, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{})
++	if err != nil || CountErrors(diagnostics) != 0 {
++		t.Fatalf("load failed: %v; %v", err, diagnostics)
++	}
++	defer prog.Close()
++	index := prog.SourceFile(filepath.Join(root, "index.ts"))
++	if index == nil {
++		t.Fatal("index.ts is not in the Program")
++	}
++	mode := prog.TSProgram.GetDefaultResolutionModeForFile(index)
++	resolve := func(name string) (resolved bool, fileName string, inProgram bool) {
++		resolution := shimcompiler.ResolveModuleName(prog.TSProgram, name, index.FileName(), mode)
++		if resolution == nil {
++			t.Fatalf("%s: the resolution is nil", name)
++		}
++		if !resolution.IsResolved() {
++			return false, "", false
++		}
++		return true, string(resolution.ResolvedFileName), shimcompiler.SourceFileForResolvedModule(prog.TSProgram, resolution) != nil
++	}
++
++	// A sibling the Program holds, which index.ts does not import.
++	resolved, fileName, inProgram := resolve("./loaded.js")
++	if !resolved || !strings.HasSuffix(fileName, "/loaded.ts") || !inProgram {
++		t.Fatalf("./loaded.js: resolved=%v file=%q inProgram=%v", resolved, fileName, inProgram)
++	}
++	if file := shimcompiler.SourceFileForResolvedModule(prog.TSProgram, shimcompiler.ResolveModuleName(prog.TSProgram, "./loaded.js", index.FileName(), mode)); file != prog.SourceFile(filepath.Join(root, "loaded.ts")) {
++		t.Fatal("./loaded.js: the source file is not the Program's loaded.ts")
++	}
++	// A sibling and a package on disk that the Program never loaded.
++	resolved, fileName, inProgram = resolve("./unloaded.js")
++	if !resolved || !strings.HasSuffix(fileName, "/unloaded.ts") || inProgram {
++		t.Fatalf("./unloaded.js: resolved=%v file=%q inProgram=%v", resolved, fileName, inProgram)
++	}
++	resolved, fileName, inProgram = resolve("pkg")
++	if !resolved || !strings.HasSuffix(fileName, "/node_modules/pkg/index.d.ts") || inProgram {
++		t.Fatalf("pkg: resolved=%v file=%q inProgram=%v", resolved, fileName, inProgram)
++	}
++	// A bare specifier the config's paths map onto a file the Program holds.
++	resolved, fileName, inProgram = resolve("@scope/mapped")
++	if !resolved || !strings.HasSuffix(fileName, "/loaded.ts") || !inProgram {
++		t.Fatalf("@scope/mapped: resolved=%v file=%q inProgram=%v", resolved, fileName, inProgram)
++	}
++	// A name nothing provides.
++	if resolved, fileName, _ = resolve("absent-package"); resolved {
++		t.Fatalf("absent-package resolved to %q", fileName)
++	}
++}
 diff --git a/driver/rewrite.go b/driver/rewrite.go
 index 79be74d..b050c9b 100644
 --- a/driver/rewrite.go
@@ -2166,110 +2259,114 @@ index 0000000..9d95790
 +        return "";
 +    return NativePluginArguments_1.NativePluginArguments.serializeNativePlugins(linked);
 +}
-diff --git a/utility/emit_transform_test.go b/utility/emit_transform_test.go
-new file mode 100644
-index 0000000..73ebec9
---- /dev/null
-+++ b/utility/emit_transform_test.go
-@@ -0,0 +1,98 @@
-+package utility
+diff --git a/shim/compiler/neutral.go b/shim/compiler/neutral.go
+index 5c94a99..8aad5cf 100644
+--- a/shim/compiler/neutral.go
++++ b/shim/compiler/neutral.go
+@@ -4,6 +4,7 @@ import (
+   innerast "github.com/microsoft/typescript-go/internal/ast"
+   innercompiler "github.com/microsoft/typescript-go/internal/compiler"
+   innercore "github.com/microsoft/typescript-go/internal/core"
++  innermodule "github.com/microsoft/typescript-go/internal/module"
+   inneroutputpaths "github.com/microsoft/typescript-go/internal/outputpaths"
+   innertsoptions "github.com/microsoft/typescript-go/internal/tsoptions"
+   innertspath "github.com/microsoft/typescript-go/internal/tspath"
+@@ -225,3 +226,22 @@ func EmitsWholeProgram(options innercompiler.EmitOptions) bool {
+ func NewProgramOptions(config *innertsoptions.ParsedCommandLine, host innercompiler.CompilerHost, useSourceOfProjectReference bool) innercompiler.ProgramOptions {
+   return innercompiler.ProgramOptions{Config: config, Host: host, UseSourceOfProjectReference: useSourceOfProjectReference}
+ }
 +
-+import (
-+	"bytes"
-+	"encoding/json"
-+	"os"
-+	"path/filepath"
-+	"strings"
-+	"testing"
-+
-+	shimast "github.com/microsoft/typescript-go/shim/ast"
-+	shimprinter "github.com/microsoft/typescript-go/shim/printer"
-+
-+	"github.com/samchon/ttsc/packages/ttsc/driver"
-+)
-+
-+type utilityEmitTransformPlugin struct{}
-+
-+func init() {
-+	driver.RegisterPlugin(utilityEmitTransformPlugin{})
++// ResolveModuleName resolves moduleName as an import written in containingFile
++// under mode would resolve, whether or not containingFile imports it. The
++// Program's cached resolutions hold only the specifiers its files wrote, so a
++// plugin that needs the target of one no file wrote (a package its transform
++// introduces, a specifier the checker printed) resolves it here. The result is
++// never nil; an unresolved name answers false from IsResolved. TypeScript 7.0
++// resolves through the Program's own resolver.
++func ResolveModuleName(program *innercompiler.Program, moduleName string, containingFile string, mode innercore.ResolutionMode) *innermodule.ResolvedModule {
++  return program.ResolveModuleName(moduleName, containingFile, mode)
 +}
 +
-+func (utilityEmitTransformPlugin) EmitTransform(ctx driver.PluginContext) (driver.PluginTransform, error) {
-+	if ctx.Program == nil {
-+		return nil, nil
-+	}
-+	return func(ec *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
-+		var visitor *shimast.NodeVisitor
-+		visitor = ec.NewNodeVisitor(func(node *shimast.Node) *shimast.Node {
-+			if node.Kind == shimast.KindStringLiteral && node.Text() == "utility-before" {
-+				return ec.Factory.NewStringLiteral("utility-after", shimast.TokenFlagsNone)
-+			}
-+			return visitor.VisitEachChild(node)
-+		})
-+		return visitor.VisitSourceFile(sf)
-+	}, nil
++// SourceFileForResolvedModule returns the Program's source file for resolved,
++// following a package redirect, or nil when the Program holds none. resolved
++// is a resolution IsResolved answers true for. TypeScript 7.0 looks the file up
++// by its resolved name.
++func SourceFileForResolvedModule(program *innercompiler.Program, resolved *innermodule.ResolvedModule) *innerast.SourceFile {
++  return program.GetSourceFileForResolvedModule(resolved.ResolvedFileName)
++}
+diff --git a/targets/7.1/bridge/compiler/neutral.go b/targets/7.1/bridge/compiler/neutral.go
+index 41a4841..0e89277 100644
+--- a/targets/7.1/bridge/compiler/neutral.go
++++ b/targets/7.1/bridge/compiler/neutral.go
+@@ -6,12 +6,14 @@ import (
+   "path/filepath"
+   "sort"
+   "sync"
++  _ "unsafe"
+ 
+   innerast "github.com/microsoft/TypeScript/tsc/internal/ast"
+   innercompiler "github.com/microsoft/TypeScript/tsc/internal/compiler"
+   "github.com/microsoft/TypeScript/tsc/internal/contentmapper"
+   innercore "github.com/microsoft/TypeScript/tsc/internal/core"
+   innerlocale "github.com/microsoft/TypeScript/tsc/internal/locale"
++  innermodule "github.com/microsoft/TypeScript/tsc/internal/module"
+   inneroutputpaths "github.com/microsoft/TypeScript/tsc/internal/outputpaths"
+   innertsoptions "github.com/microsoft/TypeScript/tsc/internal/tsoptions"
+   innertspath "github.com/microsoft/TypeScript/tsc/internal/tspath"
+@@ -289,3 +291,30 @@ func NewProgramOptions(config *innertsoptions.ParsedCommandLine, host innercompi
+     ProgramHosts:  innercompiler.ProgramHosts{Host: host},
+   }
+ }
++
++// ResolveModuleName resolves moduleName as an import written in containingFile
++// under mode would resolve, whether or not containingFile imports it. The
++// Program's cached resolutions hold only the specifiers its files wrote, so a
++// plugin that needs the target of one no file wrote (a package its transform
++// introduces, a specifier the checker printed) resolves it here. The result is
++// never nil; an unresolved name answers false from IsResolved. TypeScript 7.1
++// keeps no resolver on the Program and exports none, so this makes the one the
++// Program's own lookups make (newResolver, over its resolution data and its
++// project-reference view of the host).
++func ResolveModuleName(program *innercompiler.Program, moduleName string, containingFile innertspath.RootedFilePath, mode innercore.ResolutionMode) *innermodule.ResolvedModule {
++  resolved, _, _ := programNewResolver(program).ResolveModuleName(moduleName, containingFile, mode, nil)
++  return resolved
 +}
 +
-+func TestUtilityTransformAndServeRunLinkedEmitTransforms(t *testing.T) {
-+	root, err := filepath.EvalSymlinks(t.TempDir())
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"compilerOptions":{"target":"ES2022","module":"ESNext","strict":true},"files":["entry.ts"]}`), 0o644); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := os.WriteFile(filepath.Join(root, "entry.ts"), []byte("export const value = \"utility-before\";\n"), 0o644); err != nil {
-+		t.Fatal(err)
-+	}
-+	payload, _ := json.Marshal([]driver.PluginEntry{{Name: "utility-emit-test", Stage: "transform", Config: map[string]any{}}})
-+	baseArgs := []string{"--cwd", root, "--tsconfig", "tsconfig.json", "--plugins-json", string(payload)}
++// programNewResolver is the Program's unexported resolver constructor.
++//
++//go:linkname programNewResolver github.com/microsoft/TypeScript/tsc/internal/compiler.(*Program).newResolver
++func programNewResolver(program *innercompiler.Program) *innermodule.DefaultResolver
 +
-+	t.Run("transform", func(t *testing.T) {
-+		var stdout, stderr bytes.Buffer
-+		status := RunTransformWithIO(baseArgs, &stdout, &stderr)
-+		if status != 0 {
-+			t.Fatalf("RunTransformWithIO status=%d stderr=%s", status, stderr.String())
-+		}
-+		var env struct {
-+			TypeScript map[string]string          `json:"typescript"`
-+			SourceMaps map[string]json.RawMessage `json:"sourceMaps"`
-+		}
-+		if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
-+			t.Fatalf("decode transform output: %v\n%s", err, stdout.String())
-+		}
-+		if got := env.TypeScript["entry.ts"]; !strings.Contains(got, `"utility-after"`) || strings.Contains(got, `"utility-before"`) {
-+			t.Fatalf("transform output did not apply linked emit transform:\n%s", got)
-+		}
-+		if len(env.SourceMaps["entry.ts"]) == 0 {
-+			t.Fatalf("expected source map for entry.ts after linked emit transform")
-+		}
-+	})
-+
-+	t.Run("serve", func(t *testing.T) {
-+		in := strings.NewReader("{\"file\":\"entry.ts\"}\n{\"update\":\"entry.ts\",\"content\":\"export const value = \\\"utility-before\\\";\\nexport const n = 2;\\n\"}\n{\"file\":\"entry.ts\"}\n")
-+		var out bytes.Buffer
-+		status := RunServe(in, &out, baseArgs)
-+		if status != 0 {
-+			t.Fatalf("RunServe status=%d out=%s", status, out.String())
-+		}
-+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-+		if len(lines) != 3 {
-+			t.Fatalf("expected 3 serve responses, got %d:\n%s", len(lines), out.String())
-+		}
-+		for _, idx := range []int{0, 2} {
-+			var resp struct {
-+				Found      bool   `json:"found"`
-+				TypeScript string `json:"typescript"`
-+			}
-+			if err := json.Unmarshal([]byte(lines[idx]), &resp); err != nil {
-+				t.Fatalf("decode serve line %d: %v", idx, err)
-+			}
-+			if !resp.Found || !strings.Contains(resp.TypeScript, `"utility-after"`) || strings.Contains(resp.TypeScript, `"utility-before"`) {
-+				t.Fatalf("serve line %d missing linked emit transform:\n%s", idx, resp.TypeScript)
-+			}
-+		}
-+	})
++// SourceFileForResolvedModule returns the Program's source file for resolved,
++// following a package redirect, or nil when the Program holds none. resolved
++// is a resolution IsResolved answers true for. TypeScript 7.1 looks the file up
++// by its resolved path key.
++func SourceFileForResolvedModule(program *innercompiler.Program, resolved *innermodule.ResolvedModule) *innerast.SourceFile {
++  return program.GetSourceFileForResolvedModule(resolved)
 +}
+diff --git a/targets/7.1/facade/compiler/facade_gen.go b/targets/7.1/facade/compiler/facade_gen.go
+index 6aa7ef3..10feadc 100644
+--- a/targets/7.1/facade/compiler/facade_gen.go
++++ b/targets/7.1/facade/compiler/facade_gen.go
+@@ -167,10 +167,18 @@ func ReplayProgramResolutions(p0 []tsccompiler.ProgramResolutionTask, p1 tscvfs.
+   return tsccompiler.ReplayProgramResolutions(p0, p1)
+ }
+ 
++// ResolveModuleName holds the bridge function: its signature uses a type no bridge
++// exposes (github.com/microsoft/TypeScript/tsc/internal/module.ResolvedModule).
++var ResolveModuleName = tsccompiler.ResolveModuleName
++
+ func SortAndDeduplicateDiagnostics(p0 []*tscast.Diagnostic) []*tscast.Diagnostic {
+   return tsccompiler.SortAndDeduplicateDiagnostics(p0)
+ }
+ 
++// SourceFileForResolvedModule holds the bridge function: its signature uses a type no bridge
++// exposes (github.com/microsoft/TypeScript/tsc/internal/module.ResolvedModule).
++var SourceFileForResolvedModule = tsccompiler.SourceFileForResolvedModule
++
+ type SourceFileMayBeEmittedHost = tsccompiler.SourceFileMayBeEmittedHost
+ 
+ func SourceFilesToEmit(p0 tsccompiler.SourceFileMayBeEmittedHost) []*tscast.SourceFile {
 diff --git a/utility/host.go b/utility/host.go
 index 79da234..8ec18dd 100644
 --- a/utility/host.go
@@ -2352,6 +2449,116 @@ index 79da234..8ec18dd 100644
          )
          key := apiOutputKey(opts.cwd, string(file.FileName()))
          out.TypeScript[key] = text
+diff --git a/utility/linkedemit/emit_transform_test.go b/utility/linkedemit/emit_transform_test.go
+new file mode 100644
+index 0000000..2840828
+--- /dev/null
++++ b/utility/linkedemit/emit_transform_test.go
+@@ -0,0 +1,104 @@
++// Package linkedemit holds the utility host's linked emit-transform test in a
++// test binary of its own. The linked-plugin registry is process-wide and a
++// manifest entry selects the registration at its own position; the utility
++// package's check-serve tests register their probes at positions 0 and 1, so a
++// plugin registered beside them could only be reached through those probes.
++package linkedemit
++
++import (
++	"bytes"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	shimast "github.com/microsoft/typescript-go/shim/ast"
++	shimprinter "github.com/microsoft/typescript-go/shim/printer"
++
++	"github.com/samchon/ttsc/packages/ttsc/driver"
++	"github.com/samchon/ttsc/packages/ttsc/utility"
++)
++
++type utilityEmitTransformPlugin struct{}
++
++func init() {
++	driver.RegisterPlugin(utilityEmitTransformPlugin{})
++}
++
++func (utilityEmitTransformPlugin) EmitTransform(ctx driver.PluginContext) (driver.PluginTransform, error) {
++	if ctx.Program == nil {
++		return nil, nil
++	}
++	return func(ec *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
++		var visitor *shimast.NodeVisitor
++		visitor = ec.NewNodeVisitor(func(node *shimast.Node) *shimast.Node {
++			if node.Kind == shimast.KindStringLiteral && node.Text() == "utility-before" {
++				return ec.Factory.NewStringLiteral("utility-after", shimast.TokenFlagsNone)
++			}
++			return visitor.VisitEachChild(node)
++		})
++		return visitor.VisitSourceFile(sf)
++	}, nil
++}
++
++func TestUtilityTransformAndServeRunLinkedEmitTransforms(t *testing.T) {
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"compilerOptions":{"target":"ES2022","module":"ESNext","strict":true},"files":["entry.ts"]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "entry.ts"), []byte("export const value = \"utility-before\";\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	payload, _ := json.Marshal([]driver.PluginEntry{{Name: "utility-emit-test", Stage: "transform", Config: map[string]any{}}})
++	baseArgs := []string{"--cwd", root, "--tsconfig", "tsconfig.json", "--plugins-json", string(payload)}
++
++	t.Run("transform", func(t *testing.T) {
++		var stdout, stderr bytes.Buffer
++		status := utility.RunTransformWithIO(baseArgs, &stdout, &stderr)
++		if status != 0 {
++			t.Fatalf("RunTransformWithIO status=%d stderr=%s", status, stderr.String())
++		}
++		var env struct {
++			TypeScript map[string]string          `json:"typescript"`
++			SourceMaps map[string]json.RawMessage `json:"sourceMaps"`
++		}
++		if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
++			t.Fatalf("decode transform output: %v\n%s", err, stdout.String())
++		}
++		if got := env.TypeScript["entry.ts"]; !strings.Contains(got, `"utility-after"`) || strings.Contains(got, `"utility-before"`) {
++			t.Fatalf("transform output did not apply linked emit transform:\n%s", got)
++		}
++		if len(env.SourceMaps["entry.ts"]) == 0 {
++			t.Fatalf("expected source map for entry.ts after linked emit transform")
++		}
++	})
++
++	t.Run("serve", func(t *testing.T) {
++		in := strings.NewReader("{\"file\":\"entry.ts\"}\n{\"update\":\"entry.ts\",\"content\":\"export const value = \\\"utility-before\\\";\\nexport const n = 2;\\n\"}\n{\"file\":\"entry.ts\"}\n")
++		var out bytes.Buffer
++		status := utility.RunServe(in, &out, baseArgs)
++		if status != 0 {
++			t.Fatalf("RunServe status=%d out=%s", status, out.String())
++		}
++		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
++		if len(lines) != 3 {
++			t.Fatalf("expected 3 serve responses, got %d:\n%s", len(lines), out.String())
++		}
++		for _, idx := range []int{0, 2} {
++			var resp struct {
++				Found      bool   `json:"found"`
++				TypeScript string `json:"typescript"`
++			}
++			if err := json.Unmarshal([]byte(lines[idx]), &resp); err != nil {
++				t.Fatalf("decode serve line %d: %v", idx, err)
++			}
++			if !resp.Found || !strings.Contains(resp.TypeScript, `"utility-after"`) || strings.Contains(resp.TypeScript, `"utility-before"`) {
++				t.Fatalf("serve line %d missing linked emit transform:\n%s", idx, resp.TypeScript)
++			}
++		}
++	})
++}
 diff --git a/utility/serve.go b/utility/serve.go
 index ae4bd0e..499c093 100644
 --- a/utility/serve.go

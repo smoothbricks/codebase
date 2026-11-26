@@ -502,6 +502,16 @@ caller supply that manifest per `LoadProgram` or `NewSession` call instead of mu
 the existing environment lookup, while a non-empty value overrides it (including `"[]"` to disable linked plugins for
 one session) and names `LoadProgramOptions.LinkedPluginsJSON` on invalid JSON.
 
+A linked plugin that needs the target of a specifier no file of the Program wrote (a package its transform introduces, a
+module the checker printed) calls `shimcompiler.ResolveModuleName(program, moduleName, containingFile, mode)` and
+`shimcompiler.SourceFileForResolvedModule(program, resolved)` (`shim/compiler/neutral.go`, and for the TypeScript 7.1
+target `targets/7.1/bridge/compiler/neutral.go` with its regenerated facade). TypeScript 7.0's
+`Program.ResolveModuleName` is gone in 7.1, whose Program keeps no resolver and exports none, so a plugin had no call
+that compiles on both targets; the Program's cached resolutions hold only the specifiers its files wrote. Both legs
+resolve through the Program's own resolver (7.1: its unexported `newResolver`, linked by name), never a second resolver
+configuration. `containingFile` is the target's rooted file path, so `file.FileName()` passes as it is, and the result
+is used by inference (`IsResolved()`, `ResolvedFileName`): its type lives in the compiler's internal `module` package.
+
 The packaged managed asset is the source, so clean managed installs receive the same repairs without a compiler fork or
 edits to the dependency cache. The registration applies only to that exact compiler version; the repository's lockfile
 continues to own its compiler pin.
