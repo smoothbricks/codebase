@@ -24,7 +24,7 @@ import { findCycles } from 'nx/src/tasks-runner/task-graph-utils.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
-import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
+import { type CargoFixtureOptions, prepareCargoFixture } from './__tests__/cargo-fixture.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import { OutputOverlapError, refuseOverlappingOutputs } from './build-state-output-policy.js';
@@ -2198,7 +2198,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '[package]\nname = "ferris-wasm"\n\n[lib]\ncrate-type = ["cdylib", "rlib"]\n',
       );
 
-      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+      // Smoke: proves graph inference is wired to real `cargo metadata` rather than only seeded recordings.
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json', undefined, {
+        liveCargo: true,
+      });
 
       // Even a cdylib crate named *-wasm infers no cargo-wasm: rust output
       // targets are declared package-locally, never derived from crate metadata.
@@ -5201,9 +5204,10 @@ async function inferProject(
   workspace: WorkspaceFixture,
   packageJsonPath: string,
   createNodes: CreateNodesV2 = createNodesV2,
+  cargoFixture?: CargoFixtureOptions,
 ) {
   const [, infer] = createNodes;
-  await prepareCargoFixture(workspace.context.workspaceRoot);
+  await prepareCargoFixture(workspace.context.workspaceRoot, cargoFixture);
   // Each inference indexes the tree as it is now, as a fresh Nx process would: the
   // in-process workspace context otherwise keeps the files of the first inference.
   resetWorkspaceContext();
@@ -5235,8 +5239,9 @@ async function inferProjectTargets(
   workspace: WorkspaceFixture,
   packageJsonPath: string,
   createNodes?: CreateNodesV2,
+  cargoFixture?: CargoFixtureOptions,
 ): Promise<Record<string, TargetConfiguration>> {
-  return (await inferProject(workspace, packageJsonPath, createNodes))?.targets ?? {};
+  return (await inferProject(workspace, packageJsonPath, createNodes, cargoFixture))?.targets ?? {};
 }
 
 /**

@@ -28,6 +28,7 @@ import {
 import { DIAGNOSTIC_CONTEXT_ENV, DIAGNOSTIC_MODULE_ENV, grantMemoryEnvironment } from './child-exit-diagnostics.js';
 import { type CpuPool, createCpuPool, lendParentToken } from './cpu-pool.js';
 import type { CpuRise } from './cpu-rise.js';
+import { formatExitDiagnostic } from './exit-diagnostic.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { declaredGoTests, goRunSummaryText } from './go-run-summary.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
@@ -1752,23 +1753,18 @@ async function runCommand(
   await releaseCpu();
 
   const code = exitCode ?? signalToExitCode(exitSignal);
-  if (code !== 0 && state.expiry === null) {
-    // The executor ended it for a cause of its own, which is said; otherwise no bound of this executor ended it, so a
-    // signal it died of came from outside (the kernel's OOM killer sends SIGKILL): the signal is named, never folded
-    // into a bare status.
-    const signalled = exitCode === null && exitSignal !== null;
-    const endedBy = endedFor();
-    const ended =
-      endedBy !== null
-        ? `was ended by bounded-exec because ${endedBy.message} (${signalled ? `${exitSignal}, ` : ''}status ${code})`
-        : signalled
-          ? `was killed by ${exitSignal} (status ${code})`
-          : `exited with status ${code}`;
-    appendStderr(
-      fixture !== null && !mainStarted
-        ? `Fixture command ${ended}: ${segment ?? fixture.command}\n`
-        : `Command ${ended}: ${command}\n`,
-    );
+  const exitDiagnostic = formatExitDiagnostic({
+    code,
+    exitCode,
+    exitSignal,
+    expired: state.expiry !== null,
+    endedByMessage: endedFor()?.message ?? null,
+    fixtureCommand: fixture === null ? null : (segment ?? fixture.command),
+    mainStarted,
+    command,
+  });
+  if (exitDiagnostic !== null) {
+    appendStderr(exitDiagnostic);
   }
 
   if (state.expiry !== null && !state.forceKillNeeded) {

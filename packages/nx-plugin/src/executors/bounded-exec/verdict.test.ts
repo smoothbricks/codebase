@@ -14,6 +14,7 @@ import {
   type ProcessTreeKiller,
   runBoundedExec,
 } from './executor.js';
+import { type ExitDiagnosticInput, formatExitDiagnostic } from './exit-diagnostic.js';
 import { readLastPeak } from './peak-charge.js';
 import type { BoundedExecBounds } from './schema.js';
 import {
@@ -147,6 +148,155 @@ describe('bounded-exec verdicts', () => {
         { 'slow.test.ts': SLOW_TEST, 'failing.test.ts': FAILING_TEST },
       ),
     ).toEqual({ outcome: 'failed', exitCode: 1, tests: ['wrong'] });
+  });
+
+  it.each([
+    [
+      'native fixture build failure before tests start',
+      {
+        exit: {
+          code: 101,
+          exitCode: 101,
+          exitSignal: null,
+          expired: false,
+          endedByMessage: null,
+          fixtureCommand: 'cargo --frozen nextest list -p alpha',
+          mainStarted: false,
+          command: 'cargo --frozen nextest run -E package(alpha)',
+        },
+        junitXml: null,
+      },
+      {
+        diagnostic: 'Fixture command exited with status 101: cargo --frozen nextest list -p alpha\n',
+        verdict: { outcome: 'failed', exitCode: 101, tests: [] },
+      },
+    ],
+    [
+      'native test failure after fixture succeeds',
+      {
+        exit: {
+          code: 100,
+          exitCode: 100,
+          exitSignal: null,
+          expired: false,
+          endedByMessage: null,
+          fixtureCommand: 'cargo --frozen nextest list -p alpha',
+          mainStarted: true,
+          command: 'cargo --frozen nextest run -E package(alpha)',
+        },
+        junitXml: `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="1" failures="1">
+  <testsuite name="alpha" tests="1" failures="1">
+    <testcase name="alpha_case" classname="alpha" time="0.010">
+      <failure message="thread &apos;alpha_case&apos; panicked: native test failed" type="test failure with exit code 101">native test failed</failure>
+    </testcase>
+  </testsuite>
+</testsuites>`,
+      },
+      {
+        diagnostic: 'Command exited with status 100: cargo --frozen nextest run -E package(alpha)\n',
+        verdict: { outcome: 'failed', exitCode: 100, tests: ['alpha alpha_case'] },
+      },
+    ],
+    [
+      'passing native test run writes no exit diagnostic',
+      {
+        exit: {
+          code: 0,
+          exitCode: 0,
+          exitSignal: null,
+          expired: false,
+          endedByMessage: null,
+          fixtureCommand: 'cargo --frozen nextest list -p alpha',
+          mainStarted: true,
+          command: 'cargo --frozen nextest run -E package(alpha)',
+        },
+        junitXml:
+          '<testsuites name="nextest-run" tests="1" failures="0"><testsuite name="alpha" tests="1" failures="0"><testcase name="alpha_case" classname="alpha" time="0.010"/></testsuite></testsuites>',
+      },
+      {
+        diagnostic: null,
+        verdict: { outcome: 'passed' },
+      },
+    ],
+    [
+      'external signal on fixture names the fixture and signal',
+      {
+        exit: {
+          code: 137,
+          exitCode: null,
+          exitSignal: 'SIGKILL',
+          expired: false,
+          endedByMessage: null,
+          fixtureCommand: 'cargo --frozen nextest list -p alpha',
+          mainStarted: false,
+          command: 'cargo --frozen nextest run -E package(alpha)',
+        },
+        junitXml: null,
+      },
+      {
+        diagnostic: 'Fixture command was killed by SIGKILL (status 137): cargo --frozen nextest list -p alpha\n',
+        verdict: { outcome: 'failed', exitCode: 137, tests: [] },
+      },
+    ],
+    [
+      'executor-ended run names the operational cause without blaming the fixture once main started',
+      {
+        exit: {
+          code: 143,
+          exitCode: null,
+          exitSignal: 'SIGTERM',
+          expired: false,
+          endedByMessage: 'runner lifecycle failed: channel closed',
+          fixtureCommand: 'cargo --frozen nextest list -p alpha',
+          mainStarted: true,
+          command: 'cargo --frozen nextest run -E package(alpha)',
+        },
+        junitXml: null,
+      },
+      {
+        diagnostic:
+          'Command was ended by bounded-exec because runner lifecycle failed: channel closed (SIGTERM, status 143): cargo --frozen nextest run -E package(alpha)\n',
+        verdict: { outcome: 'failed', exitCode: 143, tests: [] },
+      },
+    ],
+    [
+      'bound-expired run writes no non-zero exit diagnostic line',
+      {
+        exit: {
+          code: 143,
+          exitCode: null,
+          exitSignal: 'SIGTERM',
+          expired: true,
+          endedByMessage: null,
+          fixtureCommand: 'cargo --frozen nextest list -p alpha',
+          mainStarted: false,
+          command: 'cargo --frozen nextest run -E package(alpha)',
+        },
+        junitXml: null,
+      },
+      {
+        diagnostic: null,
+        verdict: { outcome: 'bound', bound: 'fixture', limitMs: 600_000, elapsedMs: 600_100 },
+      },
+    ],
+  ] as readonly (readonly [
+    name: string,
+    input: { readonly exit: ExitDiagnosticInput; readonly junitXml: string | null },
+    expected: { readonly diagnostic: string | null; readonly verdict: BoundedExecVerdict },
+  ])[])('classifies %s by phase, exit line and JUnit report', (_name, { exit, junitXml }, expected) => {
+    expect(formatExitDiagnostic(exit)).toBe(expected.diagnostic);
+    expect(
+      judgeRun({
+        exitCode: exit.code,
+        elapsedMs: 600_100,
+        expiry: exit.expired ? { kind: 'fixture', limitMs: 600_000 } : null,
+        report: junitXml === null ? null : junitFailures(junitXml),
+        noSpace: null,
+        lockWaits: [],
+        cpuRising: [],
+      }),
+    ).toEqual(expected.verdict);
   });
 
   it('records the total bound as a bound and the progress bound as a wedge', async () => {

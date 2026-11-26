@@ -1,10 +1,15 @@
 import { expect, it } from 'bun:test';
-import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
+import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { WorkspaceContext } from 'nx/src/native/index.js';
+import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
+import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
-import { readRecord, taskDirectory } from './executors/bounded-exec/verdict.js';
+import { createNodesV2 } from './index.js';
 
 useFixtureCargoHome();
 
@@ -20,8 +25,21 @@ fn ${name}_case() {
 `;
 }
 
+function filesetGlobs(target: TargetConfiguration | undefined): {
+  readonly positive: string[];
+  readonly negative: string[];
+} {
+  const strings = (target?.inputs ?? []).filter(
+    (input): input is string => typeof input === 'string' && input.includes('{workspaceRoot}/'),
+  );
+  return {
+    positive: strings.filter((input) => !input.startsWith('!')).map((input) => input.slice('{workspaceRoot}/'.length)),
+    negative: strings.filter((input) => input.startsWith('!')).map((input) => input.slice('!{workspaceRoot}/'.length)),
+  };
+}
+
 //#region smoo/cowshed!n/native-test-verdicts
-it('replays native NX results without binaries and builds only the missed selections', async () => {
+it('replays native NX results without binaries and restores declared outputs on a cache hit', async () => {
   await withNxFixture('native-result-cache', async ({ workspace, socketDirectory }) => {
     await symlink(
       fileURLToPath(new URL('../../../node_modules', import.meta.url)),
@@ -111,7 +129,6 @@ it('replays native NX results without binaries and builds only the missed select
     const mark = (name: string) => join(workspace, name, 'ran.log');
     const absent = (name: string) => expect(readFile(mark(name), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     const cleanMarks = () => Promise.all(probes.map((name) => rm(mark(name), { force: true })));
-    const alpha = join(workspace, 'alpha/src/lib.rs');
     const report = join(workspace, 'alpha/published-report.txt');
 
     const cold = await nx();
@@ -129,36 +146,62 @@ it('replays native NX results without binaries and builds only the missed select
     for (const name of probes) await absent(name);
     await expect(readFile(join(workspace, 'target/.rustc_info.json'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readFile(report, 'utf8')).toBe('alpha');
-
-    await writeFile(alpha, testSource('alpha', '// invalidate only alpha'));
-    const miss = await nx();
-    expect(miss.code, miss.log).toBe(0);
-    expect(await readFile(mark('alpha'), 'utf8')).toBe('alpha');
-    await absent('beta');
-    expect(miss.log).toMatch(/nx run native-probe:cargo-test-beta +\[(?:local cache|existing outputs match the cache)/);
-
-    await cleanMarks();
-    const record = taskDirectory(join(workspace, '.nx/workspace-data'), 'native-probe:cargo-test-alpha');
-    await writeFile(alpha, 'compile_error!("native fixture did not build");\n');
-    const buildFailure = await nx();
-    expect(buildFailure.code, buildFailure.log).not.toBe(0);
-    expect(buildFailure.log).toContain('native fixture did not build');
-    expect(buildFailure.log).toContain('Fixture command exited');
-    expect(buildFailure.log).toMatch(/could not compile.*alpha/);
-    expect(await readRecord(record)).toMatchObject({ verdict: { outcome: 'failed', tests: [] } });
-    await absent('alpha');
-    await absent('beta');
-
-    await writeFile(alpha, testSource('alpha', 'panic!("native test failed");'));
-    const testFailure = await nx();
-    expect(testFailure.code, testFailure.log).not.toBe(0);
-    expect(testFailure.log).toContain('native test failed');
-    expect(testFailure.log).not.toContain('Fixture command exited');
-    expect(await readRecord(record)).toMatchObject({
-      verdict: { outcome: 'failed', tests: [expect.stringContaining('alpha_case')] },
-    });
-    expect(await readFile(mark('alpha'), 'utf8')).toBe('alpha');
-    await absent('beta');
   });
+});
+
+// Laws: specs/cowshed/laws/cache_key.bend `key_has_only_reads` (:599) and `changed_input_changes_key` (:838).
+// Each per-crate runner declares only its own crate's sources (plus workspace manifests), never a sibling crate's, so
+// an edit to one member re-keys only that member's runner.
+it('keys each per-crate native test runner on its own crate sources and not sibling or unselected crates', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'smoothbricks-native-test-inputs-')));
+  try {
+    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'native-probe', private: true }));
+    await writeFile(join(root, 'Cargo.toml'), '[workspace]\nmembers=["alpha","beta","unselected"]\nresolver="2"\n');
+    for (const name of [...probes, 'unselected'] as const) {
+      await mkdir(join(root, name, 'src'), { recursive: true });
+      await writeFile(join(root, name, 'Cargo.toml'), `[package]\nname="${name}"\nversion="0.1.0"\nedition="2021"\n`);
+      await writeFile(join(root, name, 'src/lib.rs'), `pub fn ${name}() {}\n`);
+    }
+    await prepareCargoFixture(root);
+    resetWorkspaceContext();
+    const [, infer] = createNodesV2;
+    const results = await infer(['package.json'], undefined, { workspaceRoot: root, nxJsonConfiguration: {} });
+    const targets = results[0]?.[1].projects?.['.']?.targets ?? {};
+    const alphaTarget = targets['cargo-test-alpha'];
+    const betaTarget = targets['cargo-test-beta'];
+
+    expect(alphaTarget?.inputs).toContain('{workspaceRoot}/alpha/**/*');
+    expect(alphaTarget?.inputs).not.toContain('{workspaceRoot}/beta/**/*');
+    expect(alphaTarget?.inputs).not.toContain('{workspaceRoot}/unselected/**/*');
+
+    expect(betaTarget?.inputs).toContain('{workspaceRoot}/beta/**/*');
+    expect(betaTarget?.inputs).not.toContain('{workspaceRoot}/alpha/**/*');
+    expect(betaTarget?.inputs).not.toContain('{workspaceRoot}/unselected/**/*');
+
+    const context = new WorkspaceContext(root, join(root, '.nx/input-hash-context'));
+    const alphaGlobs = filesetGlobs(alphaTarget);
+    const betaGlobs = filesetGlobs(betaTarget);
+    const alphaBefore = context.hashFilesMatchingGlob(alphaGlobs.positive, alphaGlobs.negative);
+    const betaBefore = context.hashFilesMatchingGlob(betaGlobs.positive, betaGlobs.negative);
+
+    await writeFile(join(root, 'alpha/src/lib.rs'), 'pub fn alpha() {} // invalidate only alpha\n');
+    context.incrementalUpdate(['alpha/src/lib.rs'], []);
+    const alphaAfterAlphaEdit = context.hashFilesMatchingGlob(alphaGlobs.positive, alphaGlobs.negative);
+    expect(alphaAfterAlphaEdit).not.toBe(alphaBefore);
+    expect(context.hashFilesMatchingGlob(betaGlobs.positive, betaGlobs.negative)).toBe(betaBefore);
+
+    await writeFile(join(root, 'beta/src/lib.rs'), 'pub fn beta() {} // invalidate only beta\n');
+    context.incrementalUpdate(['beta/src/lib.rs'], []);
+    const betaAfterBetaEdit = context.hashFilesMatchingGlob(betaGlobs.positive, betaGlobs.negative);
+    expect(betaAfterBetaEdit).not.toBe(betaBefore);
+    expect(context.hashFilesMatchingGlob(alphaGlobs.positive, alphaGlobs.negative)).toBe(alphaAfterAlphaEdit);
+
+    await writeFile(join(root, 'unselected/src/lib.rs'), 'compile_error!("changed unselected");\n');
+    context.incrementalUpdate(['unselected/src/lib.rs'], []);
+    expect(context.hashFilesMatchingGlob(alphaGlobs.positive, alphaGlobs.negative)).toBe(alphaAfterAlphaEdit);
+    expect(context.hashFilesMatchingGlob(betaGlobs.positive, betaGlobs.negative)).toBe(betaAfterBetaEdit);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 //#endregion smoo/cowshed!n/native-test-verdicts

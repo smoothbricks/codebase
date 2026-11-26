@@ -334,6 +334,18 @@ const resolves = new Map<string, ResolveState>();
 const RESOLVE_CACHE_SCHEMA = 'cargo-resolve-v3';
 
 /**
+ * Where one Cargo workspace's resolution is cached: `identity` keys it among this process's flights, and `directory`
+ * (under Nx's workspace data) holds its `entry.cache` and its lock. `root` and `manifest` are canonical.
+ */
+export function cargoResolveCache(
+  root: string,
+  manifest: string,
+): { readonly identity: string; readonly directory: string } {
+  const identity = createHash('sha256').update(`${RESOLVE_CACHE_SCHEMA}\0${root}\0${manifest}`).digest('hex');
+  return { identity, directory: join(workspaceDataDirectoryForWorkspace(root), 'cargo-resolve', identity) };
+}
+
+/**
  * The longest one Cargo child, or one wait for a foreign resolve flight's lock, may take.
  * Both waits sit on every project-graph construction, so an unbounded one is a silent,
  * output-free hang of every gate that resolves the graph (a stopped lock holder, a Cargo
@@ -508,8 +520,7 @@ export async function readCargoResolve(
     manifest = await realpath(manifest);
     const index =
       indexed ?? new Set(new WorkspaceContext(root, workspaceDataDirectoryForWorkspace(root)).glob(['**/Cargo.toml']));
-    const identity = createHash('sha256').update(`${RESOLVE_CACHE_SCHEMA}\0${root}\0${manifest}`).digest('hex');
-    const directory = join(workspaceDataDirectoryForWorkspace(root), 'cargo-resolve', identity);
+    const { identity, directory } = cargoResolveCache(root, manifest);
     const file = join(directory, 'entry.cache');
     let state = resolves.get(identity);
     if (state === undefined) {
