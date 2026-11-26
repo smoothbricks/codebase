@@ -59,60 +59,6 @@
     doCheck = false;
   };
 
-  # The Bun the Nx plugin's inferred `lint` runs as `bun lint` (SMOO_LINT_BUN
-  # below), for linting only: every other task runs the repository's own
-  # runtime Bun, which this pin does not move. `bun lint` first ships in Bun
-  # 1.4.6, which has no release yet and which nixpkgs does not carry, so this
-  # is upstream's own canary build as Bun publishes it to npm:
-  # @oven/bun-<platform>@1.4.5-canary.20261124.1 answers `bun --revision`
-  # 1.4.6-canary.1+bd92f9bef. An npm version never changes, so each
-  # platform's tarball is a fixed-output fetch by its registry integrity. The
-  # lint targets hash the store path (an `env` input), so moving this pin
-  # re-runs every lint and nothing else. Like jactionlint above, the Darwin
-  # binary keeps upstream's signature (no fixup); Linux links it against the
-  # store's glibc as nixpkgs' own bun does.
-  lintBun = let
-    version = "1.4.5-canary.20261124.1";
-    sources = {
-      aarch64-darwin = {
-        platform = "darwin-aarch64";
-        hash = "sha512-akutH6TzdaE0eIVXZcH1+PaxZtC/a7yhlf13H+CwmdU6QrwmNC/CIscoh10OPrWImKWTrk5CKUazwCySgEc7VA==";
-      };
-      x86_64-darwin = {
-        platform = "darwin-x64";
-        hash = "sha512-zzrmhxx7G122c8AepWazzUBvHEPip0NRcxi55LBBDDtbxWgbb7bjdzwXfoqVcNqbq2DjA11gQePWS3sSLr4Z5w==";
-      };
-      aarch64-linux = {
-        platform = "linux-aarch64";
-        hash = "sha512-/z+WzPRwCOCwzDRIiw1KAWUaietm+QKqGcV04ZERo8HEhYJqNB13ub1hNanaA1P//y323vY5C95pGt9SltMgtw==";
-      };
-      x86_64-linux = {
-        platform = "linux-x64";
-        hash = "sha512-bPgrPTNQtJp8oLQBaak99SCQEob5vZ33SlkbzFkzR0M4l7XWpqYiLTM4BqFs1gMJDgkU3DyQPbQRYxUxdUWCTw==";
-      };
-    };
-    system = pkgs.stdenv.hostPlatform.system;
-    source = sources.${system} or (throw "bun-lint: unsupported managed shell platform ${system}");
-  in
-    pkgs.stdenvNoCC.mkDerivation {
-      pname = "bun-lint";
-      inherit version;
-      src = pkgs.fetchurl {
-        url = "https://registry.npmjs.org/@oven/bun-${source.platform}/-/bun-${source.platform}-${version}.tgz";
-        inherit (source) hash;
-      };
-      nativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.autoPatchelfHook];
-      buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.openssl];
-      dontConfigure = true;
-      dontBuild = true;
-      dontFixup = pkgs.stdenv.hostPlatform.isDarwin;
-      installPhase = ''
-        runHook preInstall
-        install -Dm755 bin/bun "$out/bin/bun"
-        runHook postInstall
-      '';
-    };
-
   # A repository that enables uv under languages.python gets its uv workspace
   # synced and activated by this contract (enterShell item 5), never by
   # devenv's own python tasks.
@@ -239,13 +185,19 @@ in {
     # package set for x86_64-darwin.
     #
     # A repository's own overlays apply after this one, so one that sets `bun`
-    # itself still decides it.
+    # itself still decides its runtime Bun. The managed build stays reachable as
+    # `smooBun` whatever a repository does to `bun`: it is the Bun the Nx
+    # plugin's inferred `lint` runs as `bun lint` (SMOO_LINT_BUN below), so lint
+    # and its built-in rules are one pin across every managed repository, and a
+    # repository that builds its own runtime Bun does not move them. Where no
+    # repository overrides `bun`, `bun` and `smooBun` are the same store path:
+    # one Bun, fetched once.
     #
     # `bun --version` of this build prints 1.4.6, the release it precedes, and
     # that is what `packageManager` names. When Bun 1.4.6 is released, pin that
     # release here; `packageManager` then stays as it is.
-    (_final: prev: {
-      bun = prev.bun.overrideAttrs (finalAttrs: previous: {
+    (_final: prev: let
+      smooBun = prev.bun.overrideAttrs (finalAttrs: previous: {
         version = "1.4.5-canary.20261125.1";
         # nixpkgs warns when `version` changes and `src` is not set beside it.
         # Here `src` follows `passthru.sources`, as the derivation defines it.
@@ -276,6 +228,9 @@ in {
             };
           };
       });
+    in {
+      bun = smooBun;
+      inherit smooBun;
     })
   ];
 
@@ -305,7 +260,10 @@ in {
       # reads only "false" as off (project-graph/plugins/isolation/enabled.js).
       NX_ISOLATE_PLUGINS = "false";
       SMOO_TYPECHECK_TSC = "${typecheckTsc}/bin/tsc";
-      SMOO_LINT_BUN = "${lintBun}/bin/bun";
+      # The lint Bun the inferred `lint` runs and keys by store path: the
+      # managed Bun of the overlay above, even where a repository's `bun` is
+      # its own build.
+      SMOO_LINT_BUN = "${pkgs.smooBun}/bin/bun";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
     # (CI reached the executable, then failed loading libglib-2.0.so.0). Use

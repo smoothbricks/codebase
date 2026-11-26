@@ -176,10 +176,10 @@ function typecheckCommand(args: string): string {
 }
 
 /**
- * The lint-only Bun the inferred `lint` runs as `bun lint`, separate from the runtime Bun on PATH: devenv.smoo.nix
- * fetches it and exports its path, so a repository whose runtime Bun lacks `bun lint` still lints and the pin keys
- * every lint by its store path without coupling lint keys to the runtime Bun. The command refuses an unset variable:
- * falling back to PATH would lint with another Bun under the same key.
+ * The Bun the inferred `lint` runs as `bun lint`: the managed Bun devenv.smoo.nix pins for every repository, which is
+ * the shell's own `bun` unless a repository builds its runtime Bun itself. A repository's runtime Bun therefore never
+ * decides whether or how it lints, and the pin keys every lint by its store path. The command refuses an unset
+ * variable: falling back to PATH would lint with another Bun under the same key.
  */
 const LINT_BUN_ENV = 'SMOO_LINT_BUN';
 const LINT_BUN_INPUT = { env: LINT_BUN_ENV };

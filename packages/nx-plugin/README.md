@@ -90,8 +90,9 @@ files.
 
 The command names no file. It is `"$SMOO_LINT_BUN" lint --no-script --type-aware -f stylish {eslintSources}`, and the
 target's `eslintProjectRoot` option names the project whose sources the placeholder stands for. `SMOO_LINT_BUN` names
-the lint-only Bun that the managed `devenv.smoo.nix` pins (Bun 1.4.6 canary, the first with `bun lint`), so the runtime
-Bun of a repository never decides whether or how it lints, and the command refuses an unset variable. A graph holds the
+the managed Bun that `devenv.smoo.nix` pins for every repository (a Bun 1.4.6 canary, the first with `bun lint`). It is
+the shell's own `bun` unless a repository builds its runtime Bun itself, and then it stays the managed one, so a
+repository's runtime Bun never decides whether or how it lints; the command refuses an unset variable. A graph holds the
 files of the moment it was computed, and the daemon serves it past a deletion or an addition its watcher never reported:
 a list in the command made ESLint refuse a pattern no file matches, and left a new file unlinted, until the graph
 recomputed. The `all-verdicts` executor replaces the placeholder when the command runs, with the files the rules above
