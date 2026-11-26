@@ -713,11 +713,13 @@ nothing when nothing changed:
 - Shell secrets resolve only for an entry that installs; see below.
 - `tooling/direnv/ttsc-env.sh`, sourced by shell entry and by the git hooks, names the checkout's own native compiler in
   `TTSC_TSGO_BINARY`, caches ttsc's plugin binaries in the checkout's `.cache/ttsc-plugins` (the output a repository's
-  plugin build target declares) and its Go build cache in `.cache/ttsc/go-build`. `GOFLAGS` carries `-trimpath`. A cache
-  the caller already exported wins, so a host or a sandbox that shares these caches across checkouts sets them itself,
-  unless the caller's environment was bound for another workspace (its `NX_WORKSPACE_ROOT_PATH` names another
-  directory): that workspace's caches are dropped. Go's own caches keep Go's defaults. Sourced from a directory that is
-  not a workspace root, it refuses rather than cache beside that directory.
+  plugin build target declares) and its Go build cache in `.cache/ttsc/go-build`. `GOFLAGS` carries `-trimpath`.
+  `CGO_ENABLED` defaults to `0` because the plugins ttsc builds are pure Go, and with cgo off neither ttsc's key nor the
+  build asks the C toolchain; an inherited value wins. A cache the caller already exported wins, so a host or a sandbox
+  that shares these caches across checkouts sets them itself, unless the caller's environment was bound for another
+  workspace (its `NX_WORKSPACE_ROOT_PATH` names another directory): that workspace's caches are dropped. Go's own caches
+  keep Go's defaults. Sourced from a directory that is not a workspace root, it refuses rather than cache beside that
+  directory.
 - `SMOO_TYPECHECK_TSC` names the native compiler the inferred `typecheck` and `typecheck-tests` targets run.
   `devenv.smoo.nix` builds it from one pinned TypeScript source revision with `go_1_27` from the `nixpkgs-go` input. The
   targets run it directly rather than through ttsc, whose auto-loaded transform plugins (typia) check inside their own

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -24,6 +26,7 @@ interface TtscEnv {
   readonly TTSC_TSGO_BINARY: string;
   readonly TTSC_CACHE_DIR: string;
   readonly TTSC_GO_CACHE_DIR: string;
+  readonly CGO_ENABLED: string;
 }
 
 /**
@@ -34,13 +37,22 @@ interface TtscEnv {
 function enter(checkout: string, inherited: Record<string, string>): TtscEnv {
   const result = spawnSync(
     '/bin/sh',
-    ['-c', `. "$0" && printf '%s\\n' "$TTSC_TSGO_BINARY" "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR"`, checkoutScript],
+    [
+      '-c',
+      `. "$0" && printf '%s\\n' "$TTSC_TSGO_BINARY" "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR" "\${CGO_ENABLED-unset}"`,
+      checkoutScript,
+    ],
     { cwd: checkout, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...inherited }, encoding: 'utf8' },
   );
   if (result.status !== 0) printCommandOutput(result.stdout ?? '', result.stderr ?? '');
   expect(result.status).toBe(0);
-  const [binary, cache, goCache] = result.stdout.split('\n');
-  return { TTSC_TSGO_BINARY: binary ?? '', TTSC_CACHE_DIR: cache ?? '', TTSC_GO_CACHE_DIR: goCache ?? '' };
+  const [binary, cache, goCache, cgoEnabled] = result.stdout.split('\n');
+  return {
+    TTSC_TSGO_BINARY: binary ?? '',
+    TTSC_CACHE_DIR: cache ?? '',
+    TTSC_GO_CACHE_DIR: goCache ?? '',
+    CGO_ENABLED: cgoEnabled ?? '',
+  };
 }
 
 function withCheckouts(run: (checkout: string, other: string, scratch: string) => void): void {
@@ -78,6 +90,7 @@ it('selects this checkout profile when the repository declares its native produc
       TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'),
       TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
       TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+      CGO_ENABLED: '0',
     });
   });
 });
@@ -118,6 +131,7 @@ describe('ttsc-env.sh', () => {
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
         TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
         TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+        CGO_ENABLED: '0',
       });
     });
   });
@@ -128,6 +142,7 @@ describe('ttsc-env.sh', () => {
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
         TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
         TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+        CGO_ENABLED: '0',
       });
     });
   });
@@ -139,9 +154,18 @@ describe('ttsc-env.sh', () => {
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
         TTSC_CACHE_DIR: shared,
         TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+        CGO_ENABLED: '0',
       };
       expect(enter(checkout, { TTSC_CACHE_DIR: shared })).toEqual(expected);
       expect(enter(checkout, { NX_WORKSPACE_ROOT_PATH: checkout, TTSC_CACHE_DIR: shared })).toEqual(expected);
+    });
+  });
+
+  it('defaults CGO_ENABLED to 0 and keeps an inherited value', () => {
+    withCheckouts((checkout, other) => {
+      expect(enter(checkout, {}).CGO_ENABLED).toBe('0');
+      expect(enter(checkout, { CGO_ENABLED: '1' }).CGO_ENABLED).toBe('1');
+      expect(enter(checkout, { ...boundFor(other), CGO_ENABLED: '1' }).CGO_ENABLED).toBe('1');
     });
   });
 });
@@ -235,6 +259,178 @@ describe("ttsc's plugin source files", () => {
       const refused = collect();
       expect(refused.status).toBe(1);
       expect(refused.stderr).toContain(`contains a link at ${join(plugin, 'linked')}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Run ttsc's `hashPluginBuildEnvironment` over the cwd under the child's env,
+ * recording every framed `[key, value]` chunk and the resulting SHA-256 digest.
+ */
+const HASH_PLUGIN_BUILD_ENV = `const crypto = require('node:crypto');
+const fs = require('node:fs');
+const { hashPluginBuildEnvironment } = require(process.argv.at(-1));
+const hasher = crypto.createHash('sha256');
+const entries = [];
+const sink = {
+  update(chunk) {
+    hasher.update(chunk);
+    entries.push(JSON.parse(chunk));
+  },
+};
+hashPluginBuildEnvironment(sink, 'go', process.cwd(), process.env, {
+  readFile: (location) => fs.readFileSync(location),
+});
+process.stdout.write(JSON.stringify({ digest: hasher.digest('hex'), entries }));`;
+
+const COSTLY_CGO_KEYS = [
+  'PKG_CONFIG',
+  'CGO_CFLAGS',
+  'CGO_CPPFLAGS',
+  'CGO_CXXFLAGS',
+  'CGO_FFLAGS',
+  'CGO_LDFLAGS',
+] as const;
+
+describe("ttsc's plugin build environment hash", () => {
+  function runHash(
+    root: string,
+    extraEnv: Record<string, string>,
+  ): {
+    readonly digest: string;
+    readonly entries: readonly [string, unknown][];
+    readonly clangSpawns: readonly string[];
+  } {
+    const bin = join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const clangLog = join(root, 'clang.log');
+    writeFileSync(clangLog, '');
+    const recordingClang = join(bin, 'clang');
+    writeFileSync(recordingClang, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TTSC_TEST_CLANG_LOG"\nexit 0\n');
+    chmodSync(recordingClang, 0o755);
+    const fakePkgConfig = join(bin, 'pkg-config');
+    writeFileSync(fakePkgConfig, '#!/bin/sh\nexit 0\n');
+    chmodSync(fakePkgConfig, 0o755);
+
+    const ttsc = dirname(createRequire(import.meta.url).resolve('ttsc/package.json'));
+    const result = spawnSync(
+      process.execPath,
+      ['-e', HASH_PLUGIN_BUILD_ENV, join(ttsc, 'lib/plugin/internal/source/hashPluginBuildEnvironment.js')],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          CC: 'clang',
+          GOCACHE: join(root, 'go-build'),
+          GOENV: join(root, 'go.env'),
+          GOWORK: 'off',
+          PKG_CONFIG: fakePkgConfig,
+          TTSC_TEST_CLANG_LOG: clangLog,
+          ...extraEnv,
+        },
+        encoding: 'utf8',
+      },
+    );
+    if (result.status !== 0) printCommandOutput(result.stdout ?? '', result.stderr ?? '');
+    expect(result.status).toBe(0);
+    const parsed: unknown = JSON.parse(result.stdout);
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      !('digest' in parsed) ||
+      typeof parsed.digest !== 'string' ||
+      !('entries' in parsed) ||
+      !Array.isArray(parsed.entries)
+    ) {
+      throw new Error(`Unexpected hash output: ${result.stdout}`);
+    }
+    const entries: [string, unknown][] = [];
+    for (const entry of parsed.entries) {
+      if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string') {
+        throw new Error(`Unexpected hash entry: ${JSON.stringify(entry)}`);
+      }
+      entries.push([entry[0], entry[1]]);
+    }
+    const logLines = readFileSync(clangLog, 'utf8')
+      .split('\n')
+      .filter((line) => line.length > 0);
+    return { digest: parsed.digest, entries, clangSpawns: logLines };
+  }
+
+  it('skips Go costly cgo keys and spawns clang zero times when CGO_ENABLED=0', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'ttsc-cgo-off-')));
+    try {
+      const first = runHash(root, {
+        CGO_ENABLED: '0',
+        CGO_CFLAGS: '-DIGNORED_C_ONE',
+        CGO_CPPFLAGS: '-DIGNORED_CPP',
+        CGO_CXXFLAGS: '-DIGNORED_CXX',
+        CGO_FFLAGS: '-DIGNORED_F',
+        CGO_LDFLAGS: '-L/ignored',
+      });
+      expect(first.clangSpawns).toEqual([]);
+      const keys = new Map(first.entries);
+      expect(keys.get('CGO_ENABLED')).toBe('0');
+      for (const key of COSTLY_CGO_KEYS) {
+        expect(keys.has(key)).toBe(false);
+      }
+
+      // Changing any costly cgo flag must not move the digest when cgo is off.
+      const second = runHash(root, {
+        CGO_ENABLED: '0',
+        CGO_CFLAGS: '-DIGNORED_C_TWO',
+        CGO_CPPFLAGS: '-DIGNORED_CPP_TWO',
+        CGO_CXXFLAGS: '-DIGNORED_CXX_TWO',
+        CGO_FFLAGS: '-DIGNORED_F_TWO',
+        CGO_LDFLAGS: '-L/ignored-two',
+      });
+      expect(second.clangSpawns).toEqual([]);
+      expect(second.digest).toBe(first.digest);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads and hashes all six costly cgo keys in order when CGO_ENABLED=1', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'ttsc-cgo-on-')));
+    try {
+      const cgoValues = {
+        CGO_ENABLED: '1',
+        CGO_CFLAGS: '-DTEST_C',
+        CGO_CPPFLAGS: '-DTEST_CPP',
+        CGO_CXXFLAGS: '-DTEST_CXX',
+        CGO_FFLAGS: '-DTEST_F',
+        CGO_LDFLAGS: '-L/test',
+      };
+      const first = runHash(root, cgoValues);
+      const keys = new Map(first.entries);
+      expect(keys.get('CGO_ENABLED')).toBe('1');
+      expect(keys.get('CGO_CFLAGS')).toBe('-DTEST_C');
+      expect(keys.get('CGO_CPPFLAGS')).toBe('-DTEST_CPP');
+      expect(keys.get('CGO_CXXFLAGS')).toBe('-DTEST_CXX');
+      expect(keys.get('CGO_FFLAGS')).toBe('-DTEST_F');
+      expect(keys.get('CGO_LDFLAGS')).toBe('-L/test');
+      expect(String(keys.get('PKG_CONFIG'))).toContain(`${join(root, 'bin', 'pkg-config')}\0command:sha256:`);
+
+      // Key ordering must match stock GO_BUILD_ENV_KEYS so the digest is unchanged when cgo is on.
+      const entryNames = first.entries.map(([key]) => key);
+      const positions = COSTLY_CGO_KEYS.map((key) => entryNames.indexOf(key));
+      expect(positions.every((pos) => pos >= 0)).toBe(true);
+      for (let i = 1; i < positions.length; i += 1) {
+        const previous = positions[i - 1];
+        const current = positions[i];
+        expect(previous).toBeDefined();
+        expect(current).toBeDefined();
+        if (previous !== undefined && current !== undefined) {
+          expect(current).toBeGreaterThan(previous);
+        }
+      }
+
+      const second = runHash(root, { ...cgoValues, CGO_CFLAGS: '-DTEST_C_CHANGED' });
+      expect(second.digest).not.toBe(first.digest);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

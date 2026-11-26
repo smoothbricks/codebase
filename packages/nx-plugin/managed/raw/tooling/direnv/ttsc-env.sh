@@ -48,3 +48,6 @@ fi
 export TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-$PWD/.cache/ttsc-plugins}"
 export TTSC_GO_CACHE_DIR="${TTSC_GO_CACHE_DIR:-$PWD/.cache/ttsc/go-build}"
 mkdir -p "$TTSC_GO_CACHE_DIR"
+# The plugins ttsc builds are pure Go; with cgo off neither ttsc's cache key nor
+# the build asks the C toolchain. An inherited value stays.
+export CGO_ENABLED="${CGO_ENABLED:-0}"

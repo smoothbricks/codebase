@@ -2000,7 +2000,7 @@ index 22ef5cb..e6aae92 100644
  //# sourceMappingURL=collectPluginSourceFiles.js.map
 \ No newline at end of file
 diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
-index 9a33d59..d76a0f1 100644
+index 9a33d59..b830b49 100644
 --- a/lib/plugin/internal/source/hashPluginBuildEnvironment.js
 +++ b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
 @@ -13,6 +13,7 @@ const GoSourceInputs_1 = require("./GoSourceInputs");
@@ -2011,7 +2011,73 @@ index 9a33d59..d76a0f1 100644
  const spawnGoTool_1 = require("./spawnGoTool");
  /**
   * Hash the environment a plugin build is keyed on into `hash`: the Go
-@@ -341,6 +342,9 @@ function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identiti
+@@ -117,6 +118,21 @@ const GO_BUILD_ENV_KEYS = [
+     "GOTOOLCHAIN",
+     "GOROOT",
+ ];
++// Go's `src/cmd/go/internal/envcmd/env.go` `needCostly` switch runs
++// `ExtraEnvVarsCostly` (which probes the C compiler) when any of these keys is
++// requested. Skip them only when `CGO_ENABLED` is `"0"` (fail safe toward
++// hashing more when `CGO_ENABLED` is absent): with cgo off they cannot affect
++// the binary, while with cgo on the hashed values remain identical to stock ttsc.
++const GO_BUILD_COSTLY_CGO_ENV_KEYS = [
++    "PKG_CONFIG",
++    "CGO_CFLAGS",
++    "CGO_CPPFLAGS",
++    "CGO_CXXFLAGS",
++    "CGO_FFLAGS",
++    "CGO_LDFLAGS",
++];
++const GO_BUILD_COSTLY_CGO_ENV_KEY_SET = new Set(GO_BUILD_COSTLY_CGO_ENV_KEYS);
++const GO_BUILD_BASE_ENV_KEYS = GO_BUILD_ENV_KEYS.filter((key) => !GO_BUILD_COSTLY_CGO_ENV_KEY_SET.has(key));
+ const GO_BUILD_COMMAND_ENV_KEYS = new Set([
+     "AR",
+     "CC",
+@@ -307,16 +323,31 @@ function hashGoBuildEnvironment(hash, goBinary, cwd, env, filesystem, witness, i
+ }
+ function resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, identities) {
+     const values = new Map();
++    let cgoEnabled = env.CGO_ENABLED !== "0";
+     if (goBinary !== undefined) {
+-        const parsed = GoEnvironmentReading_1.GoEnvironmentReading.read(goBinary, cwd, env, GO_BUILD_ENV_KEYS, witness, identities);
++        const parsed = GoEnvironmentReading_1.GoEnvironmentReading.read(goBinary, cwd, env, GO_BUILD_BASE_ENV_KEYS, witness, identities);
+         if (parsed !== undefined) {
++            cgoEnabled = parsed.CGO_ENABLED !== "0";
++            // Keep the cgo-on path's hashed values identical to stock ttsc:
++            // skip the six costly keys only when Go reports CGO_ENABLED="0".
++            const cgoParsed = cgoEnabled
++                ? GoEnvironmentReading_1.GoEnvironmentReading.read(goBinary, cwd, env, GO_BUILD_COSTLY_CGO_ENV_KEYS, witness, identities)
++                : undefined;
+             try {
+-                for (const key of GO_BUILD_ENV_KEYS) {
++                for (const key of GO_BUILD_BASE_ENV_KEYS) {
+                     const raw = parsed[key];
+                     if (typeof raw === "string" && raw !== "") {
+                         values.set(key, normalizeGoBuildEnvValue(key, raw, env, filesystem, witness, identities));
+                     }
+                 }
++                if (cgoParsed !== undefined) {
++                    for (const key of GO_BUILD_COSTLY_CGO_ENV_KEYS) {
++                        const raw = cgoParsed[key];
++                        if (typeof raw === "string" && raw !== "") {
++                            values.set(key, normalizeGoBuildEnvValue(key, raw, env, filesystem, witness, identities));
++                        }
++                    }
++                }
+             }
+             catch {
+                 // Fall back to the effective env below; a cache key is still better
+@@ -324,7 +355,8 @@ function resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, iden
+             }
+         }
+     }
+-    for (const key of GO_BUILD_ENV_KEYS) {
++    const fallbackKeys = cgoEnabled ? GO_BUILD_ENV_KEYS : GO_BUILD_BASE_ENV_KEYS;
++    for (const key of fallbackKeys) {
+         if (values.has(key))
+             continue;
+         const value = env[key];
+@@ -341,6 +373,9 @@ function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identiti
          // nested content changes that do not move the root or VERSION metadata.
          PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.add(witness, value);
          PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.add(witness, node_path_1.default.join(value, "VERSION"));
@@ -2021,7 +2087,7 @@ index 9a33d59..d76a0f1 100644
          return resolveGoRootCacheIdentity(value, filesystem, witness, identities);
      }
      if (key === "GOFLAGS") {
-@@ -355,6 +359,40 @@ function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identiti
+@@ -355,6 +390,40 @@ function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identiti
      }
      return value;
  }
