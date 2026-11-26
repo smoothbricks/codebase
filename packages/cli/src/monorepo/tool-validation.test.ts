@@ -109,6 +109,22 @@ describe('tool configuration validation', () => {
     }
   });
 
+  it('leaves Bun to the managed module: a package list without it is complete and gains none', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-managed-bun-'));
+    try {
+      const path = join(root, 'tooling/direnv/devenv.nix');
+      const content =
+        '{pkgs, ...}: {\n  imports = [./devenv.smoo.nix];\n  packages = with pkgs; [\n    git\n    git-format-staged\n    jq\n    alejandra\n    coreutils\n    gnutar\n  ];\n}\n';
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content);
+
+      expect(validateDevenvPackages(root)).toBe(0);
+      applyDevenvPackageDefaults(root);
+      expect(await readFile(path, 'utf8')).toBe(content);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   describe('complete coreutils providers', () => {
     const packageList = (provider: string) => `{
   pkgs,

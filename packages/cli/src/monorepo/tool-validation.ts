@@ -100,15 +100,18 @@ const rootDevDependencies: RequiredDependency[] = [
 
 const cliPackageName = '@smoothbricks/cli';
 
-// Go and Node are deliberately absent: ./devenv.smoo.nix supplies both, and
+// Go, Node and Bun are deliberately absent: ./devenv.smoo.nix supplies them, and
 // every repository is required to import it (validateDevenvModuleImport). Go
 // comes from the dedicated `nixpkgs-go` input pinned to the patch release ttsc
 // vendors, and Node as an explicit major. Requiring them again here made
 // `smoo monorepo update` append a bare `go` — which resolves from the default
 // channel and reintroduces the `compile: version does not match go tool
 // version` skew the pinned input exists to prevent — and a `nodejs_latest`,
-// which is the opposite of a pinned fleet-wide runtime.
-const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar'];
+// which is the opposite of a pinned fleet-wide runtime. Bun is the managed
+// overlay's `pkgs.bun` in the managed package list; a repository that still
+// lists `bun` gets that same package, so the entry is neither required nor
+// refused.
+const requiredDevenvPackages = ['git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar'];
 // A repo-owned bare `go` shadows the pinned one on PATH, so it is rejected
 // rather than merely not required. Anchored to a package-list entry, never a
 // comment that only mentions Go.
