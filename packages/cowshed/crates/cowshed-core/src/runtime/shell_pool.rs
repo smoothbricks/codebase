@@ -232,7 +232,7 @@ pub(crate) struct PoolInspection {
 /// cache"): an idle host of the current generation, the spare, or a host the command activated
 /// for itself. A caller proves which path its commands took from these, not from their timing.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PoolCounts {
     /// Acquires an idle host of the current generation answered.
     pub idle: u64,

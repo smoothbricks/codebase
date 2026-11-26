@@ -21,12 +21,7 @@ use crate::error::{CowshedError, Result};
 
 /// Where one progress read found the job.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "phase",
-    content = "sample",
-    rename_all = "camelCase",
-    deny_unknown_fields
-)]
+#[serde(tag = "phase", content = "sample", rename_all = "camelCase")]
 pub(crate) enum ProgressRead {
     /// Admitted, and no process of its own yet: nothing to sample.
     Unowned,

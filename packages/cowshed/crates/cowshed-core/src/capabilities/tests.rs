@@ -114,6 +114,78 @@ fn the_installed_cowshed_is_a_core_bootstrap_without_controller_data_authority()
     assert!(detected.contribution.shared_caches.is_empty());
 }
 
+/// Preparation mirrors the installed `cowshed` bootstrap into the job's private HOME so the npm
+/// launcher finds it through `~` without adding any filesystem grant beyond the stable link and
+/// its resolved executable; when no install exists nothing is created, and after an install is
+/// removed the next preparation removes the stale link (15_capabilities.md, "Bootstrap
+/// executables").
+#[test]
+fn preparation_links_the_installed_cowshed_into_the_private_home_without_extra_grants() {
+    let fixture = Fixture::new();
+    let private_home = fixture.environment.join("home");
+    let private_install =
+        crate::host_dirs::installed_binary_directory(&private_home).join("cowshed");
+
+    let without_install = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    crate::runtime::supervisor::prepare_private_environment(
+        &fixture.root,
+        &fixture.environment,
+        None,
+        &without_install.contribution,
+    )
+    .unwrap();
+    assert!(
+        fs::read_dir(&private_home).unwrap().next().is_none(),
+        "no host install creates nothing in the private HOME"
+    );
+
+    let bin = crate::host_dirs::installed_binary_directory(&fixture.home);
+    fs::create_dir_all(&bin).unwrap();
+    let program = bin.join("cowshed-build");
+    fs::write(&program, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let stable = bin.join("cowshed");
+    std::os::unix::fs::symlink("cowshed-build", &stable).unwrap();
+
+    let with_install = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    let mut expected_grants = [stable.clone(), program.clone()]
+        .map(|path| CapabilityGrant {
+            path,
+            scope: GrantScope::Literal,
+            access: GrantAccess::Read,
+        })
+        .to_vec();
+    expected_grants.extend(fixture.core_programs().grants);
+    expected_grants.sort();
+    expected_grants.dedup();
+    assert_eq!(with_install.contribution.grants, expected_grants);
+    assert!(with_install.contribution.shared_caches.is_empty());
+
+    crate::runtime::supervisor::prepare_private_environment(
+        &fixture.root,
+        &fixture.environment,
+        None,
+        &with_install.contribution,
+    )
+    .unwrap();
+    assert_eq!(fs::read_link(&private_install).unwrap(), program);
+    assert_eq!(fs::canonicalize(&private_install).unwrap(), program);
+
+    fs::remove_file(&stable).unwrap();
+    let after_removal = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    crate::runtime::supervisor::prepare_private_environment(
+        &fixture.root,
+        &fixture.environment,
+        None,
+        &after_removal.contribution,
+    )
+    .unwrap();
+    assert!(
+        fs::symlink_metadata(&private_install).is_err(),
+        "a removed host install leaves no stale private HOME link"
+    );
+}
+
 #[test]
 fn a_detector_conflicting_with_the_core_program_returns_a_typed_conflict() {
     let mut output = CapabilityContribution {

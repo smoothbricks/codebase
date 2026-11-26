@@ -38,7 +38,7 @@ struct FeedState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct FeedPage {
     pub entries: Vec<FeedEntry>,
     /// Cursors after the one asked for that were dropped before anyone read them.
@@ -46,7 +46,7 @@ pub struct FeedPage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct FeedEntry {
     pub cursor: u64,
     pub draft: CommitmentDraft,

@@ -169,7 +169,7 @@ pub fn job_span_thread(
 /// What a supervisor's span writer did: the segments it sealed, what it refused, and the last
 /// refusal.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct TraceHealth {
     /// Segments sealed, never rows: one seal makes at most one job segment and one process
     /// segment, however many rows each holds.

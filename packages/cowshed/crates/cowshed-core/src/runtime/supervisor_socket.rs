@@ -222,7 +222,7 @@ enum Request {
 
 /// A job the supervisor has not concluded, as `gateway status` counts it.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct LiveJobWire {
     class: ExecClass,
     state: JobState,
@@ -232,11 +232,19 @@ struct LiveJobWire {
     )]
     gate_priority: super::supervisor::JobGatePriority,
 }
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HelloWire {
     build: BuildId,
     authority: AuthorityWire,
+    pid: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HelloAnswer {
+    authority: AuthorityAnswer,
     pid: u32,
 }
 
@@ -248,6 +256,30 @@ pub(super) struct AuthorityWire {
     workspace_incarnation: crate::metadata::WorkspaceIncarnation,
     grant_revision: u64,
     lifecycle_revision: u64,
+}
+
+/// Reader projection of [`AuthorityWire`] for answers the client decodes from a supervisor
+/// (11_shell.md, "Protocol"); requests decoded by the supervisor stay strict via [`AuthorityWire`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityAnswer {
+    repo_id: crate::repository::RepoId,
+    workspace: crate::metadata::WorkspaceName,
+    workspace_incarnation: crate::metadata::WorkspaceIncarnation,
+    grant_revision: u64,
+    lifecycle_revision: u64,
+}
+
+impl From<AuthorityAnswer> for WorkspaceAuthoritySnapshot {
+    fn from(wire: AuthorityAnswer) -> Self {
+        Self {
+            repo_id: wire.repo_id,
+            workspace: wire.workspace,
+            workspace_incarnation: wire.workspace_incarnation,
+            grant_revision: wire.grant_revision,
+            lifecycle_revision: wire.lifecycle_revision,
+        }
+    }
 }
 
 impl From<&WorkspaceAuthoritySnapshot> for AuthorityWire {
@@ -486,6 +518,57 @@ struct SessionWire {
     name: Option<String>,
 }
 
+/// Reader projection of [`SessionWire`] for `OpenSession` answers; requests decoded by the
+/// supervisor stay strict via [`SessionWire`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAnswer {
+    identity: u64,
+    name: Option<String>,
+}
+
+/// Reader projection of [`JobSubtreeHandle`] for membership answers; public API validation stays
+/// strict on [`JobSubtreeHandle`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtreeHandleAnswer {
+    job_id: JobId,
+    index: u32,
+    incarnation: String,
+}
+
+/// Reader projection of [`JobSubtreeAdmission`] for membership answers; public API validation stays
+/// strict on [`JobSubtreeAdmission`].
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum SubtreeAdmissionAnswer {
+    Admitted {
+        handle: SubtreeHandleAnswer,
+    },
+    Refused {
+        reason: crate::api::process::JobSubtreeRefusal,
+    },
+}
+
+impl From<SubtreeAdmissionAnswer> for JobSubtreeAdmission {
+    fn from(wire: SubtreeAdmissionAnswer) -> Self {
+        match wire {
+            SubtreeAdmissionAnswer::Admitted { handle } => Self::Admitted {
+                handle: JobSubtreeHandle {
+                    job_id: handle.job_id,
+                    index: handle.index,
+                    incarnation: handle.incarnation,
+                },
+            },
+            SubtreeAdmissionAnswer::Refused { reason } => Self::Refused { reason },
+        }
+    }
+}
+
 impl From<&SessionToken> for SessionWire {
     fn from(session: &SessionToken) -> Self {
         Self {
@@ -590,7 +673,7 @@ enum StdinWire {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct SessionSnapshotWire {
     identity: u64,
     name: Option<String>,
@@ -600,14 +683,14 @@ struct SessionSnapshotWire {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct LogChunkWire {
     next_offset: u64,
     eof: bool,
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 enum Response {
     Ok {
         value: serde_json::Value,
@@ -623,7 +706,7 @@ enum Response {
 /// What a call still being answered says each heartbeat: how many it has said, for a call about
 /// a job that job as the supervisor's actor last published it, and that actor.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ProgressWire {
     seq: u64,
     job: Option<JobPulse>,
@@ -635,7 +718,7 @@ struct ProgressWire {
 /// turn that holds a call up names itself here, and one that never ends shows a `forMs` that
 /// keeps rising while the turn count stays put.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ActorPulse {
     turns: u64,
     busy: Option<TurnBusy>,
@@ -645,7 +728,7 @@ struct ActorPulse {
 
 /// The turn an actor is in: the command or event it handles, and for how long so far.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct TurnBusy {
     turn: String,
     for_ms: u64,
@@ -660,7 +743,7 @@ struct Pulse {
 
 /// A job as a heartbeat reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct JobPulse {
     pub(crate) job_id: JobId,
     state: JobState,
@@ -2705,7 +2788,7 @@ pub async fn subtree_handle(path: &Path) -> Result<JobSubtreeAdmission> {
         Bytes::new(),
     )
     .await?;
-    decode(value)
+    decode::<SubtreeAdmissionAnswer>(value).map(Into::into)
 }
 
 /// Spend a root-issued capability from a live peer of the same admitted job.
@@ -2727,7 +2810,7 @@ pub async fn retire_descendants(
         Bytes::new(),
     )
     .await?;
-    decode(value)
+    decode_projected(value)
 }
 async fn serve_call(
     mut stream: UnixStream,
@@ -3598,7 +3681,7 @@ fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
             hint,
         ));
     }
-    let hello: HelloWire = decode(value)?;
+    let hello: HelloAnswer = decode(value)?;
     Ok(Hello {
         authority: hello.authority.into(),
         pid: hello.pid,
@@ -3752,7 +3835,7 @@ pub async fn await_other_build_retired(path: &Path, deadline: std::time::Instant
 /// it serves afterwards.
 pub async fn advance(path: &Path) -> Result<WorkspaceAuthoritySnapshot> {
     let (value, _) = exchange(path, "advance", &Request::Advance, Bytes::new()).await?;
-    let authority: AuthorityWire = decode(value)?;
+    let authority: AuthorityAnswer = decode(value)?;
     Ok(authority.into())
 }
 
@@ -3803,6 +3886,13 @@ fn decode<T: for<'de> Deserialize<'de>>(value: serde_json::Value) -> Result<T> {
         .map_err(|error| protocol_error(format!("malformed answer: {error}")))
 }
 
+fn decode_projected<T: crate::api::reader::Projected + for<'de> Deserialize<'de>>(
+    mut value: serde_json::Value,
+) -> Result<T> {
+    crate::api::reader::project(&mut value, T::READER);
+    decode(value)
+}
+
 async fn call<T: for<'de> Deserialize<'de>>(
     path: &Path,
     authority: &WorkspaceAuthoritySnapshot,
@@ -3811,6 +3901,16 @@ async fn call<T: for<'de> Deserialize<'de>>(
 ) -> Result<T> {
     let (value, _) = round_trip(path, authority.into(), call, payload).await?;
     decode(value)
+}
+
+async fn call_projected<T: crate::api::reader::Projected + for<'de> Deserialize<'de>>(
+    path: &Path,
+    authority: &WorkspaceAuthoritySnapshot,
+    call: Call,
+    payload: Bytes,
+) -> Result<T> {
+    let (value, _) = round_trip(path, authority.into(), call, payload).await?;
+    decode_projected(value)
 }
 
 async fn open_process_events(
@@ -3855,7 +3955,9 @@ async fn open_process_events(
                 break;
             };
             let event = match answered {
-                Ok((value, raw)) if raw.is_empty() => decode::<Option<JobProcessEvent>>(value),
+                Ok((value, raw)) if raw.is_empty() => {
+                    decode_projected::<Option<JobProcessEvent>>(value)
+                }
                 Ok(_) => Err(protocol_error("process event carried raw bytes")),
                 Err(error) => Err(error),
             };
@@ -4015,7 +4117,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             reply,
         } => {
             let result =
-                call::<SessionWire>(path, &authority, Call::OpenSession { name }, Bytes::new())
+                call::<SessionAnswer>(path, &authority, Call::OpenSession { name }, Bytes::new())
                     .await
                     .map(|wire| SessionToken::remote(&authority, wire.identity, wire.name));
             let _ = reply.send(result);
@@ -4110,30 +4212,35 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             job_id,
             reply,
         } => {
-            let _ = reply.send(call(path, &authority, Call::Info { job_id }, Bytes::new()).await);
+            let _ = reply
+                .send(call_projected(path, &authority, Call::Info { job_id }, Bytes::new()).await);
         }
         Command::Sealed {
             authority,
             job_id,
             reply,
         } => {
-            let _ = reply.send(call(path, &authority, Call::Sealed { job_id }, Bytes::new()).await);
+            let _ = reply.send(
+                call_projected(path, &authority, Call::Sealed { job_id }, Bytes::new()).await,
+            );
         }
         Command::Resources {
             authority,
             job_id,
             reply,
         } => {
-            let _ =
-                reply.send(call(path, &authority, Call::Resources { job_id }, Bytes::new()).await);
+            let _ = reply.send(
+                call_projected(path, &authority, Call::Resources { job_id }, Bytes::new()).await,
+            );
         }
         Command::Processes {
             authority,
             job_id,
             reply,
         } => {
-            let _ =
-                reply.send(call(path, &authority, Call::Processes { job_id }, Bytes::new()).await);
+            let _ = reply.send(
+                call_projected(path, &authority, Call::Processes { job_id }, Bytes::new()).await,
+            );
         }
         Command::ProcessEvents {
             authority,
@@ -4166,7 +4273,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             reply,
         } => {
             let _ = reply.send(
-                call(
+                call_projected(
                     path,
                     &authority,
                     Call::ListeningPorts { job_id },
@@ -4180,18 +4287,35 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             key,
             reply,
         } => {
-            let _ = reply.send(call(path, &authority, Call::JobByKey { key }, Bytes::new()).await);
+            let _ = reply
+                .send(call_projected(path, &authority, Call::JobByKey { key }, Bytes::new()).await);
         }
         Command::Progress {
             authority,
             job_id,
             reply,
         } => {
-            let _ =
-                reply.send(call(path, &authority, Call::Progress { job_id }, Bytes::new()).await);
+            let result = round_trip(
+                path,
+                (&authority).into(),
+                Call::Progress { job_id },
+                Bytes::new(),
+            )
+            .await
+            .and_then(|(mut value, _)| {
+                use crate::api::reader::Projected as _;
+                if let Some(sample) = value.get_mut("sample") {
+                    crate::api::reader::project(
+                        sample,
+                        crate::api::resources::JobResourceSample::READER,
+                    );
+                }
+                decode(value)
+            });
+            let _ = reply.send(result);
         }
         Command::List { authority, reply } => {
-            let _ = reply.send(call(path, &authority, Call::List, Bytes::new()).await);
+            let _ = reply.send(call_projected(path, &authority, Call::List, Bytes::new()).await);
         }
         Command::Kill {
             authority,
@@ -4207,10 +4331,11 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         } => {
             // A wait nobody reads any more ends, and its connection with it (07_api.md, "A
             // job's calls are its supervisor's to answer").
+            let wait = call_projected(path, &authority, Call::Wait { job_id }, Bytes::new());
             let answered = tokio::select! {
                 biased;
                 () = reply.closed() => return,
-                answered = call(path, &authority, Call::Wait { job_id }, Bytes::new()) => answered,
+                answered = wait => answered,
             };
             let _ = reply.send(answered);
         }
@@ -4219,7 +4344,8 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             job_id,
             reply,
         } => {
-            let _ = reply.send(call(path, &authority, Call::Ended { job_id }, Bytes::new()).await);
+            let _ = reply
+                .send(call_projected(path, &authority, Call::Ended { job_id }, Bytes::new()).await);
         }
         Command::LogRead {
             authority,
@@ -4265,7 +4391,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             reply,
         } => {
             let _ = reply.send(
-                call(
+                call_projected(
                     path,
                     &authority,
                     Call::Tail {
@@ -4391,7 +4517,7 @@ async fn forward_exec(
             parent_jobserver,
         }),
     };
-    let admitted = call::<JobId>(path, &authority, call_request, payload).await;
+    let admitted = call_projected::<JobId>(path, &authority, call_request, payload).await;
     let job_id = admitted.as_ref().ok().copied();
     let _ = reply.send(admitted);
     if let (Some(job_id), Some(mut reader)) = (job_id, stream) {
@@ -5988,6 +6114,250 @@ mod call_deadline_tests {
         let mut nothing = Vec::new();
         client.read_to_end(&mut nothing).await.unwrap();
         assert!(nothing.is_empty(), "no heartbeat frame was written");
+    }
+
+    /// A client reading a newer supervisor's heartbeats and `Ok` answers drops unknown object
+    /// members at every depth (07_api.md, "Reader projection"; 11_shell.md, "Protocol").
+    #[tokio::test(start_paused = true)]
+    async fn a_client_projects_unknown_fields_from_heartbeats_and_ok_answers() {
+        use crate::api::process::{JobContainment, JobProcessRetirement};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let supervisor = tokio::spawn(async move {
+            let heartbeat = serde_json::json!({
+                "progress": {
+                    "seq": 1,
+                    "topNewField": "ignored",
+                    "job": {
+                        "jobId": 7,
+                        "state": "running",
+                        "members": 2,
+                        "gatePriority": {
+                            "tokensWithdrawn": 1,
+                            "someNestedGateField": 9
+                        },
+                        "someNewField": "future"
+                    },
+                    "actor": {
+                        "turns": 3,
+                        "busy": {
+                            "turn": "exec",
+                            "forMs": 50,
+                            "someNestedBusyField": "future"
+                        },
+                        "gateActive": true,
+                        "someNewField": true
+                    }
+                }
+            });
+            let ok = serde_json::json!({
+                "ok": {
+                    "value": {
+                        "kind": "retired",
+                        "someNewField": "ignored",
+                        "retirement": {
+                            "containment": {
+                                "kind": "kernel",
+                                "someNestedField": 1
+                            },
+                            "outlived": [],
+                            "someNewRetirementField": true
+                        }
+                    },
+                    "bytes": 0,
+                    "someNewEnvelopeField": "ignored"
+                }
+            });
+            for frame in [heartbeat, ok] {
+                let bytes = serde_json::to_vec(&frame).unwrap();
+                write_frame(&mut server, &bytes, MAX_JSON_FRAME)
+                    .await
+                    .unwrap();
+            }
+            server
+        });
+
+        let (value, raw) = answer_of(&mut waiting(client)).await.unwrap();
+        assert!(raw.is_empty());
+        assert_eq!(
+            decode_projected::<JobSubtreeRetirement>(value).unwrap(),
+            JobSubtreeRetirement::Retired {
+                retirement: JobProcessRetirement {
+                    containment: JobContainment::Kernel,
+                    outlived: Vec::new(),
+                    outlived_incomplete: false,
+                },
+            }
+        );
+        drop(supervisor.await.unwrap());
+
+        let admission: JobSubtreeAdmission = decode::<SubtreeAdmissionAnswer>(serde_json::json!({
+            "kind": "admitted",
+            "someNewField": 1,
+            "handle": {
+                "jobId": 7,
+                "index": 2,
+                "incarnation": "0123456789abcdef0123456789abcdef",
+                "someNestedField": "ignored"
+            }
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(
+            admission,
+            JobSubtreeAdmission::Admitted {
+                handle: JobSubtreeHandle {
+                    job_id: JobId::new(7).unwrap(),
+                    index: 2,
+                    incarnation: "0123456789abcdef0123456789abcdef".into(),
+                },
+            }
+        );
+
+        let jobs: Vec<LiveJobWire> = decode(serde_json::json!([{
+            "class": "background",
+            "state": "running",
+            "gatePriority": {
+                "tokensWithdrawn": 2,
+                "someNestedField": true
+            },
+            "someNewField": "ignored"
+        }]))
+        .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].class, ExecClass::Background);
+        assert_eq!(jobs[0].state, JobState::Running);
+        assert_eq!(jobs[0].gate_priority.tokens_withdrawn, 2);
+
+        let authority: WorkspaceAuthoritySnapshot = decode::<AuthorityAnswer>(serde_json::json!({
+            "repoId": "acme/widget",
+            "workspace": "raven",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "grantRevision": 3,
+            "lifecycleRevision": 4,
+            "someNewField": "ignored"
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(authority.grant_revision, 3);
+        assert_eq!(authority.lifecycle_revision, 4);
+
+        let session: SessionAnswer = decode(serde_json::json!({
+            "identity": 11,
+            "name": "shell",
+            "someNewField": "ignored"
+        }))
+        .unwrap();
+        assert_eq!(session.identity, 11);
+        assert_eq!(session.name.as_deref(), Some("shell"));
+    }
+
+    /// Projection never supplies a missing required field, never retypes a value and never accepts
+    /// an unknown enum variant; requests the supervisor decodes stay strict (07_api.md, "Reader
+    /// projection"; 11_shell.md, "Protocol").
+    #[tokio::test(start_paused = true)]
+    async fn a_client_refuses_missing_required_fields_retyped_values_and_unknown_variants() {
+        for (label, frame, expected) in [
+            (
+                "heartbeat missing required seq",
+                serde_json::json!({
+                    "progress": {
+                        "job": null,
+                        "actor": { "turns": 1, "busy": null }
+                    }
+                }),
+                "seq",
+            ),
+            (
+                "heartbeat with retyped seq",
+                serde_json::json!({
+                    "progress": {
+                        "seq": "one",
+                        "job": null,
+                        "actor": { "turns": 1, "busy": null }
+                    }
+                }),
+                "malformed frame",
+            ),
+            (
+                "heartbeat with unknown job state variant",
+                serde_json::json!({
+                    "progress": {
+                        "seq": 1,
+                        "job": { "jobId": 7, "state": "futureState", "members": 1 },
+                        "actor": { "turns": 1, "busy": null }
+                    }
+                }),
+                "futureState",
+            ),
+            (
+                "top-level unknown response variant",
+                serde_json::json!({ "futureFrame": {} }),
+                "futureFrame",
+            ),
+            (
+                "ok answer missing required bytes",
+                serde_json::json!({ "ok": { "value": null } }),
+                "bytes",
+            ),
+        ] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let bytes = serde_json::to_vec(&frame).unwrap();
+            let supervisor = tokio::spawn(async move {
+                write_frame(&mut server, &bytes, MAX_JSON_FRAME)
+                    .await
+                    .unwrap();
+                server
+            });
+            let error = answer_of(&mut waiting(client)).await.expect_err(label);
+            assert_eq!(error.code, crate::ErrorCode::Integrity, "{label}: {error}");
+            assert!(
+                error.message.contains(expected),
+                "{label}: expected {expected:?} in {}",
+                error.message
+            );
+            drop(supervisor.await.unwrap());
+        }
+
+        // Requests decoded by the supervisor remain strict on unknown fields.
+        let strict_membership = serde_json::from_value::<MembershipRequest>(serde_json::json!({
+            "retireDescendants": {
+                "handle": {
+                    "jobId": 7,
+                    "index": 1,
+                    "incarnation": "0123456789abcdef0123456789abcdef"
+                },
+                "graceMs": 100,
+                "unknownField": true
+            }
+        }));
+        assert!(
+            strict_membership.is_err(),
+            "membership request must reject unknown fields"
+        );
+
+        let strict_authority = serde_json::from_value::<AuthorityWire>(serde_json::json!({
+            "repoId": "acme/widget",
+            "workspace": "raven",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "grantRevision": 1,
+            "lifecycleRevision": 1,
+            "unknownField": true
+        }));
+        assert!(
+            strict_authority.is_err(),
+            "request authority must reject unknown fields"
+        );
+
+        let strict_session = serde_json::from_value::<SessionWire>(serde_json::json!({
+            "identity": 11,
+            "name": null,
+            "unknownField": true
+        }));
+        assert!(
+            strict_session.is_err(),
+            "request session must reject unknown fields"
+        );
     }
 }
 

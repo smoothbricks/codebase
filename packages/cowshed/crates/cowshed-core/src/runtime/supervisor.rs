@@ -1788,7 +1788,7 @@ pub(super) const PRIVATE_TOOLS_DIRECTORY: &std::ffi::CStr = c"tools";
 ///
 /// Every shared cache directory is created where the host keeps it before any child runs: a
 /// child granted writes inside one cannot create its parent.
-fn prepare_private_environment(
+pub(crate) fn prepare_private_environment(
     workspace_root: &Path,
     environment_root: &Path,
     runtime: Option<(&Path, &Path)>,
@@ -1857,6 +1857,31 @@ fn prepare_private_environment(
         .map_err(private_environment_error)?;
     bin.reconcile_links(c".links", &programs)
         .map_err(private_environment_error)?;
+    // Mirror the installed `cowshed` bootstrap into the private HOME so a consumer npm launcher
+    // looking under `~` runs the host's install inside a job as it does outside one (06_cli.md,
+    // "Launcher"; 15_capabilities.md, "Bootstrap executables").
+    let private_install_bin =
+        crate::host_dirs::installed_binary_directory(&environment_root.join("home"));
+    let installed_cowshed = programs
+        .iter()
+        .find(|(name, _)| name.as_c_str() == c"cowshed")
+        .map(|(_, target)| (c"cowshed", *target));
+    if let Some(link) = installed_cowshed {
+        let relative = private_install_bin
+            .strip_prefix(environment_root)
+            .expect("private home install directory is beneath the private environment");
+        private_directory(&environment, relative)
+            .and_then(|directory| directory.reconcile_links(c".links", &[link]))
+            .map_err(private_environment_error)?;
+    } else {
+        match AnchoredDirectory::open(&private_install_bin) {
+            Ok(directory) => directory
+                .reconcile_links::<&std::ffi::CStr>(c".links", &[])
+                .map_err(private_environment_error)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(private_environment_error(error)),
+        }
+    }
     for cache in &contribution.shared_caches {
         AnchoredDirectory::create(&cache.path).map_err(|error| {
             CowshedError::environment_missing(

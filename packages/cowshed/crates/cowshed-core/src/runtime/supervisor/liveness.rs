@@ -32,7 +32,7 @@ const fn is_zero_u64(value: &u64) -> bool {
 /// heartbeats, `gateway status`, and watch subscribers (05_gateway.md "A land's gate takes tokens
 /// back").
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct JobGatePriority {
     /// Token bytes currently withdrawn from this job's jobserver fifo while a land's gate runs.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
