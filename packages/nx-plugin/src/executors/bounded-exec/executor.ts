@@ -85,15 +85,20 @@ import { createRunProgress, withProgressReport, withTestResultReport } from './p
 import { PROGRESS_SOCKET_ENV, type ProgressChannel, serveProgressChannel } from './progress-channel.js';
 import {
   createHostCommands,
+  createHostTaskDirectory,
   describeCoverageGap,
   describeRamTempError,
   describeSignalled,
+  type HostTaskFailureVerdict,
   LEFTOVER_GRACE_MS,
   PRODUCTION,
   RAM_TEMP_CAPACITY_BYTES,
   type RamTempLease,
   RamTempVolume,
   ramTempPaths,
+  recognizeHostLease,
+  removeHostTaskDirectory,
+  writeHostTaskFailure,
 } from './ram-temp.js';
 import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner, sizeRunnerToGrant } from './runner-sizing.js';
@@ -186,7 +191,7 @@ export interface ProcessTreeKiller {
 /** Where the command's TMPDIR comes from; `null` leaves the inherited one. */
 export type TempVolume = Pick<
   RamTempVolume,
-  'acquire' | 'release' | 'fullness' | 'space' | 'record' | 'ordinaryParent'
+  'acquire' | 'release' | 'fullness' | 'space' | 'record' | 'ordinaryParent' | 'mountpoint'
 >;
 
 /** Workspace-provided cowshed launchers, in the order a workspace that provides one names them. */
@@ -493,15 +498,35 @@ async function runCommand(
   const chargeParallelism = lastPeak?.ok === true ? lastPeak.parallelism : null;
 
   let lease: RamTempLease | null = null;
+  let hostTaskDir: { readonly directory: string; readonly device: number } | null = null;
   let ordinaryTemp: string | null = null;
   let fixtureDirectory: string | undefined;
   let mutationCapture: Capture | undefined;
   let templateDirectory: string | undefined;
   // Before spawn there is nothing to retire. Once started, only the owner's terminal retirement permits deletion.
   let subtreeRetired = true;
-  // A lease is removed when its command ends, so it is taken only where whatever the command leaves
-  // in it can be ended by its owner first: the supervisor's subtree retirement, never a census.
-  if (tempVolume !== null && owner === null) {
+  let subtreeRetirementFailed = false;
+  // Inside a sandbox whose exec host holds a RAM host lease (`<mount>/h<5>`), recognize it without probing the
+  // volume marker or lock and take a `<lease>/<5>` subdirectory (unless the target declared its own env.TMPDIR).
+  const hostLease = tempVolume === null ? null : await recognizeHostLease(process.env.TMPDIR, tempVolume.mountpoint);
+  if (hostLease !== null) {
+    if (options.env?.TMPDIR !== undefined) {
+      appendStderr(
+        `RAM temp host lease ${hostLease.directory} skipped; using target-provided TMPDIR ${options.env.TMPDIR} (medium not inferred)\n`,
+      );
+    } else {
+      try {
+        hostTaskDir = { directory: await createHostTaskDirectory(hostLease), device: hostLease.device };
+      } catch (error) {
+        appendStderr(
+          `RAM temp host lease ${hostLease.directory}: could not create task directory: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        return { success: false, terminalOutput: outputChunks.join('') };
+      }
+    }
+  } else if (tempVolume !== null && owner === null) {
+    // A lease is removed when its command ends, so it is taken only where whatever the command leaves
+    // in it can be ended by its owner first: the supervisor's subtree retirement, never a census.
     appendStderr(
       `RAM temp volume not leased: no cowshed supervisor owns this command's processes (${SUPERVISOR_SOCKET_ENV} is unset); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`,
     );
@@ -581,17 +606,19 @@ async function runCommand(
         }
         return;
       case 'refused':
+        subtreeRetirementFailed = true;
         appendStderr(`cowshed: the supervisor refused to retire the command's processes (${retired.reason})\n`);
         return;
       case 'failed':
+        subtreeRetirementFailed = true;
         state.retireError = retired.detail;
         appendStderr(`cowshed: could not retire the command's processes: ${retired.detail}\n`);
         return;
     }
   };
-  // Failed scratch remains evidence: RAM leases are archived; ordinary scratch is retained at its reported path.
+  // Failed scratch remains evidence: RAM leases are archived; host-lease task dirs get `<5>.failed`; ordinary scratch stays at its reported path.
   let tempReleased: Promise<void> | null = null;
-  const releaseLease = (keep: boolean): Promise<void> => {
+  const releaseLease = (keep: boolean, failureVerdict: HostTaskFailureVerdict = 'failed'): Promise<void> => {
     tempReleased ??= (async () => {
       await retireSubtree();
       if (mutationCapture !== undefined) {
@@ -635,6 +662,33 @@ async function runCommand(
             await rm(path, { recursive: true, force: true });
           } catch (error) {
             tell(`bounded-exec: could not remove ${what} at ${path}: ${String(error)}\n`);
+          }
+        }
+      }
+      if (hostTaskDir !== null) {
+        const held = hostTaskDir;
+        hostTaskDir = null;
+        const unretired =
+          subtreeRetirementFailed || state.retireError !== null || (!keep && owner !== null && !subtreeRetired);
+        if (keep || unretired) {
+          const verdict: HostTaskFailureVerdict = unretired ? 'unretired' : failureVerdict;
+          try {
+            await writeHostTaskFailure(held.directory, verdict);
+            appendStderr(
+              `RAM temp host lease: task scratch retained at ${held.directory} (${verdict}); archived when this exec host retires\n`,
+            );
+          } catch (error) {
+            appendStderr(
+              `RAM temp host lease: task scratch retained at ${held.directory} (${verdict}), but marking it failed: ${error instanceof Error ? error.message : String(error)}\n`,
+            );
+          }
+        } else {
+          try {
+            await removeHostTaskDirectory(held.directory, held.device);
+          } catch (error) {
+            appendStderr(
+              `RAM temp host lease: could not remove task scratch at ${held.directory}: ${error instanceof Error ? error.message : String(error)}\n`,
+            );
           }
         }
       }
@@ -777,7 +831,7 @@ async function runCommand(
   const queue = new AdmissionObservation({
     over: () => state.settled || state.expiry !== null,
     pid: () => child.pid,
-    environment: () => mergeEnv(lease?.directory ?? ordinaryTemp, env),
+    environment: () => mergeEnv(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp, env),
     tell,
     step: (event) => stepTo(event),
     testing: () => isTesting(),
@@ -1011,7 +1065,9 @@ async function runCommand(
   let child: ChildProcess;
   if (fixture !== null) {
     try {
-      fixtureDirectory = await mkdtemp(resolvePath(lease?.directory ?? ordinaryTemp ?? tmpdir(), 'smoo-fixture-'));
+      fixtureDirectory = await mkdtemp(
+        resolvePath(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp ?? tmpdir(), 'smoo-fixture-'),
+      );
       env[FIXTURE_DIRECTORY_ENV] = fixtureDirectory;
     } catch (error) {
       return refuse(`bounded-exec: could not create fixture scratch: ${String(error)}\n`);
@@ -1027,7 +1083,7 @@ async function runCommand(
   }
   if (options.mutationReport !== undefined) {
     try {
-      mutationCapture = await openCapture(lease?.directory ?? ordinaryTemp ?? tmpdir());
+      mutationCapture = await openCapture(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp ?? tmpdir());
       env[MUTATION_REPORT_ENV] = mutationCapture.path;
     } catch (error) {
       return refuse(`bounded-exec: could not create the mutation report capture: ${String(error)}\n`);
@@ -1044,7 +1100,7 @@ async function runCommand(
       measured !== null
         ? spawn(measured.file, measured.args, {
             cwd,
-            env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
+            env: mergeEnv(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp, env),
             stdio: measured.stdio,
             detached: process.platform !== 'win32',
             windowsHide: true,
@@ -1052,7 +1108,7 @@ async function runCommand(
         : root === undefined
           ? spawn(shellCommand, [], {
               cwd,
-              env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
+              env: mergeEnv(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp, env),
               shell: true,
               stdio: descriptors.length === 0 ? 'pipe' : ['pipe', 'pipe', 'pipe', ...descriptors],
               detached: process.platform !== 'win32',
@@ -1060,7 +1116,7 @@ async function runCommand(
             })
           : spawn(root.file, root.args, {
               cwd,
-              env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
+              env: mergeEnv(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp, env),
               stdio: ['pipe', 'pipe', 'pipe', ...descriptors],
               detached: process.platform !== 'win32',
               windowsHide: true,
@@ -1354,7 +1410,7 @@ async function runCommand(
       .finally(closeProgress)
       .finally(closeCaseGate)
       .finally(releaseCpu)
-      .finally(() => releaseLease(true))
+      .finally(() => releaseLease(true, 'signalled'))
       .finally(releaseReservation)
       .finally(async () =>
         recordRun(
@@ -1729,7 +1785,10 @@ async function runCommand(
       appendStderr(`${describeRamTempError(full)}\n`);
     }
   }
-  await releaseLease(code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null);
+  const failed = code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null;
+  const failureVerdict: HostTaskFailureVerdict =
+    state.expiry !== null ? 'timed-out' : exitCode === null && exitSignal !== null ? 'signalled' : 'failed';
+  await releaseLease(failed, failureVerdict);
   releaseReservation();
 
   // The command's peak, as its waiter reported it once both ended; a peak that was not measured is said, never zero.
@@ -1746,7 +1805,12 @@ async function runCommand(
     appendStdout(
       goRunSummaryText(
         goRun,
-        declaredGoTests(goRun.failedTests, cwd, context.root, mergeEnv(lease?.directory ?? ordinaryTemp, env)),
+        declaredGoTests(
+          goRun.failedTests,
+          cwd,
+          context.root,
+          mergeEnv(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp, env),
+        ),
       ),
     );
   }

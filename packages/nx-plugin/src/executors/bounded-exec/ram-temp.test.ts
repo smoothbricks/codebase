@@ -2312,7 +2312,7 @@ describe('host lease recognition and scratch provider protocol', () => {
       attach: 'attach-1',
       registryEntry: '0x1',
     };
-    let settled: string | null = null;
+    const settled: string[] = [];
     const provider = runScratchProvider({
       platform: 'darwin',
       stdin,
@@ -2338,7 +2338,7 @@ describe('host lease recognition and scratch provider protocol', () => {
           };
         },
         async settleHostLease(held) {
-          settled = held.directory;
+          settled.push(held.directory);
           return { ok: true, value: [`${held.directory}/t1234 archived at .archive/...`] };
         },
       },
@@ -2347,30 +2347,31 @@ describe('host lease recognition and scratch provider protocol', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(out.join('')).toBe(`${JSON.stringify({ directory: lease.directory })}\n`);
-    expect(settled).toBeNull();
+    expect(settled).toEqual([]);
     stdin.end();
     expect(await provider).toBe(0);
-    expect(settled).toBe(lease.directory);
+    expect(settled).toEqual([lease.directory]);
     expect(err.join('')).toContain('archived');
   });
 
   it('prints {"unavailable":...} and exits 0 when the volume is unavailable or refused', async () => {
-    for (const [label, platform, answer] of [
-      ['non-darwin', 'linux' as const, null],
+    const cases: readonly (readonly [
+      string,
+      NodeJS.Platform,
+      Result<{ kind: 'unavailable'; reason: 'gateway-absent'; detail: string }, RamTempError> | null,
+    ])[] = [
+      ['non-darwin', 'linux', null],
       [
         'unavailable',
-        'darwin' as const,
+        'darwin',
         {
-          ok: true as const,
-          value: { kind: 'unavailable' as const, reason: 'gateway-absent' as const, detail: 'no sock' },
+          ok: true,
+          value: { kind: 'unavailable', reason: 'gateway-absent', detail: 'no sock' },
         },
       ],
-      [
-        'error',
-        'darwin' as const,
-        { ok: false as const, error: { kind: 'root-unready' as const, root: '/r', detail: 'is missing' } },
-      ],
-    ]) {
+      ['error', 'darwin', { ok: false, error: { kind: 'root-unready', root: '/r', detail: 'is missing' } }],
+    ];
+    for (const [label, platform, answer] of cases) {
       const stdin = new PassThrough();
       const out: string[] = [];
       let settled = false;

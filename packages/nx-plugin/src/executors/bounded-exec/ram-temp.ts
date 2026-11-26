@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { type BigIntStats, constants, type Stats } from 'node:fs';
 import {
   type FileHandle,
@@ -17,7 +17,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { Socket } from 'node:net';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { O_EXLOCK } from '@smoothbricks/cargo-retain/open-flags';
 import { DEADLINE_PATIENCE, describeMembersLeft, killProcessGroup } from '../../process-group.js';
@@ -147,10 +147,16 @@ import type { TempVolumeSpace } from './verdict.js';
  * entry's absence proves it safe. A dead caller alone proves neither; its death only
  * turns queueing into reporting. The facade pid is a diagnostic, never authority.
  *
- * A cowshed sandbox denies the volume's paths (EPERM reading its mountpoint or
- * marker, or opening the lock in /private/tmp) and cannot attach disk images at
- * all; whichever refusal comes first, the task keeps the workspace's own TMPDIR
- * and says so once on stderr.
+ * A cowshed sandbox denies the volume's own paths (its mountpoint's listing, its
+ * marker, and the lock in /private/tmp) and cannot attach disk images at all. To
+ * keep sandboxed scratch off the SSD without widening the sandbox to the whole
+ * volume, cowshed's host-side scratch provider takes a host lease (`<mount>/h<5>`
+ * with `<mount>/h<5>.holder` outside the sandbox grant) per exec host and passes
+ * it as `TMPDIR` with metadata-only access to the mountpoint. A sandboxed task
+ * recognizes that host lease by its mountpoint parent, `h<5>` name and matching
+ * `st_dev` without touching the marker or lock, and takes `<lease>/<5>` below it.
+ * Without a host lease, whichever refusal comes first keeps the workspace's own
+ * TMPDIR and says so once on stderr.
  */
 
 /** Contended opens yield without occupying a filesystem worker needed by the lock holder. */
@@ -186,17 +192,45 @@ const RAM_TEMP_REVISION = 3;
 export const RAM_TEMP_CAPACITY_BYTES = 8 * GIB + RAM_TEMP_REVISION * SECTOR_BYTES;
 /** A failed task with less than this free on the volume is reported as having run out of space. */
 const FULL_FREE_BYTES = 64 * MIB;
-/** `<pid>-<mkdtemp suffix>`: the pid says whether the lease's task is alive. */
-const LEASE_NAME = /^(\d+)-[A-Za-z0-9]{6}$/;
-/** The random suffix `mkdtemp` gives a lease name. */
+/** `<pid>-<mkdtemp suffix>`: a host task lease whose pid says whether the task is alive. */
+const TASK_LEASE_NAME = /^(\d+)-[A-Za-z0-9]{6}$/;
+/** `h<5 random>`: a host lease held by a cowshed scratch provider whose holder pid lives in `<lease>.holder`. */
+export const HOST_LEASE_NAME = /^h[A-Za-z0-9]{5}$/;
+/** `<5 random>`: a sandboxed task directory inside a host lease. */
+const HOST_TASK_DIR_NAME = /^[A-Za-z0-9]{5}$/;
+/** The random suffix `mkdtemp` gives a task lease name. */
 const LEASE_SUFFIX_BYTES = 6;
+/** The random suffix on a host lease (`h<5>`) and on each task directory below it (`<5>`). */
+const HOST_LEASE_SUFFIX_BYTES = 5;
+const HOST_TASK_SUFFIX_BYTES = 5;
+const RANDOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+function isLeaseName(name: string): boolean {
+  return TASK_LEASE_NAME.test(name) || HOST_LEASE_NAME.test(name);
+}
+
+/** Uniform base-62 random characters for host lease and task directory names. */
+function randomBase62(length: number): string {
+  let out = '';
+  while (out.length < length) {
+    for (const byte of randomBytes(length * 2)) {
+      // 248 = 62 * 4: reject values >= 248 so every character is equally likely.
+      if (byte < 248) {
+        out += RANDOM_ALPHABET[byte % 62];
+        if (out.length === length) break;
+      }
+    }
+  }
+  return out;
+}
+
 /** Darwin's `sockaddr_un.sun_path` holds 104 bytes, the last a NUL: a socket's path is at most 103. */
 const SOCKET_PATH_BYTES = 103;
 /**
- * The one length rule of the RAM temp layout (specs/cowshed/01_storage.md, "RAM temp path budget"): a lease directory,
- * the TMPDIR its task gets, is at most this many bytes. It is the layout's worst case, a test namespace's at the largest
- * uid and pid: `/private/var/folders/cowshed/` (29), a u32 uid (10), `/<ns>` (8), `/ram3` (5), `/<pid ≤ 99999>-` (7)
- * and the suffix (6). Production's worst case is 57.
+ * The one length rule of the RAM temp layout (specs/cowshed/01_storage.md, "RAM temp path budget"): a task's TMPDIR is
+ * at most this many bytes. It is the layout's worst case, a test namespace's at the largest uid and pid:
+ * `/private/var/folders/cowshed/` (29), a u32 uid (10), `/<ns>` (8), `/ram3` (5), plus 13 bytes for either
+ * `/<pid ≤ 99999>-<6>` or `/h<5>/<5>`. Production's worst case is 57.
  */
 export const RAM_TMPDIR_MAX_BYTES = 65;
 /** What the rule leaves below a lease for a socket's `/<names>`: 38 bytes. */
@@ -206,20 +240,27 @@ export const RAM_TMPDIR_SOCKET_BUDGET_BYTES = SOCKET_PATH_BYTES - RAM_TMPDIR_MAX
 export function leaseDirectoryBytes(mountpoint: string, pid: number): number {
   return Buffer.byteLength(`${mountpoint}/${pid}-`) + LEASE_SUFFIX_BYTES;
 }
+
+/** The length in bytes of a sandboxed task directory `<mountpoint>/h<5>/<5>` under a host lease. */
+export function hostTaskDirectoryBytes(mountpoint: string): number {
+  return Buffer.byteLength(`${mountpoint}/h`) + HOST_LEASE_SUFFIX_BYTES + 1 + HOST_TASK_SUFFIX_BYTES;
+}
+
 const MARKER_FILE = '.smoo-ram';
 /**
  * The scratch of a run that did not pass, moved out of its lease when the lease is reclaimed: a directory beside the
  * leases on the same volume, so the move is one `rename(2)` and copies nothing. An entry is
- * `<archived at, epoch ms, 13 digits>-<lease name>`, so the names sort oldest first.
+ * `<archived at, epoch ms, 13 digits>-<lease or host-lease-task>`, so the names sort oldest first.
  */
 const ARCHIVE_DIR = '.archive';
-const ARCHIVE_NAME = /^\d{13}-\d+-[A-Za-z0-9]{6}$/;
+const ARCHIVE_ENTRY = '(?:\\d+-[A-Za-z0-9]{6}|h[A-Za-z0-9]{5}(?:-[A-Za-z0-9]{5})?)';
+const ARCHIVE_NAME = new RegExp(`^\\d{13}-${ARCHIVE_ENTRY}$`);
 /**
  * Archives on their way out, below the archive directory: each is renamed here as `<deleter pid>-<archive name>` and
  * deleted by that process in the background. A dead deleter's entries are claimed by renaming them to the next one's pid.
  */
 const DELETING_DIR = '.deleting';
-const DELETING_NAME = /^(\d+)-(\d{13}-\d+-[A-Za-z0-9]{6})$/;
+const DELETING_NAME = new RegExp(`^(\\d+)-(\\d{13}-${ARCHIVE_ENTRY})$`);
 /**
  * How many archives the volume keeps: the failing run under triage and the one before it, the pair a triage compares to
  * tell a flake from a regression. A stated reason, not a measurement.
@@ -296,6 +337,137 @@ export const LEFTOVER_GRACE_MS = 5_000;
 /** A lease's subtree handle file: beside the lease on the volume, never in it, so the command cannot remove it. */
 function subtreeRecordPath(directory: string): string {
   return `${directory}.subtree`;
+}
+
+/** A host lease's holder sidecar: beside `<mount>/h<5>` on the volume, outside the sandbox's grant. */
+function holderRecordPath(directory: string): string {
+  return `${directory}.holder`;
+}
+
+/** Failure verdicts recorded beside a sandboxed task directory `<lease>/<5>` inside a host lease. */
+export type HostTaskFailureVerdict = 'failed' | 'timed-out' | 'signalled' | 'unretired';
+
+const HOST_TASK_FAILURE_VERDICTS: ReadonlySet<string> = new Set(['failed', 'timed-out', 'signalled', 'unretired']);
+
+function isHostTaskFailureVerdict(value: unknown): value is HostTaskFailureVerdict {
+  return typeof value === 'string' && HOST_TASK_FAILURE_VERDICTS.has(value);
+}
+
+interface HostTaskFailureMarker {
+  readonly version: 1;
+  readonly verdict: HostTaskFailureVerdict;
+  readonly at: number;
+}
+
+function parseHostTaskFailure(text: string): HostTaskFailureMarker | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (
+    !isRecord(parsed) ||
+    parsed.version !== 1 ||
+    !isHostTaskFailureVerdict(parsed.verdict) ||
+    typeof parsed.at !== 'number' ||
+    !Number.isFinite(parsed.at)
+  ) {
+    return undefined;
+  }
+  return { version: 1, verdict: parsed.verdict, at: parsed.at };
+}
+
+/** Write `<lease>/<5>.failed` whole (scratch name + rename) inside the host lease. */
+export async function writeHostTaskFailure(
+  taskDirectory: string,
+  verdict: HostTaskFailureVerdict,
+  at: number = Date.now(),
+): Promise<void> {
+  const markerPath = `${taskDirectory}.failed`;
+  const text = `${JSON.stringify({ version: 1, verdict, at })}\n`;
+  await writeAtomic(markerPath, text, 0o600);
+}
+
+interface HostLeaseHolder {
+  readonly version: 1;
+  readonly pid: number;
+  readonly workspace?: string;
+}
+
+function parseHostLeaseHolder(text: string): HostLeaseHolder | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (
+    !isRecord(parsed) ||
+    parsed.version !== 1 ||
+    typeof parsed.pid !== 'number' ||
+    !Number.isInteger(parsed.pid) ||
+    parsed.pid <= 0 ||
+    (parsed.workspace !== undefined && typeof parsed.workspace !== 'string')
+  ) {
+    return undefined;
+  }
+  return parsed.workspace === undefined
+    ? { version: 1, pid: parsed.pid }
+    : { version: 1, pid: parsed.pid, workspace: parsed.workspace };
+}
+
+/** A host lease recognized from inside a sandbox without reading the volume's marker or lock. */
+export interface RecognizedHostLease {
+  readonly directory: string;
+  readonly mountpoint: string;
+  readonly device: number;
+}
+
+/**
+ * Recognize an inherited `TMPDIR` as a host lease on `expectedMountpoint`: parent is `expectedMountpoint`, name
+ * matches `h<5>`, both are directories, and `st_dev` matches. Uses only `lstat` on the lease and its parent, so it
+ * succeeds under a sandbox profile granting `(subpath "<lease>")` and `(file-read-metadata (literal "<mount>"))`.
+ */
+export async function recognizeHostLease(
+  inheritedTmpdir: string | undefined,
+  expectedMountpoint: string,
+): Promise<RecognizedHostLease | null> {
+  if (inheritedTmpdir === undefined || !isAbsolute(inheritedTmpdir)) {
+    return null;
+  }
+  if (dirname(inheritedTmpdir) !== expectedMountpoint || !HOST_LEASE_NAME.test(basename(inheritedTmpdir))) {
+    return null;
+  }
+  try {
+    const [leaseInfo, mountInfo] = await Promise.all([lstat(inheritedTmpdir), lstat(expectedMountpoint)]);
+    if (!leaseInfo.isDirectory() || !mountInfo.isDirectory() || leaseInfo.dev !== mountInfo.dev) {
+      return null;
+    }
+    return { directory: inheritedTmpdir, mountpoint: expectedMountpoint, device: leaseInfo.dev };
+  } catch {
+    return null;
+  }
+}
+
+/** Exclusively create a `<lease>/<5>` task directory inside a recognized host lease. */
+export async function createHostTaskDirectory(hostLease: RecognizedHostLease): Promise<string> {
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const candidate = join(hostLease.directory, randomBase62(HOST_TASK_SUFFIX_BYTES));
+    try {
+      await mkdir(candidate, { mode: 0o700 });
+      return candidate;
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error;
+    }
+  }
+  throw new Error(`could not allocate a unique 5-character task directory under ${hostLease.directory}`);
+}
+
+/** Remove a passing task's `<lease>/<5>` directory, making readonly subdirectories removable on the same device first. */
+export async function removeHostTaskDirectory(taskDirectory: string, device: number): Promise<void> {
+  await prepareForRemoval(taskDirectory, device);
+  await rm(taskDirectory, { recursive: true, force: true });
 }
 
 /** One coverage gap the supervisor reported for a subtree it retired, as text. */
@@ -603,6 +775,8 @@ interface MountedVolume {
   readonly leases: readonly string[];
 }
 
+type LeaseRequest = { readonly kind: 'task' } | { readonly kind: 'host'; readonly workspace?: string };
+
 /**
  * One acquire or release. `claimed`: the ledger as it last published holds one of its claims.
  * `made`: the lease directory an acquire made, with its identity, until the caller has it.
@@ -612,8 +786,9 @@ interface Operation {
   provenance?: string;
   readonly owner: ClaimOwner;
   readonly subtrees: SubtreeOwner;
+  readonly request: LeaseRequest;
   claimed: boolean;
-  made: { readonly directory: string; readonly identity: string } | null;
+  made: { readonly directory: string; readonly identity: string; readonly holderPath?: string } | null;
 }
 
 /** What one locked step publishes, and what it found. */
@@ -631,6 +806,8 @@ interface Candidate {
   readonly own: boolean;
   /** Its scratch is archived, not deleted: its task died, or its own run did not pass. */
   readonly keep: boolean;
+  /** Settling this caller's own host lease: archive `<5>` subdirs marked `<5>.failed` and delete the rest. */
+  readonly hostSettle: boolean;
 }
 
 /** A lease kept because something is attached below it, described for the task's output. */
@@ -655,10 +832,11 @@ interface Settled {
   readonly verdicts: readonly HeldEntry[];
 }
 
-/** A reclaimed lease whose scratch was renamed into the archive, and the name it has there. */
+/** A reclaimed lease or failed host-lease task dir whose scratch was renamed into the archive, and the name it has there. */
 interface Archived {
   readonly directory: string;
   readonly archive: string;
+  readonly verdict?: HostTaskFailureVerdict;
 }
 
 /**
@@ -717,6 +895,8 @@ export class RamTempVolume {
    * its own root, so its ordinary scratch does too.
    */
   readonly ordinaryParent: string;
+  /** Where the RAM temp volume mounts; sandboxed tasks compare `dirname(TMPDIR)` against this without probing the volume. */
+  readonly mountpoint: string;
 
   constructor(
     private readonly paths: RamTempPaths,
@@ -729,6 +909,7 @@ export class RamTempVolume {
     this.sectors = Math.ceil(capacityBytes / SECTOR_BYTES);
     this.ledgerPath = `${paths.lockFile}.ledger`;
     this.ordinaryParent = dirname(paths.lockFile);
+    this.mountpoint = paths.mountpoint;
   }
 
   /**
@@ -736,7 +917,28 @@ export class RamTempVolume {
    * lease found on the way is settled through `subtrees`, the supervisor that owns the caller.
    */
   async acquire(subtrees: SubtreeOwner): Promise<Result<RamTempAcquisition, RamTempError>> {
-    const bytes = leaseDirectoryBytes(this.paths.mountpoint, this.pid);
+    return this.acquireWithRequest(subtrees, { kind: 'task' });
+  }
+
+  /**
+   * Take a host lease (`<mount>/h<5>` with `<mount>/h<5>.holder`) for a cowshed exec host's scratch provider.
+   * Reuses the volume's single lock, ledger, provisioning, reclaim and retention machinery.
+   */
+  async acquireHostLease(
+    subtrees: SubtreeOwner,
+    workspace?: string,
+  ): Promise<Result<RamTempAcquisition, RamTempError>> {
+    return this.acquireWithRequest(subtrees, { kind: 'host', workspace });
+  }
+
+  private async acquireWithRequest(
+    subtrees: SubtreeOwner,
+    request: LeaseRequest,
+  ): Promise<Result<RamTempAcquisition, RamTempError>> {
+    const bytes =
+      request.kind === 'host'
+        ? hostTaskDirectoryBytes(this.paths.mountpoint)
+        : leaseDirectoryBytes(this.paths.mountpoint, this.pid);
     if (bytes > this.paths.leaseBytesMax) {
       return {
         ok: false,
@@ -751,7 +953,13 @@ export class RamTempVolume {
     }
     const readiness = await rootReadiness(this.paths);
     if (!readiness.ok) return readiness;
-    const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, subtrees, claimed: false, made: null };
+    const op: Operation = {
+      owner: { pid: this.pid, token: randomUUID() },
+      subtrees,
+      request,
+      claimed: false,
+      made: null,
+    };
     let result: Result<RamTempAcquisition, LockedError>;
     try {
       result = await this.lease(op);
@@ -784,6 +992,36 @@ export class RamTempVolume {
 
   /** Make a lease directory for `op`'s caller, recorded so a failed acquire takes it back. */
   private async make(op: Operation): Promise<string> {
+    if (op.request.kind === 'host') {
+      let directory: string | null = null;
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        const candidate = join(this.paths.mountpoint, `h${randomBase62(HOST_LEASE_SUFFIX_BYTES)}`);
+        try {
+          await mkdir(candidate, { mode: 0o700 });
+          directory = candidate;
+          break;
+        } catch (error) {
+          if (errorCode(error) !== 'EEXIST') throw error;
+        }
+      }
+      if (directory === null) {
+        throw new Error(`could not allocate a unique host lease directory under ${this.paths.mountpoint}`);
+      }
+      const holderPath = holderRecordPath(directory);
+      const holder: HostLeaseHolder =
+        op.request.workspace === undefined
+          ? { version: 1, pid: this.pid }
+          : { version: 1, pid: this.pid, workspace: op.request.workspace };
+      try {
+        await writeAtomic(holderPath, `${JSON.stringify(holder)}\n`, 0o600);
+      } catch (error) {
+        await rmdir(directory).catch(() => {});
+        throw error;
+      }
+      const identity = await leaseIdentity(directory);
+      op.made = identity === null ? null : { directory, identity, holderPath };
+      return directory;
+    }
     const directory = await mkdtemp(join(this.paths.mountpoint, `${this.pid}-`));
     const identity = await leaseIdentity(directory);
     op.made = identity === null ? null : { directory, identity };
@@ -844,6 +1082,9 @@ export class RamTempVolume {
         return failed('lease rollback', `${made.directory} is no longer the lease made for this task; left in place`);
       }
       if (identity !== null) {
+        if (made.holderPath !== undefined) {
+          await rm(made.holderPath, { force: true });
+        }
         await rmdir(made.directory);
       }
       op.made = null;
@@ -1000,10 +1241,34 @@ export class RamTempVolume {
    * of every scratch this release reclaimed, its own included.
    */
   async release(lease: RamTempLease, keep: boolean, subtrees: SubtreeOwner): Promise<Result<string[], RamTempError>> {
-    const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, subtrees, claimed: false, made: null };
+    return this.releaseWithMode(lease, keep, subtrees, false);
+  }
+
+  /**
+   * Settle a host lease (`<mount>/h<5>`) when its exec host retires: archives every `<5>` task directory marked by a
+   * sibling `<5>.failed` file through the existing retention, deletes the rest of the lease and its `.holder` sidecar,
+   * and detaches the volume if this was the last live lease.
+   */
+  async settleHostLease(lease: RamTempLease, subtrees: SubtreeOwner): Promise<Result<string[], RamTempError>> {
+    return this.releaseWithMode(lease, false, subtrees, true);
+  }
+
+  private async releaseWithMode(
+    lease: RamTempLease,
+    keep: boolean,
+    subtrees: SubtreeOwner,
+    hostSettle: boolean,
+  ): Promise<Result<string[], RamTempError>> {
+    const op: Operation = {
+      owner: { pid: this.pid, token: randomUUID() },
+      subtrees,
+      request: hostSettle ? { kind: 'host' } : { kind: 'task' },
+      claimed: false,
+      made: null,
+    };
     let result: Result<string[], LockedError>;
     try {
-      result = await this.releaseLease(op, lease, keep);
+      result = await this.releaseLease(op, lease, keep, hostSettle);
     } catch (error) {
       result = failed('release', errorText(error));
     }
@@ -1022,6 +1287,7 @@ export class RamTempVolume {
     op: Operation,
     lease: RamTempLease,
     keep: boolean,
+    hostSettle: boolean,
   ): Promise<Result<string[], LockedError>> {
     const own = basename(lease.directory);
     let waited: ClaimWait | null = null;
@@ -1035,7 +1301,7 @@ export class RamTempVolume {
         if (ledger.lifecycle !== null) {
           return { ledger, value: { kind: 'wait', claim: ledger.lifecycle } };
         }
-        const claimed = await this.claim(ledger, held.on, op.owner, own, keep);
+        const claimed = await this.claim(ledger, held.on, op.owner, own, keep, hostSettle);
         return {
           ledger: claimed.ledger,
           value: { kind: 'claimed', volume: held.on, held: claimed.held, candidates: claimed.candidates },
@@ -1590,7 +1856,7 @@ export class RamTempVolume {
         key: [rootIdentity, `marker ${mark.dev}:${mark.ino}:${mark.birthtimeNs}:${mark.ctimeNs}`, registry].join(' '),
         attach: `${rootIdentity} ${registry}`,
         device: Number(root.dev),
-        leases: names.filter((name) => LEASE_NAME.test(name)),
+        leases: names.filter(isLeaseName),
       },
     };
   }
@@ -1636,6 +1902,33 @@ export class RamTempVolume {
         );
   }
 
+  /** Whether the owner of lease `name` is alive: from the name for task leases, from `<lease>.holder` for host leases. */
+  private async leaseIsAlive(name: string): Promise<boolean> {
+    if (TASK_LEASE_NAME.test(name)) {
+      return this.isAlive(leasePid(name));
+    }
+    const holderPath = holderRecordPath(join(this.paths.mountpoint, name));
+    let text: string;
+    try {
+      const handle = await open(holderPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        text = await handle.readFile('utf8');
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') {
+        return false;
+      }
+      throw error;
+    }
+    const holder = parseHostLeaseHolder(text);
+    if (holder === undefined) {
+      throw new Error(`${holderPath} is not a valid version-1 host lease holder`);
+    }
+    return this.isAlive(holder.pid);
+  }
+
   /**
    * Under the lock: claim `own`, the caller's ending lease if any, and every dead lease no other
    * caller is settling. A dead lease whose cached verdict still validates is named held and left
@@ -1647,13 +1940,14 @@ export class RamTempVolume {
     owner: ClaimOwner,
     own: string | null,
     keepOwn: boolean,
+    hostSettle = false,
   ): Promise<Claimed> {
     const held: HeldLease[] = [];
     const candidates: Candidate[] = [];
     const claims = [...ledger.claims];
     let verdicts = ledger.held;
     for (const name of volume.leases) {
-      if ((name !== own && this.isAlive(leasePid(name))) || ledger.claims.some((claim) => claim.name === name)) {
+      if ((name !== own && (await this.leaseIsAlive(name))) || ledger.claims.some((claim) => claim.name === name)) {
         continue;
       }
       const directory = join(this.paths.mountpoint, name);
@@ -1678,7 +1972,14 @@ export class RamTempVolume {
         verdicts = verdicts.filter((entry) => entry !== cached);
       }
       claims.push({ name, identity, owner });
-      candidates.push({ name, directory, identity, own: name === own, keep: name !== own || keepOwn });
+      candidates.push({
+        name,
+        directory,
+        identity,
+        own: name === own,
+        keep: name !== own || keepOwn,
+        hostSettle: name === own && hostSettle,
+      });
     }
     return { ledger: { ...ledger, claims, held: verdicts }, held, candidates };
   }
@@ -1710,7 +2011,7 @@ export class RamTempVolume {
       // supervisor's to end, named by the handle the task recorded — never by who works in the lease
       // (specs/cowshed/07_api.md, `JobSubtreeHandle`). A lease with no readable handle recorded none
       // to retire: its task died before its command was admitted, or that admission was refused.
-      if (candidate.own) {
+      if (candidate.own || HOST_LEASE_NAME.test(candidate.name)) {
         continue;
       }
       const recorded = await readFile(subtreeRecordPath(candidate.directory), 'utf8').catch((error: unknown) => {
@@ -1781,8 +2082,45 @@ export class RamTempVolume {
         return confirmed;
       }
       for (const candidate of confirmed.value) {
+        if (candidate.hostSettle) {
+          // Archive each `<5>` task directory marked by a sibling `<5>.failed` file, then delete the rest and the sidecar.
+          const entries = await readdir(candidate.directory, { withFileTypes: true }).catch((error: unknown) => {
+            if (errorCode(error) === 'ENOENT') return [];
+            throw error;
+          });
+          const entryNames = new Set(entries.map((entry) => entry.name));
+          const failedDirs = entries
+            .filter(
+              (entry) =>
+                entry.isDirectory() && HOST_TASK_DIR_NAME.test(entry.name) && entryNames.has(`${entry.name}.failed`),
+            )
+            .map((entry) => entry.name)
+            .sort();
+          if (failedDirs.length > 0) {
+            await mkdir(join(this.paths.mountpoint, ARCHIVE_DIR), { recursive: true, mode: 0o700 });
+          }
+          for (const taskName of failedDirs) {
+            const taskDir = join(candidate.directory, taskName);
+            const markerText = await readFile(join(candidate.directory, `${taskName}.failed`), 'utf8').catch(
+              () => null,
+            );
+            const verdict = markerText === null ? undefined : parseHostTaskFailure(markerText)?.verdict;
+            const archive = `${String(Date.now()).padStart(13, '0')}-${candidate.name}-${taskName}`;
+            await rename(taskDir, join(this.paths.mountpoint, ARCHIVE_DIR, archive));
+            archived.push(
+              verdict === undefined ? { directory: taskDir, archive } : { directory: taskDir, archive, verdict },
+            );
+          }
+          await prepareForRemoval(candidate.directory, volume.device);
+          await rm(candidate.directory, { recursive: true, force: true });
+          await rm(holderRecordPath(candidate.directory), { force: true });
+          continue;
+        }
         // Its subtree was retired above, or had ended: the handle beside the lease is spent either way.
         await rm(subtreeRecordPath(candidate.directory), { force: true });
+        if (HOST_LEASE_NAME.test(candidate.name)) {
+          await rm(holderRecordPath(candidate.directory), { force: true });
+        }
         if (candidate.keep) {
           // One rename on the volume: the scratch stays whole and readable, and nothing waits on a deletion.
           const archive = `${String(Date.now()).padStart(13, '0')}-${candidate.name}`;
@@ -1821,13 +2159,14 @@ export class RamTempVolume {
       });
     }
     this.deleteArchives(volume.device);
-    return archived.map(({ directory, archive }) =>
-      kept.includes(archive)
-        ? `${directory} archived at ${join(root, archive)}: kept until ${ARCHIVES_KEPT} newer archives replace it, less than ${Math.round(floorBytes / MIB)} MiB of the volume is free when one arrives, or the volume detaches with its last lease`
+    return archived.map(({ directory, archive, verdict }) => {
+      const subject = verdict === undefined ? directory : `${directory} (verdict=${verdict})`;
+      return kept.includes(archive)
+        ? `${subject} archived at ${join(root, archive)}: kept until ${ARCHIVES_KEPT} newer archives replace it, less than ${Math.round(floorBytes / MIB)} MiB of the volume is free when one arrives, or the volume detaches with its last lease`
         : freeBytes < floorBytes
-          ? `${directory} deleted: the volume has ${Math.round(freeBytes / MIB)} MiB free, below the ${Math.round(floorBytes / MIB)} MiB under which it keeps no archive`
-          : `${directory} deleted: ${ARCHIVES_KEPT} newer archives are kept`,
-    );
+          ? `${subject} deleted: the volume has ${Math.round(freeBytes / MIB)} MiB free, below the ${Math.round(floorBytes / MIB)} MiB under which it keeps no archive`
+          : `${subject} deleted: ${ARCHIVES_KEPT} newer archives are kept`;
+    });
   }
 
   /**
@@ -1890,7 +2229,7 @@ export class RamTempVolume {
       );
       if (
         claimed &&
-        (candidate.own || !this.isAlive(leasePid(candidate.name))) &&
+        (candidate.own || !(await this.leaseIsAlive(candidate.name))) &&
         (await leaseIdentity(candidate.directory)) === candidate.identity
       ) {
         confirmed.push(candidate);
@@ -2194,7 +2533,7 @@ export class RamTempVolume {
     for (const disk of strays.value) {
       for (const point of disk.mountpoints) {
         const leases = await readdir(point).then(
-          (names) => ({ ok: true as const, names: names.filter((name) => LEASE_NAME.test(name)) }),
+          (names) => ({ ok: true as const, names: names.filter(isLeaseName) }),
           (error: unknown) => ({ ok: false as const, detail: errorText(error) }),
         );
         if (!leases.ok) {
@@ -2409,9 +2748,9 @@ function leaseOn(
     : { lost: `${lease.directory} is gone from the volume while the task held it` };
 }
 
-/** The pid a lease directory is named after: whether its task is alive. */
+/** The pid a task lease directory is named after: whether its task is alive. */
 function leasePid(name: string): number {
-  return Number(LEASE_NAME.exec(name)?.[1]);
+  return Number(TASK_LEASE_NAME.exec(name)?.[1]);
 }
 
 /** A lease directory's identity: device, inode and birth, which a directory made again at its path does not share. */
@@ -2495,11 +2834,11 @@ function ledgerText(ledger: Ledger): string {
   return `${JSON.stringify({ version: ledger.lifecycle?.pending === undefined ? 1 : 2, lifecycle: ledger.lifecycle, claims: ledger.claims, held: ledger.held, ...(ledger.kept === null ? {} : { kept: ledger.kept }) })}\n`;
 }
 
-/** Publish the ledger in one rename, so no reader, and no crash, ever leaves half of it. */
-async function publishLedger(path: string, text: string): Promise<void> {
+/** Publish a small file in one rename, so no reader, and no crash, ever leaves half of it. */
+async function writeAtomic(path: string, text: string, mode: number): Promise<void> {
   const staged = `${path}.${randomUUID()}`;
   try {
-    await writeFile(staged, text, { flag: 'wx', mode: 0o600 });
+    await writeFile(staged, text, { flag: 'wx', mode });
     await rename(staged, path);
   } catch (error) {
     await rm(staged, { force: true }).catch((cleanup: unknown) => {
@@ -2510,6 +2849,11 @@ async function publishLedger(path: string, text: string): Promise<void> {
     });
     throw error;
   }
+}
+
+/** Publish the ledger in one rename, so no reader, and no crash, ever leaves half of it. */
+async function publishLedger(path: string, text: string): Promise<void> {
+  await writeAtomic(path, text, 0o600);
 }
 
 /**
@@ -2548,7 +2892,7 @@ function parseLedger(value: unknown): Ledger | undefined {
     }
     const { name, identity } = entry;
     const owner = parseOwner(entry.owner);
-    if (typeof name !== 'string' || !LEASE_NAME.test(name) || typeof identity !== 'string' || owner === undefined) {
+    if (typeof name !== 'string' || !isLeaseName(name) || typeof identity !== 'string' || owner === undefined) {
       return undefined;
     }
     claims.push({ name, identity, owner });

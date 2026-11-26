@@ -2327,8 +2327,26 @@ other job's lease, whose open files then read EIO. The helper belongs to the gat
 The gateway holds the disk until the creating task keeps it, once the volume is mounted and marked at its mountpoint, or
 releases it, which detaches it. A task that dies, fails or misses its deadline first leaves the detach to the gateway,
 and a gateway restart leaves it to the next gateway's startup scan. A target's own `env.TMPDIR` wins over the lease.
-Inside a cowshed sandbox, which refuses the volume's own paths (its mountpoint and marker, and the lock in
-`/private/tmp`), the task keeps its inherited `TMPDIR` and says so once, whichever refusal it meets first.
+Inside a cowshed sandbox, which refuses the volume's own paths (its mountpoint listing, its marker, and the lock in
+`/private/tmp`), sandboxed scratch used to fall back to the store directory and accounted for the bulk of the host's SSD
+write traffic. Instead, cowshed's host-side `[scratch]` provider
+(`provider = ["bun", "packages/nx-plugin/dist/executors/bounded-exec/scratch-provider.js"]` in main's `.cowshed.toml`,
+running main's built copy produced by `[land] after` under the declared host bootstrap PATH
+`declared_land::bootstrap_path`, implemented by `scratch-provider.ts` driving `RamTempVolume`) takes one host lease per
+exec host (`<mount>/h<5>`, mode 0700) on the same RAM volume with a sibling `<mount>/h<5>.holder` sidecar (version-1
+JSON naming the provider pid, outside the sandbox's grant), and cowshed gives the exec host read/write access to
+`<mount>/h<5>` plus metadata-only access to `<mount>`. A sandboxed `bounded-exec` task recognizes its inherited `TMPDIR`
+as a host lease by its mountpoint parent, `h<5>` name and matching `st_dev` — touching neither `.smoo-ram` nor the lock
+— and makes an exclusive `<lease>/<5>` directory as the command's `TMPDIR` (unless the target declared its own
+`env.TMPDIR`, which still wins as target-provided). On pass the task deletes `<lease>/<5>`; on failure, timeout, signal
+or unretired subtree it leaves `<lease>/<5>` in place, writes `<lease>/<5>.failed` (`{"version":1,"verdict":…,"at":…}`)
+beside it inside the lease, and reports the path. When the exec host retires and cowshed closes the provider's stdin,
+the provider settles the host lease through `RamTempVolume`: each `<5>` directory with a `<5>.failed` marker is renamed
+whole into `.archive` through the existing retention rules (logging its verdict), the rest of `<mount>/h<5>` and
+`<mount>/h<5>.holder` are deleted, and the volume detaches if that was the last live lease. Reclaim reads a host lease's
+holder pid from `.holder`: a live holder's lease is never claimed (nor does a host task's release detach the volume
+under it), and a dead holder's host lease is archived whole with its sidecar removed. When no host lease is present
+inside a sandbox, the task keeps its inherited `TMPDIR` and says so once, whichever refusal it meets first.
 
 Every owned `bounded-exec` target attempts the lease, test targets included. Explicit RAM unavailability uses a unique
 owned ordinary directory beside the RAM lock that answer was taken under, in the system temp directory `/private/tmp`.
