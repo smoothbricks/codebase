@@ -4,8 +4,28 @@ import { deadlinePlugin } from './tooling/checks/no-unbounded-wait.ts';
 
 // Type-checked rules only — biome handles everything else (formatting, imports, style).
 // This config catches unsafe type assertions that biome cannot detect (rule 9, AGENTS.md "Types"), in the packages'
-// sources and in the repository's own tooling, and refuses an unbounded wait on another process
-// (tooling/checks/no-unbounded-wait.ts): both need the types.
+// sources and in the repository's own tooling. `bun lint --type-aware` runs it and builds its own types. The rules it
+// cannot run, custom rules that walk a TypeScript program, are in eslint.typed.config.ts, which ESLint runs.
+
+/**
+ * The sources the deadline rules read (eslint.typed.config.ts): every package source but the bound's own module and
+ * test code.
+ */
+export const UNBOUNDED_WAIT_SOURCES = {
+  files: ['packages/*/src/**/*.ts', 'packages/*/src/**/*.tsx'],
+  ignores: [
+    // The primitive's own module is the bound.
+    'packages/lmao/src/lib/errors/Deadline.ts',
+    // WHY unbounded: test code and the fixtures only tests load wait under the bound the test runner puts on a test
+    // that stops finishing (specs/cowshed/08_testing.md).
+    'packages/*/src/**/*.test.ts',
+    'packages/*/src/**/*.test.tsx',
+    'packages/*/src/**/__tests__/**',
+    'packages/*/src/**/testing/**',
+    'packages/nx-plugin/src/testing.ts',
+    'packages/nx-plugin/src/executors/bounded-exec/ram-temp-fixtures.ts',
+  ],
+};
 const typeAssertionRules: Linter.RulesRecord = {
   // Catches `as any`, `as unknown as T`, and other unsafe type assertions
   '@typescript-eslint/no-unsafe-type-assertion': 'error',
@@ -65,24 +85,15 @@ export default tseslint.config(
     },
     rules: typeAssertionRules,
   },
-  // Every wait on another process is bounded (specs/cowshed/05_gateway.md, "Deadlines", "Enforcement"): a kept one says
-  // what ends it in its `// eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: …` directive.
+  // The deadline rules run in ESLint (eslint.typed.config.ts), and these sources carry their
+  // `eslint-disable-next-line deadline/no-unbounded-wait` directives. bun lint refuses a directive naming a rule of an
+  // unregistered plugin, so the plugin is registered here with no rule on. A directive whose rule this pass does not run
+  // suppresses nothing in it and would be reported unused, and that report is per file, never per rule, so it is off
+  // for these sources in both passes: `deadline/unbounded-wait-why` is what judges those directives.
   {
-    files: ['packages/*/src/**/*.ts', 'packages/*/src/**/*.tsx'],
-    ignores: [
-      // The primitive's own module is the bound.
-      'packages/lmao/src/lib/errors/Deadline.ts',
-      // WHY unbounded: test code and the fixtures only tests load wait under the test runner's no-progress bound
-      // (bounded-exec's idleTimeoutMs, specs/cowshed/08_testing.md), which ends a test that stops finishing.
-      'packages/*/src/**/*.test.ts',
-      'packages/*/src/**/*.test.tsx',
-      'packages/*/src/**/__tests__/**',
-      'packages/*/src/**/testing/**',
-      'packages/nx-plugin/src/testing.ts',
-      'packages/nx-plugin/src/executors/bounded-exec/ram-temp-fixtures.ts',
-    ],
+    ...UNBOUNDED_WAIT_SOURCES,
     plugins: { deadline: deadlinePlugin },
-    rules: { 'deadline/no-unbounded-wait': 'error', 'deadline/unbounded-wait-why': 'error' },
+    linterOptions: { reportUnusedDisableDirectives: 'off' },
   },
   {
     files: ['packages/*/src/**/*.test.ts', 'packages/*/src/**/*.test.tsx', 'packages/*/src/**/__tests__/**/*.ts'],

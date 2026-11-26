@@ -79,22 +79,42 @@ published package that really is deployed declares `deploy` itself. Whether CI d
 question, answered only by the deploy tags the CLI reads (`stage-deploy-target` and its three siblings).
 
 Lint commands are inferred per project. A workspace Biome configuration enables the project-wide Biome check; an ESLint
-flat configuration enables ESLint for existing JavaScript/TypeScript files under that project's `src` and the files its
-`tsconfig.test.json` declares, wherever they live. TypeScript resolves inherited `include`, `files` and `exclude`. Only
-files in Nx's workspace file index (.gitignore and .nxignore applied) count, so a gitignored generated module that a
-build left on disk is neither linted nor keyed, and the lint target is the same in every checkout of one tree. Rust-only
-source trees keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript inputs.
-Test-config diagnostics retain TypeScript's parsed-command-line types through bootstrap emit; invalid declarations fail
-with their diagnostic code and message, while an empty test program (TS18003) contributes no test files.
+flat configuration enables `bun lint` for existing JavaScript/TypeScript files under that project's `src` and the files
+its `tsconfig.test.json` declares, wherever they live. TypeScript resolves inherited `include`, `files` and `exclude`.
+Only files in Nx's workspace file index (.gitignore and .nxignore applied) count, so a gitignored generated module that
+a build left on disk is neither linted nor keyed, and the lint target is the same in every checkout of one tree.
+Rust-only source trees keep their Cargo validation and manifest checks without invoking a linter on nonexistent
+JavaScript inputs. Test-config diagnostics retain TypeScript's parsed-command-line types through bootstrap emit; invalid
+declarations fail with their diagnostic code and message, while an empty test program (TS18003) contributes no test
+files.
 
-The ESLint command names no file. It is `eslint {eslintSources}`, and the target's `eslintProjectRoot` option names the
-project whose sources the placeholder stands for. A graph holds the files of the moment it was computed, and the daemon
-serves it past a deletion or an addition its watcher never reported: a list in the command made ESLint refuse a pattern
-no file matches, and left a new file unlinted, until the graph recomputed. The `all-verdicts` executor replaces the
-placeholder when the command runs, with the files the rules above select out of a fresh workspace file index: a new
-native context over the filesystem, never the table of the process or of the daemon, which learn of a write only when a
-watcher event reaches them. A project with none passes without starting ESLint. Adding JavaScript/TypeScript sources or
-changing the declared test program changes what the next run lints, with no graph computation in between.
+The command names no file. It is `bun lint --no-script --type-aware -f stylish {eslintSources}`, and the target's
+`eslintProjectRoot` option names the project whose sources the placeholder stands for. A graph holds the files of the
+moment it was computed, and the daemon serves it past a deletion or an addition its watcher never reported: a list in
+the command made ESLint refuse a pattern no file matches, and left a new file unlinted, until the graph recomputed. The
+`all-verdicts` executor replaces the placeholder when the command runs, with the files the rules above select out of a
+fresh workspace file index: a new native context over the filesystem, never the table of the process or of the daemon,
+which learn of a write only when a watcher event reaches them. A project with none passes without starting a linter.
+Adding JavaScript/TypeScript sources or changing the declared test program changes what the next run lints, with no
+graph computation in between.
+
+`bun lint` reads the workspace's `eslint.config.*` itself, the nearest one above each file as ESLint's lookup does, and
+builds its own types for the type-aware rules. `--no-script` keeps a root `lint` script from running in its place, and
+`-f stylish` prints ESLint's own report. It hands a rule written in JavaScript no TypeScript program, so a type-directed
+custom rule cannot run in it. Such rules are configured in a typed config, a file named
+`eslint.typed.config.{js,mjs,cjs,ts,mts,cts}` that neither linter's lookup reaches. The typed config in the nearest
+directory at or above a project's root applies to it (the project's own, else the workspace root's), and the project's
+`lint` then also runs `eslint --no-config-lookup --no-warn-ignored -c <that config> {eslintSources}`: one ESLint pass,
+over that config alone, since each pass builds the project's type program. A project config that wants the workspace's
+typed blocks imports them. The config's own `files` blocks decide what the pass reads; `--no-warn-ignored` because the
+placeholder also names sources no typed block matches. A lint is keyed by every path a typed config of its project can
+have, each name in each directory from the project root up to the workspace root, whether or not a file is there: a
+typed config added, removed or moved nearer re-keys the lints it applies to, and a sibling project's typed config keys
+nothing else. The pass itself is keyed by the workspace files its config loads and the lock scopes of the packages it
+loads by name, on the projects it applies to and no other. A lint that runs `bun lint` is also keyed by
+`bun --revision`, a runtime input: the linter and its built-in rules are the Bun binary, which no lockfile names. A
+typed config applies only in a workspace whose root ESLint configuration enables the lint, and two typed configs in one
+directory are refused.
 
 The lint inputs key the same program without naming each file: the test declaration and its existing `extends` chain,
 one glob over the JavaScript and TypeScript kinds for each directory the declaration's include patterns walk (none for a
@@ -112,9 +132,9 @@ command's output prints as one block when it closes, then every command's verdic
 `UNJUDGED` with its cause when a signal ended it, it never started, or the run itself was signalled. A signal to the run
 ends each command's process group, and the run then ends by the same signal. The target passes only when every command
 passed; an empty command list is refused, since it could never fail. The options are `commands`, `cwd` and, for a
-project with an ESLint command, `eslintProjectRoot`; a command's block and verdict name it as it ran.
+project with a command that names the placeholder, `eslintProjectRoot`; a command's block and verdict name it as it ran.
 
-Lint inputs include dependency production inputs because type-aware ESLint reads dependencies' declarations. This uses
+Lint inputs include dependency production inputs because the type-aware lint reads dependencies' declarations. This uses
 `^production` unless the workspace opts into the versionless production input described below. Keep
 `targetDefaults.lint` limited to shared cache policy or additive inputs such as `["...", "^production"]`. Smoo's
 workspace policy removes static lint executors, commands, dependencies, outputs and replacement input lists because they

@@ -439,7 +439,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/example/src/index.ts', 'export const value = 1;\n');
 
       const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
-      expect(lint?.options?.commands).toEqual(['eslint {eslintSources}']);
+      expect(lint?.options?.commands).toEqual(['bun lint --no-script --type-aware -f stylish {eslintSources}']);
       expect(externalDependencies(lint)).toContainEqual([
         'bun-lock:packages/example',
         'eslint',
@@ -2366,7 +2366,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const withJavaScript = resolveLint(javaScript);
       expect(withJavaScript.executor).toBe(ALL_VERDICTS_EXECUTOR);
       expect(withJavaScript.dependsOn).toEqual(['cargo-lint']);
-      expect(withJavaScript.options?.commands).toEqual([biome, 'eslint {eslintSources}']);
+      expect(withJavaScript.options?.commands).toEqual([
+        biome,
+        'bun lint --no-script --type-aware -f stylish {eslintSources}',
+      ]);
       expect(withJavaScript.options?.eslintProjectRoot).toBe(root);
       expect(javaScript.lint?.metadata?.eslintFileSet.files).toEqual([`${root}/src/check.js`]);
 
@@ -2382,7 +2385,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write(`${root}/tsconfig.lib.json`, '{"compilerOptions":{"outDir":"dist"}}\n');
       await workspace.write(`${root}/src/index.ts`, 'export const value = 1;\n');
       const mixed = await inferProjectTargets(workspace, `${root}/package.json`);
-      expect(resolveLint(mixed).options?.commands).toEqual([biome, 'eslint {eslintSources}']);
+      expect(resolveLint(mixed).options?.commands).toEqual([
+        biome,
+        'bun lint --no-script --type-aware -f stylish {eslintSources}',
+      ]);
       expect(mixed.lint?.metadata?.eslintFileSet.files).toEqual([`${root}/src/check.js`, `${root}/src/index.ts`]);
       expectNoSchedulerThrottle(mixed);
     } finally {
@@ -2412,7 +2418,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/contract/schema.d.ts', 'export interface Contract { value: number }\n');
 
       const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
-      expect(lint?.options?.commands).toEqual(['eslint {eslintSources}']);
+      expect(lint?.options?.commands).toEqual(['bun lint --no-script --type-aware -f stylish {eslintSources}']);
       expect(lint?.options?.eslintProjectRoot).toBe('packages/example');
       expect(lint?.metadata?.eslintFileSet).toEqual({
         command: lint?.options?.commands?.[0],
@@ -2462,11 +2468,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
       const files = ['packages/example/src/index.ts', 'packages/example/tests/check.test.ts'];
-      expect(lint?.metadata?.eslintFileSet).toEqual({ command: 'eslint {eslintSources}', files });
+      expect(lint?.metadata?.eslintFileSet).toEqual({
+        command: 'bun lint --no-script --type-aware -f stylish {eslintSources}',
+        files,
+      });
       expect(lint?.options?.commands).toEqual([lint?.metadata?.eslintFileSet.command]);
-      // The tests directory is keyed as a glob; the index, which holds no ignored file, decides what it hashes.
+      // The tests directory is keyed as a glob; the index, which holds no ignored file, decides what it hashes. The
+      // project's typed-config candidates are keyed beside it and are no program file.
       const programInputs = (lint?.inputs ?? []).filter(
-        (input): input is string => typeof input === 'string' && input.startsWith('{workspaceRoot}/packages/example/'),
+        (input): input is string =>
+          typeof input === 'string' &&
+          input.startsWith('{workspaceRoot}/packages/example/') &&
+          !input.includes('/eslint.typed.config.'),
       );
       expect(programInputs).toEqual(['{workspaceRoot}/packages/example/tests/**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}']);
     } finally {
@@ -2500,6 +2513,75 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'packages/example/src/added.ts',
         'packages/example/src/index.ts',
       ]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('adds one ESLint pass over the nearest typed config, only to the projects it applies to', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('eslint.config.mjs', 'export default [{ files: ["**/*.ts"] }];\n');
+      for (const name of ['owner', 'plain']) {
+        await workspace.write(`packages/${name}/package.json`, `{"name":"${name}"}\n`);
+        await workspace.write(`packages/${name}/src/index.ts`, 'export const value = 1;\n');
+      }
+      const bunLint = 'bun lint --no-script --type-aware -f stylish {eslintSources}';
+      const typedPass = (config: string) =>
+        `eslint --no-config-lookup --no-warn-ignored -c '${config}' {eslintSources}`;
+
+      // No typed config anywhere: bun lint runs the workspace config, and no ESLint process starts.
+      const untyped = await inferProjectTargets(workspace, 'packages/plain/package.json');
+      expect(untyped.lint?.options?.commands).toEqual([bunLint]);
+      // Every path a typed config of this project can have is keyed before one exists, each name in each directory
+      // from the project up to the workspace root: adding or removing one re-keys the lint. A sibling's is not.
+      for (const candidate of [
+        'eslint.typed.config.ts',
+        'packages/eslint.typed.config.mjs',
+        'packages/plain/eslint.typed.config.cts',
+      ]) {
+        expect({ candidate, keyed: hashes(untyped.lint, candidate) }).toEqual({ candidate, keyed: true });
+      }
+      expect(hashes(untyped.lint, 'packages/owner/eslint.typed.config.ts')).toBe(false);
+      // The linter is the Bun binary: a moved Bun pin re-runs the lint.
+      expect(untyped.lint?.inputs).toContainEqual({
+        runtime: 'sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --revision',
+      });
+
+      // A project's own typed config adds the pass to that project alone, keyed on the config and what it loads.
+      const ownerConfig = 'packages/owner/eslint.typed.config.mjs';
+      await workspace.write(ownerConfig, "import { rule } from './lint/rule.mjs';\nexport default [rule];\n");
+      await workspace.write('packages/owner/lint/rule.mjs', 'export const rule = {};\n');
+      await workspace.write('packages/owner/lint/unloaded.mjs', 'export const unloaded = {};\n');
+      const owner = await inferProjectTargets(workspace, 'packages/owner/package.json');
+      expect(owner.lint?.options?.commands).toEqual([bunLint, typedPass(ownerConfig)]);
+      expect(owner.lint?.options?.eslintProjectRoot).toBe('packages/owner');
+      expect(owner.lint?.metadata?.eslintFileSet.command).toBe(bunLint);
+      expect(owner.lint?.inputs).toEqual(
+        expect.arrayContaining([`{workspaceRoot}/${ownerConfig}`, '{workspaceRoot}/packages/owner/lint/rule.mjs']),
+      );
+      expect(owner.lint?.inputs).not.toContain('{workspaceRoot}/packages/owner/lint/unloaded.mjs');
+      const plain = await inferProjectTargets(workspace, 'packages/plain/package.json');
+      expect(plain.lint?.options?.commands).toEqual([bunLint]);
+      expect(plain.lint?.inputs).not.toContain(`{workspaceRoot}/${ownerConfig}`);
+
+      // A workspace-root typed config applies to every project with none nearer; the nearest one wins, alone.
+      await workspace.write(
+        'eslint.typed.config.mjs',
+        "import { rule } from './tooling/checks/typed-rule.mjs';\nexport default [rule];\n",
+      );
+      await workspace.write('tooling/checks/package.json', '{"type":"module"}\n');
+      await workspace.write('tooling/checks/typed-rule.mjs', 'export const rule = {};\n');
+      const rooted = await inferProjectTargets(workspace, 'packages/plain/package.json');
+      expect(rooted.lint?.options?.commands).toEqual([bunLint, typedPass('eslint.typed.config.mjs')]);
+      expect(rooted.lint?.inputs).toContain('{workspaceRoot}/eslint.typed.config.mjs');
+      expect(keyedTooling(rooted.lint)).toEqual(['tooling/checks/package.json', 'tooling/checks/typed-rule.mjs']);
+      const nearest = await inferProjectTargets(workspace, 'packages/owner/package.json');
+      expect(nearest.lint?.options?.commands).toEqual([bunLint, typedPass(ownerConfig)]);
+      // The root's path stays a candidate of this project (removing its own config makes the root's apply), but what
+      // the root's config loads is not this lint's.
+      expect(nearest.lint?.inputs).toContain('{workspaceRoot}/eslint.typed.config.mjs');
+      expect(keyedTooling(nearest.lint)).toEqual([]);
     } finally {
       await workspace.cleanup();
     }

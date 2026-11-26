@@ -279,7 +279,6 @@ async function withTargetLock<T>(targetDirectory: string, body: () => Promise<T>
       await rm(lock, { force: true });
       continue;
     }
-    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the wait lasts while a live fixture of this checkout builds; the runner's fixture budget ends a hung one
     await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
   }
   try {

@@ -486,20 +486,47 @@ const ESLINT_CONFIG_FILES = [
   'eslint.config.mts',
   'eslint.config.cts',
 ];
+/**
+ * A config neither `bun lint` nor ESLint's lookup reaches, for the rules only ESLint can run: `bun lint` hands a
+ * JavaScript rule no TypeScript program, so a type-directed custom rule is configured here and ESLint is passed the
+ * file with `-c`.
+ */
+const ESLINT_TYPED_CONFIG_FILES = [
+  'eslint.typed.config.js',
+  'eslint.typed.config.mjs',
+  'eslint.typed.config.cjs',
+  'eslint.typed.config.ts',
+  'eslint.typed.config.mts',
+  'eslint.typed.config.cts',
+];
 
-/** What ESLint lints in this workspace and what its configuration loads. */
+/** A typed ESLint config and what it loads: the keys of the one ESLint pass that runs it. */
+interface TypedEslintConfig {
+  /** The config file, workspace-relative. */
+  readonly config: string;
+  /** The workspace modules it loads, transitively, workspace-relative and sorted; the config excluded. */
+  readonly imports: readonly string[];
+  /** The lock scopes of the installed packages those modules load by name, each where its module loads it; sorted. */
+  readonly scopes: readonly string[];
+}
+
+/** What the lint reads in this workspace and what its configuration loads. */
 interface EslintWorkspace {
+  /** The JavaScript, TypeScript and JSON files of Nx's workspace file index: what a config closure may load. */
+  readonly indexed: ReadonlySet<string>;
   /** The JavaScript and TypeScript files of Nx's workspace file index. */
   readonly sources: ReadonlySet<string>;
   /** The workspace modules the root configs load, transitively, workspace-relative and sorted; the configs excluded. */
   readonly configImports: readonly string[];
   /** The lock scopes of the installed packages those modules load by name, each where its module loads it; sorted. */
   readonly configScopes: readonly string[];
+  /** The typed config each directory asked about holds, `null` for none: each closure is walked once per graph. */
+  readonly typedConfigs: Map<string, TypedEslintConfig | null>;
 }
 
 /**
  * The ESLint sources and config closure of Nx's workspace file index, listed
- * once per graph computation; `null` when no workspace ESLint config enables ESLint.
+ * once per graph computation; `null` when no workspace ESLint config enables the lint.
  *
  * The lists the graph records for a project (its lint target's metadata, and
  * the inputs that name its program files) are drawn from the index, not from a
@@ -523,20 +550,65 @@ async function eslintWorkspace(workspaceRoot: string): Promise<EslintWorkspace |
   const indexed = new Set(await globIndexedFiles(workspaceRoot, [ESLINT_SOURCES_GLOB, '**/*.json']));
   const closure = eslintConfigClosure(workspaceRoot, configs, indexed);
   return {
+    indexed,
     sources: new Set([...indexed].filter((path) => !path.endsWith('.json'))),
     configImports: closure.files,
     configScopes: bunLoadScopes(workspaceRoot, closure.packageLoads),
+    typedConfigs: new Map(),
   };
+}
+
+/**
+ * The typed config that applies to `projectRoot`: the one in the nearest directory at or above it, as ESLint's own
+ * lookup picks a config, or `null`. One config runs, never two: each ESLint pass builds the project's type program, and
+ * a project config that wants the workspace's blocks imports them.
+ */
+function nearestTypedConfig(
+  workspaceRoot: string,
+  projectRoot: string,
+  eslint: EslintWorkspace,
+): TypedEslintConfig | null {
+  for (const directory of typedConfigDirectories(projectRoot)) {
+    let typed = eslint.typedConfigs.get(directory);
+    if (typed === undefined) {
+      const configs = ESLINT_TYPED_CONFIG_FILES.map((name) => posix.join(directory, name)).filter((path) =>
+        eslint.indexed.has(path),
+      );
+      const [config] = configs;
+      if (configs.length > 1) {
+        throw new Error(`${configs.join(' and ')} are both the typed ESLint config of ${directory}: keep one`);
+      }
+      if (config === undefined) {
+        typed = null;
+      } else {
+        const closure = eslintConfigClosure(workspaceRoot, [config], eslint.indexed);
+        typed = { config, imports: closure.files, scopes: bunLoadScopes(workspaceRoot, closure.packageLoads) };
+      }
+      eslint.typedConfigs.set(directory, typed);
+    }
+    if (typed !== null) return typed;
+  }
+  return null;
+}
+
+/** `projectRoot`, then each directory above it up to the workspace root (`.`): where a typed config of it can be. */
+function typedConfigDirectories(projectRoot: string): string[] {
+  const directories: string[] = [];
+  for (let directory = posix.normalize(projectRoot); ; directory = posix.dirname(directory)) {
+    directories.push(directory);
+    if (directory === '.') return directories;
+  }
 }
 
 function projectLintCommands(
   projectRoot: string,
   workspaceRoot: string,
   eslint: EslintWorkspace | null,
-): { commands: string[]; inputs: string[]; eslintFileSet: EslintFileSet | null } {
+): { commands: string[]; inputs: string[]; eslintFileSet: EslintFileSet | null; typed: TypedEslintConfig | null } {
   const commands: string[] = [];
   const inputs: string[] = [];
   let eslintFileSet: EslintFileSet | null = null;
+  let typed: TypedEslintConfig | null = null;
   const quote = (path: string) => `'${path.replaceAll("'", "'\"'\"'")}'`;
   if (BIOME_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
     commands.push(`biome check --files-ignore-unknown=true ${quote(projectRoot)}`);
@@ -544,15 +616,26 @@ function projectLintCommands(
   if (eslint !== null) {
     const sources = eslintSources(workspaceRoot, projectRoot, eslint.sources);
     inputs.push(...sources.inputs);
-    // The command names no file: a graph the daemon serves past a deletion or an addition would hand ESLint a pattern
-    // no file matches, or leave a new file unlinted. The all-verdicts executor resolves the token when it runs, and the
-    // list beside the command is the file set this graph resolved, for the inspectors that read it.
+    // The commands name no file: a graph the daemon serves past a deletion or an addition would hand the linter a
+    // pattern no file matches, or leave a new file unlinted. The all-verdicts executor resolves the token when it runs,
+    // and the list beside the command is the file set this graph resolved, for the inspectors that read it.
     if (sources.files.length > 0) {
-      eslintFileSet = { command: `eslint ${ESLINT_SOURCES_TOKEN}`, files: sources.files };
+      // `bun lint` reads the workspace's eslint.config.* itself, the nearest above each file, and builds its own types.
+      // `--no-script`: a root `lint` script would run instead of the linter. `-f stylish` is ESLint's own report, which
+      // is what the readers of this output parse.
+      eslintFileSet = {
+        command: `bun lint --no-script --type-aware -f stylish ${ESLINT_SOURCES_TOKEN}`,
+        files: sources.files,
+      };
       commands.push(eslintFileSet.command);
+      // The sources include files no typed block matches, which ESLint would otherwise warn it ignored.
+      typed = nearestTypedConfig(workspaceRoot, projectRoot, eslint);
+      if (typed !== null) {
+        commands.push(`eslint --no-config-lookup --no-warn-ignored -c ${quote(typed.config)} ${ESLINT_SOURCES_TOKEN}`);
+      }
     }
   }
-  return { commands, inputs, eslintFileSet };
+  return { commands, inputs, eslintFileSet, typed };
 }
 
 type NapiArchitecture = 'arm64' | 'x64';
@@ -2424,8 +2507,10 @@ async function createProjectTargets(
     commands: lintCommands,
     inputs: lintProgramInputs,
     eslintFileSet,
+    typed: typedLint,
   } = projectLintCommands(projectRoot, workspaceRoot, eslint);
-  // The lint tools run from the root's node_modules/.bin, and ESLint loads the packages its configs name.
+  // Biome and the typed ESLint pass run from the root's node_modules/.bin, and each linter loads the packages its
+  // configs name; the jiti that reads a TypeScript config's loads is ESLint's.
   const runsEslint = eslintFileSet !== null;
   const lintScopes = [
     ...bunLoadInput(rootManifests, [
@@ -2433,6 +2518,7 @@ async function createProjectTargets(
       ...(lintCommands.some((command) => command.startsWith('biome ')) ? ['@biomejs/biome'] : []),
     ]).externalDependencies,
     ...(runsEslint ? (eslint?.configScopes ?? []) : []),
+    ...(typedLint?.scopes ?? []),
   ];
   // Every lint tool reaches its own verdict in one run: run-commands would end the
   // other tools once one fails, and their findings would surface a run later.
@@ -2453,7 +2539,17 @@ async function createProjectTargets(
           `{projectRoot}/${name}`,
         ]),
         ...(eslint?.configImports ?? []).map((path) => `{workspaceRoot}/${path}`),
+        // Every path a typed config of this project can have, whether or not a file is there: one added or removed
+        // re-keys the lint, and a sibling project's keys nothing here. Then what the selected one loads.
+        ...(eslintFileSet === null ? [] : typedConfigDirectories(projectRoot)).flatMap((directory) =>
+          ESLINT_TYPED_CONFIG_FILES.map((name) => `{workspaceRoot}/${posix.join(directory, name)}`),
+        ),
+        ...(typedLint?.imports ?? [])
+          .filter((path) => !ESLINT_CONFIG_FILES.includes(path) && eslint?.configImports.includes(path) !== true)
+          .map((path) => `{workspaceRoot}/${path}`),
         ...(lintScopes.length > 0 ? [bunScopeInput(projectRoot, lintScopes)] : []),
+        // The linter and its built-in rules are the Bun binary itself, which no lock scope names.
+        ...(eslintFileSet === null ? [] : [runtimeInput('bun --revision')]),
       ],
       ...(lintCommands.length > 0
         ? {
