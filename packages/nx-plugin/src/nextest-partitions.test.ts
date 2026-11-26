@@ -1,10 +1,11 @@
 import { afterAll, afterEach, beforeAll, expect, it } from 'bun:test';
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { countedCargo } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, nxFixtureRoot } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { SERIAL_TEST_GROUP_PLATFORM } from './cargo-workspace.js';
@@ -471,6 +472,38 @@ it(
     const path = /^owned binary: (.+)$/m.exec(result.stdout)?.[1];
     if (path === undefined) throw new Error('the consumer printed no prepared binary');
     await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
+  }),
+);
+it(
+  'starts cargo metadata once across repeated and sibling native test tasks on unchanged inputs',
+  caseBody(async () => {
+    const { root, targets } = fixture();
+    const countedRoot = await mkdtemp(join(root, 'counted-metadata-'));
+    const cargo = await countedCargo(countedRoot);
+    const log = join(countedRoot, 'executions.log');
+    try {
+      const overlay = {
+        PATH: `${cargo.bin}${delimiter}${process.env.PATH ?? ''}`,
+        PARTITION_EXECUTIONS: log,
+      };
+      const shard1 = nativeOptions(targets, 'cargo-test-partition-probe-shard1');
+      const shard2 = nativeOptions(targets, 'cargo-test-partition-probe-shard2');
+
+      const first = await runGroupExecutor(root, shard1, { root }, overlay);
+      expect(first.code, first.output).toBe(0);
+      expect((await cargo.runs()).spawned).toBe(1);
+
+      const second = await runGroupExecutor(root, shard1, { root }, overlay);
+      expect(second.code, second.output).toBe(0);
+      expect((await cargo.runs()).spawned).toBe(1);
+
+      const sibling = await runGroupExecutor(root, shard2, { root }, overlay);
+      expect(sibling.code, sibling.output).toBe(0);
+      expect((await cargo.runs()).spawned).toBe(1);
+    } finally {
+      await cargo.release();
+      await rm(countedRoot, { recursive: true, force: true });
+    }
   }),
 );
 //#endregion smoo/cowshed!n/native-test-verdicts

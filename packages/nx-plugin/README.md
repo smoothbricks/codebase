@@ -1392,17 +1392,21 @@ Concrete targets come from concrete files:
   outputs. A hit does not start Cargo's test build or nextest's run, even when the checkout has no test binaries. On a
   miss, bounded-exec first uses the Cargo shim to build the crate's test binaries with
   `nextest list -p <package> --list-type binaries-only`. The fixture has its own ceiling, before the reservation and
-  180-second test idle bound. Cargo and mbx reuse unchanged units among shards and crates in the workspace's target
-  directory; nothing copies it or scans it for binaries. An invocation that needs Cargo's final artifacts gives Cargo a
-  private final target in its existing fixture scratch: another build can replace the shared executable alias without
-  unlinking this invocation's selected file. Only final artifacts are exported, not compiled units; Cargo can copy these
-  bytes when the filesystem cannot share them. The ordinary nextest version check lets mbx place this invocation's build
-  view before selecting a private export, even when a warm target link belongs to a different store. The executor
-  retires the private exports with the invocation, after its command subtree. Repositories that need the same feature
-  resolution as `--workspace` use their existing Cargo workspace feature unification policy. The run feeds the
-  invocation's Cargo and nextest metadata back to nextest without relocation, under the same filter, partition and
-  nextest configuration. Valid inferred empty suites and partitions can pass. Cross archives remain separate: the
-  archive runner receives its binaries from another platform.
+  180-second test idle bound. The fixture reads the workspace's Cargo metadata from a content-keyed store in Nx's
+  workspace data (`BOUNDED_EXEC_FIXTURE_STORE_DIR`, never an Nx output), keyed by the Cargo identity, environment,
+  manifests, lockfile, configuration and target-discovery inputs Cargo reads. An unchanged repeat starts no
+  `cargo metadata` process and concurrent cold fixtures share one flight under a kernel file lock, while each invocation
+  still writes its private `cargo-metadata.json` to `BOUNDED_EXEC_FIXTURE_DIR`. Cargo and mbx reuse unchanged units
+  among shards and crates in the workspace's target directory; nothing copies it or scans it for binaries. An invocation
+  that needs Cargo's final artifacts gives Cargo a private final target in its existing fixture scratch: another build
+  can replace the shared executable alias without unlinking this invocation's selected file. Only final artifacts are
+  exported, not compiled units; Cargo can copy these bytes when the filesystem cannot share them. The ordinary nextest
+  version check lets mbx place this invocation's build view before selecting a private export, even when a warm target
+  link belongs to a different store. The executor retires the private exports with the invocation, after its command
+  subtree. Repositories that need the same feature resolution as `--workspace` use their existing Cargo workspace
+  feature unification policy. The run feeds the invocation's Cargo and nextest metadata back to nextest without
+  relocation, under the same filter, partition and nextest configuration. Valid inferred empty suites and partitions can
+  pass. Cross archives remain separate: the archive runner receives its binaries from another platform.
 
   An explicit `@smoothbricks/nx-plugin:bounded-exec` target supplies `options.nativeTest` with literal argv arrays:
   `cargoArgs` selects packages, binary targets, Cargo profile, target triple and features; `selectionArgs` supplies

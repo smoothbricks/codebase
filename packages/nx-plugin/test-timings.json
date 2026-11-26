@@ -10,6 +10,7 @@
     "src/cargo-source-hash.test.ts": 27639,
     "src/cargo-resolve-cache.test.ts": 23878,
     "src/executors/typescript-emit/executor.test.ts": 21502,
+    "src/executors/bounded-exec/native-fixture-metadata.test.ts": 19850,
     "src/native-test-cache.test.ts": 15607,
     "src/linked-snapshots.nx.test.ts": 14606,
     "src/cargo-closure-input.test.ts": 13289,

@@ -6,6 +6,11 @@ import type { NativeBoundedExecOptions, ShellBoundedExecOptions } from './schema
 /** Set by bounded-exec, never by a target: metadata belongs to one invocation, even for concurrent runs of a target. */
 export const FIXTURE_DIRECTORY_ENV = 'BOUNDED_EXEC_FIXTURE_DIR';
 /**
+ * Set by bounded-exec, never by a target: the workspace's directory for fixture answers that outlive one invocation, in
+ * Nx's ignored workspace data, never an Nx output.
+ */
+export const FIXTURE_STORE_ENV = 'BOUNDED_EXEC_FIXTURE_STORE_DIR';
+/**
  * Set by bounded-exec for a fixture target that opts into same-volume clones (`templateClones`): the task's test
  * template directory, made under {@link TEMPLATE_PARENT} and removed when the task ends, after its command subtree.
  */
@@ -55,12 +60,11 @@ export function nativeTestPhases({
     runArgs?.some((arg) => arg === '--no-tests' || arg.startsWith('--no-tests=')) === true ? '' : ' --no-tests=fail';
   const run = `cargo --frozen nextest run ${reuse} ${config}${select}${verdict}${args(runArgs ?? [])}`;
   const list = `cargo --frozen nextest list${args(cargoArgs)} --list-type binaries-only --message-format json --cargo-metadata ${CARGO} ${config}`;
-  const metadata = 'cargo --frozen metadata --format-version 1 --all-features';
   const layout = `"$${FIXTURE_DIRECTORY_ENV}/layout.toml"`;
   const prepare =
-    `${metadata} > ${CARGO} && mode=$(${shellWord(process.execPath)} ${LAYOUT} "$${FIXTURE_DIRECTORY_ENV}"${args(cargoArgs)}) && ` +
+    `mode=$(${shellWord(process.execPath)} ${LAYOUT} "$${FIXTURE_DIRECTORY_ENV}"${args(cargoArgs)}) && ` +
     `if [ "$mode" = shared ]; then ${list} > ${BINARIES}; else ` +
-    `cargo --frozen nextest show-config version ${config} && ${metadata} --config ${layout} > ${CARGO} && ${list} --config ${layout} > ${BINARIES}; fi`;
+    `cargo --frozen nextest show-config version ${config} && ${list} --config ${layout} > ${BINARIES}; fi`;
   return {
     ...options,
     command: command ?? run,

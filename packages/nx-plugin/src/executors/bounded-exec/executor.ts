@@ -63,6 +63,7 @@ import {
 } from './mutation-report.js';
 import {
   FIXTURE_DIRECTORY_ENV,
+  FIXTURE_STORE_ENV,
   nativeTestPhases,
   TEMPLATE_DIRECTORY_ENV,
   TEMPLATE_PARENT,
@@ -1069,6 +1070,7 @@ async function runCommand(
         resolvePath(lease?.directory ?? hostTaskDir?.directory ?? ordinaryTemp ?? tmpdir(), 'smoo-fixture-'),
       );
       env[FIXTURE_DIRECTORY_ENV] = fixtureDirectory;
+      env[FIXTURE_STORE_ENV] = join(workspaceDataDirectoryForWorkspace(context.root), 'native-fixture-metadata');
     } catch (error) {
       return refuse(`bounded-exec: could not create fixture scratch: ${String(error)}\n`);
     }
