@@ -56,6 +56,16 @@ interface RegistryPackument {
 }
 
 const isRegistryPackument = typia.createIs<RegistryPackument>();
+
+interface CowshedCachesConfig {
+  home?: string[];
+}
+
+interface CowshedConfig {
+  caches?: CowshedCachesConfig;
+}
+
+const isCowshedConfig = typia.createIs<CowshedConfig>();
 const rootDevDependencies: RequiredDependency[] = [
   { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
   { name: '@nx/js', fallbackVersion: '24.0.6', minimumVersion: '24.0.0' },
@@ -159,6 +169,7 @@ export function validateToolConfig(root: string): number {
     validateRootDevDependencies(context.policy, context.rootPackage) +
     validateCliPinnedPackages(root) +
     validateTtscPatch(root, context.rootPackage) +
+    validateTtscCowshedCache(root) +
     validateToolingPackage(root, context.policy) +
     validateToolingWorkspace(context.rootPackage) +
     validateDevenvPackages(root)
@@ -391,6 +402,71 @@ function validateTtscPatch(root: string, rootPackage: PackageJson | null): numbe
     }
   }
   return failures;
+}
+
+const ttscSharedCacheComponents = ['.cache', 'ttsc'] as const;
+
+function sharesTtscHomeCache(entry: string): boolean {
+  if (entry.startsWith('/') || entry.includes('\\')) {
+    return false;
+  }
+  const components: string[] = [];
+  for (const part of entry.split('/')) {
+    if (part === '' || part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      return false;
+    }
+    components.push(part);
+  }
+  return (
+    components.length > 0 &&
+    components.length <= ttscSharedCacheComponents.length &&
+    components.every((part, index) => part === ttscSharedCacheComponents[index])
+  );
+}
+
+/**
+ * Decides whether a checkout's tracked `.cowshed.toml` shares `$HOME/.cache/ttsc` when the managed
+ * `tooling/direnv/ttsc-env.sh` is present. Returns null when the check passes or does not apply.
+ */
+export function ttscCowshedCacheFailure(cowshedToml: string | null, hasTtscEnv: boolean): string | null {
+  if (!hasTtscEnv || cowshedToml === null) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = Bun.TOML.parse(cowshedToml);
+  } catch (error) {
+    const detail = error instanceof Error && error.message ? `: ${error.message}` : '';
+    return `.cowshed.toml cannot be parsed as TOML${detail}; fix the TOML syntax before relying on [caches] home validation`;
+  }
+  if (!isCowshedConfig(parsed)) {
+    return '.cowshed.toml [caches] home must be an array of strings; fix the TOML shape before relying on cache sharing validation';
+  }
+  const home = parsed.caches?.home;
+  if (home !== undefined && home.some(sharesTtscHomeCache)) {
+    return null;
+  }
+  const instruction =
+    home === undefined ? 'add `[caches] home = [".cache/ttsc"]`' : 'add `".cache/ttsc"` to `[caches] home`';
+  return (
+    `.cowshed.toml must ${instruction}: tooling/direnv/ttsc-env.sh keeps ttsc's Go build cache under ` +
+    '$HOME/.cache/ttsc, and without that declaration every cowshed sandbox gets a private one'
+  );
+}
+
+export function validateTtscCowshedCache(root: string): number {
+  const hasTtscEnv = existsSync(join(root, 'tooling', 'direnv', 'ttsc-env.sh'));
+  const configPath = join(root, '.cowshed.toml');
+  const cowshedToml = hasTtscEnv && existsSync(configPath) ? readFileSync(configPath, 'utf8') : null;
+  const failure = ttscCowshedCacheFailure(cowshedToml, hasTtscEnv);
+  if (failure !== null) {
+    console.error(failure);
+    return 1;
+  }
+  return 0;
 }
 
 export function validateToolingPackage(root: string, policy: ToolPolicy): number {

@@ -258,14 +258,17 @@ there; they contain the endpoint URL, whose userinfo is the workspace token (bel
   directory outside every root, such as a sibling checkout's package at `<checkouts>/pnpm/store/pkg`, stays a developer
   binding. An unset variable leaves its root inactive, and a present root that is empty or relative is refused.
 
-  **Repository-placed caches.** A cache that no detector names — one a repository's own tooling places, such as a
-  TypeScript compiler plugin cache or a prebuilt runtime store — is declared by the repository in main's
-  `.cowshed.toml`, trusted only from main exactly like `[sandbox] deny`:
+  <a id="smoo/cowshed!n/repository-placed-caches"></a>**Repository-placed caches.** A cache that no detector names — one
+  a repository's own tooling places, such as a TypeScript compiler plugin cache or a prebuilt runtime store — is
+  declared by the repository in main's `.cowshed.toml`, trusted only from main exactly like `[sandbox] deny`:
   `[caches] home = ["<path relative to HOME>", …]`. Each entry shares `<host home>/<path>` read-write into every sandbox
   of the project and links `<private HOME>/<path>` to it, so a tool that resolves `$HOME/<path>` reaches the same bytes
   on the host and in every sandbox. Entries are plain relative paths of normal components, created by the supervisor
   like a detector's, and refused when they reach into a hard deny (credentials, cowshed's controller state, another
-  workspace). Nothing is shared for a repository that declares none.
+  workspace). Nothing is shared for a repository that declares none. A repository whose managed shell names a HOME cache
+  declares it, and `smoo monorepo check` refuses the managed ttsc shell file beside a `.cowshed.toml` that does not
+  share `.cache/ttsc`; a repository cowshed adopts without a `.cowshed.toml` is not judged and gets a per-workspace cold
+  Go build cache for ttsc until it adds `[caches] home = [".cache/ttsc"]`.
 
   **Retiring the caches volume.** Earlier releases kept these caches on a dedicated `cowshed.caches` volume (a
   `<pool>/cowshed/caches` dataset on ZFS) at `/private/cowshed/caches` and linked the host's tool paths into it.
@@ -289,22 +292,15 @@ there; they contain the endpoint URL, whose userinfo is the workspace token (bel
      dropping either copy.
   3. Directories the volume held for no detector — the gateway's `mirror/` and `repo-mirrors/`, repository-placed caches
      such as `ttsc/` — move to their HOME location the same way: the gateway's to cowshed's own cache directory, a
-     repository's to the `[caches] home` path that repository declares. Earlier Nix XDG-root wiring also placed Bun's
-     install cache at `nix/.bun/install/cache` and Bun's runtime transpiler cache at `nix/bun`: those move to
-     `~/.bun/install/cache` and `~/.cache/bun`, respectively, not into the transpiler cache at `nix/bun`: those move to
-     `~/.bun/install/cache` and `~/.cache/bun`, respectively, not into the Nix client cache.
-
-     A legacy toolchain cache whose current owner instead declares checkout build state is placed with that existing
-     build volume, never made into a new shared HOME cache merely to retire this volume. For `ttsc/`, the managed shell
-     writes `TTSC_CACHE_DIR=<checkout>/.cache/ttsc-plugins` and `TTSC_GO_CACHE_DIR=<checkout>/.cache/ttsc/go-build`;
-     main already declares `.cache/ttsc` in `[build] state` (16_build_volumes.md, "Declared build state"). The operator
-     explicitly selects that main and witnesses its existing fixed link before moving the legacy tree with the
-     retirement executor. If several mains declare the same toolchain path, this is a deliberate choice of the main
-     whose build volume will retain the old state, not a global name match: the other mains keep their independently
-     declared caches. No detector, HOME-sharing declaration or configuration knob is added. A legacy tree with divergent
-     mutable lock or usage bookkeeping is preserved whole at `<checkout>/.cache/ttsc/cowshed-retired/ttsc`, within that
-     existing declared build state, rather than merged with the current cache; the retained bytes are reported. Writers
-     of the source and destination must be quiet; bytes are preserved, never discarded as a substitute for placement.
+     repository's to the `[caches] home` path that repository declares. A repository's directory is matched to a
+     declared path by name: it goes to the one declared path, among every adopted main's, whose final component is the
+     directory's name, merged as a content-addressed cache. A directory no declared path names, or one that several
+     name, stays in place and is reported with that reason; nothing is placed by guessing. `ttsc/` is such a directory
+     and has no rule of its own: a main whose tooling keeps ttsc's caches under `$HOME/.cache/ttsc` declares
+     `[caches] home = [".cache/ttsc"]`, and the legacy tree, whose `plugins/` and `go-build/` are that directory's
+     layout, merges into it. Earlier Nix XDG-root wiring also placed Bun's install cache at `nix/.bun/install/cache` and
+     Bun's runtime transpiler cache at `nix/bun`: those move to `~/.bun/install/cache` and `~/.cache/bun`, respectively,
+     not into the Nix client cache.
 
   4. Under `--retire-caches-volume`, and only once steps 1–3 left the volume holding nothing but its marker, setup
      deletes the volume (or destroys the dataset), removes its `/etc/fstab` pin and drops it from the storage mount

@@ -594,14 +594,16 @@ in {
     #    6 API, so the two must be named separately.
     # 4. ttsc caches its plugin binaries in the checkout's .cache/ttsc-plugins (the
     #    path the CI ttsc-plugin cache restores, and the output a repository's
-    #    plugin build target declares), its Go build cache in .cache/ttsc/go-build,
-    #    a directory of its own outside that output, so
-    #    `ttsc clean` can reclaim it: ttsc never deletes a GOCACHE it did not
-    #    resolve itself, and sharing GOCACHE once left 35G nothing could empty.
-    #    GOFLAGS carries -trimpath, Go's stable way to keep absolute build paths
-    #    out of an artifact. A value the caller exported wins for each. Where Go
-    #    and the machine-wide caches live otherwise is the host's or the
-    #    sandbox's business, not this shell's.
+    #    plugin build target declares). Its Go build cache is the host's,
+    #    $HOME/.cache/ttsc/go-build: one cache serves every checkout's shared Go
+    #    dependencies; each plugin host's own packages still compile per
+    #    checkout. It is a directory of ttsc's own, so "ttsc clean" can reclaim
+    #    it: ttsc never deletes a GOCACHE it did not resolve itself, and sharing
+    #    GOCACHE once left 35G nothing could empty. GOFLAGS carries -trimpath,
+    #    Go's stable way to keep absolute build paths out of an artifact. A
+    #    value the caller exported wins for each. Where Go and the machine-wide
+    #    caches live otherwise is the host's or the sandbox's business, not this
+    #    shell's.
     # 5. Dependencies are installed by the smoo:install and smoo:cargo-fetch
     #    tasks above, which devenv runs before this prologue; the prologue only
     #    activates what they installed.

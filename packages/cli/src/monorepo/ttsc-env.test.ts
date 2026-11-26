@@ -29,10 +29,23 @@ interface TtscEnv {
   readonly CGO_ENABLED: string;
 }
 
+/** The HOME every checkout of one fixture enters with: one host, however many checkouts. */
+function homeOf(checkout: string): string {
+  return join(dirname(checkout), 'home');
+}
+
+/** This checkout's plugin store, and the Go build cache every checkout of the fixture's host shares. */
+function ownCaches(checkout: string): Pick<TtscEnv, 'TTSC_CACHE_DIR' | 'TTSC_GO_CACHE_DIR'> {
+  return {
+    TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
+    TTSC_GO_CACHE_DIR: join(homeOf(checkout), '.cache/ttsc/go-build'),
+  };
+}
+
 /**
- * Source the checkout's own copy from its root with exactly `inherited` as the
- * environment (plus PATH), the way a git hook or devenv's enterShell does, and
- * read back what it exported.
+ * Source the checkout's own copy from its root with exactly "inherited" as the
+ * environment (plus PATH and the fixture's HOME), the way a git hook or devenv's
+ * enterShell does, and read back what it exported.
  */
 function enter(checkout: string, inherited: Record<string, string>): TtscEnv {
   const result = spawnSync(
@@ -42,7 +55,11 @@ function enter(checkout: string, inherited: Record<string, string>): TtscEnv {
       `. "$0" && printf '%s\\n' "$TTSC_TSGO_BINARY" "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR" "\${CGO_ENABLED-unset}"`,
       checkoutScript,
     ],
-    { cwd: checkout, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...inherited }, encoding: 'utf8' },
+    {
+      cwd: checkout,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: homeOf(checkout), ...inherited },
+      encoding: 'utf8',
+    },
   );
   if (result.status !== 0) printCommandOutput(result.stdout ?? '', result.stderr ?? '');
   expect(result.status).toBe(0);
@@ -70,7 +87,7 @@ function withCheckouts(run: (checkout: string, other: string, scratch: string) =
   }
 }
 
-/** What another checkout's shell exports, as a hook run from that shell inherits it. */
+/** What a shell bound for another checkout exports when it names caches inside that checkout. */
 function boundFor(other: string): Record<string, string> {
   return {
     NX_WORKSPACE_ROOT_PATH: other,
@@ -88,8 +105,7 @@ it('selects this checkout profile when the repository declares its native produc
     symlinkSync(process.execPath, join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'));
     expect(enter(checkout, boundFor(other))).toEqual({
       TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'),
-      TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
-      TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+      ...ownCaches(checkout),
       CGO_ENABLED: '0',
     });
   });
@@ -125,35 +141,45 @@ it('refuses a directory that is not a workspace root instead of caching beside i
 });
 
 describe('ttsc-env.sh', () => {
-  it("names this checkout's compiler and caches when nothing is inherited", () => {
+  //#region smoo/cowshed!n/repository-placed-caches
+  it("names this checkout's compiler and plugin store and the host's Go build cache when nothing is inherited", () => {
     withCheckouts((checkout) => {
       expect(enter(checkout, {})).toEqual({
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
-        TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
-        TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+        ...ownCaches(checkout),
         CGO_ENABLED: '0',
       });
     });
   });
+
+  it('gives every checkout of a host one Go build cache, and each its own plugin store', () => {
+    withCheckouts((checkout, other) => {
+      const first = enter(checkout, {});
+      const second = enter(other, {});
+      expect(second.TTSC_GO_CACHE_DIR).toBe(first.TTSC_GO_CACHE_DIR);
+      expect(second.TTSC_CACHE_DIR).not.toBe(first.TTSC_CACHE_DIR);
+      expect(existsSync(first.TTSC_GO_CACHE_DIR)).toBe(true);
+    });
+  });
+  //#endregion smoo/cowshed!n/repository-placed-caches
 
   it("drops another workspace's compiler and caches that a shell bound for it left behind", () => {
     withCheckouts((checkout, other) => {
       expect(enter(checkout, boundFor(other))).toEqual({
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
-        TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
-        TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+        ...ownCaches(checkout),
         CGO_ENABLED: '0',
       });
     });
   });
 
-  it('keeps a cache the host chose, with no workspace bound or with this one', () => {
+  it("keeps a plugin store the host chose, with no workspace bound or with this one, beside the host's Go build cache", () => {
     withCheckouts((checkout, _other, scratch) => {
       const shared = join(scratch, 'shared-ttsc');
       const expected = {
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
         TTSC_CACHE_DIR: shared,
-        TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+        TTSC_GO_CACHE_DIR: ownCaches(checkout).TTSC_GO_CACHE_DIR,
         CGO_ENABLED: '0',
       };
       expect(enter(checkout, { TTSC_CACHE_DIR: shared })).toEqual(expected);
@@ -166,6 +192,18 @@ describe('ttsc-env.sh', () => {
       expect(enter(checkout, {}).CGO_ENABLED).toBe('0');
       expect(enter(checkout, { CGO_ENABLED: '1' }).CGO_ENABLED).toBe('1');
       expect(enter(checkout, { ...boundFor(other), CGO_ENABLED: '1' }).CGO_ENABLED).toBe('1');
+    });
+  });
+
+  it('refuses to guess a Go build cache when no HOME names the host', () => {
+    withCheckouts((checkout) => {
+      const result = spawnSync('/bin/sh', ['-c', '. "$0"', checkoutScript], {
+        cwd: checkout,
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+        encoding: 'utf8',
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('HOME is unset');
     });
   });
 });

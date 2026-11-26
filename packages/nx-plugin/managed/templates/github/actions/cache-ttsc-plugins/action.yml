@@ -3,7 +3,7 @@ description: >
   Restore or save the compiled ttsc native plugin binaries (typia, etc.) under TTSC_CACHE_DIR/plugins
   (.cache/ttsc-plugins/plugins). ttsc names every entry by a hash of what it was compiled from and skips the
   multi-minute `go build` when one matches. Setup restores them, and save-nix-devenv saves the entries the job used when
-  the job ends, red or green. The Go object cache (.cache/ttsc/go-build, outside the plugin root) is NOT cached: it is
+  the job ends, red or green. The Go object cache (~/.cache/ttsc/go-build, outside the plugin root) is NOT cached: it is
   multi-GB and only helps when the plugin key misses.
 
 inputs:

@@ -1,21 +1,30 @@
 # Repository-owned cowshed settings (specs/cowshed/06_cli.md "Configuration").
 
+[caches]
+# ttsc's directory in the host HOME, shared into every sandbox of this project
+# (specs/cowshed/03_caches.md "Repository-placed caches"). Its go-build is the shell's
+# TTSC_GO_CACHE_DIR (tooling/direnv/ttsc-env.sh), the Go build cache that compiles ttsc's native
+# plugins. Go keys an object by its content and GOFLAGS=-trimpath keeps paths out of it, so one
+# cache serves every checkout's shared Go dependencies while each plugin host's own packages
+# still compile per checkout (measured on six plugins: 498 Go cache files and 341 s in a second
+# workspace against 2058 and 728 s in the first). As checkout build state each fork compiled
+# what main never had: about 90 s and 3 GiB of Go objects per fork.
+home = [".cache/ttsc"]
+
 [build]
 # Build state no capability detects, kept on the build volume instead of the source image
 # (specs/cowshed/16_build_volumes.md "Declared build state"): cloned at fork, adopted by main at
 # land. `.cache/ttsc-plugins` is the shell's TTSC_CACHE_DIR (ttsc-env.sh): ttsc's native plugin
-# binaries; `.cache/ttsc` holds its TTSC_GO_CACHE_DIR (go-build), the Go build cache that
-# compiles them. A plugin's key hashes its sources by relative path plus the ttsc/tsgo versions,
-# platform and Go environment, never the checkout, and GOFLAGS=-trimpath keeps paths out of the
-# Go cache, so an entry built in any checkout is valid in every fork. On the source image a fork
-# gets only main's copy, which no land writes, so its first compile rebuilds every plugin main
-# never built.
+# binaries. A plugin's key hashes its sources by relative path plus the ttsc/tsgo versions,
+# platform and Go environment, never the checkout, so an entry built in any checkout is valid in
+# every fork. On the source image a fork gets only main's copy, which no land writes, so its
+# first compile rebuilds every plugin main never built.
 #
 # Not declared: `.cache/nextest` and `.cache/lmao-thread-ffi` are Nx task outputs, which never
 # live on the build volume (16_build_volumes.md "Nx outputs never live in the build volume"); the
 # Nx cache restores them. `.cache/statebus-packages` is the packed-consumer verification's declared
 # Nx output on the same footing; its consumer lockfiles name tarballs workspace-relatively.
-state = [".cache/ttsc-plugins", ".cache/ttsc"]
+state = [".cache/ttsc-plugins"]
 
 [scratch]
 # Each exec host's TMPDIR (specs/cowshed/04_sandbox.md, TMPDIR; 06_cli.md "Configuration"): a host lease on the RAM

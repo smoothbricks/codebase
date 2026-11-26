@@ -11,9 +11,11 @@ import {
   applyToolConfigDefaults,
   applyToolingPackageDefaults,
   readToolContext,
+  ttscCowshedCacheFailure,
   validateDevenvPackages,
   validateToolConfig,
   validateToolingPackage,
+  validateTtscCowshedCache,
 } from './tool-validation.js';
 
 const registryVersions: Record<string, string[]> = {
@@ -642,6 +644,122 @@ it('smoo monorepo check refuses a root @smoothbricks package bun.lock resolves t
     await rm(root, { recursive: true, force: true });
   }
 });
+
+//#region smoo/cowshed!n/repository-placed-caches
+describe('ttsc cowshed cache declaration', () => {
+  it('refuses the managed ttsc shell beside a .cowshed.toml without [caches] home and names the line to add', () => {
+    const failure = ttscCowshedCacheFailure('[build]\nstate = [".cache/ttsc-plugins"]\n', true);
+    expect(failure).not.toBeNull();
+    expect(failure).toContain('.cowshed.toml');
+    expect(failure).toContain('[caches] home = [".cache/ttsc"]');
+    expect(failure).toContain('$HOME/.cache/ttsc');
+
+    const emptyHome = ttscCowshedCacheFailure('[caches]\nhome = []\n', true);
+    expect(emptyHome).not.toBeNull();
+    expect(emptyHome).toContain('.cowshed.toml');
+    expect(emptyHome).toContain('".cache/ttsc"');
+  });
+
+  it.each([
+    ['exact path', '.cache/ttsc'],
+    ['parent directory', '.cache'],
+    ['leading dot-slash', './.cache/ttsc'],
+    ['trailing slash', '.cache/ttsc/'],
+    ['dot components', './.cache/./ttsc/'],
+  ])('accepts a [caches] home entry that shares .cache/ttsc (%s: %s)', (_label, entry) => {
+    expect(ttscCowshedCacheFailure(`[caches]\nhome = ["${entry}"]\n`, true)).toBeNull();
+  });
+
+  it.each(['.cache/ttsc-plugins', '.cache/other'])(
+    'refuses a [caches] home entry that only shares a sibling (%s)',
+    (entry) => {
+      const failure = ttscCowshedCacheFailure(`[caches]\nhome = ["${entry}"]\n`, true);
+      expect(failure).not.toBeNull();
+      expect(failure).toContain('.cowshed.toml');
+      expect(failure).toContain('".cache/ttsc"');
+    },
+  );
+
+  it('does not judge checkouts without .cowshed.toml or without tooling/direnv/ttsc-env.sh', () => {
+    expect(ttscCowshedCacheFailure(null, true)).toBeNull();
+    expect(ttscCowshedCacheFailure('[build]\nstate = [".cache/ttsc-plugins"]\n', false)).toBeNull();
+    expect(ttscCowshedCacheFailure('[caches\n', false)).toBeNull();
+  });
+
+  it('refuses an unparseable .cowshed.toml or non-string-array [caches] home as unreadable rather than undeclared', () => {
+    const syntax = ttscCowshedCacheFailure('[caches\nhome = [".cache/ttsc"]\n', true);
+    expect(syntax).not.toBeNull();
+    expect(syntax).toContain('.cowshed.toml');
+    expect(syntax).toMatch(/parse|syntax/i);
+    expect(syntax).not.toContain('[caches] home = [".cache/ttsc"]');
+
+    const notArray = ttscCowshedCacheFailure('[caches]\nhome = ".cache/ttsc"\n', true);
+    expect(notArray).not.toBeNull();
+    expect(notArray).toContain('.cowshed.toml');
+    expect(notArray).toMatch(/array of strings/i);
+    expect(notArray).not.toContain('[caches] home = [".cache/ttsc"]');
+
+    const nonStringElement = ttscCowshedCacheFailure('[caches]\nhome = [7]\n', true);
+    expect(nonStringElement).not.toBeNull();
+    expect(nonStringElement).toContain('.cowshed.toml');
+    expect(nonStringElement).toMatch(/array of strings/i);
+    expect(nonStringElement).not.toContain('[caches] home = [".cache/ttsc"]');
+  });
+
+  it('reports the refusal through validateTtscCowshedCache, smoo monorepo check, and smoo monorepo validate', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    const cowshedFindings = (run: () => void | Promise<void>): Promise<string[]> =>
+      Promise.resolve()
+        .then(() => {
+          errors.mockClear();
+          return run();
+        })
+        .then(() => errors.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('.cowshed.toml')));
+    try {
+      const shellPath = join(root, 'tooling/direnv/ttsc-env.sh');
+      await mkdir(dirname(shellPath), { recursive: true });
+      await writeFile(shellPath, '# managed ttsc shell\n');
+      await writeFile(join(root, '.cowshed.toml'), '[build]\nstate = [".cache/ttsc-plugins"]\n');
+
+      errors.mockClear();
+      expect(validateTtscCowshedCache(root)).toBe(1);
+      expect(errors.mock.calls.map((call) => String(call[0]))).toEqual([
+        expect.stringContaining('[caches] home = [".cache/ttsc"]'),
+      ]);
+
+      expect(
+        await cowshedFindings(async () => {
+          await checkPolicyFailures(root, []);
+        }),
+      ).toEqual([expect.stringContaining('[caches] home = [".cache/ttsc"]')]);
+      expect(
+        await cowshedFindings(() => {
+          validateToolConfig(root);
+        }),
+      ).toEqual([expect.stringContaining('[caches] home = [".cache/ttsc"]')]);
+
+      await writeFile(join(root, '.cowshed.toml'), '[caches]\nhome = [".cache/ttsc"]\n');
+      errors.mockClear();
+      expect(validateTtscCowshedCache(root)).toBe(0);
+      expect(errors.mock.calls).toEqual([]);
+      expect(
+        await cowshedFindings(async () => {
+          await checkPolicyFailures(root, []);
+        }),
+      ).toEqual([]);
+      expect(
+        await cowshedFindings(() => {
+          validateToolConfig(root);
+        }),
+      ).toEqual([]);
+    } finally {
+      errors.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+//#endregion smoo/cowshed!n/repository-placed-caches
 
 async function currentCliRange(): Promise<string> {
   return `^${registryLatestTags['@smoothbricks/cli']}`;

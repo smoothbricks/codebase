@@ -49,6 +49,7 @@ import {
   applyCliPinnedPackageDefaults,
   applyToolConfigDefaults,
   validateCliPinnedPackages,
+  validateTtscCowshedCache,
 } from './tool-validation.js';
 
 export interface InitOptions {
@@ -204,6 +205,7 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     // Nx renders managed files with the root's nx-plugin, smoo with its own: Publish's `nx sync:check` fails the
     // skew, so the CI lane refuses it here.
     validateCliPinnedPackages(root) +
+    validateTtscCowshedCache(root) +
     validateNxProjectNames(root) +
     validateExplicitTaskInputs(projectTargets) +
     validateAggregateMemberCache(projectTargets) +

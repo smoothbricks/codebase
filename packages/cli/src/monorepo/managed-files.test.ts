@@ -296,8 +296,9 @@ describe('managed raw files', () => {
     const temp = await mkdtemp(join(tmpdir(), 'smoo-github-bootstrap-'));
     const bin = join(temp, 'bin');
     await mkdir(bin);
-    // The workspace the emulated shell enters: a checkout of its own with ttsc-env.sh copied in, so the cache
-    // that ttsc-env.sh computes lands under temp rather than in the checkout the suite runs from.
+    // The workspace the emulated shell enters: a checkout of its own with ttsc-env.sh copied in, and a HOME of its
+    // own, so the caches that ttsc-env.sh names land under temp rather than in the checkout and HOME the suite runs in.
+    const home = join(temp, 'home');
     const checkout = join(temp, 'checkout');
     await mkdir(join(checkout, 'tooling', 'direnv'), { recursive: true });
     await copyFile(
@@ -350,6 +351,7 @@ describe('managed raw files', () => {
               PATH: `${bin}:${Bun.env.PATH ?? ''}`,
               // The inherited environment may name the real checkout's cache: every ttsc path points at this fixture.
               NX_WORKSPACE_ROOT_PATH: checkout,
+              HOME: home,
               TTSC_CACHE_DIR: cache.input,
               TTSC_GO_CACHE_DIR: '',
             },

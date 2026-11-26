@@ -713,13 +713,19 @@ nothing when nothing changed:
 - Shell secrets resolve only for an entry that installs; see below.
 - `tooling/direnv/ttsc-env.sh`, sourced by shell entry and by the git hooks, names the checkout's own native compiler in
   `TTSC_TSGO_BINARY`, caches ttsc's plugin binaries in the checkout's `.cache/ttsc-plugins` (the output a repository's
-  plugin build target declares) and its Go build cache in `.cache/ttsc/go-build`. `GOFLAGS` carries `-trimpath`.
-  `CGO_ENABLED` defaults to `0` because the plugins ttsc builds are pure Go, and with cgo off neither ttsc's key nor the
-  build asks the C toolchain; an inherited value wins. A cache the caller already exported wins, so a host or a sandbox
-  that shares these caches across checkouts sets them itself, unless the caller's environment was bound for another
-  workspace (its `NX_WORKSPACE_ROOT_PATH` names another directory): that workspace's caches are dropped. Go's own caches
-  keep Go's defaults. Sourced from a directory that is not a workspace root, it refuses rather than cache beside that
-  directory.
+  plugin build target declares) and keeps ttsc's Go build cache in the host's `$HOME/.cache/ttsc/go-build`: one cache
+  serves every checkout's shared Go dependencies while each plugin host's own packages still compile per checkout, and
+  `ttsc clean` empties that directory and never the host's `GOCACHE`. A repository shares it into its cowshed sandboxes
+  with `[caches] home = [".cache/ttsc"]` in main's `.cowshed.toml`. `smoo monorepo check` and `smoo monorepo validate`
+  refuse `tooling/direnv/ttsc-env.sh` beside a `.cowshed.toml` that does not share `.cache/ttsc`; a repository cowshed
+  adopts without a `.cowshed.toml` is not judged and gets a per-workspace cold Go build cache for ttsc until it adds
+  `[caches] home = [".cache/ttsc"]`. `GOFLAGS` carries `-trimpath`. `CGO_ENABLED` defaults to `0` because the plugins
+  ttsc builds are pure Go, and with cgo off neither ttsc's key nor the build asks the C toolchain; an inherited value
+  wins. A cache the caller already exported wins, so a host or a sandbox that places these caches elsewhere sets them
+  itself, unless the caller's environment was bound for another workspace (its `NX_WORKSPACE_ROOT_PATH` names another
+  directory): that workspace's caches are dropped. Go's own caches keep Go's defaults. Sourced from a directory that is
+  not a workspace root, it refuses rather than cache beside that directory, and with neither `HOME` nor
+  `TTSC_GO_CACHE_DIR` it refuses rather than guess the host's.
 - `SMOO_TYPECHECK_TSC` names the native compiler the inferred `typecheck` and `typecheck-tests` targets run.
   `devenv.smoo.nix` builds it from one pinned TypeScript source revision with `go_1_27` from the `nixpkgs-go` input. The
   targets run it directly rather than through ttsc, whose auto-loaded transform plugins (typia) check inside their own
@@ -1245,17 +1251,17 @@ Managed CI setup is split across local composite actions:
   archive, and the stamp is the input devenv's `smoo:install` watches, so a restored stamp beside a restored `.devenv`
   task state would skip the install that recreates those links. A `!node_modules/.smoo-install` cache path cannot do
   this, because actions/cache archives a listed directory whole and ignores excludes inside it.
-- `cache-ttsc-plugins` restores the compiled ttsc plugin binaries (`.cache/ttsc-plugins/plugins`) in `setup-devenv` and
-  saves them when `save-nix-devenv` runs at the end of the job. ttsc names each entry by a hash of what it was compiled
-  from and runs only an entry whose name it computes for the checkout, so the restore falls back to the newest cache of
-  the runner's OS and architecture: a release commit rewrites `bun.lock` and moves the exact key without changing a
-  plugin input. A composite action has no post step, so the save is a second call of the action. It runs after a red job
-  too, only when the restore was not an exact hit, and under the key that restore looked up, because the release steps
-  can have rewritten `bun.lock` by then. First it drops the entries the job did not use, judged by the `.last-used`
-  stamp ttsc writes on every hit and build: ttsc evicts only from a cache it owns, not one named by `TTSC_CACHE_DIR`, so
-  every earlier generation would otherwise ride along into each new key. A job that used no entry saves nothing, so an
-  emptied cache is never pinned to the exact key. A workflow that runs `setup-devenv` without `save-nix-devenv` restores
-  the plugins and never saves them.
+- `cache-ttsc-plugins` restores the compiled ttsc plugin binaries (`.cache/ttsc-plugins/plugins`, the store the shell
+  names) in `setup-devenv` and saves them when `save-nix-devenv` runs at the end of the job. ttsc names each entry by a
+  hash of what it was compiled from and runs only an entry whose name it computes for the checkout, so the restore falls
+  back to the newest cache of the runner's OS and architecture: a release commit rewrites `bun.lock` and moves the exact
+  key without changing a plugin input. A composite action has no post step, so the save is a second call of the action.
+  It runs after a red job too, only when the restore was not an exact hit, and under the key that restore looked up,
+  because the release steps can have rewritten `bun.lock` by then. First it drops the entries the job did not use,
+  judged by the `.last-used` stamp ttsc writes on every hit and build: ttsc evicts only from a cache it owns, not one
+  named by `TTSC_CACHE_DIR`, so every earlier generation would otherwise ride along into each new key. A job that used
+  no entry saves nothing, so an emptied cache is never pinned to the exact key. A workflow that runs `setup-devenv`
+  without `save-nix-devenv` restores the plugins and never saves them.
 
 The cache split is intentional. The store segment is large. Its key hashes the pins (`devenv.lock`, `devenv.yaml`), then
 the files that choose and override packages on top of them (`devenv.nix`, `devenv.smoo.nix`, `nixpkgs-overlay/`), and a

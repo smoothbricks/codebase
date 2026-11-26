@@ -320,65 +320,6 @@ fn retained_mutable_state_resumes_without_overwriting_different_bytes() {
     assert_eq!(fs::read(target.join("a.sqlite")).unwrap(), vec![b'y'; 11]);
 }
 
-/// Explicit selection follows an existing declared build-state link. Divergent legacy state
-/// stays whole beneath it; current bookkeeping, the fixed link and another main stay unchanged.
-#[test]
-fn an_explicit_toolchain_placement_preserves_the_selected_build_state() {
-    let fixture = Fixture::new();
-    let selected = fixture.root.join("selected/.cache/ttsc");
-    let build = fixture.root.join("build/declared/.cache/ttsc");
-    fs::create_dir_all(selected.parent().unwrap()).unwrap();
-    fs::create_dir_all(&build).unwrap();
-    symlink(&build, &selected).unwrap();
-    fixture.file(&selected.join("plugins/same/.last-used"), 3);
-    let other = fixture.root.join("other/.cache/ttsc");
-    fixture.file(&other.join("plugins/other/plugin"), 4);
-    let source = fixture.volume.join("ttsc");
-    fixture.file(&source.join("plugins/same/.last-used"), 5);
-    fixture.file(&source.join("go-build/aa/old-d"), 7);
-    let bytes = tree_bytes(&source).unwrap();
-    let plan = Plan {
-        steps: vec![Step::Move {
-            placement: Placement {
-                label: "selected declared ttsc build state (retained)".to_owned(),
-                volume: source,
-                host: selected.join("cowshed-retired/ttsc"),
-                merge: Merge::Preserve,
-                owner: None,
-            },
-            replace_link: false,
-            bytes,
-        }],
-        leftovers: Vec::new(),
-    };
-    let report = execute(&fixture.layout(&[]), &plan).unwrap();
-    assert_eq!(
-        (report.caches[0].moved_bytes, report.caches[0].dropped_bytes),
-        (12, 0)
-    );
-    assert_eq!(fs::read_link(&selected).unwrap(), build);
-    assert_eq!(
-        fs::read(selected.join("plugins/same/.last-used"))
-            .unwrap()
-            .len(),
-        3
-    );
-    assert_eq!(
-        fs::read(selected.join("cowshed-retired/ttsc/plugins/same/.last-used"))
-            .unwrap()
-            .len(),
-        5
-    );
-    assert!(
-        selected
-            .join("cowshed-retired/ttsc/go-build/aa/old-d")
-            .is_file()
-    );
-    assert!(other.join("plugins/other/plugin").is_file());
-    assert!(!fixture.home.join(".cache/ttsc").exists());
-    assert!(holds_only_marker(&fixture.volume).unwrap());
-}
-
 /// A sealed host cache refuses publication; rebuildability does not authorize losing the
 /// only copy. The source survives the error and the host's permissions are never relaxed.
 #[test]
