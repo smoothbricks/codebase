@@ -1,0 +1,126 @@
+{
+  "packages": [
+    {
+      "id": "path+file://<FIXTURE_ROOT>/workspace/packages/app#0.1.0",
+      "name": "app",
+      "version": "0.1.0",
+      "source": null,
+      "manifest_path": "<FIXTURE_ROOT>/workspace/packages/app/Cargo.toml",
+      "targets": [
+        {
+          "src_path": "<FIXTURE_ROOT>/workspace/packages/app/src/main.rs"
+        }
+      ],
+      "governing_manifest_path": "<FIXTURE_ROOT>/workspace/Cargo.toml"
+    },
+    {
+      "id": "path+file://<FIXTURE_ROOT>/workspace/crates/bridge#0.1.0",
+      "name": "bridge",
+      "version": "0.1.0",
+      "source": null,
+      "manifest_path": "<FIXTURE_ROOT>/workspace/crates/bridge/Cargo.toml",
+      "targets": [
+        {
+          "src_path": "<FIXTURE_ROOT>/workspace/crates/bridge/src/lib.rs"
+        }
+      ],
+      "governing_manifest_path": "<FIXTURE_ROOT>/workspace/Cargo.toml"
+    },
+    {
+      "id": "path+file://<FIXTURE_ROOT>/external#0.1.0",
+      "name": "external",
+      "version": "0.1.0",
+      "source": null,
+      "manifest_path": "<FIXTURE_ROOT>/external/Cargo.toml",
+      "targets": [
+        {
+          "src_path": "<FIXTURE_ROOT>/external/src/lib.rs"
+        }
+      ],
+      "governing_manifest_path": "<FIXTURE_ROOT>/external/Cargo.toml"
+    },
+    {
+      "id": "path+file://<FIXTURE_ROOT>/workspace/crates/leaf#0.1.0",
+      "name": "leaf",
+      "version": "0.1.0",
+      "source": null,
+      "manifest_path": "<FIXTURE_ROOT>/workspace/crates/leaf/Cargo.toml",
+      "targets": [
+        {
+          "src_path": "<FIXTURE_ROOT>/workspace/crates/leaf/src/lib.rs"
+        }
+      ],
+      "governing_manifest_path": "<FIXTURE_ROOT>/workspace/Cargo.toml"
+    },
+    {
+      "id": "path+file://<FIXTURE_ROOT>/workspace/crates/unrelated#0.1.0",
+      "name": "unrelated",
+      "version": "0.1.0",
+      "source": null,
+      "manifest_path": "<FIXTURE_ROOT>/workspace/crates/unrelated/Cargo.toml",
+      "targets": [
+        {
+          "src_path": "<FIXTURE_ROOT>/workspace/crates/unrelated/src/lib.rs"
+        }
+      ],
+      "governing_manifest_path": "<FIXTURE_ROOT>/workspace/Cargo.toml"
+    }
+  ],
+  "resolve": {
+    "nodes": [
+      {
+        "id": "path+file://<FIXTURE_ROOT>/workspace/packages/app#0.1.0",
+        "deps": [
+          {
+            "pkg": "path+file://<FIXTURE_ROOT>/workspace/crates/bridge#0.1.0",
+            "dep_kinds": [
+              {
+                "kind": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "path+file://<FIXTURE_ROOT>/workspace/crates/bridge#0.1.0",
+        "deps": [
+          {
+            "pkg": "path+file://<FIXTURE_ROOT>/external#0.1.0",
+            "dep_kinds": [
+              {
+                "kind": null
+              }
+            ]
+          },
+          {
+            "pkg": "path+file://<FIXTURE_ROOT>/workspace/crates/leaf#0.1.0",
+            "dep_kinds": [
+              {
+                "kind": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "path+file://<FIXTURE_ROOT>/external#0.1.0",
+        "deps": []
+      },
+      {
+        "id": "path+file://<FIXTURE_ROOT>/workspace/crates/leaf#0.1.0",
+        "deps": []
+      },
+      {
+        "id": "path+file://<FIXTURE_ROOT>/workspace/crates/unrelated#0.1.0",
+        "deps": []
+      }
+    ]
+  },
+  "workspace_members": [
+    "path+file://<FIXTURE_ROOT>/workspace/packages/app#0.1.0",
+    "path+file://<FIXTURE_ROOT>/workspace/crates/bridge#0.1.0",
+    "path+file://<FIXTURE_ROOT>/workspace/crates/leaf#0.1.0",
+    "path+file://<FIXTURE_ROOT>/workspace/crates/unrelated#0.1.0"
+  ],
+  "workspace_root": "<FIXTURE_ROOT>/workspace"
+}

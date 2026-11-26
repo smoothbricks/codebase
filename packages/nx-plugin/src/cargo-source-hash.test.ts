@@ -17,55 +17,153 @@ import {
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
+import { parseCargoMetadata } from '@smoothbricks/build-inputs/cargo-closure';
 import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
+import { assertRealKeyMatchesCacheKeyLaws } from './__tests__/cargo-key-law-binding.js';
+import { loadRecordedCargoResolve, writeWorkspaceCargoFixtureFiles } from './__tests__/recorded-cargo-metadata.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { indexedCargoSources } from './cargo-closure-input.js';
-import { compiledInFiles, hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
+import {
+  type CargoResolve,
+  cargoFromMetadata,
+  compiledInFiles,
+  hashCargoInputs,
+  hashCargoPathInputs,
+  resolutionKey,
+} from './cargo-source-hash.js';
 
 useFixtureCargoHome();
 
-it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx rooted at %s', async (nxDirectory) => {
-  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-'));
-  const app = join(root, 'app');
-  const manifest = join(app, 'Cargo.toml');
-  const nxRoot = join(root, nxDirectory);
-  async function put(path: string, text: string): Promise<void> {
-    const file = join(root, path);
-    await mkdir(dirname(file), { recursive: true });
-    await writeFile(file, text);
+/** Builds a validated {@link CargoResolve} from in-memory metadata without spawning Cargo. */
+function resolveFrom(document: unknown): CargoResolve {
+  return cargoFromMetadata(parseCargoMetadata(JSON.stringify(document)));
+}
+
+async function put(root: string, path: string, text: string): Promise<void> {
+  const file = join(root, path);
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, text);
+}
+
+/** Writes the standard fixture workspace and locks it with real Cargo (for real-process boundary tests only). */
+async function lockedWorkspaceCargoFixture(root: string) {
+  const fixture = await writeWorkspaceCargoFixtureFiles(root);
+  execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', fixture.manifest], { stdio: 'pipe' });
+  return fixture;
+}
+
+it('hashCargoInputs satisfies key_is_pure (cache_key.bend:790) and key_moves_with_input (cache_key.bend:828) differentially against cache-key-model', async () => {
+  // Two sibling checkouts of the recorded workspace share identical ancestors; model items listed in `xs` map to `.rs`
+  // inputs of the `external` package, and items absent from `xs` map to non-input `.txt` files beside them.
+  const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-laws-')));
+  try {
+    const first = await writeWorkspaceCargoFixtureFiles(join(root, 'c1'));
+    const second = await writeWorkspaceCargoFixtureFiles(join(root, 'c2'));
+    const cargo1 = loadRecordedCargoResolve(first.root);
+    const cargo2 = loadRecordedCargoResolve(second.root);
+    const drawn1 = join(first.root, 'external/src/drawn');
+    const drawn2 = join(second.root, 'external/src/drawn');
+
+    await assertRealKeyMatchesCacheKeyLaws({
+      name: 'hashCargoInputs',
+      drawsPerSeed: 15,
+      evaluate: async ({ entries }) => {
+        await Promise.all([rm(drawn1, { recursive: true, force: true }), rm(drawn2, { recursive: true, force: true })]);
+        await Promise.all([mkdir(drawn1, { recursive: true }), mkdir(drawn2, { recursive: true })]);
+        await Promise.all(
+          entries.flatMap(({ slug, inKey, bytes1, bytes2 }) => {
+            const filename = inKey ? `${slug}.rs` : `${slug}.txt`;
+            return [writeFile(join(drawn1, filename), bytes1), writeFile(join(drawn2, filename), bytes2)];
+          }),
+        );
+        return Promise.all([hashCargoInputs(cargo1, first.workspace), hashCargoInputs(cargo2, second.workspace)]);
+      },
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
+});
+
+it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx rooted at %s', async (nxDirectory) => {
+  const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-')));
+  const app = join(root, 'app');
+  const nxRoot = join(root, nxDirectory);
   try {
     await put(
+      root,
       'app/Cargo.toml',
       '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nbridge={path="../external/bridge"}\n[workspace]\n',
     );
-    await put('app/src/lib.rs', 'pub fn run() {}\n');
+    await put(root, 'app/src/lib.rs', 'pub fn run() {}\n');
     await put(
+      root,
       'external/Cargo.toml',
       '[workspace]\nmembers=["bridge","leaf"]\nresolver="2"\n[workspace.package]\nedition="2021"\n',
     );
     await put(
+      root,
       'external/bridge/Cargo.toml',
       '[package]\nname="bridge"\nversion="0.1.0"\nedition.workspace=true\n[dependencies]\nleaf={path="../leaf"}\n',
     );
-    await put('external/bridge/src/lib.rs', 'pub fn bridge() {}\n');
-    await put('external/leaf/Cargo.toml', '[package]\nname="leaf"\nversion="0.1.0"\nedition.workspace=true\n');
-    await put('external/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 1 }\n');
-    execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe' });
-    const initial = await hashCargoPathInputs(manifest, nxRoot);
-    await put('external/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 2 }\n');
-    const sourceChanged = await hashCargoPathInputs(manifest, nxRoot);
+    await put(root, 'external/bridge/src/lib.rs', 'pub fn bridge() {}\n');
+    await put(root, 'external/leaf/Cargo.toml', '[package]\nname="leaf"\nversion="0.1.0"\nedition.workspace=true\n');
+    await put(root, 'external/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 1 }\n');
+    const cargo = resolveFrom({
+      packages: [
+        {
+          id: 'app',
+          name: 'app',
+          version: '0.1.0',
+          source: null,
+          manifest_path: join(app, 'Cargo.toml'),
+          targets: [{ src_path: join(app, 'src/lib.rs') }],
+          governing_manifest_path: join(app, 'Cargo.toml'),
+        },
+        {
+          id: 'bridge',
+          name: 'bridge',
+          version: '0.1.0',
+          source: null,
+          manifest_path: join(root, 'external/bridge/Cargo.toml'),
+          targets: [{ src_path: join(root, 'external/bridge/src/lib.rs') }],
+          governing_manifest_path: join(root, 'external/Cargo.toml'),
+        },
+        {
+          id: 'leaf',
+          name: 'leaf',
+          version: '0.1.0',
+          source: null,
+          manifest_path: join(root, 'external/leaf/Cargo.toml'),
+          targets: [{ src_path: join(root, 'external/leaf/src/lib.rs') }],
+          governing_manifest_path: join(root, 'external/Cargo.toml'),
+        },
+      ],
+      resolve: {
+        nodes: [
+          { id: 'app', deps: [{ pkg: 'bridge', dep_kinds: [{ kind: null }] }] },
+          { id: 'bridge', deps: [{ pkg: 'leaf', dep_kinds: [{ kind: null }] }] },
+          { id: 'leaf', deps: [] },
+        ],
+      },
+      workspace_members: ['app'],
+      workspace_root: app,
+    });
+
+    const initial = await hashCargoInputs(cargo, nxRoot);
+    await put(root, 'external/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 2 }\n');
+    const sourceChanged = await hashCargoInputs(cargo, nxRoot);
     expect(sourceChanged).not.toBe(initial);
     await put(
+      root,
       'external/Cargo.toml',
       '[workspace]\nmembers=["bridge","leaf"]\nresolver="2"\n[workspace.package]\nedition="2024"\n',
     );
-    const inheritedChanged = await hashCargoPathInputs(manifest, nxRoot);
+    const inheritedChanged = await hashCargoInputs(cargo, nxRoot);
     expect(inheritedChanged).not.toBe(sourceChanged);
-    await put('external/leaf/target/noise.rs', 'uncompiled build output');
-    expect(await hashCargoPathInputs(manifest, nxRoot)).toBe(inheritedChanged);
+    await put(root, 'external/leaf/target/noise.rs', 'uncompiled build output');
+    expect(await hashCargoInputs(cargo, nxRoot)).toBe(inheritedChanged);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -89,41 +187,67 @@ it('identical external inputs hash equally at different checkout depths, with by
       '[package]\nname="consumer"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nshared={path=' +
       JSON.stringify(shared) +
       '}\n[workspace]\n';
-    for (const workspace of roots) {
-      await mkdir(join(workspace, 'src'), { recursive: true });
-      await writeFile(join(workspace, 'Cargo.toml'), manifest);
-      await writeFile(join(workspace, 'src/lib.rs'), `pub fn value() -> u8 { shared::value() }\n${include}`);
-      await symlink(join(shared, 'src'), join(workspace, 'linked-src'), 'dir');
-      execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(workspace, 'Cargo.toml')], {
-        stdio: 'pipe',
-      });
-    }
-    expect(await readFile(join(roots[0], 'Cargo.lock'), 'utf8')).toBe(
-      await readFile(join(roots[1], 'Cargo.lock'), 'utf8'),
+    const pairs = await Promise.all(
+      roots.map(async (workspace): Promise<readonly [string, CargoResolve]> => {
+        await mkdir(join(workspace, 'src'), { recursive: true });
+        await writeFile(join(workspace, 'Cargo.toml'), manifest);
+        await writeFile(join(workspace, 'src/lib.rs'), `pub fn value() -> u8 { shared::value() }\n${include}`);
+        await symlink(join(shared, 'src'), join(workspace, 'linked-src'), 'dir');
+        return [
+          workspace,
+          resolveFrom({
+            packages: [
+              {
+                id: 'consumer',
+                name: 'consumer',
+                version: '0.1.0',
+                source: null,
+                manifest_path: join(workspace, 'Cargo.toml'),
+                targets: [{ src_path: join(workspace, 'src/lib.rs') }],
+                governing_manifest_path: join(workspace, 'Cargo.toml'),
+              },
+              {
+                id: 'shared',
+                name: 'shared',
+                version: '0.1.0',
+                source: null,
+                manifest_path: join(shared, 'Cargo.toml'),
+                targets: [{ src_path: join(shared, 'src/lib.rs') }],
+                governing_manifest_path: join(shared, 'Cargo.toml'),
+              },
+            ],
+            resolve: {
+              nodes: [
+                { id: 'consumer', deps: [{ pkg: 'shared', dep_kinds: [{ kind: null }] }] },
+                { id: 'shared', deps: [] },
+              ],
+            },
+            workspace_members: ['consumer'],
+            workspace_root: workspace,
+          }),
+        ];
+      }),
     );
+    const hashBoth = (options?: { includeWorkspace?: boolean }) =>
+      Promise.all(pairs.map(([workspace, cargo]) => hashCargoInputs(cargo, workspace, options)));
+
     const before: string[] = [];
     const after: string[] = [];
     for (const includeWorkspace of [false, true]) {
-      const hashes = await Promise.all(
-        roots.map((workspace) => hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace, { includeWorkspace })),
-      );
+      const hashes = await hashBoth({ includeWorkspace });
       expect(hashes[0]).toBeDefined();
       expect(hashes[1]).toBe(hashes[0]);
       before.push(hashes.join(','));
     }
     await writeFile(join(root, 'data.txt'), 'shared-data-two');
     for (const [index, includeWorkspace] of [false, true].entries()) {
-      const hashes = await Promise.all(
-        roots.map((workspace) => hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace, { includeWorkspace })),
-      );
+      const hashes = await hashBoth({ includeWorkspace });
       expect(hashes[1]).toBe(hashes[0]);
       expect(hashes.join(',')).not.toBe(before[index]);
       after.push(hashes.join(','));
     }
     await rename(join(shared, 'src/extra.rs'), join(shared, 'src/renamed.rs'));
-    const renamed = await Promise.all(
-      roots.map((workspace) => hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace)),
-    );
+    const renamed = await hashBoth();
     expect(renamed[1]).toBe(renamed[0]);
     expect(renamed.join(',')).not.toBe(after[0]);
   } finally {
@@ -208,51 +332,24 @@ it('failed runtime inputs have the same key at different checkout paths and stil
   }
 });
 
-async function workspaceCargoFixture(root: string) {
-  const workspace = join(root, 'workspace');
-  const manifest = join(workspace, 'Cargo.toml');
-  const sources = {
-    'workspace/Cargo.toml':
-      '[workspace]\nmembers=["packages/app","crates/bridge","crates/leaf","crates/unrelated"]\nresolver="2"\n',
-    'workspace/packages/app/Cargo.toml':
-      '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nbridge={path="../../crates/bridge"}\n',
-    'workspace/packages/app/src/main.rs': 'fn main() { println!("{}", bridge::answer()); }\n',
-    'workspace/crates/bridge/Cargo.toml':
-      '[package]\nname="bridge"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nleaf={path="../leaf"}\nexternal={path="../../../external"}\n',
-    'workspace/crates/bridge/src/lib.rs': 'pub fn answer() -> u8 { leaf::answer() + external::answer() }\n',
-    'workspace/crates/leaf/Cargo.toml': '[package]\nname="leaf"\nversion="0.1.0"\nedition="2021"\n',
-    'workspace/crates/leaf/src/lib.rs': 'pub fn answer() -> u8 { 1 }\n',
-    'workspace/crates/unrelated/Cargo.toml': '[package]\nname="unrelated"\nversion="0.1.0"\nedition="2021"\n',
-    'workspace/crates/unrelated/src/lib.rs': 'pub fn unrelated() -> u8 { 3 }\n',
-    'external/Cargo.toml': '[package]\nname="external"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
-    'external/src/lib.rs': 'pub fn answer() -> u8 { 10 }\n',
-  };
-  for (const [path, text] of Object.entries(sources)) {
-    const file = join(root, path);
-    await mkdir(dirname(file), { recursive: true });
-    await writeFile(file, text);
-  }
-  execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe' });
-  return { workspace, manifest, leafSource: join(workspace, 'crates/leaf/src/lib.rs') };
-}
-
 it('include-workspace hashes in-workspace transitive source edits without changing the external-only contract', async () => {
   const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-workspace-'));
   try {
-    const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
-    const external = await hashCargoPathInputs(manifest, workspace);
-    const included = await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true });
-    expect(await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })).toBe(included);
+    const { root: canonical, workspace, leafSource } = await writeWorkspaceCargoFixtureFiles(root);
+    const cargo = loadRecordedCargoResolve(canonical);
+    const external = await hashCargoInputs(cargo, workspace);
+    const included = await hashCargoInputs(cargo, workspace, { includeWorkspace: true });
+    expect(await hashCargoInputs(cargo, workspace, { includeWorkspace: true })).toBe(included);
 
     await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
-    expect(await hashCargoPathInputs(manifest, workspace)).toBe(external);
-    const changed = await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true });
+    expect(await hashCargoInputs(cargo, workspace)).toBe(external);
+    const changed = await hashCargoInputs(cargo, workspace, { includeWorkspace: true });
     expect(changed).not.toBe(included);
-    expect(await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })).toBe(changed);
+    expect(await hashCargoInputs(cargo, workspace, { includeWorkspace: true })).toBe(changed);
 
-    await writeFile(join(root, 'external/src/lib.rs'), 'pub fn answer() -> u8 { 20 }\n');
-    expect(await hashCargoPathInputs(manifest, workspace)).not.toBe(external);
-    expect(await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })).not.toBe(changed);
+    await writeFile(join(canonical, 'external/src/lib.rs'), 'pub fn answer() -> u8 { 20 }\n');
+    expect(await hashCargoInputs(cargo, workspace)).not.toBe(external);
+    expect(await hashCargoInputs(cargo, workspace, { includeWorkspace: true })).not.toBe(changed);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -266,67 +363,101 @@ it.each(['external', 'workspace/node_modules/external'])(
     const manifest = join(workspace, 'Cargo.toml');
     const external = join(root, externalDirectory);
     const externalManifest = join(external, 'Cargo.toml');
-    async function put(file: string, text: string): Promise<void> {
-      await mkdir(dirname(file), { recursive: true });
-      await writeFile(file, text);
-    }
     const dependencyManifest = (name: string) =>
       '[package]\nname="external"\nversion="0.1.0"\nedition="2021"\n[workspace]\n' +
       `[dependencies]\nside={path=${JSON.stringify(relative(external, join(root, name)))}}\n`;
     const sideManifest = '[package]\nname="side"\nversion="0.1.0"\nedition="2021"\n[workspace]\n';
     const timestamp = new Date(1_700_000_000_000);
+    const resolveSide = (side: 'left' | 'rght'): CargoResolve =>
+      resolveFrom({
+        packages: [
+          {
+            id: 'app',
+            name: 'app',
+            version: '0.1.0',
+            source: null,
+            manifest_path: manifest,
+            targets: [{ src_path: join(workspace, 'src/lib.rs') }],
+            governing_manifest_path: manifest,
+          },
+          {
+            id: 'external',
+            name: 'external',
+            version: '0.1.0',
+            source: null,
+            manifest_path: externalManifest,
+            targets: [{ src_path: join(external, 'src/lib.rs') }],
+            governing_manifest_path: externalManifest,
+          },
+          {
+            id: 'side',
+            name: 'side',
+            version: '0.1.0',
+            source: null,
+            manifest_path: join(root, side, 'Cargo.toml'),
+            targets: [{ src_path: join(root, side, 'src/lib.rs') }],
+            governing_manifest_path: join(root, side, 'Cargo.toml'),
+          },
+        ],
+        resolve: {
+          nodes: [
+            { id: 'app', deps: [{ pkg: 'external', dep_kinds: [{ kind: null }] }] },
+            { id: 'external', deps: [{ pkg: 'side', dep_kinds: [{ kind: null }] }] },
+            { id: 'side', deps: [] },
+          ],
+        },
+        workspace_members: ['app'],
+        workspace_root: workspace,
+      });
     try {
-      // A nested installed workspace must not be auto-enrolled as a member of this one.
       await put(
-        manifest,
+        root,
+        'workspace/Cargo.toml',
         '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[workspace]\nexclude=["node_modules/external"]\n' +
           `[dependencies]\nexternal={path=${JSON.stringify(relative(workspace, external))}}\n`,
       );
-      await put(join(workspace, 'src/lib.rs'), 'pub fn app() {}\n');
-      await put(externalManifest, dependencyManifest('left'));
-      await put(join(external, 'src/lib.rs'), 'pub fn external() {}\n');
+      await put(root, 'workspace/src/lib.rs', 'pub fn app() {}\n');
+      await put(root, `${externalDirectory}/Cargo.toml`, dependencyManifest('left'));
+      await put(root, `${externalDirectory}/src/lib.rs`, 'pub fn external() {}\n');
       for (const side of ['left', 'rght']) {
-        await put(join(root, side, 'Cargo.toml'), sideManifest);
-        await put(join(root, side, 'src/lib.rs'), 'pub fn side() -> u8 { 1 }\n');
+        await put(root, `${side}/Cargo.toml`, sideManifest);
+        await put(root, `${side}/src/lib.rs`, 'pub fn side() -> u8 { 1 }\n');
       }
       execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
-      await put(join(workspace, '.gitignore'), 'node_modules/\n.nx/\n');
-      execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe' });
+      await put(root, 'workspace/.gitignore', 'node_modules/\n.nx/\n');
       await utimes(externalManifest, timestamp, timestamp);
       const before = await stat(externalManifest);
-      const lock = await readFile(join(workspace, 'Cargo.lock'), 'utf8');
-      const initialResolve = await readCargoResolve(manifest, workspace);
-      expect(initialResolve.local.map((pkg) => pkg.manifest)).toContain(join(root, 'left/Cargo.toml'));
-      const initial = await hashCargoPathInputs(manifest, workspace);
+      const leftResolve = resolveSide('left');
+      const indexed = new Set(['Cargo.toml']);
+      const keyBefore = resolutionKey(workspace, manifest, leftResolve, indexed);
+      const initial = await hashCargoInputs(leftResolve, workspace);
 
-      // Both packages have the same name/version, so the locked graph stays
-      // valid. Only the dependency manifest's bytes identify its new location.
+      // Both packages have the same name/version, so only the dependency manifest's bytes identify its new location.
       await writeFile(externalManifest, dependencyManifest('rght'));
       await utimes(externalManifest, timestamp, timestamp);
       const after = await stat(externalManifest);
       expect(after.size).toBe(before.size);
       expect(after.mtimeMs).toBe(before.mtimeMs);
-      const changedResolve = await readCargoResolve(manifest, workspace);
-      const manifests = changedResolve.local.map((pkg) => pkg.manifest);
-      expect(manifests).toContain(join(root, 'rght/Cargo.toml'));
-      expect(manifests).not.toContain(join(root, 'left/Cargo.toml'));
-      expect(await readFile(join(workspace, 'Cargo.lock'), 'utf8')).toBe(lock);
-      const changed = await hashCargoPathInputs(manifest, workspace);
+      expect(resolutionKey(workspace, manifest, leftResolve, indexed)).not.toBe(keyBefore);
+
+      const rightResolve = resolveSide('rght');
+      const changed = await hashCargoInputs(rightResolve, workspace);
       expect(changed).not.toBe(initial);
 
       await writeFile(join(root, 'left/src/lib.rs'), 'pub fn side() -> u8 { 2 }\n');
-      expect(await hashCargoPathInputs(manifest, workspace)).toBe(changed);
+      expect(await hashCargoInputs(rightResolve, workspace)).toBe(changed);
+
       const source = join(root, 'rght/src/lib.rs');
       const sourceBefore = await stat(source);
       await writeFile(source, 'pub fn side() -> u8 { 2 }\n');
       await utimes(source, sourceBefore.atime, sourceBefore.mtime);
-      const sourceChanged = await hashCargoPathInputs(manifest, workspace);
+      const sourceChanged = await hashCargoInputs(rightResolve, workspace);
       expect(sourceChanged).not.toBe(changed);
 
       await rm(join(root, 'rght/Cargo.toml'));
-      await expect(hashCargoPathInputs(manifest, workspace)).rejects.toThrow('Locked offline Cargo resolution failed');
-      await put(join(root, 'rght/Cargo.toml'), sideManifest);
-      expect(await hashCargoPathInputs(manifest, workspace)).toBe(sourceChanged);
+      await expect(hashCargoInputs(rightResolve, workspace)).rejects.toThrow('ENOENT');
+      await put(root, 'rght/Cargo.toml', sideManifest);
+      expect(await hashCargoInputs(rightResolve, workspace)).toBe(sourceChanged);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -336,7 +467,7 @@ it.each(['external', 'workspace/node_modules/external'])(
 it('include-workspace CLI accepts an optional manifest and refuses unsupported arguments', async () => {
   const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-cli-'));
   try {
-    const { workspace, leafSource } = await workspaceCargoFixture(root);
+    const { workspace, leafSource } = await lockedWorkspaceCargoFixture(root);
     const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
     const run = async (args: string[]) => {
       // Bun.spawn's default environment is the one this process started with,
@@ -375,7 +506,7 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
     expect(closure.stdout).not.toBe(changed.stdout);
     expect(await run(['--closure', 'crates/leaf', '--include-workspace'])).toEqual(closure);
 
-    for (const args of [
+    const invalidArgs: string[][] = [
       ['--unknown'],
       ['--include-workspace', '--unknown'],
       ['Cargo.toml', '--include-workspace'],
@@ -384,8 +515,9 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
       ['--closure'],
       ['--closure', '--include-workspace'],
       ['--closure', 'crates/leaf', '--closure', 'packages/app'],
-    ]) {
-      const refused = await run(args);
+    ];
+    const refusals = await Promise.all(invalidArgs.map((args) => run(args)));
+    for (const refused of refusals) {
       expect(refused.exitCode, refused.stderr).toBe(2);
       expect(refused.stdout).toBe('cargo-input-invalid-arguments\n');
       expect(refused.stderr).toBe('');
@@ -398,36 +530,37 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
 it('closure hashes the dependency closure of one directory and ignores unrelated workspace members', async () => {
   const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-closure-'));
   try {
-    const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
+    const { root: canonical, workspace, leafSource } = await writeWorkspaceCargoFixtureFiles(root);
+    const cargo = loadRecordedCargoResolve(canonical);
     const app = { includeWorkspace: true, closure: join(workspace, 'packages/app') };
     const leaf = { includeWorkspace: true, closure: join(workspace, 'crates/leaf') };
-    const initial = await hashCargoPathInputs(manifest, workspace, app);
-    const leafOnly = await hashCargoPathInputs(manifest, workspace, leaf);
-    const whole = await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true });
+    const initial = await hashCargoInputs(cargo, workspace, app);
+    const leafOnly = await hashCargoInputs(cargo, workspace, leaf);
+    const whole = await hashCargoInputs(cargo, workspace, { includeWorkspace: true });
 
     await writeFile(join(workspace, 'crates/unrelated/src/lib.rs'), 'pub fn unrelated() -> u8 { 4 }\n');
-    expect(await hashCargoPathInputs(manifest, workspace, app)).toBe(initial);
-    expect(await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })).not.toBe(whole);
+    expect(await hashCargoInputs(cargo, workspace, app)).toBe(initial);
+    expect(await hashCargoInputs(cargo, workspace, { includeWorkspace: true })).not.toBe(whole);
 
     await writeFile(join(workspace, 'crates/bridge/src/lib.rs'), 'pub fn answer() -> u8 { leaf::answer() }\n');
-    const bridgeChanged = await hashCargoPathInputs(manifest, workspace, app);
+    const bridgeChanged = await hashCargoInputs(cargo, workspace, app);
     expect(bridgeChanged).not.toBe(initial);
-    expect(await hashCargoPathInputs(manifest, workspace, leaf)).toBe(leafOnly);
+    expect(await hashCargoInputs(cargo, workspace, leaf)).toBe(leafOnly);
 
     await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
-    expect(await hashCargoPathInputs(manifest, workspace, app)).not.toBe(bridgeChanged);
-    expect(await hashCargoPathInputs(manifest, workspace, leaf)).not.toBe(leafOnly);
+    expect(await hashCargoInputs(cargo, workspace, app)).not.toBe(bridgeChanged);
+    expect(await hashCargoInputs(cargo, workspace, leaf)).not.toBe(leafOnly);
 
     // The external package is reached through bridge, so the app closure sees it and the leaf closure does not.
-    const appBefore = await hashCargoPathInputs(manifest, workspace, app);
-    const leafBefore = await hashCargoPathInputs(manifest, workspace, leaf);
-    await writeFile(join(root, 'external/src/lib.rs'), 'pub fn answer() -> u8 { 20 }\n');
-    expect(await hashCargoPathInputs(manifest, workspace, app)).not.toBe(appBefore);
-    expect(await hashCargoPathInputs(manifest, workspace, leaf)).toBe(leafBefore);
+    const appBefore = await hashCargoInputs(cargo, workspace, app);
+    const leafBefore = await hashCargoInputs(cargo, workspace, leaf);
+    await writeFile(join(canonical, 'external/src/lib.rs'), 'pub fn answer() -> u8 { 20 }\n');
+    expect(await hashCargoInputs(cargo, workspace, app)).not.toBe(appBefore);
+    expect(await hashCargoInputs(cargo, workspace, leaf)).toBe(leafBefore);
 
     await mkdir(join(workspace, 'docs'), { recursive: true });
     await expect(
-      hashCargoPathInputs(manifest, workspace, { includeWorkspace: true, closure: join(workspace, 'docs') }),
+      hashCargoInputs(cargo, workspace, { includeWorkspace: true, closure: join(workspace, 'docs') }),
     ).rejects.toThrow('no local Cargo package lies under');
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -437,24 +570,25 @@ it('closure hashes the dependency closure of one directory and ignores unrelated
 it('leaves gitignored sources beneath a package out of the digest but keeps an ignored package root', async () => {
   const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-ignored-'));
   try {
-    const { workspace, manifest } = await workspaceCargoFixture(root);
+    const { root: canonical, workspace } = await writeWorkspaceCargoFixtureFiles(root);
+    const cargo = loadRecordedCargoResolve(canonical);
     execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
     await writeFile(join(workspace, '.gitignore'), 'target/\ngenerated.rs\ncrates/leaf/\n');
     const options = { includeWorkspace: true };
-    const initial = await hashCargoPathInputs(manifest, workspace, options);
+    const initial = await hashCargoInputs(cargo, workspace, options);
 
     // A source a producer generates later: a fresh tree and a built one hash alike.
     await writeFile(join(workspace, 'crates/bridge/src/generated.rs'), 'pub const GENERATED: u8 = 1;\n');
-    expect(await hashCargoPathInputs(manifest, workspace, options)).toBe(initial);
+    expect(await hashCargoInputs(cargo, workspace, options)).toBe(initial);
 
     // An untracked source nobody ignores is an edit like any other.
     await writeFile(join(workspace, 'crates/bridge/src/extra.rs'), 'pub const EXTRA: u8 = 1;\n');
-    const untracked = await hashCargoPathInputs(manifest, workspace, options);
+    const untracked = await hashCargoInputs(cargo, workspace, options);
     expect(untracked).not.toBe(initial);
 
     // A package whose own directory is ignored still hashes its sources.
     await writeFile(join(workspace, 'crates/leaf/src/lib.rs'), 'pub fn answer() -> u8 { 3 }\n');
-    expect(await hashCargoPathInputs(manifest, workspace, options)).not.toBe(untracked);
+    expect(await hashCargoInputs(cargo, workspace, options)).not.toBe(untracked);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -467,11 +601,16 @@ it('hashes a Cargo workspace that lives inside a directory its enclosing reposit
   try {
     execFileSync('git', ['init', '--quiet', repository], { stdio: 'pipe' });
     await writeFile(join(repository, '.gitignore'), 'scratch/\n');
-    const { workspace, manifest, leafSource } = await workspaceCargoFixture(join(repository, 'scratch/deep'));
+    const {
+      root: canonical,
+      workspace,
+      leafSource,
+    } = await writeWorkspaceCargoFixtureFiles(join(repository, 'scratch/deep'));
+    const cargo = loadRecordedCargoResolve(canonical);
     const options = { includeWorkspace: true };
-    const initial = await hashCargoPathInputs(manifest, workspace, options);
+    const initial = await hashCargoInputs(cargo, workspace, options);
     await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
-    expect(await hashCargoPathInputs(manifest, workspace, options)).not.toBe(initial);
+    expect(await hashCargoInputs(cargo, workspace, options)).not.toBe(initial);
   } finally {
     await rm(repository, { recursive: true, force: true });
   }
@@ -484,7 +623,7 @@ it('the runtime input reads no git configuration from the operator home', async 
   // decide which sources the key covers.
   const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-operator-git-'));
   try {
-    const { workspace } = await workspaceCargoFixture(root);
+    const { workspace } = await lockedWorkspaceCargoFixture(root);
     execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
     const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
     const run = async (home: string) => {
@@ -536,36 +675,59 @@ it('the runtime input reads no git configuration from the operator home', async 
   }
 });
 
-it.each(['helper', 'cli'])(
-  'include-workspace gives a custom Nx cached Cargo consumer a runtime input that follows transitive edits via %s',
-  async (mode) => {
-    const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-consumer-'));
-    const dist = join(import.meta.dir, '../dist');
-    try {
-      const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
-      const hashProgram =
-        `import { hashCargoPathInputs } from ${JSON.stringify(join(dist, 'cargo-source-hash.js'))}; ` +
-        'console.log(await hashCargoPathInputs("Cargo.toml", process.cwd(), { includeWorkspace: true }));';
-      // What a consumer's nx.json names as a `runtime` input; Nx keys the task on its stdout.
-      const runtime =
-        mode === 'helper'
-          ? `bun -e '${hashProgram}'`
-          : `bun ${JSON.stringify(join(dist, 'bin/smoo-nx-cargo-hash.js'))} --include-workspace`;
+it('real-cargo smoke: hashCargoPathInputs matches recorded metadata, drives helper and CLI runtime inputs, and refuses a missing manifest', async () => {
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-smoke-'));
+  const dist = join(import.meta.dir, '../dist');
+  try {
+    const { root: canonical, workspace, manifest, leafSource } = await lockedWorkspaceCargoFixture(root);
+    const recorded = loadRecordedCargoResolve(canonical);
 
-      const initial = await runtimeInputValue(runtime, workspace);
-      expect(initial).toBe(`${await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })}\n`);
-      expect(await runtimeInputValue(runtime, workspace)).toBe(initial);
+    // Real cargo resolution produces the exact same digests as the recorded CargoMetadata fixture.
+    const appClosure = { includeWorkspace: true, closure: join(workspace, 'packages/app') };
+    expect(await hashCargoPathInputs(manifest, workspace)).toBe(await hashCargoInputs(recorded, workspace));
+    expect(await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })).toBe(
+      await hashCargoInputs(recorded, workspace, { includeWorkspace: true }),
+    );
+    expect(await hashCargoPathInputs(manifest, workspace, appClosure)).toBe(
+      await hashCargoInputs(recorded, workspace, appClosure),
+    );
 
-      // Reached from the consumer only through bridge.
-      await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
-      const edited = await runtimeInputValue(runtime, workspace);
-      expect(edited).not.toBe(initial);
-      expect(edited).toBe(`${await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })}\n`);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  },
-);
+    // Both runtime-input spellings (helper import and CLI binary) match hashCargoPathInputs before and after edits.
+    const hashProgram =
+      `import { hashCargoPathInputs } from ${JSON.stringify(join(dist, 'cargo-source-hash.js'))}; ` +
+      'console.log(await hashCargoPathInputs("Cargo.toml", process.cwd(), { includeWorkspace: true }));';
+    const helperRuntime = `bun -e '${hashProgram}'`;
+    const cliRuntime = `bun ${JSON.stringify(join(dist, 'bin/smoo-nx-cargo-hash.js'))} --include-workspace`;
+
+    const initialExpected = `${await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })}\n`;
+    const [initialHelper, initialCli] = await Promise.all([
+      runtimeInputValue(helperRuntime, workspace),
+      runtimeInputValue(cliRuntime, workspace),
+    ]);
+    expect(initialHelper).toBe(initialExpected);
+    expect(initialCli).toBe(initialExpected);
+
+    await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
+    const editedExpected = `${await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })}\n`;
+    expect(editedExpected).not.toBe(initialExpected);
+    const [editedHelper, editedCli] = await Promise.all([
+      runtimeInputValue(helperRuntime, workspace),
+      runtimeInputValue(cliRuntime, workspace),
+    ]);
+    expect(editedHelper).toBe(editedExpected);
+    expect(editedCli).toBe(editedExpected);
+
+    // Missing path dependency manifest refuses resolution cleanly and recovers once restored.
+    const externalManifest = join(canonical, 'external/Cargo.toml');
+    const savedExternal = await readFile(externalManifest, 'utf8');
+    await rm(externalManifest);
+    await expect(hashCargoPathInputs(manifest, workspace)).rejects.toThrow('Locked offline Cargo resolution failed');
+    await writeFile(externalManifest, savedExternal);
+    expect(await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })).toBe(editedExpected.trimEnd());
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it('keeps the v2 transcript across forward source includes and an ignored source included through an alias', async () => {
   const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-fused-')));
@@ -588,7 +750,36 @@ it('keeps the v2 transcript across forward source includes and an ignored source
     }
     await symlink('src/hidden.rs', join(root, 'z/hidden.txt'));
     execFileSync('git', ['init', '--quiet', root], { stdio: 'pipe' });
-    execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe' });
+    const cargo = resolveFrom({
+      packages: [
+        {
+          id: 'a',
+          name: 'a',
+          version: '0.1.0',
+          source: null,
+          manifest_path: join(root, 'a/Cargo.toml'),
+          targets: [{ src_path: join(root, 'a/src/lib.rs') }],
+          governing_manifest_path: manifest,
+        },
+        {
+          id: 'z',
+          name: 'z',
+          version: '0.1.0',
+          source: null,
+          manifest_path: join(root, 'z/Cargo.toml'),
+          targets: [{ src_path: join(root, 'z/src/lib.rs') }],
+          governing_manifest_path: manifest,
+        },
+      ],
+      resolve: {
+        nodes: [
+          { id: 'a', deps: [] },
+          { id: 'z', deps: [] },
+        ],
+      },
+      workspace_members: ['a', 'z'],
+      workspace_root: root,
+    });
     // Independent explicit v2 transcript. In particular, z's source is named by a,
     // while hidden.rs is discovery-only until the unignored alias names its bytes.
     const inputs: { file: string; key: string }[] = [
@@ -634,10 +825,10 @@ it('keeps the v2 transcript across forward source includes and an ignored source
       expected.update(`\0${bytes.length}\0`);
       expected.update(bytes);
     }
-    const before = await hashCargoPathInputs(manifest, root, { includeWorkspace: true });
+    const before = await hashCargoInputs(cargo, root, { includeWorkspace: true });
     expect(before).toBe(expected.digest('hex'));
     await writeFile(join(root, 'z/src/secret.bin'), 'changed');
-    expect(await hashCargoPathInputs(manifest, root, { includeWorkspace: true })).not.toBe(before);
+    expect(await hashCargoInputs(cargo, root, { includeWorkspace: true })).not.toBe(before);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -645,14 +836,12 @@ it('keeps the v2 transcript across forward source includes and an ignored source
 
 it('keeps literal discovery exact and refuses unreadable sources', async () => {
   const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-literals-')));
+  const manifest = join(root, 'Cargo.toml');
   const source = join(root, 'src/lib.rs');
   const unicode = 'spelling-e\u0301-\u{10000}-payload';
   try {
     await mkdir(dirname(source), { recursive: true });
-    await writeFile(
-      join(root, 'Cargo.toml'),
-      '[package]\nname="literals"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
-    );
+    await writeFile(manifest, '[package]\nname="literals"\nversion="0.1.0"\nedition="2021"\n[workspace]\n');
     await writeFile(join(root, 'src/data'), 'data');
     await writeFile(join(root, 'src', unicode), 'unicode spelling');
     await writeFile(
@@ -678,8 +867,21 @@ it('keeps literal discovery exact and refuses unreadable sources', async () => {
       { file: join(root, 'src/data'), source, literal: 'data' },
       { file: join(root, 'src', unicode), source, literal: unicode },
     ]);
-    execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(root, 'Cargo.toml')], {
-      stdio: 'pipe',
+    const cargo = resolveFrom({
+      packages: [
+        {
+          id: 'literals',
+          name: 'literals',
+          version: '0.1.0',
+          source: null,
+          manifest_path: manifest,
+          targets: [{ src_path: source }],
+          governing_manifest_path: manifest,
+        },
+      ],
+      resolve: { nodes: [{ id: 'literals', deps: [] }] },
+      workspace_members: ['literals'],
+      workspace_root: root,
     });
     // A source text no scan has seen is read, so a read the operating system refuses is a refusal, never a skip.
     // Nx indexes only a file it can read: the new text is hashed first, then the scan's own read is denied.
@@ -691,11 +893,8 @@ it('keeps literal discovery exact and refuses unreadable sources', async () => {
     const unread = await indexedCargoSources(root);
     await chmod(source, 0);
     expect(() => compiledInFiles(root, unread, new Map())).toThrow('EACCES');
-    // A cold native Cargo census can report the denial before the source read;
-    // both paths must preserve the operational refusal rather than skip the file.
-    await expect(hashCargoPathInputs(join(root, 'Cargo.toml'), root, { includeWorkspace: true })).rejects.toThrow(
-      'EACCES',
-    );
+    // The digest walk must also preserve the operational refusal rather than skip the unreadable source.
+    await expect(hashCargoInputs(cargo, root, { includeWorkspace: true })).rejects.toThrow('EACCES');
   } finally {
     await chmod(source, 0o600);
     await rm(root, { recursive: true, force: true });

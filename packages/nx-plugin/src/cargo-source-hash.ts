@@ -348,7 +348,7 @@ export const CARGO_RESOLVE_BOUND_MS = 300_000;
  * take a fresh native snapshot. File contents below are read directly so an
  * edit within Nx's mtime granularity cannot reuse a stale resolution.
  */
-function resolutionFiles(
+export function resolutionFiles(
   root: string,
   manifest: string,
   cargo: CargoResolve | null,
@@ -417,7 +417,7 @@ function rustupHome(): string {
   return existsSync(home) ? home : '';
 }
 
-function resolutionKey(
+export function resolutionKey(
   root: string,
   manifest: string,
   cargo: CargoResolve | null,
@@ -445,7 +445,7 @@ function resolutionKey(
   return hash.digest('hex');
 }
 
-function cargoFromMetadata(metadata: CargoMetadata): CargoResolve {
+export function cargoFromMetadata(metadata: CargoMetadata): CargoResolve {
   return {
     root: metadata.workspace_root,
     members: new Set(metadata.workspace_members),
@@ -809,6 +809,16 @@ export async function hashCargoPathInputs(
 ): Promise<string> {
   const root = await realpath(workspaceRoot);
   const cargo = await readCargoResolve(manifestPath, root);
+  return hashCargoInputs(cargo, root, options);
+}
+
+/** Computes the `cargo-path-inputs-v2` digest over a resolved Cargo workspace without running Cargo. */
+export async function hashCargoInputs(
+  cargo: CargoResolve,
+  workspaceRoot: string,
+  options?: CargoPathInputsOptions,
+): Promise<string> {
+  const root = await realpath(workspaceRoot);
   const members = options?.closure === undefined ? undefined : await dependencyClosure(cargo, resolve(options.closure));
   type InputRole = 'manifest' | 'workspace' | 'ancestor' | 'target' | 'file' | 'link' | 'include';
   const inputKey = (pkg: LocalCargoPackage, role: InputRole, path: string) =>

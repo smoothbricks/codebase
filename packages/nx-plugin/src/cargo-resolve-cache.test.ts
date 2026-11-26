@@ -1,4 +1,4 @@
-import { afterAll, expect, it, jest } from 'bun:test';
+import { expect, it, jest } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import {
   appendFile,
@@ -17,11 +17,13 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
+import { parseCargoMetadata } from '@smoothbricks/build-inputs/cargo-closure';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { FileLock } from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
+import { assertRealKeyMatchesCacheKeyLaws } from './__tests__/cargo-key-law-binding.js';
 import {
   type CannedCargo,
   type CountedCargo,
@@ -34,22 +36,21 @@ import {
   waitForCargoJoins,
   withEnvironment,
 } from './__tests__/counted-cargo.js';
-import { testFileInstallation } from './__tests__/owned-installation.js';
+import { loadRecordedCargoResolve, writeWorkspaceCargoFixtureFiles } from './__tests__/recorded-cargo-metadata.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
 import {
   acquireCargoResolveLock,
   type CargoResolve,
   CargoResolveLockError,
+  cargoFromMetadata,
   readCargoResolve,
+  resolutionFiles,
+  resolutionKey,
 } from './cargo-source-hash.js';
 import { createNodesV2 } from './index.js';
 
 useFixtureCargoHome();
-
-/** The Nx installation this file's graph fixtures share; none may write into it. */
-const installation = testFileInstallation();
-afterAll(() => installation.retire());
 
 /*
  * What Cargo resolution costs, measured by the one number that matters: how many `cargo metadata`
@@ -59,9 +60,9 @@ afterAll(() => installation.retire());
  * or a sharer joining an in-flight resolution. Only the outer hang guards keep time, and they report
  * what was still open instead of advancing anything.
  *
- * These regressions exercise the content-keyed cache through `readCargoResolve`, project-graph
- * inference and the hash command. Join readiness comes from the resolution's diagnostics channel;
- * child counts and process-lifetime evidence come from the fixture's control connections.
+ * Pure key membership (`resolutionFiles`) and differential key-law proofs (`resolutionKey`) run
+ * directly without spawning Cargo; process-boundary tests cover shared flights, concurrent edit
+ * races, kill/signal teardown, cache publication failures, and real-Cargo graph/CLI wiring.
  *
  * Every fixture is a temporary directory of its own, with its own Nx workspace-data directory (where
  * the cache is kept), deleted with the fixture.
@@ -178,7 +179,12 @@ function spawnDrained(command: readonly string[], cwd: string, environment: Read
         notify();
       }),
     ended: Promise.all([out, err, proc.exited]).then(
-      (): Ended => ({ exitCode: proc.exitCode, signalCode: proc.signalCode, stdout, stderr }),
+      (): Ended => ({
+        exitCode: proc.exitCode,
+        signalCode: proc.signalCode,
+        stdout,
+        stderr,
+      }),
     ),
     describe,
   };
@@ -192,6 +198,259 @@ function summarize(resolved: CargoResolve) {
     edges: resolved.edges === null ? null : [...resolved.edges],
   };
 }
+
+/* ---- Pure key membership and cache_key.bend differential laws (no Cargo process) ---- */
+
+it('resolutionKey satisfies key_is_pure (cache_key.bend:790) and key_moves_with_input (cache_key.bend:828) differentially against cache-key-model', async () => {
+  // Model items listed in `xs` map to indexed `Cargo.toml` manifests under `drawn/in-<slug>/`; items absent from `xs`
+  // map to unindexed sibling manifests under `drawn/out-<slug>/`, which are never ancestors of any indexed path.
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-laws-')));
+  try {
+    const { root: canonical, workspace, manifest } = await writeWorkspaceCargoFixtureFiles(root);
+    const cargo = loadRecordedCargoResolve(canonical);
+    const baseIndexed = [
+      'Cargo.toml',
+      'packages/app/Cargo.toml',
+      'crates/bridge/Cargo.toml',
+      'crates/leaf/Cargo.toml',
+      'crates/unrelated/Cargo.toml',
+    ];
+    const drawnDir = join(workspace, 'drawn');
+
+    await withEnvironment({ CARGO_HOME: join(canonical, 'cargo-home') }, async () => {
+      await assertRealKeyMatchesCacheKeyLaws({
+        name: 'resolutionKey',
+        drawsPerSeed: 100,
+        evaluate: async ({ entries }) => {
+          await rm(drawnDir, { recursive: true, force: true });
+          const indexed = new Set(baseIndexed);
+          const files: { readonly file: string; readonly bytes1: string; readonly bytes2: string }[] = [];
+          for (const { slug, inKey, bytes1, bytes2 } of entries) {
+            const rel = inKey ? `drawn/in-${slug}/Cargo.toml` : `drawn/out-${slug}/Cargo.toml`;
+            if (inKey) indexed.add(rel);
+            files.push({ file: join(workspace, rel), bytes1, bytes2 });
+          }
+          await Promise.all(
+            files.map(async ({ file, bytes1 }) => {
+              await mkdir(dirname(file), { recursive: true });
+              await writeFile(file, bytes1);
+            }),
+          );
+          const key1 = resolutionKey(workspace, manifest, cargo, indexed);
+          await Promise.all(files.map(({ file, bytes2 }) => writeFile(file, bytes2)));
+          const key2 = resolutionKey(workspace, manifest, cargo, indexed);
+          return [key1, key2];
+        },
+      });
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("resolutionFiles includes every input Cargo's answer keys on and excludes unkeyed files", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-files-')));
+  try {
+    const workspace = join(root, 'workspace');
+    const manifest = join(workspace, 'Cargo.toml');
+    const cargoHome = join(root, 'cargo-home');
+    const cargo = cargoFromMetadata(
+      parseCargoMetadata(
+        JSON.stringify({
+          packages: [
+            {
+              id: 'leaf',
+              name: 'leaf',
+              version: '0.1.0',
+              source: null,
+              manifest_path: join(workspace, 'crates/leaf/Cargo.toml'),
+              targets: [{ src_path: join(workspace, 'crates/leaf/src/lib.rs') }],
+              governing_manifest_path: manifest,
+            },
+            {
+              id: 'external-sub',
+              name: 'external-sub',
+              version: '0.1.0',
+              source: null,
+              manifest_path: join(root, 'external/sub/Cargo.toml'),
+              targets: [{ src_path: join(root, 'external/sub/src/lib.rs') }],
+              governing_manifest_path: join(root, 'external/Cargo.toml'),
+            },
+          ],
+          resolve: {
+            nodes: [
+              { id: 'leaf', deps: [{ pkg: 'external-sub', dep_kinds: [{ kind: null }] }] },
+              { id: 'external-sub', deps: [] },
+            ],
+          },
+          workspace_members: ['leaf'],
+          workspace_root: workspace,
+        }),
+      ),
+    );
+    const indexed = new Set(['Cargo.toml', 'crates/leaf/Cargo.toml', 'crates/new/Cargo.toml']);
+
+    await withEnvironment({ CARGO_HOME: cargoHome }, async () => {
+      const files = resolutionFiles(workspace, manifest, cargo, indexed);
+      const coldFiles = resolutionFiles(workspace, manifest, null, indexed);
+
+      // Every input kind Cargo's answer depends on must be present in the membership set.
+      const included: readonly [string, string, boolean][] = [
+        ['workspace manifest', join(workspace, 'Cargo.toml'), true],
+        ["member's manifest", join(workspace, 'crates/leaf/Cargo.toml'), true],
+        ['newly indexed manifest in workspace', join(workspace, 'crates/new/Cargo.toml'), true],
+        ["path dependency's manifest outside workspace", join(root, 'external/sub/Cargo.toml'), false],
+        ['governing manifest of external path dependency', join(root, 'external/Cargo.toml'), false],
+        ['Cargo.lock at workspace root', join(workspace, 'Cargo.lock'), true],
+        ['Cargo.lock at member directory', join(workspace, 'crates/leaf/Cargo.lock'), true],
+        ['Cargo.lock at new indexed manifest directory', join(workspace, 'crates/new/Cargo.lock'), true],
+        ['Cargo.lock at external package directory', join(root, 'external/sub/Cargo.lock'), false],
+        ['Cargo.lock at external governing directory', join(root, 'external/Cargo.lock'), false],
+        ['.cargo/config in workspace', join(workspace, '.cargo/config'), true],
+        ['.cargo/config.toml in workspace', join(workspace, '.cargo/config.toml'), true],
+        ['.cargo/config.toml in member directory', join(workspace, 'crates/leaf/.cargo/config.toml'), true],
+        ['.cargo/config.toml in intermediate directory', join(workspace, 'crates/.cargo/config.toml'), true],
+        ['.cargo/config above workspace', join(root, '.cargo/config'), true],
+        ['.cargo/config.toml above workspace', join(root, '.cargo/config.toml'), true],
+        ['.cargo/config.toml in external ancestor', join(root, 'external/.cargo/config.toml'), false],
+        ['rust-toolchain in workspace', join(workspace, 'rust-toolchain'), true],
+        ['rust-toolchain.toml in workspace', join(workspace, 'rust-toolchain.toml'), true],
+        ['rust-toolchain above workspace', join(root, 'rust-toolchain'), true],
+        ['rust-toolchain.toml above workspace', join(root, 'rust-toolchain.toml'), true],
+        ['Cargo.toml above workspace', join(root, 'Cargo.toml'), true],
+        ['Cargo.toml in intermediate ancestor', join(workspace, 'crates/Cargo.toml'), true],
+        ['root devenv.lock toolchain pin', join(workspace, 'devenv.lock'), true],
+        ['tooling/direnv/devenv.lock toolchain pin', join(workspace, 'tooling/direnv/devenv.lock'), true],
+        ["CARGO_HOME's config", join(cargoHome, 'config'), true],
+        ["CARGO_HOME's config.toml", join(cargoHome, 'config.toml'), true],
+      ];
+      for (const [label, path, alsoWhenCold] of included) {
+        expect(files.has(path), `expected in resolutionFiles: ${label} (${path})`).toBe(true);
+        if (alsoWhenCold) {
+          expect(coldFiles.has(path), `expected in cold resolutionFiles: ${label} (${path})`).toBe(true);
+        }
+      }
+
+      // Files Cargo's resolution never keys on must stay out of the set.
+      const excluded: readonly [string, string][] = [
+        ['member Rust source', join(workspace, 'crates/leaf/src/lib.rs')],
+        ['new Rust source file', join(workspace, 'crates/leaf/src/extra.rs')],
+        ['non-Rust workspace file', join(workspace, 'README.md')],
+        ['non-Rust file in member crate', join(workspace, 'crates/leaf/notes.json')],
+        ['source edit outside workspace', join(root, 'external/sub/src/lib.rs')],
+        ['unindexed non-ancestor manifest', join(workspace, 'crates/unindexed/Cargo.toml')],
+      ];
+      for (const [label, path] of excluded) {
+        expect(files.has(path), `expected out of resolutionFiles: ${label} (${path})`).toBe(false);
+        expect(coldFiles.has(path), `expected out of cold resolutionFiles: ${label} (${path})`).toBe(false);
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('resolutionKey tracks content bytes, canonical symlink targets, and toolchain/PATH selection while ignoring mtime and unkeyed edits', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-key-')));
+  try {
+    const { root: canonical, workspace, manifest } = await writeWorkspaceCargoFixtureFiles(root);
+    await put(workspace, 'Cargo.lock', '# fixture lock\nversion = 3\n');
+    await put(workspace, 'README.md', '# fixture\n');
+    const cargo = loadRecordedCargoResolve(canonical);
+    const indexed = new Set([
+      'Cargo.toml',
+      'packages/app/Cargo.toml',
+      'crates/bridge/Cargo.toml',
+      'crates/leaf/Cargo.toml',
+      'crates/unrelated/Cargo.toml',
+    ]);
+    const cargoHome = join(canonical, 'cargo-home');
+    const binA = join(canonical, 'bin-a');
+    const binB = join(canonical, 'bin-b');
+    await mkdir(binA, { recursive: true });
+    await mkdir(binB, { recursive: true });
+    const dummyCargo = '#!/bin/sh\nexit 0\n';
+    await writeFile(join(binA, 'cargo'), dummyCargo, { mode: 0o755 });
+    await writeFile(join(binB, 'cargo'), dummyCargo, { mode: 0o755 });
+
+    const baseEnv = {
+      CARGO_HOME: cargoHome,
+      PATH: `${binA}${delimiter}${process.env.PATH ?? ''}`,
+      RUSTUP_TOOLCHAIN: 'fixture-a',
+      RUSTUP_HOME: '',
+    };
+
+    await withEnvironment(baseEnv, async () => {
+      const key = () => resolutionKey(workspace, manifest, cargo, indexed);
+      const baseline = key();
+
+      // Unkeyed edits and same-bytes rewrites (later mtime) never move the key.
+      await put(workspace, 'crates/leaf/src/lib.rs', 'pub fn answer() -> u8 { 2 }\n');
+      await put(workspace, 'crates/leaf/src/extra.rs', 'pub const EXTRA: u8 = 1;\n');
+      await put(workspace, 'README.md', '# edited\n');
+      await put(workspace, 'crates/leaf/notes.json', '{}\n');
+      await put(canonical, 'external/src/lib.rs', 'pub fn answer() -> u8 { 11 }\n');
+      await touch(workspace, 'crates/leaf/Cargo.toml');
+      await touch(workspace, 'Cargo.lock');
+      expect(key()).toBe(baseline);
+
+      // Identical size and mtime cannot stand in for changed bytes.
+      const leafManifest = join(workspace, 'crates/leaf/Cargo.toml');
+      const originalLeaf = await readFile(leafManifest, 'utf8');
+      await writeFile(leafManifest, `${originalLeaf}# one\n`);
+      const afterOne = key();
+      expect(afterOne).not.toBe(baseline);
+      const stamped = await stat(leafManifest);
+      await writeFile(leafManifest, `${originalLeaf}# two\n`);
+      await utimes(leafManifest, stamped.atime, stamped.mtime);
+      expect(key()).not.toBe(afterOne);
+
+      // Adding and removing a removable keyed file moves the key and restores it on removal.
+      const beforePin = key();
+      const pin = join(workspace, 'devenv.lock');
+      await writeFile(pin, '{}\n');
+      expect(key()).not.toBe(beforePin);
+      await rm(pin);
+      expect(key()).toBe(beforePin);
+
+      // Retargeting a configuration symlink with identical bytes still keys the new canonical path.
+      const config = join(workspace, '.cargo/config.toml');
+      await put(canonical, 'config-a.toml', '[net]\noffline=true\n');
+      await put(canonical, 'config-b.toml', '[net]\noffline=true\n');
+      await mkdir(dirname(config), { recursive: true });
+      await symlink(join(canonical, 'config-a.toml'), config);
+      const symlinkA = key();
+      expect(symlinkA).not.toBe(beforePin);
+      await rm(config);
+      await symlink(join(canonical, 'config-b.toml'), config);
+      const symlinkB = key();
+      expect(symlinkB).not.toBe(symlinkA);
+      expect(key()).toBe(symlinkB);
+
+      // Toolchain selection, rustup home, default-home equivalence, and cargo PATH identity.
+      const toolchainA = key();
+      const toolchainB = await withEnvironment({ RUSTUP_TOOLCHAIN: 'fixture-b' }, async () => key());
+      expect(toolchainB).not.toBe(toolchainA);
+      expect(key()).toBe(toolchainA);
+
+      const customHome = await withEnvironment({ RUSTUP_HOME: join(canonical, 'rustup-home') }, async () => key());
+      expect(customHome).not.toBe(toolchainA);
+
+      // Default rustup home is one selection whether RUSTUP_HOME is unset/empty or names `~/.rustup`.
+      const defaultUnset = await withEnvironment({ RUSTUP_HOME: '' }, async () => key());
+      const defaultNamed = await withEnvironment({ RUSTUP_HOME: join(homedir(), '.rustup') }, async () => key());
+      expect(defaultNamed).toBe(defaultUnset);
+
+      // Identical cargo binary bytes at a different PATH location yield a distinct key.
+      const elsewhere = await withEnvironment({ PATH: `${binB}${delimiter}${process.env.PATH ?? ''}` }, async () =>
+        key(),
+      );
+      expect(elsewhere).not.toBe(toolchainA);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 /* ---- The cache's own behavior, against a Cargo that answers whatever the test says ---- */
 
@@ -416,169 +675,29 @@ it('a Cargo that cannot run, or whose answer is not metadata, is a CargoMetadata
   });
 });
 
-interface KeyedFile {
-  readonly name: string;
-  /** Relative to the fixture root; the workspace is `workspace/` in it. */
-  readonly path: string;
-  /** Whether the fixture has the file before the test touches it. */
-  readonly exists: boolean;
-  /** Whether the test may delete it: the fixture's Cargo answers with packages whose manifests must stay. */
-  readonly removable: boolean;
-}
-
-/** Every file whose bytes Cargo's answer depends on, or that the toolchain pin and configuration stand for. */
-const KEYED_FILES: readonly KeyedFile[] = [
-  { name: 'the workspace manifest', path: 'workspace/Cargo.toml', exists: true, removable: false },
-  { name: "a member's manifest", path: 'workspace/crates/leaf/Cargo.toml', exists: true, removable: false },
-  {
-    name: "a path dependency's manifest outside the workspace",
-    path: 'external/Cargo.toml',
-    exists: true,
-    removable: false,
-  },
-  { name: 'a new manifest in the workspace', path: 'workspace/crates/new/Cargo.toml', exists: false, removable: true },
-  { name: 'Cargo.lock', path: 'workspace/Cargo.lock', exists: true, removable: true },
-  {
-    name: 'a .cargo/config.toml in the workspace',
-    path: 'workspace/.cargo/config.toml',
-    exists: false,
-    removable: true,
-  },
-  { name: 'a .cargo/config in the workspace', path: 'workspace/.cargo/config', exists: false, removable: true },
-  { name: 'a .cargo/config.toml above the workspace', path: '.cargo/config.toml', exists: false, removable: true },
-  { name: 'a Cargo.toml above the workspace', path: 'Cargo.toml', exists: false, removable: true },
-  { name: "CARGO_HOME's config.toml", path: 'cargo-home/config.toml', exists: false, removable: true },
-  { name: 'rust-toolchain.toml', path: 'workspace/rust-toolchain.toml', exists: false, removable: true },
-  { name: 'rust-toolchain', path: 'workspace/rust-toolchain', exists: false, removable: true },
-  { name: 'devenv.lock', path: 'workspace/devenv.lock', exists: false, removable: true },
-  { name: 'tooling/direnv/devenv.lock', path: 'workspace/tooling/direnv/devenv.lock', exists: false, removable: true },
-];
-
-// One canned workspace walks every input Cargo's answer keys on, each step from the state the one before left. A change
-// to a keyed input is a cache miss by construction; the same bytes, and a change nothing keys on, are answered from the
-// cache. Every merged case's label stays in its assertion messages.
-it("resolves again exactly once when an input Cargo's answer keys on changes, and never for the same bytes or what it does not key on", async () => {
-  await withCannedWorkspace(async ({ root, workspace, cargo, answer, members, environment }) => {
-    const resolvesAs = async (name: string, selection: Readonly<Record<string, string>> = {}): Promise<string[]> => {
-      await answer(name);
-      return withEnvironment(selection, members);
-    };
-    expect(await resolvesAs('cold')).toEqual(['cold']);
-    let runs = await spawned(cargo);
-    expect(runs).toBe(1);
-
-    // Changes nothing Cargo's answer keys on: the cache answers, and Cargo, asked now, would say otherwise.
-    const unkeyed: [string, () => Promise<void>][] = [
-      ['a source edit', () => put(workspace, 'crates/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 2 }\n')],
-      ['a new source file', () => put(workspace, 'crates/leaf/src/extra.rs', 'pub const EXTRA: u8 = 1;\n')],
-      ['a non-Rust edit', () => put(workspace, 'README.md', '# edited\n')],
-      ['a new non-Rust file', () => put(workspace, 'crates/leaf/notes.json', '{}\n')],
-      ['the manifest rewritten with the same bytes', () => touch(workspace, 'crates/leaf/Cargo.toml')],
-      ['Cargo.lock rewritten with the same bytes', () => touch(workspace, 'Cargo.lock')],
-      [
-        'a source edit outside the workspace',
-        () => put(root, 'external/src/lib.rs', 'pub fn external() -> u8 { 11 }\n'),
-      ],
-    ];
-    for (const [what, change] of unkeyed) {
-      await change();
-      // A Cargo asked after this change would say so.
-      await answer(`after ${what}`);
-      expect(await members(), what).toEqual(['cold']);
-    }
+it('resolves again exactly once when an input changes, and zero times for unchanged bytes or an unkeyed edit', async () => {
+  // Full per-input membership and byte/mtime/env keying live in the pure tests above; this single canned-Cargo run
+  // proves the cache shell wires `resolutionKey` to spawn once on a key miss and zero times on a hit.
+  await withCannedWorkspace(async ({ workspace, cargo, answer, members }) => {
+    await answer('cold');
+    expect(await members()).toEqual(['cold']);
     expect(await spawned(cargo)).toBe(1);
 
-    // Each input Cargo's answer keys on: one change resolves again once; the same bytes never do, nor bytes with an
-    // identical size and mtime; removing a removable input resolves again once more.
-    for (const file of KEYED_FILES) {
-      const { name } = file;
-      const original = file.exists ? await readFile(join(root, file.path), 'utf8') : '';
-      await put(root, file.path, `${original}# one\n`);
-      expect(await resolvesAs(`${name}: one`), name).toEqual([`${name}: one`]);
-      runs += 1;
-      expect(await spawned(cargo), name).toBe(runs);
+    // Unkeyed edit and same-bytes rewrite never re-spawn Cargo.
+    await put(workspace, 'crates/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 2 }\n');
+    await touch(workspace, 'crates/leaf/Cargo.toml');
+    await answer('unkeyed');
+    expect(await members()).toEqual(['cold']);
+    expect(await spawned(cargo)).toBe(1);
 
-      // The bytes are the same, so Cargo, which would answer differently, is not asked.
-      await touch(root, file.path);
-      expect(await resolvesAs(`${name}: same bytes`), name).toEqual([`${name}: one`]);
-      expect(await spawned(cargo), name).toBe(runs);
-
-      // Identical size and mtime cannot stand in for the current bytes.
-      const before = await stat(join(root, file.path));
-      await put(root, file.path, `${original}# two\n`);
-      await utimes(join(root, file.path), before.atime, before.mtime);
-      expect(await resolvesAs(`${name}: two`), name).toEqual([`${name}: two`]);
-      runs += 1;
-      expect(await spawned(cargo), name).toBe(runs);
-
-      if (file.removable) {
-        await rm(join(root, file.path));
-        expect(await resolvesAs(`${name}: removed`), name).toEqual([`${name}: removed`]);
-        runs += 1;
-        expect(await spawned(cargo), name).toBe(runs);
-      }
-      expect(await resolvesAs(`${name}: settled`), name).toEqual([
-        file.removable ? `${name}: removed` : `${name}: two`,
-      ]);
-      expect(await spawned(cargo), name).toBe(runs);
-    }
-
-    // A configuration symlink retargeted with identical bytes: its canonical input is what Cargo's answer keys on.
-    const retargets = 'retargeting a configuration symlink with identical bytes still resolves the new canonical input';
-    const config = join(workspace, '.cargo/config.toml');
-    await put(root, 'config-a.toml', '[net]\noffline=true\n');
-    await put(root, 'config-b.toml', '[net]\noffline=true\n');
-    await mkdir(dirname(config), { recursive: true });
-    await symlink(join(root, 'config-a.toml'), config);
-    expect(await resolvesAs('symlink: first target'), retargets).toEqual(['symlink: first target']);
-    runs += 1;
-    expect(await spawned(cargo), retargets).toBe(runs);
-
-    await rm(config);
-    await symlink(join(root, 'config-b.toml'), config);
-    expect(await resolvesAs('symlink: second target'), retargets).toEqual(['symlink: second target']);
-    runs += 1;
-    expect(await spawned(cargo), retargets).toBe(runs);
-    expect(await resolvesAs('symlink: unchanged'), retargets).toEqual(['symlink: second target']);
-    expect(await spawned(cargo), retargets).toBe(runs);
-
-    // The cargo on PATH and the rustup selection are keyed by value: each new selection resolves again once.
-    const selects = 'resolves again exactly once when the cargo on PATH or the rustup selection changes';
-    expect(await resolvesAs('toolchain a', { RUSTUP_TOOLCHAIN: 'fixture-a' }), selects).toEqual(['toolchain a']);
-    runs += 1;
-    expect(await spawned(cargo), selects).toBe(runs);
-    expect(await resolvesAs('same selection', { RUSTUP_TOOLCHAIN: 'fixture-a' }), selects).toEqual(['toolchain a']);
-    expect(await spawned(cargo), selects).toBe(runs);
-
-    expect(await resolvesAs('toolchain b', { RUSTUP_TOOLCHAIN: 'fixture-b' }), selects).toEqual(['toolchain b']);
-    runs += 1;
-    expect(await spawned(cargo), selects).toBe(runs);
-
-    const selected = { RUSTUP_TOOLCHAIN: 'fixture-b', RUSTUP_HOME: join(root, 'rustup-home') };
-    expect(await resolvesAs('rustup home', selected), selects).toEqual(['rustup home']);
-    runs += 1;
-    expect(await spawned(cargo), selects).toBe(runs);
-
-    // The default home is one selection, named or not, as a host job (unset) and a sandbox lent it (named) select it.
-    const homes = 'the default rustup home is one selection whether RUSTUP_HOME names it or is unset';
-    const unset = { RUSTUP_TOOLCHAIN: 'fixture-b', RUSTUP_HOME: '' };
-    expect(await resolvesAs('default home unset', unset), homes).toEqual(['default home unset']);
-    runs += 1;
-    expect(await spawned(cargo), homes).toBe(runs);
-    const named = { RUSTUP_TOOLCHAIN: 'fixture-b', RUSTUP_HOME: join(homedir(), '.rustup') };
-    expect(await resolvesAs('default home named', named), homes).toEqual(['default home unset']);
-    expect(await spawned(cargo), homes).toBe(runs);
-
-    // The same bytes of Cargo, found elsewhere, are not the same Cargo: a toolchain proxy is a path.
-    const other = join(root, 'other-bin');
-    await mkdir(other, { recursive: true });
-    await writeFile(join(other, 'cargo'), await readFile(join(cargo.bin, 'cargo')), { mode: 0o755 });
-    const elsewhere = { ...selected, PATH: `${other}${delimiter}${environment.PATH}` };
-    expect(await resolvesAs('another cargo', elsewhere), selects).toEqual(['another cargo']);
-    runs += 1;
-    expect(await spawned(cargo), selects).toBe(runs);
-    expect(await resolvesAs('same cargo', elsewhere), selects).toEqual(['another cargo']);
-    expect(await spawned(cargo), selects).toBe(runs);
+    // One keyed input change resolves again once, and a repeat read with unchanged bytes resolves zero times.
+    await appendFile(join(workspace, 'crates/leaf/Cargo.toml'), '# edited\n');
+    await answer('edited');
+    expect(await members()).toEqual(['edited']);
+    expect(await spawned(cargo)).toBe(2);
+    await answer('trap');
+    expect(await members()).toEqual(['edited']);
+    expect(await spawned(cargo)).toBe(2);
   });
 });
 
@@ -808,7 +927,7 @@ it('a standalone smoo-nx-cargo-hash ended by SIGTERM, SIGINT or SIGHUP takes its
   });
 });
 
-/* ---- The same, with the real Cargo, through the project graph and the hash command ---- */
+/* ---- Real Cargo through the project graph, hash command, and cache publication ---- */
 
 /** `leaf` as the fixture writes it, and the dependency that draws `unrelated` into every closure reaching `leaf`. */
 const LEAF_MANIFEST = '[package]\nname="leaf"\nversion="0.1.0"\nedition="2021"\n';
@@ -828,7 +947,7 @@ function relock(workspace: string): void {
 /**
  * An Nx workspace that is also the Cargo workspace. `app` reaches `leaf` through `bridge`, and
  * `external`, outside the Nx workspace, through `bridge` too. `unrelated` is a member nothing
- * depends on. Returns the workspace.
+ * depends on. Calls `createNodesV2` in process, so it needs no copied `node_modules` installation.
  */
 async function graphFixture(root: string): Promise<string> {
   const workspace = join(root, 'workspace');
@@ -859,7 +978,6 @@ async function graphFixture(root: string): Promise<string> {
   };
   for (const [path, text] of Object.entries(files)) await put(root, path, text);
   execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
-  await symlink(await installation.nodeModules(), join(workspace, 'node_modules'), 'dir');
   relock(workspace);
   return workspace;
 }
@@ -915,47 +1033,20 @@ function closureOf(graph: CreateNodesResultV2, projectRoot: string) {
   );
 }
 
-it('a project graph and fresh smoo-nx-cargo-hash processes over one Cargo workspace run Cargo once per changed input, and a refused resolution fails the graph', async () => {
-  // One Nx and Cargo workspace serves the graph, its refused resolution and the fresh hash processes. Each step changes
-  // what Cargo keys on or asks the same question again; every merged case's label stays in its assertion messages.
+it('a project graph and fresh smoo-nx-cargo-hash processes over one Cargo workspace share cached Cargo runs, and a refused resolution fails the graph', async () => {
+  // Per-input key membership is proven purely above; this real-Cargo smoke proves graph inference and fresh CLI
+  // processes share the cache, refuse stale locks without caching refusals, and re-resolve once on manifest changes.
   await withGraphWorkspace(async ({ root, workspace, cargo, graph }) => {
     const baseline = byFile(await graph());
     expect(closureOf(baseline, 'packages/app')).toContain(crateFiles('{bridge,leaf}'));
     expect(closureOf(baseline, 'packages/app')).not.toContain(crateFiles('{bridge,leaf,unrelated}'));
     expect(await spawned(cargo)).toBe(1);
 
-    // The daemon recomputes the graph for every batch of file events.
-    for (let round = 0; round < 3; round += 1) expect(byFile(await graph())).toEqual(baseline);
-    expect(await spawned(cargo)).toBe(1);
-
-    // A source, a new source file, a file that is not Rust, a manifest or lockfile rewritten byte for byte.
+    // Repeated recomputations and unkeyed edits reuse the cached resolution without re-spawning Cargo.
     await put(workspace, 'crates/leaf/src/lib.rs', 'pub fn answer() -> u8 { 2 }\n');
-    await put(workspace, 'crates/leaf/src/extra.rs', 'pub const EXTRA: u8 = 1;\n');
-    await put(workspace, 'crates/leaf/README.md', '# leaf\n');
     await touch(workspace, 'crates/leaf/Cargo.toml');
-    await touch(workspace, 'Cargo.lock');
-    expect(byFile(await graph())).toEqual(baseline);
+    for (let round = 0; round < 2; round += 1) expect(byFile(await graph())).toEqual(baseline);
     expect(await spawned(cargo)).toBe(1);
-
-    // What Cargo reads brings it back once for the bytes that changed, not for every recomputation after.
-    const inputs: [string, () => Promise<void>][] = [
-      ['a member manifest', () => appendFile(join(workspace, 'crates/leaf/Cargo.toml'), '# note\n')],
-      ['Cargo.lock', () => appendFile(join(workspace, 'Cargo.lock'), '# note\n')],
-      ['Cargo configuration', () => put(workspace, '.cargo/config.toml', '[env]\nFIXTURE = "1"\n')],
-      ['a manifest outside the Nx workspace', () => appendFile(join(root, 'external/Cargo.toml'), '# note\n')],
-      ['the toolchain pin', () => put(workspace, 'devenv.lock', '{"nodes":{}}\n')],
-    ];
-    let expected = 1;
-    for (const [what, change] of inputs) {
-      await change();
-      const changed = byFile(await graph());
-      // A manifest comment also changes the inferred versionless-manifest task
-      // input. Its dependency closure stays the same, and the new graph is stable.
-      expect(closureOf(changed, 'packages/app'), what).toEqual(closureOf(baseline, 'packages/app'));
-      expect(byFile(await graph()), what).toEqual(changed);
-      expected += 1;
-      expect(await spawned(cargo), what).toBe(expected);
-    }
 
     // Cargo refuses a Cargo.lock the manifests have outgrown (`--locked`). A refusal is no answer: each computation
     // asks Cargo again.
@@ -969,7 +1060,7 @@ it('a project graph and fresh smoo-nx-cargo-hash processes over one Cargo worksp
         expect(error.message, refused).toContain('--locked');
       }
     }
-    expected += 2;
+    let expected = 3;
     expect(await spawned(cargo), refused).toBe(expected);
 
     // Relocked to the manifests, the graph names the new dependency, and is stable under it.
@@ -1008,7 +1099,7 @@ it('a project graph and fresh smoo-nx-cargo-hash processes over one Cargo worksp
     for (const output of cold) expect(output, fresh).toBe(initial);
     expected += 1;
     expect(await spawned(cargo), fresh).toBe(expected);
-    for (let round = 0; round < 3; round += 1) expect(await hash(), fresh).toBe(initial);
+    expect(await hash(), fresh).toBe(initial);
     expect(await spawned(cargo), fresh).toBe(expected);
 
     // The digest still follows what it hashes: a source outside the Nx workspace, not one inside it.
@@ -1031,50 +1122,71 @@ it('a project graph and fresh smoo-nx-cargo-hash processes over one Cargo worksp
 
 for (const replaced of [false, true]) {
   it(`cache publication records a ${replaced ? 'rebound' : 'missing'} parent with the original filesystem cause`, async () => {
-    await withGraphWorkspace(async ({ workspace, cargo }) => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-pub-')));
+    try {
+      const workspace = join(root, 'workspace');
       const manifest = join(workspace, 'Cargo.toml');
-      await cargo.beforeAnswer.close();
-      const refused = rejectionOf(readCargoResolve(manifest, workspace));
-      await cargo.waitForRuns((runs) => runs.read === 1, 'real locked/offline Cargo to read before cache publication');
-      const namespace = join(workspaceDataDirectoryForWorkspace(workspace), 'cargo-resolve');
-      const entries = await readdir(namespace);
-      expect(entries).toHaveLength(1);
-      const [entry] = entries;
-      if (entry === undefined) throw new Error('the real resolver created no owned cache namespace');
-      const directory = join(namespace, entry);
-      const before = await stat(directory, { bigint: true });
-      let atOpen = before;
-      if (replaced) {
-        await rename(directory, `${directory}.retired`);
-        await mkdir(directory);
-        atOpen = await stat(directory, { bigint: true });
-        expect(atOpen.ino).not.toBe(before.ino);
-        // Force publication to report the replacement rather than silently sign under a new namespace.
-        await mkdir(join(directory, 'entry.cache'));
-      } else {
-        await rm(directory, { recursive: true });
+      await put(workspace, 'Cargo.toml', '[package]\nname="pub"\nversion="0.1.0"\nedition="2021"\n[workspace]\n');
+      await put(workspace, 'src/lib.rs', 'pub fn pub_test() {}\n');
+      relock(workspace);
+      const cargo = await countedCargo(root);
+      try {
+        await withEnvironment(cargo.environment, async () => {
+          await cargo.beforeAnswer.close();
+          const refused = rejectionOf(readCargoResolve(manifest, workspace));
+          await cargo.waitForRuns(
+            (runs) => runs.read === 1,
+            'real locked/offline Cargo to read before cache publication',
+          );
+          const namespace = join(workspaceDataDirectoryForWorkspace(workspace), 'cargo-resolve');
+          const entries = await readdir(namespace);
+          expect(entries).toHaveLength(1);
+          const [entry] = entries;
+          if (entry === undefined) throw new Error('the real resolver created no owned cache namespace');
+          const directory = join(namespace, entry);
+          const before = await stat(directory, { bigint: true });
+          let atOpen = before;
+          if (replaced) {
+            await rename(directory, `${directory}.retired`);
+            await mkdir(directory);
+            atOpen = await stat(directory, { bigint: true });
+            expect(atOpen.ino).not.toBe(before.ino);
+            // Force publication to report the replacement rather than silently sign under a new namespace.
+            await mkdir(join(directory, 'entry.cache'));
+          } else {
+            await rm(directory, { recursive: true });
+          }
+          await cargo.beforeAnswer.open();
+          const failure = expectCargoMetadataError(await refused, manifest);
+          expect(failure.message).toContain(directory);
+          expect(failure.message).toContain('entry.cache.');
+          expect(failure.message).toContain(
+            `"parentBeforeLock":${JSON.stringify({ state: 'present', dev: before.dev.toString(), ino: before.ino.toString() })}`,
+          );
+          if (replaced) {
+            const expected = JSON.stringify({
+              state: 'present',
+              dev: atOpen.dev.toString(),
+              ino: atOpen.ino.toString(),
+            });
+            expect(failure.message).toContain(`"parentAtTmpOpen":${expected}`);
+            expect(failure.message).toContain(`"parentAfterFailure":${expected}`);
+          } else {
+            expect(failure.message).toContain('"parentAtTmpOpen":{"state":"unavailable","code":"ENOENT"');
+            expect(failure.message).toContain('"parentAfterFailure":{"state":"unavailable","code":"ENOENT"');
+          }
+          const publication = failure.cause;
+          expect(publication).toBeInstanceOf(Error);
+          if (!(publication instanceof Error)) throw new Error('cache publication lost its structured cause');
+          expect(publication.cause).toHaveProperty('code', replaced ? 'EISDIR' : 'ENOENT');
+          expect(await spawned(cargo)).toBe(1);
+        });
+      } finally {
+        await cargo.release();
       }
-      await cargo.beforeAnswer.open();
-      const failure = expectCargoMetadataError(await refused, manifest);
-      expect(failure.message).toContain(directory);
-      expect(failure.message).toContain('entry.cache.');
-      expect(failure.message).toContain(
-        `"parentBeforeLock":${JSON.stringify({ state: 'present', dev: before.dev.toString(), ino: before.ino.toString() })}`,
-      );
-      if (replaced) {
-        const expected = JSON.stringify({ state: 'present', dev: atOpen.dev.toString(), ino: atOpen.ino.toString() });
-        expect(failure.message).toContain(`"parentAtTmpOpen":${expected}`);
-        expect(failure.message).toContain(`"parentAfterFailure":${expected}`);
-      } else {
-        expect(failure.message).toContain('"parentAtTmpOpen":{"state":"unavailable","code":"ENOENT"');
-        expect(failure.message).toContain('"parentAfterFailure":{"state":"unavailable","code":"ENOENT"');
-      }
-      const publication = failure.cause;
-      expect(publication).toBeInstanceOf(Error);
-      if (!(publication instanceof Error)) throw new Error('cache publication lost its structured cause');
-      expect(publication.cause).toHaveProperty('code', replaced ? 'EISDIR' : 'ENOENT');
-      expect(await spawned(cargo)).toBe(1);
-    });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 }
 
