@@ -154,22 +154,27 @@ const TYPESCRIPT_PATCH_INPUTS = ['{workspaceRoot}/patches/**/*', '!{workspaceRoo
 const WORKSPACE_TSCONFIG_BASE_INPUT = '{workspaceRoot}/tsconfig.base.json';
 
 /**
- * The native compiler a typecheck runs unless a dependency declares a dialect (typecheck-route.ts), apart from the one
- * emit runs: devenv.smoo.nix builds it from a pinned source revision and exports its path. The typecheck targets run it
- * directly, not through ttsc: ttsc auto-loads a dependency's transform plugin (typia) and then checks inside that
- * plugin's host, which links ttsc's own compiler and never runs the pinned one. Transform diagnostics stay enforced
- * where the transform runs: for the lib program in `tsc-js`'s emit, for test files when the test runner transforms
- * them. A test file no test executes has its types checked here but its transform calls checked nowhere. Hashed by the
- * store path, which carries the revision, so a compiler bump misses the cache. The command refuses an unset variable:
- * falling back would check with another compiler under the same key.
+ * The one pinned native TypeScript compiler `devenv.smoo.nix` builds for typecheck, emit, and the ttsc plugin hosts.
+ * Inferred `typecheck` and `typecheck-tests` run it directly unless a direct dependency declares a dialect
+ * (typecheck-route.ts), in which case they run `ttsc`; `tsc-js`, every `scriptc-*` target, and explicit plugin-host
+ * builds also run `ttsc` over that same compiler (`TTSC_TSGO_BINARY`) and its source (`TTSC_TSGO_SOURCE`).
+ *
+ * Keyed as an environment value on this store path, which carries the revision, so a compiler bump re-keys every
+ * consumer. The compiler's source (`TTSC_TSGO_SOURCE`) needs no second input: it comes from the same derivation as the
+ * binary, so this one store path moves with both. The direct typecheck command refuses an unset variable: falling back
+ * would check with another compiler under the same key.
  */
 const TYPECHECK_COMPILER_ENV = 'SMOO_TYPECHECK_TSC';
 const TYPECHECK_COMPILER_INPUT = { env: TYPECHECK_COMPILER_ENV };
 /**
  * The named input a project defines as the compiler identity of its inferred `typecheck`: {@link TYPECHECK_COMPILER_INPUT}
- * where that target runs the native compiler, undefined where it runs ttsc, whose compiler the workspace keys, or where
- * a declared `typecheck` replaces the inferred command. A workspace `typecheck` default that replaces the inferred
- * inputs names it to key exactly the compiler its command runs, and defines it empty in `nx.json` for the rest.
+ * whenever that target keeps the inferred command (direct or ttsc-routed, since both run the same pinned compiler), and
+ * undefined where no `typecheck` is inferred, where it is the noop that delegates to `tsc-js`, or where a declared
+ * `typecheck` replaces the command. A workspace whose
+ * `targetDefaults.typecheck` replaces the inferred inputs names it and defines the fallback empty in `nx.json` for the
+ * rest. Inferred targets (`tsc-js`, `scriptc-*`, `typecheck`, `typecheck-tests`) embed {@link TYPECHECK_COMPILER_INPUT}
+ * directly rather than referencing this named input, so an empty workspace fallback or a custom `typecheck` can never
+ * silently drop the compiler key on `tsc-js` or `scriptc-*`.
  */
 const TYPECHECK_COMPILER_NAMED_INPUT = 'typecheckCompiler';
 function typecheckCommand(args: string): string {
@@ -196,16 +201,16 @@ interface TypecheckTargets {
 }
 
 /**
- * A project's typecheck targets. A project whose direct dependency declares a dialect typechecks through ttsc, whose
- * linked plugin lowers the dialect and withdraws the checker's refusals of it; its compiler is the installed ttsc,
- * which bun.lock and the patches in its check inputs already key, and it waits for the targets the declaring package
- * names to prepare the plugin binaries ttsc loads. Every other project runs the pinned native compiler.
+ * A project's typecheck targets. A project whose direct dependency declares a dialect typechecks through `ttsc`, whose
+ * linked plugin lowers the dialect and withdraws the checker's refusals of it, and waits for the targets the declaring
+ * package names to prepare the plugin binaries `ttsc` loads. Every other project runs `SMOO_TYPECHECK_TSC` directly.
+ * Both routes execute the same pinned native compiler (`devenv.smoo.nix`), so both carry {@link TYPECHECK_COMPILER_INPUT}.
  */
 function typecheckTargets(manifests: readonly DependencyManifest[]): TypecheckTargets {
   const route = typecheckRoute(manifests);
   return route.declaredBy.length === 0
     ? { command: typecheckCommand, inputs: [TYPECHECK_COMPILER_INPUT], dependsOn: [] }
-    : { command: (args) => `ttsc ${args}`, inputs: [], dependsOn: route.dependsOn };
+    : { command: (args) => `ttsc ${args}`, inputs: [TYPECHECK_COMPILER_INPUT], dependsOn: route.dependsOn };
 }
 
 /**
@@ -1941,7 +1946,14 @@ async function createProjectTargets(
     targets['tsc-js'] = {
       executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
-      inputs: ['production', '^production', ...toolchainInputs, ...compileEnvInputs, '{projectRoot}/tsconfig.lib.json'],
+      inputs: [
+        'production',
+        '^production',
+        ...toolchainInputs,
+        TYPECHECK_COMPILER_INPUT,
+        ...compileEnvInputs,
+        '{projectRoot}/tsconfig.lib.json',
+      ],
       outputs: inferTypescriptOutputs(libOutDir),
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
@@ -1980,6 +1992,7 @@ async function createProjectTargets(
       targets,
       scriptcPlatformTargets(packageJson, packageJsonPath, projectRoot, libTsconfigPath, [
         ...toolchainInputs,
+        TYPECHECK_COMPILER_INPUT,
         ...compileEnvInputs,
       ]),
     );

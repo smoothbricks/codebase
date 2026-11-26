@@ -1415,13 +1415,21 @@ Concrete targets come from concrete files:
   inference by its manifest path. The routed `ttsc` runs the same pinned native compiler and builds its plugin hosts
   against the same compiler source (`TTSC_TSGO_BINARY` and `TTSC_TSGO_SOURCE`), alongside `ttsc` in `bun.lock` and the
   managed patch. A project that depends only on typia stays on the direct `SMOO_TYPECHECK_TSC` invocation.
-- A project whose inferred `typecheck` runs the native compiler (a project with `tsconfig.lib.json`, a declaration that
-  replaces `tsc-js`, and no dialect dependency) defines the named input `typecheckCompiler` as
-  `[{ "env": "SMOO_TYPECHECK_TSC" }]`; a noop `typecheck` delegating to `tsc-js`, a ttsc-routed project, and one whose
-  declared `typecheck` runs another command (another executor, a top-level `command`, or
-  `options.command`/`options.commands`), defines none. A workspace whose `targetDefaults.typecheck` replaces the
-  inferred inputs names it to key the compiler the command runs, and defines the fallback in `nx.json` empty, for the
-  projects that define none: `{ "namedInputs": { "typecheckCompiler": [] } }`.
+- Every target that runs the pinned native compiler or a `ttsc` plugin host built from it is keyed on
+  `{ "env": "SMOO_TYPECHECK_TSC" }`: inferred `tsc-js`, every `scriptc-<arch>-<family>` target, `typecheck-tests`
+  (direct or ttsc-routed), a `typecheck` that runs a command (direct or ttsc-routed; the noop that delegates to `tsc-js`
+  has no inputs of its own), and explicit host-build and host-consuming targets declared in package manifests (such as
+  `nx-plugin:ttsc-plugin-hosts` and the `nx-plugin` test shards that read its `TTSC_CACHE_DIR`). `TTSC_TSGO_SOURCE`
+  needs no second input because it comes from the same `devenv.smoo.nix` derivation as the binary, so the one store path
+  moves with both.
+- Inferred targets embed `{ "env": "SMOO_TYPECHECK_TSC" }` directly so a workspace fallback or custom `typecheck`
+  declaration can never silently resolve the key to empty. A project whose inferred `typecheck` runs the inferred
+  command (direct or ttsc-routed) also defines the named input `typecheckCompiler` as
+  `[{ "env": "SMOO_TYPECHECK_TSC" }]`; a noop `typecheck` delegating to `tsc-js`, a project with no inferred
+  `typecheck`, and one whose declared `typecheck` replaces the command (another executor, a top-level `command`, or
+  `options.command`/`options.commands`) define none. A workspace whose `targetDefaults.typecheck` replaces the inferred
+  inputs names `typecheckCompiler` to key the compiler that command runs, and defines the fallback in `nx.json` empty
+  for the projects that define none: `{ "namedInputs": { "typecheckCompiler": [] } }`.
 - A direct dependency whose ttsc plugin lowers by environment variables declares them in its manifest,
   `"smoo": { "compileEnv": ["NODE_ENV"] }` (`@smoothbricks/lmao-ttsc` does: it compiles trace statements away unless
   `NODE_ENV` is `test`). The transformed JavaScript is then a function of those variables, so `tsc-js` and every scriptc

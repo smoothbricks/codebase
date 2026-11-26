@@ -286,6 +286,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'production',
         '^production',
         ...toolchainInputs,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']);
@@ -465,9 +466,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // When `tsc-js` is inferred, `typecheck` delegates to `tsc-js` (which already runs the dialect plugins).
       expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
-      // ttsc is the workspace's to key: the project names no native compiler identity.
+      // The noop runs no compiler, so the project names no native compiler identity.
       expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
       expect(targets['typecheck-tests']?.options).toMatchObject({ command: 'ttsc -p tsconfig.test.json --noEmit' });
+      expect(targets['typecheck-tests']?.inputs).toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
       expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck', 'tools:plugins']);
       expect(targets['typecheck-tests:watch']?.options).toMatchObject({
         command: 'ttsc -p tsconfig.test.json --noEmit --watch',
@@ -487,8 +489,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const customTargets = customProject?.targets ?? {};
       expect(customTargets.typecheck?.options).toMatchObject({ command: 'ttsc -p tsconfig.lib.json --noEmit' });
       expect(customTargets.typecheck?.dependsOn).toEqual(['^*-js', 'tools:plugins']);
-      expect(customTargets.typecheck?.inputs).not.toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
-      expect(customProject?.namedInputs).not.toHaveProperty('typecheckCompiler');
+      // The routed typecheck runs ttsc over the same pinned native compiler, so it carries the same compiler key.
+      expect(customTargets.typecheck?.inputs).toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+      expect(customProject?.namedInputs?.typecheckCompiler).toEqual([{ env: 'SMOO_TYPECHECK_TSC' }]);
     } finally {
       await workspace.cleanup();
     }
@@ -516,6 +519,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
         // The inferred target always names the compiler; only a declaration that keeps its command keeps that key.
         expect(project?.targets?.typecheck?.inputs).toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+        // Even when a declared custom typecheck omits typecheckCompiler, tsc-js still keys the pinned compiler directly.
+        expect(project?.targets?.['tsc-js']?.inputs).toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
         expect([declared, project?.namedInputs?.typecheckCompiler]).toEqual([
           declared,
           named ? [{ env: 'SMOO_TYPECHECK_TSC' }] : undefined,
@@ -523,6 +528,27 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       } finally {
         await workspace.cleanup();
       }
+    }
+  });
+
+  it('adds no compiler key to a project with no TypeScript emit or typecheck', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/plain/package.json', '{"name":"plain","scripts":{"build":"echo ok"}}\n');
+      await workspace.write('packages/plain/src/index.js', 'export const value = 1;\n');
+
+      const project = await inferProject(workspace, 'packages/plain/package.json');
+      const targets = project?.targets ?? {};
+
+      expect(targets['tsc-js']).toBeUndefined();
+      expect(targets.typecheck).toBeUndefined();
+      expect(targets['typecheck-tests']).toBeUndefined();
+      expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
+      for (const target of Object.values(targets)) {
+        expect(target.inputs ?? []).not.toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+      }
+    } finally {
+      await workspace.cleanup();
     }
   });
 
@@ -564,7 +590,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
 
       const environment = targets['tsc-js']?.inputs?.filter((input) => typeof input === 'object' && 'env' in input);
-      expect(environment).toEqual([{ env: 'NODE_ENV' }, { env: 'LOWERING_MODE' }]);
+      expect(environment).toEqual([{ env: 'SMOO_TYPECHECK_TSC' }, { env: 'NODE_ENV' }, { env: 'LOWERING_MODE' }]);
       expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
     } finally {
       await workspace.cleanup();
@@ -774,6 +800,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           },
         });
         expect(mac[name]?.inputs).toContainEqual({ externalDependencies: ['scriptc', pack] });
+        expect(mac[name]?.inputs).toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
       }
       expect(mac['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts/']);
       // Only the host's own platform joins build; the publish legs build the rest by family.
@@ -1011,6 +1038,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
     } finally {
@@ -1266,6 +1294,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         ...configChain,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
       // Typed lint runs the same program (`projectService`), so its verdict

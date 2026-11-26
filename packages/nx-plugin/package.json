@@ -533,6 +533,9 @@
           "bunToolchain",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh go version"
+          },
+          {
+            "env": "SMOO_TYPECHECK_TSC"
           }
         ],
         "outputs": [
@@ -582,6 +585,9 @@
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false
+          },
+          {
+            "env": "SMOO_TYPECHECK_TSC"
           }
         ],
         "dependsOn": [
@@ -614,6 +620,9 @@
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false
+          },
+          {
+            "env": "SMOO_TYPECHECK_TSC"
           }
         ],
         "dependsOn": [
@@ -646,6 +655,9 @@
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false
+          },
+          {
+            "env": "SMOO_TYPECHECK_TSC"
           }
         ],
         "dependsOn": [
@@ -678,6 +690,9 @@
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false
+          },
+          {
+            "env": "SMOO_TYPECHECK_TSC"
           }
         ],
         "dependsOn": [
