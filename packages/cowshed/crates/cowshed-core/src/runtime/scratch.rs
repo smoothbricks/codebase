@@ -1026,6 +1026,48 @@ mod tests {
         );
     }
 
+    /// The production handshake bound admits a provider whose first answer waits on creating its
+    /// storage: the RAM provider's cold create (`diskutil apfs createContainer` then `addVolume`)
+    /// answered after 7.4-13.6 s at load 11-13. A provider answering after 6 s, past the first
+    /// guessed 5 s bound, is used; at 5 s every cold host start abandoned it.
+    #[tokio::test]
+    async fn a_provider_answering_after_a_cold_create_is_used_under_the_production_bound() {
+        let root =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cowshed-sc");
+        let root_path = std::fs::canonicalize(&*root).unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let sandbox = test_sandbox(&root_path);
+        let parent =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cowshed-sd");
+        let parent_path = std::fs::canonicalize(&*parent).unwrap();
+        let lease_dir = parent_path.join("h00002");
+        write_script(
+            &main,
+            "cold.sh",
+            &format!(
+                "#!/bin/sh\nset -eu\n/bin/sleep 6\nmkdir -m 0700 \"{0}\"\nprintf '{{\"directory\":\"%s\"}}\\n' \"{0}\"\n/bin/cat >/dev/null\n/bin/rm -rf \"{0}\"\n",
+                lease_dir.display(),
+            ),
+        );
+        let client = ScratchClient::new(ScratchProviderConfig::new(
+            vec!["/bin/sh".into(), "cold.sh".into()],
+            main.clone(),
+            "job-scratch".into(),
+            None,
+            None,
+        ));
+        let lease = match client.acquire(&sandbox).await {
+            ScratchOutcome::Lease(lease) => lease,
+            ScratchOutcome::Fallback { reason } => {
+                panic!("a provider answering after a cold create must be used: {reason}")
+            }
+        };
+        assert_eq!(lease.directory(), lease_dir.as_path());
+        lease.settle().await;
+        assert!(!lease_dir.exists());
+    }
+
     #[tokio::test]
     async fn provider_handshake_timeout_and_stuck_settle_are_bounded() {
         let root =
