@@ -175,6 +175,18 @@ function typecheckCommand(args: string): string {
   return `"\${${TYPECHECK_COMPILER_ENV}:?is unset, enter the devenv shell (devenv.smoo.nix builds the typecheck compiler)}" ${args}`;
 }
 
+/**
+ * The lint-only Bun the inferred `lint` runs as `bun lint`, separate from the runtime Bun on PATH: devenv.smoo.nix
+ * fetches it and exports its path, so a repository whose runtime Bun lacks `bun lint` still lints and the pin keys
+ * every lint by its store path without coupling lint keys to the runtime Bun. The command refuses an unset variable:
+ * falling back to PATH would lint with another Bun under the same key.
+ */
+const LINT_BUN_ENV = 'SMOO_LINT_BUN';
+const LINT_BUN_INPUT = { env: LINT_BUN_ENV };
+function lintBunCommand(args: string): string {
+  return `"\${${LINT_BUN_ENV}:?is unset, enter the devenv shell (devenv.smoo.nix fetches the lint Bun)}" ${args}`;
+}
+
 /** How one project's typecheck targets run: their command, the compiler input they hash, and what they wait for. */
 interface TypecheckTargets {
   readonly command: (args: string) => string;
@@ -620,11 +632,11 @@ function projectLintCommands(
     // pattern no file matches, or leave a new file unlinted. The all-verdicts executor resolves the token when it runs,
     // and the list beside the command is the file set this graph resolved, for the inspectors that read it.
     if (sources.files.length > 0) {
-      // `bun lint` reads the workspace's eslint.config.* itself, the nearest above each file, and builds its own types.
-      // `--no-script`: a root `lint` script would run instead of the linter. `-f stylish` is ESLint's own report, which
-      // is what the readers of this output parse.
+      // The pinned lint Bun (`SMOO_LINT_BUN`, devenv.smoo.nix) reads the workspace's eslint.config.* itself, the
+      // nearest above each file, and builds its own types. `--no-script`: a root `lint` script would run instead of
+      // the linter. `-f stylish` is ESLint's own report, which is what the readers of this output parse.
       eslintFileSet = {
-        command: `bun lint --no-script --type-aware -f stylish ${ESLINT_SOURCES_TOKEN}`,
+        command: lintBunCommand(`lint --no-script --type-aware -f stylish ${ESLINT_SOURCES_TOKEN}`),
         files: sources.files,
       };
       commands.push(eslintFileSet.command);
@@ -2548,8 +2560,8 @@ async function createProjectTargets(
           .filter((path) => !ESLINT_CONFIG_FILES.includes(path) && eslint?.configImports.includes(path) !== true)
           .map((path) => `{workspaceRoot}/${path}`),
         ...(lintScopes.length > 0 ? [bunScopeInput(projectRoot, lintScopes)] : []),
-        // The linter and its built-in rules are the Bun binary itself, which no lock scope names.
-        ...(eslintFileSet === null ? [] : [runtimeInput('bun --revision')]),
+        // The linter and its built-in rules are the lint Bun binary, keyed by its store path.
+        ...(eslintFileSet === null ? [] : [LINT_BUN_INPUT]),
       ],
       ...(lintCommands.length > 0
         ? {

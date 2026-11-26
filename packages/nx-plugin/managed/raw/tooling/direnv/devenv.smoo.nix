@@ -59,6 +59,60 @@
     doCheck = false;
   };
 
+  # The Bun the Nx plugin's inferred `lint` runs as `bun lint` (SMOO_LINT_BUN
+  # below), for linting only: every other task runs the repository's own
+  # runtime Bun, which this pin does not move. `bun lint` first ships in Bun
+  # 1.4.6, which has no release yet and which nixpkgs does not carry, so this
+  # is upstream's own canary build as Bun publishes it to npm:
+  # @oven/bun-<platform>@1.4.5-canary.20261124.1 answers `bun --revision`
+  # 1.4.6-canary.1+bd92f9bef. An npm version never changes, so each
+  # platform's tarball is a fixed-output fetch by its registry integrity. The
+  # lint targets hash the store path (an `env` input), so moving this pin
+  # re-runs every lint and nothing else. Like jactionlint above, the Darwin
+  # binary keeps upstream's signature (no fixup); Linux links it against the
+  # store's glibc as nixpkgs' own bun does.
+  lintBun = let
+    version = "1.4.5-canary.20261124.1";
+    sources = {
+      aarch64-darwin = {
+        platform = "darwin-aarch64";
+        hash = "sha512-akutH6TzdaE0eIVXZcH1+PaxZtC/a7yhlf13H+CwmdU6QrwmNC/CIscoh10OPrWImKWTrk5CKUazwCySgEc7VA==";
+      };
+      x86_64-darwin = {
+        platform = "darwin-x64";
+        hash = "sha512-zzrmhxx7G122c8AepWazzUBvHEPip0NRcxi55LBBDDtbxWgbb7bjdzwXfoqVcNqbq2DjA11gQePWS3sSLr4Z5w==";
+      };
+      aarch64-linux = {
+        platform = "linux-aarch64";
+        hash = "sha512-/z+WzPRwCOCwzDRIiw1KAWUaietm+QKqGcV04ZERo8HEhYJqNB13ub1hNanaA1P//y323vY5C95pGt9SltMgtw==";
+      };
+      x86_64-linux = {
+        platform = "linux-x64";
+        hash = "sha512-bPgrPTNQtJp8oLQBaak99SCQEob5vZ33SlkbzFkzR0M4l7XWpqYiLTM4BqFs1gMJDgkU3DyQPbQRYxUxdUWCTw==";
+      };
+    };
+    system = pkgs.stdenv.hostPlatform.system;
+    source = sources.${system} or (throw "bun-lint: unsupported managed shell platform ${system}");
+  in
+    pkgs.stdenvNoCC.mkDerivation {
+      pname = "bun-lint";
+      inherit version;
+      src = pkgs.fetchurl {
+        url = "https://registry.npmjs.org/@oven/bun-${source.platform}/-/bun-${source.platform}-${version}.tgz";
+        inherit (source) hash;
+      };
+      nativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.autoPatchelfHook];
+      buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.openssl];
+      dontConfigure = true;
+      dontBuild = true;
+      dontFixup = pkgs.stdenv.hostPlatform.isDarwin;
+      installPhase = ''
+        runHook preInstall
+        install -Dm755 bin/bun "$out/bin/bun"
+        runHook postInstall
+      '';
+    };
+
   # A repository that enables uv under languages.python gets its uv workspace
   # synced and activated by this contract (enterShell item 5), never by
   # devenv's own python tasks.
@@ -192,6 +246,7 @@ in {
       # reads only "false" as off (project-graph/plugins/isolation/enabled.js).
       NX_ISOLATE_PLUGINS = "false";
       SMOO_TYPECHECK_TSC = "${typecheckTsc}/bin/tsc";
+      SMOO_LINT_BUN = "${lintBun}/bin/bun";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
     # (CI reached the executable, then failed loading libglib-2.0.so.0). Use

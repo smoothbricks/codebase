@@ -76,7 +76,7 @@ const rootDevDependencies: RequiredDependency[] = [
     prefix: '^',
     useWorkspaceRangeInCodebase: true,
   },
-  { name: 'eslint', fallbackVersion: '^9.39.1', minimumVersion: '9.39.0', prefix: '^' },
+  { name: 'eslint', fallbackVersion: '^10.15.0', minimumVersion: '10.15.0', prefix: '^' },
   {
     name: 'eslint-stdout',
     fallbackVersion: '^1.1.1',

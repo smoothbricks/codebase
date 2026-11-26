@@ -88,15 +88,17 @@ JavaScript inputs. Test-config diagnostics retain TypeScript's parsed-command-li
 declarations fail with their diagnostic code and message, while an empty test program (TS18003) contributes no test
 files.
 
-The command names no file. It is `bun lint --no-script --type-aware -f stylish {eslintSources}`, and the target's
-`eslintProjectRoot` option names the project whose sources the placeholder stands for. A graph holds the files of the
-moment it was computed, and the daemon serves it past a deletion or an addition its watcher never reported: a list in
-the command made ESLint refuse a pattern no file matches, and left a new file unlinted, until the graph recomputed. The
-`all-verdicts` executor replaces the placeholder when the command runs, with the files the rules above select out of a
-fresh workspace file index: a new native context over the filesystem, never the table of the process or of the daemon,
-which learn of a write only when a watcher event reaches them. A project with none passes without starting a linter.
-Adding JavaScript/TypeScript sources or changing the declared test program changes what the next run lints, with no
-graph computation in between.
+The command names no file. It is `"$SMOO_LINT_BUN" lint --no-script --type-aware -f stylish {eslintSources}`, and the
+target's `eslintProjectRoot` option names the project whose sources the placeholder stands for. `SMOO_LINT_BUN` names
+the lint-only Bun that the managed `devenv.smoo.nix` pins (Bun 1.4.6 canary, the first with `bun lint`), so the runtime
+Bun of a repository never decides whether or how it lints, and the command refuses an unset variable. A graph holds the
+files of the moment it was computed, and the daemon serves it past a deletion or an addition its watcher never reported:
+a list in the command made ESLint refuse a pattern no file matches, and left a new file unlinted, until the graph
+recomputed. The `all-verdicts` executor replaces the placeholder when the command runs, with the files the rules above
+select out of a fresh workspace file index: a new native context over the filesystem, never the table of the process or
+of the daemon, which learn of a write only when a watcher event reaches them. A project with none passes without
+starting a linter. Adding JavaScript/TypeScript sources or changing the declared test program changes what the next run
+lints, with no graph computation in between.
 
 `bun lint` reads the workspace's `eslint.config.*` itself, the nearest one above each file as ESLint's lookup does, and
 builds its own types for the type-aware rules. `--no-script` keeps a root `lint` script from running in its place, and
@@ -112,9 +114,10 @@ have, each name in each directory from the project root up to the workspace root
 typed config added, removed or moved nearer re-keys the lints it applies to, and a sibling project's typed config keys
 nothing else. The pass itself is keyed by the workspace files its config loads and the lock scopes of the packages it
 loads by name, on the projects it applies to and no other. A lint that runs `bun lint` is also keyed by
-`bun --revision`, a runtime input: the linter and its built-in rules are the Bun binary, which no lockfile names. A
-typed config applies only in a workspace whose root ESLint configuration enables the lint, and two typed configs in one
-directory are refused.
+`{ "env": "SMOO_LINT_BUN" }` (the store path): the linter and its built-in rules are that pinned Bun binary, which no
+lockfile names, so moving the pin re-runs every lint without coupling to the repository's runtime Bun. A typed config
+applies only in a workspace whose root ESLint configuration enables the lint, and two typed configs in one directory are
+refused.
 
 The lint inputs key the same program without naming each file: the test declaration and its existing `extends` chain,
 one glob over the JavaScript and TypeScript kinds for each directory the declaration's include patterns walk (none for a
