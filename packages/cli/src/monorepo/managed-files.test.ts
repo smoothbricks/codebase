@@ -268,7 +268,6 @@ describe('managed raw files', () => {
     // and the managed shell watches it, without exporting the list.
     expect(managedEnvrc).toContain('watch_dir "$smoo_input_dir"');
     expect(managedEnvrc).toContain('unset smoo_input_dir SMOO_SHELL_INPUT_DIRS');
-    expect(module).toContain('((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default');
     expect(module).not.toContain('inputs.nixpkgs-overlay');
     expect(yaml).not.toContain('nixpkgs-overlay:');
     expect(json).not.toContain('"nixpkgs-overlay"');

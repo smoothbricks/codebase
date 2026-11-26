@@ -51,9 +51,6 @@ in {
 
   # https://devenv.sh/overlays/
   overlays = [
-    # Import the live owner source: a flake input evaluates its overlay outside
-    # devenv's file-read tracing, leaving generated pins absent from the eval cache.
-    ((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default
     inputs.rust-overlay.overlays.default
     # https://bugs.gnu.org/81060: tee 9.11 spins at close after a nonblocking write sets EAGAIN.
     # Keep stdenv's coreutils unchanged; only the shell selects the patched package.
@@ -81,8 +78,6 @@ in {
       git # Git hooks and repository inspection
       gh # GitHub Actions and release inspection
       direnv # Cowshed .envrc activation; hosted CI has no ambient direnv
-      # Bun.sh for javascript dependencies
-      bun
       # The managed shell's uv installer is exercised against the real producer in
       # packages/cli's shell-entry tests; those tests must find uv on PATH in CI,
       # where no ambient profile provides it.

@@ -218,6 +218,65 @@ in {
         };
       };
     })
+    # Bun, one build for every managed repository: a runtime is part of a cache
+    # key and of what a test observes, so it is not pinned per repository.
+    #
+    # A daily canary, because no Bun release has what the fleet needs:
+    # - `bun lint` exists in canary builds only (oven-sh/bun#46438).
+    # - On macOS, 1.4.5 and earlier never reap a Bun.spawn child whose exit
+    #   arrives during a nested event-loop tick: the child stays a zombie and
+    #   `exited` never settles (oven-sh/bun#45365, #45527). Bun main has the fix
+    #   at bd92f9bef; this canary is commit 0966e99d8, 14 commits later.
+    #
+    # The archives are the npm registry's per-platform packages: a published
+    # version is immutable there and the hashes below are the registry's own
+    # integrity values. GitHub's `canary` release is a rolling tag, so it is
+    # never fetched. Everything else is nixpkgs' derivation (autoPatchelf on
+    # Linux, the ICU relink and re-sign on macOS): it takes `src` and its
+    # platforms from `passthru.sources`, and an npm archive unpacks to
+    # package/bin/bun where a release zip unpacks to ./bun.
+    # The systems are nixpkgs' own three: the locked nixpkgs evaluates no
+    # package set for x86_64-darwin.
+    #
+    # A repository's own overlays apply after this one, so one that sets `bun`
+    # itself still decides it.
+    #
+    # `bun --version` of this build prints 1.4.6, the release it precedes, and
+    # that is what `packageManager` names. When Bun 1.4.6 is released, pin that
+    # release here; `packageManager` then stays as it is.
+    (_final: prev: {
+      bun = prev.bun.overrideAttrs (finalAttrs: previous: {
+        version = "1.4.5-canary.20261125.1";
+        # nixpkgs warns when `version` changes and `src` is not set beside it.
+        # Here `src` follows `passthru.sources`, as the derivation defines it.
+        __intentionallyOverridingVersion = true;
+        sourceRoot = "package/bin";
+        passthru =
+          previous.passthru
+          // {
+            sources = lib.mapAttrs (_system: source:
+              prev.fetchurl {
+                url = "https://registry.npmjs.org/@oven/bun-${source.platform}/-/bun-${source.platform}-${finalAttrs.version}.tgz";
+                inherit (source) hash;
+              }) {
+              aarch64-darwin = {
+                platform = "darwin-aarch64";
+                hash = "sha512-x4bXdyG94iTFksBIxjg7UJ+4CSM2b5MyJrhs8Kb6glwJUK/RlrAKl6Mr+MHqKlgQkw22PHNJosxzi58vavTnfg==";
+              };
+              aarch64-linux = {
+                platform = "linux-aarch64";
+                hash = "sha512-a6alL6OL/BReQPgcadeyY3dweOS78m7sC8zZyhddiB8q9Ceq8MmymejOrjniv6LQi+R4bCKySgy/VJQImU9T5A==";
+              };
+              x86_64-linux = {
+                # The baseline build, as nixpkgs' own x86_64-linux source: it
+                # runs on a CPU without AVX2.
+                platform = "linux-x64-baseline";
+                hash = "sha512-YVDDnjDhN2ZQZK65fxppMBOEkZfV63DSE2TDDF5/R4BPV0x97rZEBONBx1TJb5omC37UhMa93M8Cemh3j7Qf2g==";
+              };
+            };
+          };
+      });
+    })
   ];
 
   env = lib.mkMerge [
@@ -447,6 +506,9 @@ in {
       goPkgs.go_1_27
       pkgs.nodejs_26
       pkgs.binaryen
+      # The managed Bun of the overlay above: shell entry, the git hooks and
+      # every repository's `bun` commands run it.
+      pkgs.bun
       # Smoo's GitHub Actions validator uses the managed prebuilt package above.
       pkgs.jactionlint
       # Keep jactionlint's default shell and Python checks in the same pinned closure.

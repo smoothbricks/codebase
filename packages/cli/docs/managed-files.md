@@ -41,6 +41,22 @@ and arm64. The existing managed-file checks detect a missing or stale module, an
 same module. Nix installs the prebuilt executable with the shell; no validation-time download or Go compilation occurs.
 CI puts the same devenv profile bin on PATH, so CI uses the same pin.
 
+The managed module also supplies `bun`, through an overlay on nixpkgs' own `bun` package, so every managed repository
+runs one Bun build. The pin is the daily canary `1.4.5-canary.20261125.1` (Bun commit `0966e99d8`), because no Bun
+release has what the fleet needs. `bun lint` exists in canary builds only (oven-sh/bun#46438). On macOS, Bun 1.4.5 and
+earlier never reap a `Bun.spawn` child whose exit arrives during a nested event-loop tick, so the child stays a zombie
+and its `exited` promise never settles (oven-sh/bun#45365, #45527); Bun main has the fix at `bd92f9bef`, 14 commits
+before the pinned one. The archives are the npm registry's per-platform packages, for the three systems nixpkgs' own
+package has (`@oven/bun-darwin-aarch64`, `@oven/bun-linux-aarch64` and `@oven/bun-linux-x64-baseline`), where a
+published version is immutable and carries its SHA-512; GitHub's `canary` release is a rolling tag and is never fetched.
+nixpkgs' derivation still does the rest: autoPatchelf on Linux, the ICU relink and re-sign on macOS.
+
+This build prints 1.4.6 for `bun --version`, the release it precedes, so `packageManager` is `bun@1.4.6` and the
+executors and cowshed's wrapper that compare the two agree. When Bun 1.4.6 is released the pin moves to that release and
+`packageManager` stays. A repository's own overlays apply after the managed one: a repository that pinned a Bun release
+in its `nixpkgs-overlay` removes that entry to run the managed build, and one that builds Bun itself keeps deciding
+`pkgs.bun`.
+
 The managed package list also provides `shellcheck-minimal` and an executable-only `pyflakes` package, pinned by the
 existing devenv lockfile. The pyflakes package exposes only its checker executable, leaving the repository's configured
 Python interpreter and build environment unchanged. Both default integrations remain enabled locally and in CI.
