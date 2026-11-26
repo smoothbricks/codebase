@@ -944,10 +944,11 @@ change re-keys the tasks that can load what changed and no other.
     the root's by the package itself, since the root's node would key all of the root's tooling. Every inferred
     TypeScript target (`tsc-js`, `typecheck`, `typecheck-tests`, `lint`) names its project's node, the `@types` packages
     the manifests above it declare and `tslib` (TypeScript loads both by ancestry), and the packages holding the
-    installed configs its `tsconfig` chain extends. `tsc-js` adds `typescript` (ttsc loads the project's compiler API),
-    `ttsc` and `@typescript/native` (run from the root's `node_modules/.bin`), and each transform plugin its configs
-    name. `lint` adds `eslint` and `@biomejs/biome` when it runs them, and every package the ESLint configs load by
-    name.
+    installed configs its `tsconfig` chain extends. `tsc-js` runs the one pinned compiler from `devenv.smoo.nix` (keyed
+    through `SMOO_TYPECHECK_TSC`) and adds `typescript` (ttsc loads the project's compiler API), `ttsc` (run from the
+    root's `node_modules/.bin`), `@typescript/native` (still keyed from the root manifest, though declared only as the
+    npm alias for editors and TypeScript-7-API consumers), and each transform plugin its configs name. `lint` adds
+    `eslint` and `@biomejs/biome` when it runs them, and every package the ESLint configs load by name.
 
   An edit to a package only the root's tooling reaches, such as a dependency of an Nx generator, re-keys the root's
   targets and no member's.

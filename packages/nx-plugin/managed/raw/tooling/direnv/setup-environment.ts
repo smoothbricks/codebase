@@ -1382,7 +1382,8 @@ function ensureTypeScriptApiPackage(root: string): void {
   if (declaresNativeTypeScript(root) && !existsSync(nativeBin)) {
     throw new Error(
       `Missing ${nativeBin}. package.json declares @typescript/native but it is not installed. ` +
-        'Run bun install (or direnv reload). @typescript/native is the TypeScript 7 native compiler for ttsc.',
+        'Run bun install (or direnv reload). @typescript/native is the npm alias resolved by editors and ' +
+        'TypeScript 7 API consumers (typecheck, emit, and ttsc plugin hosts use the pinned devenv.smoo.nix compiler).',
     );
   }
 }

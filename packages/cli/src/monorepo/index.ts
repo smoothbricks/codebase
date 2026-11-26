@@ -133,7 +133,7 @@ export async function updateManagedFiles(root: string): Promise<void> {
   applyWorkspaceDependencyDefaults(root, {
     resolvedTargetsByProject: resolvedTargetsByProject(await readProjectTargets(root)),
   });
-  // Tool dependency policy (typescript API 6, @typescript/native for ttsc, nx, …)
+  // Tool dependency policy (typescript API 6, @typescript/native alias for editors and TS7 API consumers, nx, …)
   // lives next to managed templates — update must install them, not only rewrite files.
   await applyToolConfigDefaults(root);
   // Rust's half of the same job: a multi-crate Cargo workspace must resolve

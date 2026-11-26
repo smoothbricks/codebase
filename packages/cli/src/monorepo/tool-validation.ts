@@ -682,7 +682,7 @@ function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDepend
     return 'workspace:*';
   }
   if (dependency.name === '@typescript/native') {
-    return 'npm:typescript@^7 (TypeScript 7 native compiler alias for ttsc)';
+    return 'npm:typescript@^7 (npm alias for editors and TypeScript 7 API consumers)';
   }
   if (dependency.pinnedFromLockfile === true) {
     const expected = expectedPinnedVersion(policy, dependency);
