@@ -1547,15 +1547,19 @@ impl<'a> Dir64V2View<'a> {
             if target > max_hi {
                 break;
             }
-            cursor = crate::gallop_u32_by(nl, cursor, target, |j| large.high(j));
-            if cursor == nl {
-                break;
-            }
-            if large.high(cursor) == target {
-                if let (Some(a), Some(b)) = (small.child(i), large.child(cursor)) {
-                    count += on_match(target, &a, &b);
+            match crate::gallop_u32_by(nl, cursor, target, |j| large.high(j)) {
+                Ok(hit) => {
+                    if let (Some(a), Some(b)) = (small.child(i), large.child(hit)) {
+                        count += on_match(target, &a, &b);
+                    }
+                    cursor = hit + 1;
                 }
-                cursor += 1;
+                Err(next) => {
+                    if next == nl {
+                        break;
+                    }
+                    cursor = next;
+                }
             }
         }
         count
@@ -1653,21 +1657,24 @@ impl Range for Dir64V2Range<'_> {
             return;
         }
         let m = self.view.children as usize;
-        let mut at =
-            crate::gallop_u32_by(m, self.child_idx as usize, target_hi, |i| self.view.high(i));
-        if at < m && self.view.high(at) == target_hi {
-            if let Some(c) = self.view.child(at) {
-                let mut inner = c.range();
-                inner.seek(target as u32);
-                if !inner.empty() {
-                    self.high = u64::from(target_hi) << 32;
-                    self.inner = Some(inner);
-                    self.child_idx = at as u32 + 1;
-                    return;
+        let at = match crate::gallop_u32_by(m, self.child_idx as usize, target_hi, |i| {
+            self.view.high(i)
+        }) {
+            Ok(hit) => {
+                if let Some(c) = self.view.child(hit) {
+                    let mut inner = c.range();
+                    inner.seek(target as u32);
+                    if !inner.empty() {
+                        self.high = u64::from(target_hi) << 32;
+                        self.inner = Some(inner);
+                        self.child_idx = hit as u32 + 1;
+                        return;
+                    }
                 }
+                hit + 1
             }
-            at += 1;
-        }
+            Err(next) => next,
+        };
         self.inner = None;
         self.child_idx = at as u32;
         self.open_next();

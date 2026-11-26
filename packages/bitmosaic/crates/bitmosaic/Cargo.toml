@@ -131,3 +131,6 @@ required-features = ["bench-internals"]
 [[example]]
 name = "patch_sequence"
 required-features = ["bench-internals"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

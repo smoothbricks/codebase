@@ -30,6 +30,8 @@ mod array;
 mod bitmap;
 mod codec;
 mod ef;
+#[cfg(kani)]
+mod kani_proofs;
 mod list;
 mod maplet;
 #[cfg(any(test, feature = "bench-internals"))]
@@ -836,7 +838,7 @@ impl Container {
 /// bytes with no decode. The `u16` lanes take at most 16 per iteration, so
 /// the accumulators drain to a `usize` every `NEON_DRAIN` iterations and the
 /// window length is unbounded.
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
 #[inline]
 pub fn words_and_count<const N: usize>(windows: [&[u8]; N]) -> usize {
     use core::arch::aarch64::*;
@@ -970,7 +972,7 @@ pub fn words_and_count<const N: usize>(windows: [&[u8]; N]) -> usize {
 }
 
 #[cfg(not(any(
-    all(target_arch = "aarch64", target_feature = "neon"),
+    all(target_arch = "aarch64", target_feature = "neon", not(miri)),
     all(target_arch = "wasm32", not(feature = "wasm-scalar-portable")),
 )))]
 #[inline]
@@ -1322,15 +1324,19 @@ fn gallop(
     target: u16,
     at: impl Fn(usize) -> u16,
     tally: &mut Probes,
-) -> usize {
+) -> Result<usize, usize> {
+    use core::cmp::Ordering;
     if from >= len {
-        return len;
+        return Err(len);
     }
     tally.bump();
-    if at(from) >= target {
-        return from;
+    match at(from).cmp(&target) {
+        Ordering::Equal => return Ok(from),
+        Ordering::Greater => return Err(from),
+        Ordering::Less => {}
     }
-    // `at(from) < target`: bracket a position that is not below it. `lo`
+    // `at(from) < target`: bracket a position that is strictly above it,
+    // returning immediately on an exact `Equal` hit during lookahead. `lo`
     // and every `probe` stay below `len`, and `step` at most doubles past
     // `len` once before the guard fires, so the sum cannot overflow.
     let (mut lo, mut step) = (from, 1usize);
@@ -1340,23 +1346,26 @@ fn gallop(
             break len;
         }
         tally.bump();
-        if at(probe) >= target {
-            break probe;
+        match at(probe).cmp(&target) {
+            Ordering::Less => {
+                lo = probe;
+                step <<= 1;
+            }
+            Ordering::Equal => return Ok(probe),
+            Ordering::Greater => break probe,
         }
-        lo = probe;
-        step <<= 1;
     };
-    // Invariant: at(lo) < target, and hi == len or at(hi) >= target.
+    // Invariant: at(lo) < target, and hi == len or at(hi) > target.
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
         tally.bump();
-        if at(mid) < target {
-            lo = mid;
-        } else {
-            hi = mid;
+        match at(mid).cmp(&target) {
+            Ordering::Less => lo = mid,
+            Ordering::Equal => return Ok(mid),
+            Ordering::Greater => hi = mid,
         }
     }
-    hi
+    Err(hi)
 }
 
 /// Members `small` shares with `large`, driven from the small side: one
@@ -1380,16 +1389,18 @@ fn gallop_drive(
     let (mut count, mut cursor) = (0u32, 0usize);
     for i in 0..small_len {
         let target = small_at(i);
-        cursor = gallop(large_len, cursor, target, &large_at, &mut tally);
-        if cursor == large_len {
-            break;
+        match gallop(large_len, cursor, target, &large_at, &mut tally) {
+            Ok(hit) => {
+                count += 1;
+                cursor = hit + 1;
+            }
+            Err(next) => {
+                if next == large_len {
+                    break;
+                }
+                cursor = next;
+            }
         }
-        // `cursor` is the first position not below `target`, so equality is
-        // the only possible hit; a hit consumes the position, because every
-        // later target is strictly greater.
-        let hit = large_at(cursor) == target;
-        count += hit as u32;
-        cursor += hit as usize;
     }
     charge_gallop(tally);
     count
@@ -1414,13 +1425,17 @@ fn gallop_walk(
     let mut cursor = 0usize;
     for i in 0..small_len {
         let key = small_at(i);
-        cursor = gallop(large_len, cursor, key, &large_at, &mut tally);
-        if cursor == large_len {
-            break;
-        }
-        if large_at(cursor) == key {
-            on_match(i, cursor);
-            cursor += 1;
+        match gallop(large_len, cursor, key, &large_at, &mut tally) {
+            Ok(hit) => {
+                on_match(i, hit);
+                cursor = hit + 1;
+            }
+            Err(next) => {
+                if next == large_len {
+                    break;
+                }
+                cursor = next;
+            }
         }
     }
     charge_key_probes(tally);
@@ -1837,7 +1852,8 @@ fn merge_cone_array(fa: u16, sa: u64, ra: &[i8], b: &[u16]) -> u32 {
 #[cfg(all(
     target_arch = "aarch64",
     target_feature = "neon",
-    target_endian = "little"
+    target_endian = "little",
+    not(miri)
 ))]
 fn merge_and_arrays(a: &[u16], b: &[u16]) -> u32 {
     // SAFETY: u16 slices contain initialized bytes for exactly twice their element counts.
@@ -1850,7 +1866,7 @@ fn merge_and_arrays(a: &[u16], b: &[u16]) -> u32 {
     merge_and_array_bytes(a, b)
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
 pub(crate) fn merge_and_array_bytes(a: &[u8], b: &[u8]) -> u32 {
     use core::arch::aarch64::*;
     let (na, nb) = (a.len() / 2, b.len() / 2);
@@ -1902,14 +1918,15 @@ pub(crate) fn merge_and_array_bytes(a: &[u8], b: &[u8]) -> u32 {
 #[cfg(not(all(
     target_arch = "aarch64",
     target_feature = "neon",
-    target_endian = "little"
+    target_endian = "little",
+    not(miri)
 )))]
 #[inline]
 fn merge_and_arrays(a: &[u16], b: &[u16]) -> u32 {
     merge_and_scalar(a, b)
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon", not(miri))))]
 pub(crate) fn merge_and_array_bytes(a: &[u8], b: &[u8]) -> u32 {
     merge_and_scalar_by(
         a.len() / 2,
@@ -1922,7 +1939,8 @@ pub(crate) fn merge_and_array_bytes(a: &[u8], b: &[u8]) -> u32 {
 #[cfg(not(all(
     target_arch = "aarch64",
     target_feature = "neon",
-    target_endian = "little"
+    target_endian = "little",
+    not(miri)
 )))]
 fn merge_and_scalar(a: &[u16], b: &[u16]) -> u32 {
     merge_and_scalar_by(a.len(), b.len(), |i| a[i], |i| b[i])
@@ -1934,26 +1952,26 @@ fn merge_and_scalar_by(
     a: impl Fn(usize) -> u16,
     b: impl Fn(usize) -> u16,
 ) -> u32 {
-    // Branchy three-way merge, hoisted lens (bounds checks provably elided).
-    // Speculation beats a csel dependency chain here: the branch breaks the
-    // loop-carried compare->advance latency (measured 1.7 ns/iter branchless
-    // vs 0.7 ns/iter for this shape - the same lesson as the g98 audit).
+    // Branchy three-way merge with cached `va`/`vb` and hoisted lens:
+    // the unadvanced side is not reloaded on each iteration.
     if na == 0 || nb == 0 {
         return 0;
     }
     let (mut i, mut j, mut count) = (0usize, 0usize, 0u32);
+    let (mut va, mut vb) = (a(0), b(0));
     loop {
-        let (x, y) = (a(i), b(j));
-        if x < y {
+        if va < vb {
             i += 1;
             if i == na {
                 break;
             }
-        } else if x > y {
+            va = a(i);
+        } else if va > vb {
             j += 1;
             if j == nb {
                 break;
             }
+            vb = b(j);
         } else {
             count += 1;
             i += 1;
@@ -1961,6 +1979,8 @@ fn merge_and_scalar_by(
             if i == na || j == nb {
                 break;
             }
+            va = a(i);
+            vb = b(j);
         }
     }
     charge_linear(i + j);
@@ -2015,8 +2035,53 @@ pub(crate) fn stride_and_closed(a0: u32, s1: u32, n1: u32, b0: u32, s2: u32, n2:
 // The ladder: freeze staged words into the best container by exact bytes.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Extract every set bit position from a dense chunk plane into `out`
+/// (cleared first, reserving `expected`), unrolled 4-at-a-time per word.
+pub(crate) fn extract_words_into(words: &[u64; CHUNK_WORDS], expected: usize, out: &mut Vec<u16>) {
+    out.clear();
+    out.reserve(expected);
+    for (w, &word) in words.iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        let base = (w as u32) * 64;
+        let mut bits = word;
+        let count = bits.count_ones() as usize;
+        out.reserve(count);
+        let old_len = out.len();
+        let dst = &mut out.spare_capacity_mut()[..count];
+        let mut k = 0usize;
+        while k + 4 <= count {
+            let b0 = bits.trailing_zeros();
+            bits &= bits - 1;
+            let b1 = bits.trailing_zeros();
+            bits &= bits - 1;
+            let b2 = bits.trailing_zeros();
+            bits &= bits - 1;
+            let b3 = bits.trailing_zeros();
+            bits &= bits - 1;
+            dst[k].write((base + b0) as u16);
+            dst[k + 1].write((base + b1) as u16);
+            dst[k + 2].write((base + b2) as u16);
+            dst[k + 3].write((base + b3) as u16);
+            k += 4;
+        }
+        while k < count {
+            let b = bits.trailing_zeros();
+            bits &= bits - 1;
+            dst[k].write((base + b) as u16);
+            k += 1;
+        }
+        // SAFETY: `out.reserve(count)` ensured at least `count` spare elements
+        // and the two loops initialized every slot in `0..count`.
+        unsafe {
+            out.set_len(old_len + count);
+        }
+    }
+}
+
 fn freeze_chunk(words: &[u64; CHUNK_WORDS], scratch: &mut Vec<u16>) -> Option<Container> {
-    let n: u32 = words.iter().map(|w| w.count_ones()).sum();
+    let n = words_and_count::<1>([words_as_bytes(words)]) as u32;
     freeze_chunk_with_len(words, n, scratch)
 }
 
@@ -2052,15 +2117,7 @@ fn freeze_chunk_with_len(
             _ => unreachable!("dense chooser offers only stride, runs and words"),
         });
     }
-    scratch.clear();
-    scratch.reserve(n as usize);
-    for (w, &word) in words.iter().enumerate() {
-        let mut bits = word;
-        while bits != 0 {
-            scratch.push((w as u32 * 64 + bits.trailing_zeros()) as u16);
-            bits &= bits - 1;
-        }
-    }
+    extract_words_into(words, n as usize, scratch);
     freeze_members(scratch, Some(words))
 }
 
@@ -2114,19 +2171,50 @@ fn freeze_members(values: &[u16], plane: Option<&[u64; CHUNK_WORDS]>) -> Option<
     })
 }
 
+/// Popcount a 4-word (32-byte) directory stride group.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
+#[inline(always)]
+fn popcount_4_words(words: &[u64; CHUNK_WORDS], base: usize) -> u32 {
+    use core::arch::aarch64::*;
+    debug_assert!(base + 4 <= CHUNK_WORDS);
+    // SAFETY: `base + 4 <= CHUNK_WORDS`, so 32 bytes from `words[base]` are valid.
+    unsafe {
+        let ptr = words.as_ptr().add(base).cast::<u8>();
+        let c0 = vcntq_u8(vld1q_u8(ptr));
+        let c1 = vcntq_u8(vld1q_u8(ptr.add(16)));
+        let sum16 = vpadalq_u8(vpaddlq_u8(c0), c1);
+        vaddlvq_u16(sum16)
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon", not(miri))))]
+#[inline(always)]
+fn popcount_4_words(words: &[u64; CHUNK_WORDS], base: usize) -> u32 {
+    words[base].count_ones()
+        + words[base + 1].count_ones()
+        + words[base + 2].count_ones()
+        + words[base + 3].count_ones()
+}
+
 fn freeze_words(words: &[u64; CHUNK_WORDS], len: u32) -> Container {
+    const {
+        assert!(DIR_STRIDE == 4 && BLOCK_WORDS == 8);
+    };
     let mut summary = [0u64; SUMMARY_WORDS];
     let mut dir = Vec::with_capacity(CHUNK_WORDS / DIR_STRIDE);
     let mut running = 0u32;
-    for (w, word) in words.iter().enumerate() {
-        if w.is_multiple_of(DIR_STRIDE) {
-            dir.push(running as u16);
-        }
-        if *word != 0 {
-            let block = w / BLOCK_WORDS;
+    for block in 0..(CHUNK_WORDS / BLOCK_WORDS) {
+        let base = block * BLOCK_WORDS;
+        dir.push(running as u16);
+        let c0 = popcount_4_words(words, base);
+        running += c0;
+        dir.push(running as u16);
+        let c1 = popcount_4_words(words, base + DIR_STRIDE);
+        running += c1;
+        // Popcount > 0 proves the block has at least one set bit (zero extra word test).
+        if (c0 | c1) != 0 {
             summary[block / 64] |= 1u64 << (block % 64);
         }
-        running += word.count_ones();
     }
     Container::Words {
         words: Box::new(*words),
@@ -2363,17 +2451,18 @@ fn runs_sequence_count(
     let mut probes = Probes::zero();
     while r < nr && v < nv {
         let (start, end) = run(r);
-        v = gallop(nv, v, start, &value, &mut probes);
+        v = gallop(nv, v, start, &value, &mut probes).unwrap_or_else(|idx| idx);
         if v == nv {
             break;
         }
-        if value(v) > end {
-            r = gallop(nr, r, value(v), |i| run(i).1, &mut probes);
+        let val = value(v);
+        if val > end {
+            r = gallop(nr, r, val, |i| run(i).1, &mut probes).unwrap_or_else(|idx| idx);
         } else {
             let after = if end == u16::MAX {
                 nv
             } else {
-                gallop(nv, v, end + 1, &value, &mut probes)
+                gallop(nv, v, end + 1, &value, &mut probes).unwrap_or_else(|idx| idx)
             };
             count += (after - v) as u32;
             v = after;
@@ -2581,14 +2670,108 @@ impl StagedChunk {
 /// Mutable staging: a ladder-staged chunk per touched 65,536-value region;
 /// [`BitmosaicBuilder::freeze`] runs the seal-time ladder once — seal-once
 /// semantics.
-#[derive(Default)]
+///
+/// Chunks are stored append-only so out-of-order key insertion never shifts
+/// 72-byte [`StagedChunk`] slots (`O(1)` amortized insert/contains/remove).
+/// Monotonic key arrivals bypass the hash table and preserve `sorted == true`,
+/// keeping `freeze` zero-sort on the sequential fast path.
 pub struct BitmosaicBuilder {
     chunks: Vec<(u16, StagedChunk)>,
+    /// Cached most-recently-accessed `(key, slot)` for `O(1)` clustered hits.
+    last_key: u16,
+    last_slot: u32,
+    /// True while `chunks` keys are strictly ascending.
+    sorted: bool,
+    /// Open-addressed chunk-key index (`slot + 1`, `0` = empty); built lazily
+    /// once `chunks.len() > 8` so small builders allocate no lookup table.
+    /// Chunks are never removed, so no tombstones are ever needed.
+    table: Vec<u32>,
+}
+
+impl Default for BitmosaicBuilder {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            last_key: 0,
+            last_slot: u32::MAX,
+            sorted: true,
+            table: Vec::new(),
+        }
+    }
 }
 
 impl BitmosaicBuilder {
+    const LINEAR_SCAN_LIMIT: usize = 8;
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[inline(always)]
+    fn hash_key(key: u16, mask: usize) -> usize {
+        (usize::from(key).wrapping_mul(0x9E37_79B1)) & mask
+    }
+
+    #[inline]
+    fn find_slot(&self, key: u16) -> Option<usize> {
+        let last = self.last_slot as usize;
+        if last < self.chunks.len() && self.last_key == key {
+            return Some(last);
+        }
+        if self.table.is_empty() {
+            if self.sorted {
+                self.chunks.binary_search_by_key(&key, |(k, _)| *k).ok()
+            } else {
+                self.chunks.iter().position(|(k, _)| *k == key)
+            }
+        } else {
+            let mask = self.table.len() - 1;
+            let mut h = Self::hash_key(key, mask);
+            loop {
+                let entry = self.table[h];
+                if entry == 0 {
+                    return None;
+                }
+                let slot = (entry - 1) as usize;
+                if self.chunks[slot].0 == key {
+                    return Some(slot);
+                }
+                h = (h + 1) & mask;
+            }
+        }
+    }
+
+    fn rebuild_table(&mut self, cap: usize) {
+        self.table.clear();
+        self.table.resize(cap, 0);
+        let mask = cap - 1;
+        for (slot, &(key, _)) in self.chunks.iter().enumerate() {
+            let mut h = Self::hash_key(key, mask);
+            while self.table[h] != 0 {
+                h = (h + 1) & mask;
+            }
+            self.table[h] = (slot as u32) + 1;
+        }
+    }
+
+    #[inline]
+    fn insert_into_table(&mut self, key: u16, slot: usize) {
+        if self.table.is_empty() {
+            if self.chunks.len() > Self::LINEAR_SCAN_LIMIT {
+                self.rebuild_table(32);
+            }
+            return;
+        }
+        if self.chunks.len() * 2 >= self.table.len() {
+            self.rebuild_table(self.table.len() * 2);
+            return;
+        }
+        let mask = self.table.len() - 1;
+        let mut h = Self::hash_key(key, mask);
+        while self.table[h] != 0 {
+            h = (h + 1) & mask;
+        }
+        self.table[h] = (slot as u32) + 1;
     }
 
     /// Stage `value`, returning whether it was NEW.
@@ -2601,14 +2784,39 @@ impl BitmosaicBuilder {
     pub fn insert(&mut self, value: u32) -> bool {
         let key = (value >> 16) as u16;
         let low = (value & 0xFFFF) as u16;
-        let at = match self.chunks.binary_search_by_key(&key, |(k, _)| *k) {
-            Ok(at) => at,
-            Err(at) => {
-                self.chunks.insert(at, (key, StagedChunk::default()));
-                at
+        let last = self.last_slot as usize;
+        if last < self.chunks.len() && self.last_key == key {
+            return self.chunks[last].1.insert(low);
+        }
+        // Monotonic append fast path: key strictly exceeds the tail of a sorted builder.
+        if self.sorted
+            && let Some(&(tail_key, _)) = self.chunks.last()
+            && key > tail_key
+        {
+            let slot = self.chunks.len();
+            self.chunks.push((key, StagedChunk::default()));
+            self.insert_into_table(key, slot);
+            self.last_key = key;
+            self.last_slot = slot as u32;
+            return self.chunks[slot].1.insert(low);
+        }
+        let slot = match self.find_slot(key) {
+            Some(slot) => slot,
+            None => {
+                if let Some(&(tail_key, _)) = self.chunks.last()
+                    && key <= tail_key
+                {
+                    self.sorted = false;
+                }
+                let slot = self.chunks.len();
+                self.chunks.push((key, StagedChunk::default()));
+                self.insert_into_table(key, slot);
+                slot
             }
         };
-        self.chunks[at].1.insert(low)
+        self.last_key = key;
+        self.last_slot = slot as u32;
+        self.chunks[slot].1.insert(low)
     }
 
     /// Whether `value` is currently staged.
@@ -2619,9 +2827,8 @@ impl BitmosaicBuilder {
     pub fn contains(&self, value: u32) -> bool {
         let key = (value >> 16) as u16;
         let low = (value & 0xFFFF) as u16;
-        self.chunks
-            .binary_search_by_key(&key, |(k, _)| *k)
-            .is_ok_and(|at| self.chunks[at].1.contains(low))
+        self.find_slot(key)
+            .is_some_and(|slot| self.chunks[slot].1.contains(low))
     }
 
     /// Unstage `value`, returning whether it WAS a member.
@@ -2633,9 +2840,13 @@ impl BitmosaicBuilder {
     pub fn remove(&mut self, value: u32) -> bool {
         let key = (value >> 16) as u16;
         let low = (value & 0xFFFF) as u16;
-        match self.chunks.binary_search_by_key(&key, |(k, _)| *k) {
-            Ok(at) => self.chunks[at].1.remove(low),
-            Err(_) => false,
+        match self.find_slot(key) {
+            Some(slot) => {
+                self.last_key = key;
+                self.last_slot = slot as u32;
+                self.chunks[slot].1.remove(low)
+            }
+            None => false,
         }
     }
 
@@ -2654,12 +2865,30 @@ impl BitmosaicBuilder {
         );
         let mut running = 0u64;
         let mut scratch: Vec<u16> = Vec::new();
-        for (key, chunk) in self.chunks {
-            if let Some(container) = chunk.freeze(&mut scratch) {
-                running += container.cardinality() as u64;
-                keys.push(key);
-                cumulative.push(running);
-                containers.push(container);
+        if self.sorted {
+            for (key, chunk) in self.chunks {
+                if let Some(container) = chunk.freeze(&mut scratch) {
+                    running += container.cardinality() as u64;
+                    keys.push(key);
+                    cumulative.push(running);
+                    containers.push(container);
+                }
+            }
+        } else {
+            let mut order: Vec<(u16, u32)> = self
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(slot, &(key, _))| (key, slot as u32))
+                .collect();
+            order.sort_unstable_by_key(|&(key, _)| key);
+            for (key, slot) in order {
+                if let Some(container) = self.chunks[slot as usize].1.freeze(&mut scratch) {
+                    running += container.cardinality() as u64;
+                    keys.push(key);
+                    cumulative.push(running);
+                    containers.push(container);
+                }
             }
         }
         Bitmosaic {
@@ -2692,7 +2921,7 @@ impl BitmosaicBuilder {
         for (key, chunk) in &self.chunks {
             let base = usize::from(*key) * CHUNK_WORDS;
             let Some(tail) = dest.get_mut(base..) else {
-                return;
+                continue;
             };
             chunk.blit_into(tail);
         }
@@ -3226,14 +3455,152 @@ impl Bitmosaic {
                     combine_arrays(xa, xb, keep, scratch)
                 }
                 (Container::Array(xa), Container::Words { words, .. })
-                | (Container::Words { words, .. }, Container::Array(xa))
-                    if keep == [false, false, true] =>
+                    if keep == [false, false, true] || keep == [true, false, false] =>
                 {
+                    let want = keep[2];
                     scratch.members.clear();
+                    scratch.members.reserve(xa.len());
                     for &v in xa.iter() {
                         // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
-                        if (unsafe { *words.get_unchecked((v >> 6) as usize) } >> (v & 63)) & 1 != 0
-                        {
+                        let present =
+                            (unsafe { *words.get_unchecked((v >> 6) as usize) } >> (v & 63)) & 1
+                                != 0;
+                        if present == want {
+                            scratch.members.push(v);
+                        }
+                    }
+                    freeze_members(&scratch.members, None)
+                }
+                (Container::Words { words, .. }, Container::Array(xb))
+                    if keep == [false, false, true] || keep == [false, true, false] =>
+                {
+                    let want = keep[2];
+                    scratch.members.clear();
+                    scratch.members.reserve(xb.len());
+                    for &v in xb.iter() {
+                        // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                        let present =
+                            (unsafe { *words.get_unchecked((v >> 6) as usize) } >> (v & 63)) & 1
+                                != 0;
+                        if present == want {
+                            scratch.members.push(v);
+                        }
+                    }
+                    freeze_members(&scratch.members, None)
+                }
+                (Container::Words { words, len, .. }, Container::Array(xb))
+                    if keep == [true, false, false]
+                        || keep == [true, true, true]
+                        || keep == [true, true, false] =>
+                {
+                    scratch.plane.copy_from_slice(&words[..]);
+                    let mut count = *len;
+                    match keep {
+                        [true, false, false] => {
+                            for &v in xb.iter() {
+                                // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                                let w =
+                                    unsafe { scratch.plane.get_unchecked_mut((v >> 6) as usize) };
+                                let mask = 1u64 << (v & 63);
+                                count -= u32::from(*w & mask != 0);
+                                *w &= !mask;
+                            }
+                        }
+                        [true, true, true] => {
+                            for &v in xb.iter() {
+                                // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                                let w =
+                                    unsafe { scratch.plane.get_unchecked_mut((v >> 6) as usize) };
+                                let mask = 1u64 << (v & 63);
+                                count += u32::from(*w & mask == 0);
+                                *w |= mask;
+                            }
+                        }
+                        _ => {
+                            for &v in xb.iter() {
+                                // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                                let w =
+                                    unsafe { scratch.plane.get_unchecked_mut((v >> 6) as usize) };
+                                let mask = 1u64 << (v & 63);
+                                if *w & mask != 0 {
+                                    count -= 1;
+                                } else {
+                                    count += 1;
+                                }
+                                *w ^= mask;
+                            }
+                        }
+                    }
+                    freeze_chunk_with_len(&scratch.plane, count, &mut scratch.members)
+                }
+                (Container::Array(xa), Container::Words { words, len, .. })
+                    if keep == [false, true, false]
+                        || keep == [true, true, true]
+                        || keep == [true, true, false] =>
+                {
+                    scratch.plane.copy_from_slice(&words[..]);
+                    let mut count = *len;
+                    match keep {
+                        [false, true, false] => {
+                            for &v in xa.iter() {
+                                // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                                let w =
+                                    unsafe { scratch.plane.get_unchecked_mut((v >> 6) as usize) };
+                                let mask = 1u64 << (v & 63);
+                                count -= u32::from(*w & mask != 0);
+                                *w &= !mask;
+                            }
+                        }
+                        [true, true, true] => {
+                            for &v in xa.iter() {
+                                // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                                let w =
+                                    unsafe { scratch.plane.get_unchecked_mut((v >> 6) as usize) };
+                                let mask = 1u64 << (v & 63);
+                                count += u32::from(*w & mask == 0);
+                                *w |= mask;
+                            }
+                        }
+                        _ => {
+                            for &v in xa.iter() {
+                                // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                                let w =
+                                    unsafe { scratch.plane.get_unchecked_mut((v >> 6) as usize) };
+                                let mask = 1u64 << (v & 63);
+                                if *w & mask != 0 {
+                                    count -= 1;
+                                } else {
+                                    count += 1;
+                                }
+                                *w ^= mask;
+                            }
+                        }
+                    }
+                    freeze_chunk_with_len(&scratch.plane, count, &mut scratch.members)
+                }
+                // Output is a subset of `xa` (<= ARRAY_MAX): filter directly into
+                // `scratch.members` without touching the 8 KiB dense plane.
+                (Container::Array(xa), other)
+                    if keep == [false, false, true] || keep == [true, false, false] =>
+                {
+                    let want = keep[2];
+                    scratch.members.clear();
+                    scratch.members.reserve(xa.len());
+                    for &v in xa.iter() {
+                        if other.contains(v) == want {
+                            scratch.members.push(v);
+                        }
+                    }
+                    freeze_members(&scratch.members, None)
+                }
+                (other, Container::Array(xb))
+                    if keep == [false, false, true] || keep == [false, true, false] =>
+                {
+                    let want = keep[2];
+                    scratch.members.clear();
+                    scratch.members.reserve(xb.len());
+                    for &v in xb.iter() {
+                        if other.contains(v) == want {
                             scratch.members.push(v);
                         }
                     }
@@ -3743,13 +4110,17 @@ impl Bitmosaic64 {
             let mut cursor = 0usize;
             for i in 0..na {
                 let target = self.highs[i];
-                cursor = gallop_u32_by(nb, cursor, target, |j| other.highs[j]);
-                if cursor == nb {
-                    break;
-                }
-                if other.highs[cursor] == target {
-                    count += self.forests[i].and_len(&other.forests[cursor]);
-                    cursor += 1;
+                match gallop_u32_by(nb, cursor, target, |j| other.highs[j]) {
+                    Ok(hit) => {
+                        count += self.forests[i].and_len(&other.forests[hit]);
+                        cursor = hit + 1;
+                    }
+                    Err(next) => {
+                        if next == nb {
+                            break;
+                        }
+                        cursor = next;
+                    }
                 }
             }
             return count;
@@ -3759,16 +4130,29 @@ impl Bitmosaic64 {
         }
         let mut count = 0u64;
         let (mut i, mut j) = (0usize, 0usize);
-        while i < na && j < nb {
-            let (ha, hb) = (self.highs[i], other.highs[j]);
+        let (mut ha, mut hb) = (self.highs[0], other.highs[0]);
+        loop {
             if ha == hb {
                 count += self.forests[i].and_len(&other.forests[j]);
                 i += 1;
                 j += 1;
+                if i == na || j == nb {
+                    break;
+                }
+                ha = self.highs[i];
+                hb = other.highs[j];
             } else if ha < hb {
                 i += 1;
+                if i == na {
+                    break;
+                }
+                ha = self.highs[i];
             } else {
                 j += 1;
+                if j == nb {
+                    break;
+                }
+                hb = other.highs[j];
             }
         }
         count
@@ -3926,18 +4310,18 @@ impl Bitmosaic64 {
             if ha < hb {
                 i += 1;
                 if i < na && (a[i] >> 16) < hb {
-                    i = gallop_u64_slice(a, i, hb << 16);
+                    i = gallop_u64_slice(a, i, hb << 16).unwrap_or_else(|idx| idx);
                 }
                 continue;
             }
             if hb < ha {
                 j += 1;
                 if j < nb && (b[j] >> 16) < ha {
-                    j = gallop_u64_slice(b, j, ha << 16);
+                    j = gallop_u64_slice(b, j, ha << 16).unwrap_or_else(|idx| idx);
                 }
                 continue;
             }
-            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
             {
                 use core::arch::aarch64::*;
                 // SAFETY: neon is statically enabled; `i + 8 <= na` and
@@ -3986,38 +4370,69 @@ impl Bitmosaic64 {
                 }
             }
             // Scalar tail within block `ha` (or whole block on non-NEON).
-            while i < na && j < nb {
-                let (x, y) = (a[i], b[j]);
-                if (x >> 16) != ha || (y >> 16) != ha {
-                    break;
-                }
-                if x < y {
-                    i += 1;
-                } else if x > y {
-                    j += 1;
-                } else {
-                    out.push(x);
-                    i += 1;
-                    j += 1;
+            if i < na && j < nb {
+                let mut x = a[i];
+                let mut y = b[j];
+                if (x >> 16) == ha && (y >> 16) == ha {
+                    loop {
+                        if x < y {
+                            i += 1;
+                            if i == na {
+                                break;
+                            }
+                            x = a[i];
+                            if (x >> 16) != ha {
+                                break;
+                            }
+                        } else if x > y {
+                            j += 1;
+                            if j == nb {
+                                break;
+                            }
+                            y = b[j];
+                            if (y >> 16) != ha {
+                                break;
+                            }
+                        } else {
+                            out.push(x);
+                            i += 1;
+                            j += 1;
+                            if i == na || j == nb {
+                                break;
+                            }
+                            x = a[i];
+                            y = b[j];
+                            if (x >> 16) != ha || (y >> 16) != ha {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// First index in `from..len` with `at(idx) >= target`, via exponential gallop
-/// and bisection. Shared across `Bitmosaic64` / `Bitmosaic64View` /
-/// `Dir64V2View` intersections and cursor seeks (`CRange::Array`,
-/// `Bitmosaic64ViewRange`, `Dir64V2Range`).
+/// First index in strictly ascending `from..len` with `at(idx) >= target`,
+/// returning `Ok(idx)` on an exact match (early exit during lookahead or
+/// bisection) or `Err(idx)` for the first index strictly above `target` (or
+/// `len`). Shared across `Bitmosaic64` / `Bitmosaic64View` / `Dir64V2View`
+/// intersections and cursor seeks.
 #[inline(always)]
 pub(crate) fn gallop_u32_by(
     len: usize,
     from: usize,
     target: u32,
     at: impl Fn(usize) -> u32,
-) -> usize {
-    if from >= len || at(from) >= target {
-        return from.min(len);
+) -> Result<usize, usize> {
+    use core::cmp::Ordering;
+    if from >= len {
+        return Err(len);
+    }
+    match at(from).cmp(&target) {
+        Ordering::Equal => return Ok(from),
+        Ordering::Greater => return Err(from),
+        Ordering::Less => {}
     }
     let (mut lo, mut step) = (from, 1usize);
     let mut hi = loop {
@@ -4025,28 +4440,37 @@ pub(crate) fn gallop_u32_by(
         if probe >= len {
             break len;
         }
-        if at(probe) >= target {
-            break probe;
+        match at(probe).cmp(&target) {
+            Ordering::Less => {
+                lo = probe;
+                step <<= 1;
+            }
+            Ordering::Equal => return Ok(probe),
+            Ordering::Greater => break probe,
         }
-        lo = probe;
-        step <<= 1;
     };
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        if at(mid) < target {
-            lo = mid;
-        } else {
-            hi = mid;
+        match at(mid).cmp(&target) {
+            Ordering::Less => lo = mid,
+            Ordering::Equal => return Ok(mid),
+            Ordering::Greater => hi = mid,
         }
     }
-    hi
+    Err(hi)
 }
 
 #[inline(always)]
-fn gallop_u64_slice(slice: &[u64], from: usize, target: u64) -> usize {
+fn gallop_u64_slice(slice: &[u64], from: usize, target: u64) -> Result<usize, usize> {
+    use core::cmp::Ordering;
     let len = slice.len();
-    if from >= len || slice[from] >= target {
-        return from.min(len);
+    if from >= len {
+        return Err(len);
+    }
+    match slice[from].cmp(&target) {
+        Ordering::Equal => return Ok(from),
+        Ordering::Greater => return Err(from),
+        Ordering::Less => {}
     }
     let (mut lo, mut step) = (from, 1usize);
     let mut hi = loop {
@@ -4054,34 +4478,80 @@ fn gallop_u64_slice(slice: &[u64], from: usize, target: u64) -> usize {
         if probe >= len {
             break len;
         }
-        if slice[probe] >= target {
-            break probe;
+        match slice[probe].cmp(&target) {
+            Ordering::Less => {
+                lo = probe;
+                step <<= 1;
+            }
+            Ordering::Equal => return Ok(probe),
+            Ordering::Greater => break probe,
         }
-        lo = probe;
-        step <<= 1;
     };
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        if slice[mid] < target {
-            lo = mid;
-        } else {
-            hi = mid;
+        match slice[mid].cmp(&target) {
+            Ordering::Less => lo = mid,
+            Ordering::Equal => return Ok(mid),
+            Ordering::Greater => hi = mid,
         }
     }
-    hi
+    Err(hi)
 }
 
 fn gallop_intersect_u64(small: &[u64], large: &[u64], out: &mut Vec<u64>) {
     let mut cursor = 0usize;
     for &x in small {
-        cursor = gallop_u64_slice(large, cursor, x);
-        if cursor == large.len() {
-            break;
+        match gallop_u64_slice(large, cursor, x) {
+            Ok(hit) => {
+                out.push(x);
+                cursor = hit + 1;
+            }
+            Err(next) => {
+                if next == large.len() {
+                    break;
+                }
+                cursor = next;
+            }
         }
-        if large[cursor] == x {
-            out.push(x);
-            cursor += 1;
+    }
+}
+
+/// Fused single-pass NEON bitwise plane combine + `vcntq_u8`/`vpadalq_u8` popcount.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
+#[inline]
+fn combine_words_plane_neon(
+    wa: &[u64; CHUNK_WORDS],
+    wb: &[u64; CHUNK_WORDS],
+    out: &mut [u64; CHUNK_WORDS],
+    op: impl Fn(
+        core::arch::aarch64::uint8x16_t,
+        core::arch::aarch64::uint8x16_t,
+    ) -> core::arch::aarch64::uint8x16_t,
+) -> u32 {
+    use core::arch::aarch64::*;
+    const {
+        assert!(CHUNK_WORDS * 8 == 8192);
+    };
+    // 128 iterations * 64 B = 8192 B. Each u16 lane accumulates at most
+    // 128 * 16 = 2048 <= u16::MAX, so no intermediate drain is required.
+    // SAFETY: neon is statically enabled; `wa`, `wb`, and `out` are each 8192 bytes.
+    unsafe {
+        let mut pa = wa.as_ptr().cast::<u8>();
+        let mut pb = wb.as_ptr().cast::<u8>();
+        let mut po = out.as_mut_ptr().cast::<u8>();
+        let mut chains = [vdupq_n_u16(0); 4];
+        for _ in 0..128 {
+            for (lane, chain) in chains.iter_mut().enumerate() {
+                let at = lane * 16;
+                let v = op(vld1q_u8(pa.add(at)), vld1q_u8(pb.add(at)));
+                vst1q_u8(po.add(at), v);
+                *chain = vpadalq_u8(*chain, vcntq_u8(v));
+            }
+            pa = pa.add(64);
+            pb = pb.add(64);
+            po = po.add(64);
         }
+        chains.iter().map(|&c| vaddlvq_u16(c)).sum()
     }
 }
 
@@ -4093,54 +4563,92 @@ fn combine_words_plane(
     keep: [bool; 3],
     out: &mut [u64; CHUNK_WORDS],
 ) -> u32 {
-    let mut count = 0u32;
-    match keep {
-        [false, false, true] => {
-            for w in 0..CHUNK_WORDS {
-                let v = wa[w] & wb[w];
-                out[w] = v;
-                count += v.count_ones();
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
+    {
+        use core::arch::aarch64::*;
+        match keep {
+            [false, false, true] => {
+                // SAFETY: neon is statically enabled.
+                combine_words_plane_neon(wa, wb, out, |a, b| unsafe { vandq_u8(a, b) })
             }
-        }
-        [true, true, true] => {
-            for w in 0..CHUNK_WORDS {
-                let v = wa[w] | wb[w];
-                out[w] = v;
-                count += v.count_ones();
+            [true, true, true] => {
+                // SAFETY: neon is statically enabled.
+                combine_words_plane_neon(wa, wb, out, |a, b| unsafe { vorrq_u8(a, b) })
             }
-        }
-        [true, true, false] => {
-            for w in 0..CHUNK_WORDS {
-                let v = wa[w] ^ wb[w];
-                out[w] = v;
-                count += v.count_ones();
+            [true, true, false] => {
+                // SAFETY: neon is statically enabled.
+                combine_words_plane_neon(wa, wb, out, |a, b| unsafe { veorq_u8(a, b) })
             }
-        }
-        [true, false, false] => {
-            for w in 0..CHUNK_WORDS {
-                let v = wa[w] & !wb[w];
-                out[w] = v;
-                count += v.count_ones();
+            [true, false, false] => {
+                // SAFETY: neon is statically enabled.
+                combine_words_plane_neon(wa, wb, out, |a, b| unsafe { vbicq_u8(a, b) })
             }
-        }
-        [false, true, false] => {
-            for w in 0..CHUNK_WORDS {
-                let v = wb[w] & !wa[w];
-                out[w] = v;
-                count += v.count_ones();
+            [false, true, false] => {
+                // SAFETY: neon is statically enabled.
+                combine_words_plane_neon(wa, wb, out, |a, b| unsafe { vbicq_u8(b, a) })
             }
+            [true, false, true] => {
+                out.copy_from_slice(wa);
+                words_and_count::<1>([words_as_bytes(wa)]) as u32
+            }
+            [false, true, true] => {
+                out.copy_from_slice(wb);
+                words_and_count::<1>([words_as_bytes(wb)]) as u32
+            }
+            [false, false, false] => 0,
         }
-        [true, false, true] => {
-            out.copy_from_slice(wa);
-            return wa.iter().map(|w| w.count_ones()).sum();
-        }
-        [false, true, true] => {
-            out.copy_from_slice(wb);
-            return wb.iter().map(|w| w.count_ones()).sum();
-        }
-        [false, false, false] => return 0,
     }
-    count
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", not(miri))))]
+    {
+        let mut count = 0u32;
+        match keep {
+            [false, false, true] => {
+                for w in 0..CHUNK_WORDS {
+                    let v = wa[w] & wb[w];
+                    out[w] = v;
+                    count += v.count_ones();
+                }
+            }
+            [true, true, true] => {
+                for w in 0..CHUNK_WORDS {
+                    let v = wa[w] | wb[w];
+                    out[w] = v;
+                    count += v.count_ones();
+                }
+            }
+            [true, true, false] => {
+                for w in 0..CHUNK_WORDS {
+                    let v = wa[w] ^ wb[w];
+                    out[w] = v;
+                    count += v.count_ones();
+                }
+            }
+            [true, false, false] => {
+                for w in 0..CHUNK_WORDS {
+                    let v = wa[w] & !wb[w];
+                    out[w] = v;
+                    count += v.count_ones();
+                }
+            }
+            [false, true, false] => {
+                for w in 0..CHUNK_WORDS {
+                    let v = wb[w] & !wa[w];
+                    out[w] = v;
+                    count += v.count_ones();
+                }
+            }
+            [true, false, true] => {
+                out.copy_from_slice(wa);
+                return words_and_count::<1>([words_as_bytes(wa)]) as u32;
+            }
+            [false, true, true] => {
+                out.copy_from_slice(wb);
+                return words_and_count::<1>([words_as_bytes(wb)]) as u32;
+            }
+            [false, false, false] => return 0,
+        }
+        count
+    }
 }
 
 /// Direct sorted merge of two `Array` containers into `scratch.members`,
@@ -4159,26 +4667,34 @@ fn combine_arrays(
                 let mut tally = Probes::zero();
                 let mut cursor = 0usize;
                 for &v in xa {
-                    cursor = gallop(nb, cursor, v, |j| xb[j], &mut tally);
-                    if cursor == nb {
-                        break;
-                    }
-                    if xb[cursor] == v {
-                        scratch.members.push(v);
-                        cursor += 1;
+                    match gallop(nb, cursor, v, |j| xb[j], &mut tally) {
+                        Ok(hit) => {
+                            scratch.members.push(v);
+                            cursor = hit + 1;
+                        }
+                        Err(next) => {
+                            if next == nb {
+                                break;
+                            }
+                            cursor = next;
+                        }
                     }
                 }
             } else if drive_from_small(nb, na, DRIVE_RATIO_MEMBERS) {
                 let mut tally = Probes::zero();
                 let mut cursor = 0usize;
                 for &v in xb {
-                    cursor = gallop(na, cursor, v, |i| xa[i], &mut tally);
-                    if cursor == na {
-                        break;
-                    }
-                    if xa[cursor] == v {
-                        scratch.members.push(v);
-                        cursor += 1;
+                    match gallop(na, cursor, v, |i| xa[i], &mut tally) {
+                        Ok(hit) => {
+                            scratch.members.push(v);
+                            cursor = hit + 1;
+                        }
+                        Err(next) => {
+                            if next == na {
+                                break;
+                            }
+                            cursor = next;
+                        }
                     }
                 }
             } else {
@@ -4186,7 +4702,8 @@ fn combine_arrays(
                 #[cfg(all(
                     target_arch = "aarch64",
                     target_feature = "neon",
-                    target_endian = "little"
+                    target_endian = "little",
+                    not(miri)
                 ))]
                 {
                     use core::arch::aarch64::*;
@@ -4214,16 +4731,31 @@ fn combine_arrays(
                         }
                     }
                 }
-                while i < na && j < nb {
-                    let (a, b) = (xa[i], xb[j]);
-                    if a < b {
-                        i += 1;
-                    } else if a > b {
-                        j += 1;
-                    } else {
-                        scratch.members.push(a);
-                        i += 1;
-                        j += 1;
+                if i < na && j < nb {
+                    let (mut va, mut vb) = (xa[i], xb[j]);
+                    loop {
+                        if va < vb {
+                            i += 1;
+                            if i == na {
+                                break;
+                            }
+                            va = xa[i];
+                        } else if va > vb {
+                            j += 1;
+                            if j == nb {
+                                break;
+                            }
+                            vb = xb[j];
+                        } else {
+                            scratch.members.push(va);
+                            i += 1;
+                            j += 1;
+                            if i == na || j == nb {
+                                break;
+                            }
+                            va = xa[i];
+                            vb = xb[j];
+                        }
                     }
                 }
             }
@@ -4235,25 +4767,41 @@ fn combine_arrays(
                 let mut tally = Probes::zero();
                 let mut cursor = 0usize;
                 for &v in xa {
-                    cursor = gallop(nb, cursor, v, |j| xb[j], &mut tally);
-                    if cursor < nb && xb[cursor] == v {
-                        cursor += 1;
-                    } else {
-                        scratch.members.push(v);
+                    match gallop(nb, cursor, v, |j| xb[j], &mut tally) {
+                        Ok(hit) => cursor = hit + 1,
+                        Err(next) => {
+                            scratch.members.push(v);
+                            cursor = next;
+                        }
                     }
                 }
             } else {
                 let (mut i, mut j) = (0usize, 0usize);
-                while i < na && j < nb {
-                    let (a, b) = (xa[i], xb[j]);
-                    if a < b {
-                        scratch.members.push(a);
-                        i += 1;
-                    } else if a > b {
-                        j += 1;
-                    } else {
-                        i += 1;
-                        j += 1;
+                if i < na && j < nb {
+                    let (mut va, mut vb) = (xa[i], xb[j]);
+                    loop {
+                        if va < vb {
+                            scratch.members.push(va);
+                            i += 1;
+                            if i == na {
+                                break;
+                            }
+                            va = xa[i];
+                        } else if va > vb {
+                            j += 1;
+                            if j == nb {
+                                break;
+                            }
+                            vb = xb[j];
+                        } else {
+                            i += 1;
+                            j += 1;
+                            if i == na || j == nb {
+                                break;
+                            }
+                            va = xa[i];
+                            vb = xb[j];
+                        }
                     }
                 }
                 scratch.members.extend_from_slice(&xa[i..]);
@@ -4262,21 +4810,37 @@ fn combine_arrays(
         }
         [true, true, true] | [true, true, false] => {
             let emit_both = keep[2];
+            let (na, nb) = (xa.len(), xb.len());
             let (mut i, mut j) = (0usize, 0usize);
-            while i < xa.len() && j < xb.len() {
-                let (a, b) = (xa[i], xb[j]);
-                if a < b {
-                    scratch.members.push(a);
-                    i += 1;
-                } else if a > b {
-                    scratch.members.push(b);
-                    j += 1;
-                } else {
-                    if emit_both {
-                        scratch.members.push(a);
+            if i < na && j < nb {
+                let (mut va, mut vb) = (xa[i], xb[j]);
+                loop {
+                    if va < vb {
+                        scratch.members.push(va);
+                        i += 1;
+                        if i == na {
+                            break;
+                        }
+                        va = xa[i];
+                    } else if va > vb {
+                        scratch.members.push(vb);
+                        j += 1;
+                        if j == nb {
+                            break;
+                        }
+                        vb = xb[j];
+                    } else {
+                        if emit_both {
+                            scratch.members.push(va);
+                        }
+                        i += 1;
+                        j += 1;
+                        if i == na || j == nb {
+                            break;
+                        }
+                        va = xa[i];
+                        vb = xb[j];
                     }
-                    i += 1;
-                    j += 1;
                 }
             }
             scratch.members.extend_from_slice(&xa[i..]);
@@ -4411,6 +4975,40 @@ mod tests {
 
     fn shapes() -> Vec<(&'static str, Vec<u32>)> {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        if cfg!(miri) {
+            return vec![
+                (
+                    "uniform-sparse",
+                    (0..256)
+                        .map(|_| xorshift(&mut state) as u32 % 500_000)
+                        .collect(),
+                ),
+                ("strided", (0..300u32).map(|i| i * 13).collect()),
+                (
+                    "jittered-stride",
+                    (0..300u32)
+                        .map(|i| i * 11 + (xorshift(&mut state) % 3) as u32)
+                        .collect(),
+                ),
+                (
+                    "clustered",
+                    (0..4u32)
+                        .flat_map(|c| {
+                            let base = c * 100_000;
+                            (0..128u32).map(move |i| base + i * 2)
+                        })
+                        .collect(),
+                ),
+                (
+                    "dense-chunk",
+                    (0..4_200u32)
+                        .map(|i| i.wrapping_mul(2_654_435_761) % 65_536)
+                        .collect(),
+                ),
+                ("empty", Vec::new()),
+                ("single", vec![42]),
+            ];
+        }
         vec![
             (
                 "uniform-sparse",
@@ -5190,5 +5788,89 @@ mod tests {
         let mut walked = Vec::new();
         frozen.iter().for_each(|v| walked.push(v));
         assert_eq!(walked, oracle.iter().copied().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn perfloop_fast_paths_match_btreeset_oracle() {
+        // 1. Out-of-order BitmosaicBuilder (> 16 chunks, triggers hash table + unsorted freeze + blit_into).
+        let mut b = BitmosaicBuilder::new();
+        let mut ref_set = BTreeSet::new();
+        let mut state = 0xCAFE_BABE_1234_5678u64;
+        let chunk_count = if cfg!(miri) { 24u32 } else { 128u32 };
+        for round in 0..4u32 {
+            for k in (0..chunk_count).rev() {
+                let chunk = (k.wrapping_mul(17) + round * 5) % chunk_count;
+                let v = (chunk << 16) | ((xorshift(&mut state) as u32) & 0xFFFF);
+                assert_eq!(b.insert(v), ref_set.insert(v));
+                assert!(b.contains(v));
+            }
+        }
+        let to_remove: Vec<u32> = ref_set.iter().step_by(5).copied().collect();
+        for v in to_remove {
+            assert_eq!(b.remove(v), ref_set.remove(&v));
+            assert!(!b.contains(v));
+        }
+        let mut dest = vec![0u64; 2 * CHUNK_WORDS];
+        b.blit_into(&mut dest);
+        for &v in &ref_set {
+            if (v >> 16) < 2 {
+                let w = (v >> 6) as usize;
+                assert_ne!(dest[w] & (1u64 << (v & 63)), 0);
+            }
+        }
+        let frozen = b.freeze();
+        assert_eq!(
+            frozen.iter().collect::<Vec<_>>(),
+            ref_set.iter().copied().collect::<Vec<_>>()
+        );
+
+        // 2. Array vs Words / Cone / Stride across all 4 binary ops (both operand orders).
+        let arr_vals: BTreeSet<u32> = (0..180u32)
+            .map(|_| (xorshift(&mut state) as u32) & 0xFFFF)
+            .collect();
+        let words_vals: BTreeSet<u32> = (0..4_500u32)
+            .map(|i| i.wrapping_mul(2_654_435_761) & 0xFFFF)
+            .collect();
+        let stride_vals: BTreeSet<u32> = (0..200u32).map(|i| 17 + i * 29).collect();
+        let cone_vals: BTreeSet<u32> = (0..200u32)
+            .map(|i| 11 + i * 31 + (xorshift(&mut state) % 3) as u32)
+            .collect();
+
+        let sets = [
+            ("array", arr_vals),
+            ("words", words_vals),
+            ("stride", stride_vals),
+            ("cone", cone_vals),
+        ];
+        for (na, sa) in &sets {
+            let ba = Bitmosaic::from_sorted(sa.iter().copied());
+            for (nb, sb) in &sets {
+                let bb = Bitmosaic::from_sorted(sb.iter().copied());
+                let want_and: Vec<u32> = sa.intersection(sb).copied().collect();
+                let want_or: Vec<u32> = sa.union(sb).copied().collect();
+                let want_xor: Vec<u32> = sa.symmetric_difference(sb).copied().collect();
+                let want_andnot: Vec<u32> = sa.difference(sb).copied().collect();
+                assert_eq!(
+                    ba.and(&bb).iter().collect::<Vec<_>>(),
+                    want_and,
+                    "{na} & {nb}"
+                );
+                assert_eq!(
+                    ba.or(&bb).iter().collect::<Vec<_>>(),
+                    want_or,
+                    "{na} | {nb}"
+                );
+                assert_eq!(
+                    ba.xor(&bb).iter().collect::<Vec<_>>(),
+                    want_xor,
+                    "{na} ^ {nb}"
+                );
+                assert_eq!(
+                    ba.andnot(&bb).iter().collect::<Vec<_>>(),
+                    want_andnot,
+                    "{na} \\ {nb}"
+                );
+            }
+        }
     }
 }

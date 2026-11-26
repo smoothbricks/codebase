@@ -108,7 +108,14 @@ struct MapletEntry {
 
 /// Portable 16-slot fingerprint matcher returning a 16-bit mask where bit `i`
 /// is set iff `(slots[i] >> 16) == fp16` (for non-zero `fp16`).
-#[cfg(any(test, not(all(target_arch = "aarch64", target_endian = "little"))))]
+#[cfg(any(
+    test,
+    not(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        not(any(miri, kani))
+    ))
+))]
 #[inline(always)]
 #[must_use]
 fn match_bucket_scalar(slots: &[u32; BUCKET_SLOTS], fp16: u16) -> u16 {
@@ -126,7 +133,11 @@ fn match_bucket_scalar(slots: &[u32; BUCKET_SLOTS], fp16: u16) -> u16 {
 /// 128-bit vectors, deinterleaves the 16 high `u16` fingerprint lanes with two
 /// `UZP2`, compares all 16 against `fp16` with two `CMEQ`, and reduces to a
 /// 16-bit bitmask via weighted `AND`/`ORR`/`ADDV`.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    not(any(miri, kani))
+))]
 #[inline(always)]
 #[must_use]
 fn match_bucket_neon(slots: &[u32; BUCKET_SLOTS], fp16: u16) -> u16 {
@@ -165,11 +176,19 @@ fn match_bucket_neon(slots: &[u32; BUCKET_SLOTS], fp16: u16) -> u16 {
 #[inline(always)]
 #[must_use]
 fn match_bucket(slots: &[u32; BUCKET_SLOTS], fp16: u16) -> u16 {
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        not(any(miri, kani))
+    ))]
     {
         match_bucket_neon(slots, fp16)
     }
-    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        not(any(miri, kani))
+    )))]
     {
         match_bucket_scalar(slots, fp16)
     }
@@ -678,16 +697,14 @@ impl Maplet {
 
         let mut keys: Vec<u32> = Vec::with_capacity(tagged.len());
         let mut group_ends: Vec<u32> = Vec::new();
-        let mut max_val = 0u16;
+        let mut or_val = 0u16;
         let mut i = 0usize;
         while i < tagged.len() {
             let k = tagged[i].0;
             keys.push(k);
             let mut j = i;
             while j < tagged.len() && tagged[j].0 == k {
-                if tagged[j].2 > max_val {
-                    max_val = tagged[j].2;
-                }
+                or_val |= tagged[j].2;
                 j += 1;
             }
             if j < tagged.len() {
@@ -699,7 +716,7 @@ impl Maplet {
         let total_values = tagged.len();
         let key_count = keys.len();
         let multi_value = total_values > key_count;
-        let val_u16 = max_val > u8::MAX as u16;
+        let val_u16 = (or_val >> 8) != 0;
 
         let v2_len = image_len_v2(&keys);
         let val_width = if val_u16 { 2usize } else { 1usize };

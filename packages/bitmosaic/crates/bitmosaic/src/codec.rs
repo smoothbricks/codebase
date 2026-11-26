@@ -360,8 +360,9 @@ mod tests {
             assert_eq!(select64(u64::MAX, rank), rank);
         }
         // Every 8-bit pattern in every byte lane.
+        let byte_step = if cfg!(miri) { 17 } else { 1 };
         for lane in 0..8u32 {
-            for byte in 1..=255u64 {
+            for byte in (1..=255u64).step_by(byte_step) {
                 let word = byte << (lane * 8);
                 for rank in 0..word.count_ones() {
                     assert_eq!(
@@ -374,7 +375,8 @@ mod tests {
         }
         // Random words across all popcounts.
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        for _ in 0..4_096 {
+        let random_words = if cfg!(miri) { 32 } else { 4_096 };
+        for _ in 0..random_words {
             let word = xorshift(&mut state);
             let ones = word.count_ones();
             for rank in 0..ones {
@@ -389,19 +391,24 @@ mod tests {
 
     #[test]
     fn stride_quotient_matches_division_across_domain() {
-        let strides: Vec<u16> = (1..=300u16)
-            .chain([511, 512, 513, 1024, 4096, 32767, 32768, 65534, 65535])
-            .collect();
+        let strides: Vec<u16> = if cfg!(miri) {
+            vec![1, 2, 3, 7, 13, 64, 255, 256, 511, 4096, 32768, 65535]
+        } else {
+            (1..=300u16)
+                .chain([511, 512, 513, 1024, 4096, 32767, 32768, 65534, 65535])
+                .collect()
+        };
+        let delta_step = if cfg!(miri) { 1021 } else { 1 };
         for stride in strides {
             let magic = stride_magic(stride);
-            for delta in 0..=65535u32 {
+            for delta in (0..=65535u32).step_by(delta_step).chain([65535]) {
                 assert_eq!(
                     stride_quotient(delta, magic),
                     delta / u32::from(stride),
                     "stride={stride} delta={delta}"
                 );
             }
-            for delta in 0..=65536u32 {
+            for delta in (0..=65536u32).step_by(delta_step).chain([65536]) {
                 assert_eq!(
                     stride_quotient_ceil(delta, magic),
                     delta.div_ceil(u32::from(stride)),
@@ -469,7 +476,8 @@ mod tests {
     #[test]
     fn cone_window_rank_matches_partition_point() {
         let mut state = 0xBEEF_CAFE_0123_4567u64;
-        for len in 0..=140usize {
+        let max_len = if cfg!(miri) { 24 } else { 140 };
+        for len in 0..=max_len {
             let mut vals: Vec<u16> = Vec::with_capacity(len);
             let mut cur = 10u16;
             for _ in 0..len {

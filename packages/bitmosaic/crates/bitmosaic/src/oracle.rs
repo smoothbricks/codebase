@@ -403,8 +403,10 @@ mod tests {
     #[test]
     fn seeded_operation_lists_match_the_oracles() {
         let mut state = 0x0A11_5EED_u64;
-        for _ in 0..16 {
-            let data: Vec<u8> = (0..1024).map(|_| xorshift(&mut state) as u8).collect();
+        let rounds = if cfg!(miri) { 1 } else { 16 };
+        let len = if cfg!(miri) { 256 } else { 1024 };
+        for _ in 0..rounds {
+            let data: Vec<u8> = (0..len).map(|_| xorshift(&mut state) as u8).collect();
             patch_step(&data);
             and_step(&data);
         }
@@ -434,13 +436,23 @@ mod tests {
             ("array-8", scatter(8, 0x22)),
             ("array-64", scatter(64, 0x23)),
         ];
-        let wide: Vec<(&str, BTreeSet<u32>)> = vec![
-            ("stride-4000", stride(3, 13, 4_000)),
-            ("cone-1000", cone(7, 41, 1_000, 0x33)),
-            ("array-4000", scatter(4_000, 0x44)),
-            ("words-40000", scatter(40_000, 0x55)),
-            ("runs-120", runs(120)),
-        ];
+        let wide: Vec<(&str, BTreeSet<u32>)> = if cfg!(miri) {
+            vec![
+                ("stride-128", stride(3, 13, 128)),
+                ("cone-128", cone(7, 41, 128, 0x33)),
+                ("array-128", scatter(128, 0x44)),
+                ("words-4200", scatter(4_200, 0x55)),
+                ("runs-8", runs(8)),
+            ]
+        } else {
+            vec![
+                ("stride-4000", stride(3, 13, 4_000)),
+                ("cone-1000", cone(7, 41, 1_000, 0x33)),
+                ("array-4000", scatter(4_000, 0x44)),
+                ("words-40000", scatter(40_000, 0x55)),
+                ("runs-120", runs(120)),
+            ]
+        };
         for (small_name, a) in &small {
             for (wide_name, b) in &wide {
                 check_and(&format!("{small_name} x {wide_name}"), a, b);

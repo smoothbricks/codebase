@@ -915,16 +915,9 @@ fn dense_arm(plane: &[u64; CHUNK_WORDS], first: usize, n: usize) -> Arm {
     crate::choose_dense_arm(plane, first, n)
 }
 
-/// Extract the plane's members into `members` (cleared first).
-fn extract(plane: &[u64; CHUNK_WORDS], members: &mut Vec<u16>) {
-    members.clear();
-    for (w, &word) in plane.iter().enumerate() {
-        let mut bits = word;
-        while bits != 0 {
-            members.push((w * 64 + bits.trailing_zeros() as usize) as u16);
-            bits &= bits - 1;
-        }
-    }
+/// Extract the plane's members into `members` (cleared first, reserving `expected`).
+fn extract(plane: &[u64; CHUNK_WORDS], expected: usize, members: &mut Vec<u16>) {
+    crate::extract_words_into(plane, expected, members);
 }
 
 fn kind_of(arm: Arm) -> u32 {
@@ -943,7 +936,7 @@ fn finish(scratch: &mut PatchScratch, card: u32) -> Fresh {
     let n = card as usize;
     let plane = &*scratch.plane;
     let arm = if n <= ARRAY_MAX {
-        extract(plane, &mut scratch.members);
+        extract(plane, n, &mut scratch.members);
         choose_arm(&scratch.members, true)
     } else {
         let (_, _, first, _) = word_window(plane);

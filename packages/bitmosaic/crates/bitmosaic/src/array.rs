@@ -62,7 +62,9 @@ pub(crate) fn contains(plane: &[u16], v: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LEAF, contains, rank};
+    #[cfg(not(miri))]
+    use super::LEAF;
+    use super::{contains, rank};
 
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
@@ -75,11 +77,18 @@ mod tests {
     /// halving loop splits is met at least once, and the edges of each
     /// further halving up to `ARRAY_MAX`.
     fn sizes() -> Vec<usize> {
-        let mut sizes: Vec<usize> = (0..=9 * LEAF).collect();
-        sizes.extend([
-            511, 512, 513, 1000, 1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096,
-        ]);
-        sizes
+        #[cfg(miri)]
+        {
+            vec![0, 1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129, 256, 513]
+        }
+        #[cfg(not(miri))]
+        {
+            let mut sizes: Vec<usize> = (0..=9 * LEAF).collect();
+            sizes.extend([
+                511, 512, 513, 1000, 1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096,
+            ]);
+            sizes
+        }
     }
 
     fn planes(n: usize, state: &mut u64) -> Vec<Vec<u16>> {

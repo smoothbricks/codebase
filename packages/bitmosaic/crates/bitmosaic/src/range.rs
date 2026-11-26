@@ -662,13 +662,20 @@ impl ExactSizeIterator for ContainerRange<'_> {
 /// At every non-empty position, `set.len() as usize - range.len()` is the
 /// zero-based ordinal of `range.front()`. Read it before `pop_front`: no
 /// [`Bitmosaic::rank`] call or second directory descent is needed.
-/// First index in ascending `slice` whose value is `>= target`, via
+/// First index in strictly ascending `slice` whose value is `>= target`, via
 /// exponential gallop from index 0 followed by bisection: `O(log d)`.
+/// Uses 3-way comparison to exit immediately on exact `Equal` hits during
+/// both exponential lookahead and bisection.
 #[inline(always)]
 fn gallop_slice<T: Copy + Ord>(slice: &[T], target: T) -> usize {
+    use core::cmp::Ordering;
     let n = slice.len();
-    if n == 0 || slice[0] >= target {
+    if n == 0 {
         return 0;
+    }
+    match slice[0].cmp(&target) {
+        Ordering::Equal | Ordering::Greater => return 0,
+        Ordering::Less => {}
     }
     let (mut lo, mut step) = (0usize, 1usize);
     let mut hi = loop {
@@ -676,18 +683,21 @@ fn gallop_slice<T: Copy + Ord>(slice: &[T], target: T) -> usize {
         if probe >= n {
             break n;
         }
-        if slice[probe] >= target {
-            break probe;
+        match slice[probe].cmp(&target) {
+            Ordering::Less => {
+                lo = probe;
+                step <<= 1;
+            }
+            Ordering::Equal => return probe,
+            Ordering::Greater => break probe,
         }
-        lo = probe;
-        step <<= 1;
     };
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        if slice[mid] < target {
-            lo = mid;
-        } else {
-            hi = mid;
+        match slice[mid].cmp(&target) {
+            Ordering::Less => lo = mid,
+            Ordering::Equal => return mid,
+            Ordering::Greater => hi = mid,
         }
     }
     hi

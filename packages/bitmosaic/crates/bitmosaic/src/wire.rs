@@ -2217,45 +2217,80 @@ fn words_and_k(chunks: &[CView<'_>]) -> u32 {
         let w = CView::words(payload, word_count);
         slices[slot] = &w[(lo - base_word as usize) * 8..(hi - base_word as usize) * 8];
     }
-    if k == 4 && live >= 32 {
-        return crate::words_and_count::<4>([slices[0], slices[1], slices[2], slices[3]])
+    #[inline]
+    fn words_and_count_k(slices: &[&[u8]; 8], k: usize, off: usize, end: usize) -> usize {
+        match k {
+            2 => crate::words_and_count::<2>([&slices[0][off..end], &slices[1][off..end]]),
+            3 => crate::words_and_count::<3>([
+                &slices[0][off..end],
+                &slices[1][off..end],
+                &slices[2][off..end],
+            ]),
+            4 => crate::words_and_count::<4>([
+                &slices[0][off..end],
+                &slices[1][off..end],
+                &slices[2][off..end],
+                &slices[3][off..end],
+            ]),
+            5 => crate::words_and_count::<5>([
+                &slices[0][off..end],
+                &slices[1][off..end],
+                &slices[2][off..end],
+                &slices[3][off..end],
+                &slices[4][off..end],
+            ]),
+            6 => crate::words_and_count::<6>([
+                &slices[0][off..end],
+                &slices[1][off..end],
+                &slices[2][off..end],
+                &slices[3][off..end],
+                &slices[4][off..end],
+                &slices[5][off..end],
+            ]),
+            7 => crate::words_and_count::<7>([
+                &slices[0][off..end],
+                &slices[1][off..end],
+                &slices[2][off..end],
+                &slices[3][off..end],
+                &slices[4][off..end],
+                &slices[5][off..end],
+                &slices[6][off..end],
+            ]),
+            8 => crate::words_and_count::<8>([
+                &slices[0][off..end],
+                &slices[1][off..end],
+                &slices[2][off..end],
+                &slices[3][off..end],
+                &slices[4][off..end],
+                &slices[5][off..end],
+                &slices[6][off..end],
+                &slices[7][off..end],
+            ]),
+            _ => unreachable!("words_and_k handles k in 2..=8"),
+        }
+    }
+    let byte_len = (hi - lo) * 8;
+    if live >= 32 {
+        return words_and_count_k(&slices, k, 0, byte_len)
             .try_into()
             .unwrap_or(u32::MAX);
     }
-    let active = &slices[..k];
-    let mut count = 0u32;
-    if live >= 32 {
-        let words = hi - lo;
-        for w in 0..words {
-            let at = w * 8;
-            let mut bits = read_u64_at(active[0], at);
-            for s in &active[1..] {
-                bits &= read_u64_at(s, at);
+    let mut count = 0usize;
+    for (half, &word_mask) in sm.iter().enumerate() {
+        let mut mask = word_mask;
+        while mask != 0 {
+            let block = half * 64 + mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let base = block * BLOCK_WORDS;
+            if base < lo || base >= hi {
+                continue;
             }
-            count += bits.count_ones();
-        }
-    } else {
-        for (half, &word_mask) in sm.iter().enumerate() {
-            let mut mask = word_mask;
-            while mask != 0 {
-                let block = half * 64 + mask.trailing_zeros() as usize;
-                mask &= mask - 1;
-                let base = block * BLOCK_WORDS;
-                if base < lo || base >= hi {
-                    continue;
-                }
-                for w in 0..BLOCK_WORDS {
-                    let at = (base - lo + w) * 8;
-                    let mut bits = read_u64_at(active[0], at);
-                    for s in &active[1..] {
-                        bits &= read_u64_at(s, at);
-                    }
-                    count += bits.count_ones();
-                }
-            }
+            let off = (base - lo) * 8;
+            let end = off + BLOCK_WORDS.min(hi - base) * 8;
+            count += words_and_count_k(&slices, k, off, end);
         }
     }
-    count
+    count.try_into().unwrap_or(u32::MAX)
 }
 
 /// Chunk-level ascending intersection emitter for [`BitmosaicView::and_into`]:
@@ -2442,7 +2477,7 @@ fn array_bytes_and_into(xa: &[u8], xb: &[u8], high: u32, emit: &mut impl FnMut(u
         return;
     }
     let (mut i, mut j) = (0usize, 0usize);
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
     {
         use core::arch::aarch64::*;
         // SAFETY: neon is statically enabled; loop bounds guarantee 16 bytes on each side.
@@ -2469,17 +2504,32 @@ fn array_bytes_and_into(xa: &[u8], xb: &[u8], high: u32, emit: &mut impl FnMut(u
             }
         }
     }
-    while i < na && j < nb {
-        let a = read_u16_at(xa, 2 * i);
-        let b = read_u16_at(xb, 2 * j);
-        if a < b {
-            i += 1;
-        } else if a > b {
-            j += 1;
-        } else {
-            emit(high | u32::from(a));
-            i += 1;
-            j += 1;
+    if i < na && j < nb {
+        let mut va = read_u16_at(xa, 2 * i);
+        let mut vb = read_u16_at(xb, 2 * j);
+        loop {
+            if va < vb {
+                i += 1;
+                if i == na {
+                    break;
+                }
+                va = read_u16_at(xa, 2 * i);
+            } else if va > vb {
+                j += 1;
+                if j == nb {
+                    break;
+                }
+                vb = read_u16_at(xb, 2 * j);
+            } else {
+                emit(high | u32::from(va));
+                i += 1;
+                j += 1;
+                if i == na || j == nb {
+                    break;
+                }
+                va = read_u16_at(xa, 2 * i);
+                vb = read_u16_at(xb, 2 * j);
+            }
         }
     }
 }
@@ -2492,42 +2542,57 @@ fn gallop_array_bytes_into(
     high: u32,
     emit: &mut impl FnMut(u32),
 ) {
+    use core::cmp::Ordering;
     let mut cursor = 0usize;
-    for i in 0..ns {
-        let target = read_u16_at(small, 2 * i);
-        // Inline exponential gallop over `large` from `cursor`.
+    'outer: for i in 0..ns {
         if cursor >= nl {
             break;
         }
-        if read_u16_at(large, 2 * cursor) < target {
-            let (mut lo, mut step) = (cursor, 1usize);
-            let mut hi = loop {
-                let probe = lo + step;
-                if probe >= nl {
-                    break nl;
-                }
-                if read_u16_at(large, 2 * probe) >= target {
-                    break probe;
-                }
-                lo = probe;
-                step <<= 1;
-            };
-            while lo + 1 < hi {
-                let mid = lo + (hi - lo) / 2;
-                if read_u16_at(large, 2 * mid) < target {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
+        let target = read_u16_at(small, 2 * i);
+        match read_u16_at(large, 2 * cursor).cmp(&target) {
+            Ordering::Equal => {
+                emit(high | u32::from(target));
+                cursor += 1;
+                continue;
             }
-            cursor = hi;
-            if cursor == nl {
-                break;
+            Ordering::Greater => continue,
+            Ordering::Less => {}
+        }
+        let (mut lo, mut step) = (cursor, 1usize);
+        let mut hi = loop {
+            let probe = lo + step;
+            if probe >= nl {
+                break nl;
+            }
+            match read_u16_at(large, 2 * probe).cmp(&target) {
+                Ordering::Less => {
+                    lo = probe;
+                    step <<= 1;
+                }
+                Ordering::Equal => {
+                    emit(high | u32::from(target));
+                    cursor = probe + 1;
+                    continue 'outer;
+                }
+                Ordering::Greater => break probe,
+            }
+        };
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            match read_u16_at(large, 2 * mid).cmp(&target) {
+                Ordering::Less => lo = mid,
+                Ordering::Equal => {
+                    emit(high | u32::from(target));
+                    cursor = mid + 1;
+                    continue 'outer;
+                }
+                Ordering::Greater => hi = mid,
             }
         }
-        if read_u16_at(large, 2 * cursor) == target {
-            emit(high | u32::from(target));
-            cursor += 1;
+        // Invariant: hi == nl or large[hi] > target (strictly greater, no re-read needed).
+        cursor = hi;
+        if cursor == nl {
+            break;
         }
     }
 }
@@ -4207,15 +4272,19 @@ impl<'a> Bitmosaic64View<'a> {
             let mut cursor = 0usize;
             for i in 0..na {
                 let target = self.high(i);
-                cursor = gallop_u32_by(nb, cursor, target, |j| other.high(j));
-                if cursor == nb {
-                    break;
-                }
-                if other.high(cursor) == target {
-                    if let (Some(a), Some(b)) = (self.forest(i), other.forest(cursor)) {
-                        count += a.and_len(&b);
+                match gallop_u32_by(nb, cursor, target, |j| other.high(j)) {
+                    Ok(hit) => {
+                        if let (Some(a), Some(b)) = (self.forest(i), other.forest(hit)) {
+                            count += a.and_len(&b);
+                        }
+                        cursor = hit + 1;
                     }
-                    cursor += 1;
+                    Err(next) => {
+                        if next == nb {
+                            break;
+                        }
+                        cursor = next;
+                    }
                 }
             }
             return count;
@@ -4795,7 +4864,8 @@ impl Range for CRange<'_> {
             CRange::Array { values, at } => {
                 *at = gallop_u32_by(values.len() / 2, *at, u32::from(target), |i| {
                     u32::from(read_u16_at(values, i * 2))
-                });
+                })
+                .unwrap_or_else(|idx| idx);
             }
         }
     }
@@ -5147,23 +5217,26 @@ impl<'a> Bitmosaic64ViewRange<'a> {
             self.open_next();
             return;
         }
-        let mut at = gallop_u32_by(n, self.forest as usize, high, |i| self.view.high(i));
-        if at < n && self.view.high(at) == high {
-            if let Some(forest) = self.view.forest(at) {
-                let mut inner = forest.range();
-                inner.seek(value as u32);
-                if !Range::empty(&inner) {
-                    self.high = u64::from(high) << 32;
-                    self.remaining =
-                        self.view.len - self.view.before(at) - (forest.len() - inner.remaining());
-                    self.inner = inner;
-                    self.forest = at as u32 + 1;
-                    return;
+        let at = match gallop_u32_by(n, self.forest as usize, high, |i| self.view.high(i)) {
+            Ok(hit) => {
+                if let Some(forest) = self.view.forest(hit) {
+                    let mut inner = forest.range();
+                    inner.seek(value as u32);
+                    if !Range::empty(&inner) {
+                        self.high = u64::from(high) << 32;
+                        self.remaining = self.view.len
+                            - self.view.before(hit)
+                            - (forest.len() - inner.remaining());
+                        self.inner = inner;
+                        self.forest = hit as u32 + 1;
+                        return;
+                    }
                 }
+                // Every member of this forest is below `value`.
+                hit + 1
             }
-            // Every member of this forest is below `value`.
-            at += 1;
-        }
+            Err(next) => next,
+        };
         self.inner = BitmosaicViewRange::done();
         if at >= n {
             self.remaining = 0;
