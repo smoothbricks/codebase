@@ -380,6 +380,7 @@ waiting install and answers each every queue with `"fenced":true`, without waiti
 (`install_fenced_when_all_turns_fence`).
 
 While an install waits or a fence holds, an ask follows three cases:
+
 1. **Fence held (`f > 0`).** Every ask from outside every unfenced held turn — bounded or non-bounded — is parked: it is
    answered `{"turn":"fenced"}`, never numbered, and its connection is kept open (`fenced_ask_parked`).
 2. **Install waiting with no fence held (`w > 0, f = 0`).** Every non-bounded ask from outside every unfenced held turn
@@ -612,36 +613,36 @@ resumable ticket is numbered, the actor mints a 32-byte cryptographically random
 base64url), delivers it once on the asker's first numbered answer (`Held` or `Queued`), and stores only `SHA-256(token)`
 in memory and in the handoff snapshot — never on `Ticket`, so neither waiters nor `gateway status` ever see another
 land's token. The first ticket of a repository holds its turn. A waiting land is answered
-`{"turn":"queued","ticket","holder","ahead"}` when it asks and whenever its queue changes, and `{"turn":"held","ticket"}`
-once the turn is its own; an ask from outside every unfenced held turn that meets a fence, or meets a waiting install
-without a non-bounded ticket ahead of a bounded ask, is answered `{"turn":"fenced"}` and parked, then told its turn on
-that same connection once the gateway numbers it ("The read fences the turns"). A bounded ticket may stay held for at
-most the bounded-turn deadline (120 s, "Deadlines") once it takes the turn: at the deadline the gateway answers
-`{"turn":"expired","boundMs"}`, closes the connection, and ends the ticket through the lost-turn path below, so its
-bound commands receive SIGTERM and are reaped within the reap bound and `cowshed doc-commit` fails naming the bound. An
-asker that lies about its class gains at most one bound; its identity stays the kernel peer. A turn is held by
-processes, never by descriptors, and for a resumable turn by its asker's kernel identity plus its resume token rather
-than by one connection: by its asker until the asker ends its hold (`{"step":"end","outcome"}`), closes an **unfenced**
-connection or exits, and by each command bound to it (`{"step":"bind","pid"}`, answered `{"turn":"bound","pid"}`) until
-that command exits. A command binds itself: its asker arms it so that, between its fork and its exec, the child writes
-the bind step naming its own pid on the asker's connection, which it shares until its exec closes it, and the asker
-reads the answer once the spawn has returned. The gateway reads that step before the asker's end, which follows it on
-the connection, and after the asker's exit it reads the connection on to its end of file, which comes once every copy is
-closed: so a land killed at any moment after the fork leaves its command holding the turn, and one killed before it
-started none (measured 2026-10-26 in review: a land killed between spawning its gate and binding it left the gate
-running outside the turn). The gateway watches every one of those exits (`ExitWatch`: `NOTE_EXIT`, a pidfd), never
-polls, and follows a bound command across its execs by the kernel's identity of the process (Darwin's unique id, which
-an exec keeps while it renews the pid version; Linux's pidfd and `starttime`). A watch that fails is armed again once,
-on that same life, never on its bare pid, so a later process given the pid holds nothing; one that fails again leaves
-the command holding the turn until the gateway restarts, said on stderr, since a command that may still run is never
-taken for exited. The turn passes on once the last holder has ended: the next ticket is told at once that it holds the
-turn, each other how many are ahead and who holds it. Nothing a bound command starts holds the turn, whatever
-descriptors it inherits. A waiter that leaves, closed unfenced or killed, leaves the queue, and nobody behind it waits
-for it. A turn and its resume are asked only over the Unix control socket, whose peer the kernel names; the gateway
-refuses either over TCP. A waiting land says on stderr how many lands are ahead and who holds the turn — its workspace,
-its pid, the pids of the commands bound to it and when it asked — when it starts waiting, whenever the land ahead
-changes, and every 90 s between (the land watchdog's cadence), from the gateway's answers alone, and how long it waited
-once the turn is its own. `--gateway-socket <path>` names another gateway's queue than the host's, as for
+`{"turn":"queued","ticket","holder","ahead"}` when it asks and whenever its queue changes, and
+`{"turn":"held","ticket"}` once the turn is its own; an ask from outside every unfenced held turn that meets a fence, or
+meets a waiting install without a non-bounded ticket ahead of a bounded ask, is answered `{"turn":"fenced"}` and parked,
+then told its turn on that same connection once the gateway numbers it ("The read fences the turns"). A bounded ticket
+may stay held for at most the bounded-turn deadline (120 s, "Deadlines") once it takes the turn: at the deadline the
+gateway answers `{"turn":"expired","boundMs"}`, closes the connection, and ends the ticket through the lost-turn path
+below, so its bound commands receive SIGTERM and are reaped within the reap bound and `cowshed doc-commit` fails naming
+the bound. An asker that lies about its class gains at most one bound; its identity stays the kernel peer. A turn is
+held by processes, never by descriptors, and for a resumable turn by its asker's kernel identity plus its resume token
+rather than by one connection: by its asker until the asker ends its hold (`{"step":"end","outcome"}`), closes an
+**unfenced** connection or exits, and by each command bound to it (`{"step":"bind","pid"}`, answered
+`{"turn":"bound","pid"}`) until that command exits. A command binds itself: its asker arms it so that, between its fork
+and its exec, the child writes the bind step naming its own pid on the asker's connection, which it shares until its
+exec closes it, and the asker reads the answer once the spawn has returned. The gateway reads that step before the
+asker's end, which follows it on the connection, and after the asker's exit it reads the connection on to its end of
+file, which comes once every copy is closed: so a land killed at any moment after the fork leaves its command holding
+the turn, and one killed before it started none (measured 2026-10-26 in review: a land killed between spawning its gate
+and binding it left the gate running outside the turn). The gateway watches every one of those exits (`ExitWatch`:
+`NOTE_EXIT`, a pidfd), never polls, and follows a bound command across its execs by the kernel's identity of the process
+(Darwin's unique id, which an exec keeps while it renews the pid version; Linux's pidfd and `starttime`). A watch that
+fails is armed again once, on that same life, never on its bare pid, so a later process given the pid holds nothing; one
+that fails again leaves the command holding the turn until the gateway restarts, said on stderr, since a command that
+may still run is never taken for exited. The turn passes on once the last holder has ended: the next ticket is told at
+once that it holds the turn, each other how many are ahead and who holds it. Nothing a bound command starts holds the
+turn, whatever descriptors it inherits. A waiter that leaves, closed unfenced or killed, leaves the queue, and nobody
+behind it waits for it. A turn and its resume are asked only over the Unix control socket, whose peer the kernel names;
+the gateway refuses either over TCP. A waiting land says on stderr how many lands are ahead and who holds the turn — its
+workspace, its pid, the pids of the commands bound to it and when it asked — when it starts waiting, whenever the land
+ahead changes, and every 90 s between (the land watchdog's cadence), from the gateway's answers alone, and how long it
+waited once the turn is its own. `--gateway-socket <path>` names another gateway's queue than the host's, as for
 `disk-command`.
 
 **Fencing, handoff snapshot and resume.** When an install waits for the turns ("The read fences the turns"), the gateway
@@ -2054,11 +2055,11 @@ priority and ceiling from `PROC_PIDTHREADINFO` show both.
 **On macOS nothing cowshed starts is throttled for I/O, but for one case.** No process cowshed spawns that opens a path
 under the store or a workspace runs under `PRIO_DARWIN_BG`, a QoS clamp (`taskpolicy -b`,
 `taskpolicy -c utility|background`) or a disk I/O policy below IMPORTANT, and every cowshed launchd agent is
-`ProcessType=Interactive`, except a job that runs on past the tokens a land's gate left it, which is set
-`PRIO_DARWIN_BG` until that gate ends ("A land's gate takes tokens back"; the owner's ruling, 2026-11-25). Its disk I/O
-is throttled for that span, 79 to 105 times its unlink wall per file as measured above, and no other job's is: the cost
-falls on the job that would not give the gate its cores. Those mechanisms throttle a process's disk I/O along with its
-CPU, and a throttled thread sleeps while it holds work other writers wait behind:
+`ProcessType=Interactive`, except a job that runs on past the tokens a land's gate left it while the host has no idle
+core, which is set `PRIO_DARWIN_BG` until a core is idle again or that gate ends ("A land's gate takes tokens back").
+Its disk I/O is throttled for that span, 79 to 105 times its unlink wall per file as measured above, and no other job's
+is: the cost falls on the job that would not give the gate its cores. Those mechanisms throttle a process's disk I/O
+along with its CPU, and a throttled thread sleeps while it holds work other writers wait behind:
 
 - 2026-10-22 (57b1c81bc0): the image-freeing thread under `IOPOL_THROTTLE` slept on 1,213 of 1,963 metadata reads at a
   20.1 ms median; an unlink took 53.1 s against 7.6 s at normal policy, and a probe writer's p50 rose from 0.2 ms to
@@ -2079,12 +2080,16 @@ CPU, and a throttled thread sleeps while it holds work other writers wait behind
 
 <a id="smoo/cowshed!n/a-lands-gate-takes-tokens-back"></a>**A land's gate takes tokens back.** While a land's gate runs,
 every supervisor takes the jobserver tokens of the jobs it withdraws from back out of their fifos, and gives them back
-when the gate ends. A job that runs on past what it was left is set `PRIO_DARWIN_BG` on macOS for the same span. Every
-other job keeps running on what it has: none waits, is held back, stops or loses its class, and every mbx lease and hold
-stays as admitted ("Landing gets priority, never exclusivity"). The owner's ruling, 2026-11-25: a land's gate is
-prioritised by jobserver tokens taken from the other jobs, and by `PRIO_DARWIN_BG` only for a job whose tool does not
-respect tokens, both reset when the land ends. Class placement alone does not give the gate the host on macOS ("On macOS
-the order between classes is admission, not OS priority"), and the pool admits but never takes back what it admitted.
+when the gate ends. A job that runs on past what it was left is set `PRIO_DARWIN_BG` on macOS, but only while the host
+has no idle core, and returns to its class as soon as a core is idle again. Every other job keeps running on what it
+has: none waits, is held back, stops or loses its class, and every mbx lease and hold stays as admitted ("Landing gets
+priority, never exclusivity"). Why: the gate must finish quickly, so a job that will not give it its cores is
+backgrounded while it takes cores the gate needs; and idle cores must never starve other work, so a host with a core to
+spare backgrounds nothing. The background tier is starved by any foreground work whatever the idle cores, and a starved
+test is killed as wedged at its no-progress bound: measured 2026-11-26, during two land gates on a host about 38 % idle,
+about 30 nice-10 test, compile and plugin processes ran at priority 4, and test targets hit their 180 s bound. Class
+placement alone does not give the gate the host on macOS ("On macOS the order between classes is admission, not OS
+priority"), and the pool admits but never takes back what it admitted.
 
 - **A land's gate, and only a land's.** The span is a gate-class job named by its lander (`COWSHED_LANDER`, which only
   `cowshed land` sets, "Gates and lands"), from its admission to its end, whatever its verdict; a land whose gate runs
@@ -2114,21 +2119,26 @@ the order between classes is admission, not OS priority"), and the pool admits b
   : 1 before; given back, the client recovered within 0.52 s; and its unlink phase took at most 1.2 times its time
   untouched (8a11a9bbb4), so the drain throttles no I/O. A nested exec shares its parent's fifo and is withdrawn from
   with it. With mbx, a Cargo leaf reads its job's fifo, so the drain bounds its compiler fan-out too.
-- **A job that does not respect tokens, by what it does.** A tool's use of the jobserver is its behaviour, not its name,
-  so it is measured. After a grace of 1 s from the drain's start, over each window of 3 s, the job's CPU is the rusage
-  its process tree gained between the supervisor's process-tree samples at the window's ends (07_api.md, "Process-tree
-  observations"), never one sample. A job whose CPU over a window exceeds 1.5 cores per token it still holds, the
-  implicit one counted, is set `PRIO_DARWIN_BG`. A job that never read a token, its fifo never below `g − 1` bytes since
-  it started (the server's own descriptor answers how many it holds), holds only the implicit one and is judged by the
-  same rule from the span's start. A non-Cargo leaf under an mbx reservation, whose runner reads no jobserver, is such a
-  job: its job is set `PRIO_DARWIN_BG` if it runs on its grant, and its lease is untouched. The grace and the window are
-  the measured drain (at most 0.52 s in five of six runs, 1.5 s in the sixth) with room.
+- **A job that does not respect tokens, by what it does, while the gate is short of cores.** A tool's use of the
+  jobserver is its behaviour, not its name, so it is measured. After a grace of 1 s from the drain's start, over each
+  window of 3 s, the job's CPU is the rusage its process tree gained between the supervisor's process-tree samples at
+  the window's ends (07_api.md, "Process-tree observations"), never one sample, and the host's idle CPU is the idle time
+  the kernel counted across all cores between the same two instants (`HOST_CPU_LOAD_INFO` ticks on macOS), never a load
+  average. A job whose CPU over a window exceeds 1.5 cores per token it still holds, the implicit one counted, is set
+  `PRIO_DARWIN_BG` if over that same window the host had less than one core idle. A job that never read a token, its
+  fifo never below `g − 1` bytes since it started (the server's own descriptor answers how many it holds), holds only
+  the implicit one and is judged by the same rule from the span's start. A non-Cargo leaf under an mbx reservation,
+  whose runner reads no jobserver, is such a job: its job is set `PRIO_DARWIN_BG` if it runs on its grant while the host
+  has less than one core idle, and its lease is untouched. The grace and the window are the measured drain (at most 0.52
+  s in five of six runs, 1.5 s in the sixth) with room.
 - **`PRIO_DARWIN_BG` on the whole tree, and off again.** The supervisor sets it on each live process of the job's tree,
-  and on each process its observer sees start while it holds, since a process spawned before keeps its own policy. It
-  clears it on each process of the tree at the span's end, when the job ends, and when the supervisor stops hearing the
+  and on each process its observer sees start while it holds, since a process spawned before keeps its own policy. Its
+  windows go on while it holds, and it clears it on each process of the tree at the end of the first window over which
+  the host had at least one core idle, at the span's end, when the job ends, and when the supervisor stops hearing the
   gate state: a process spawned while it was set inherits it and keeps it after its parent's is cleared, so no clear is
-  of one process. On Linux a job's class cgroup weight is unchanged and nothing is set; whether a cgroup's `cpu.idle`
-  should serve there is open with the Linux question above.
+  of one process. A job cleared while the span still runs is judged again from its next window. On Linux a job's class
+  cgroup weight is unchanged and nothing is set; whether a cgroup's `cpu.idle` should serve there is open with the Linux
+  question above.
 - **What a crash leaves.** `PRIO_DARWIN_BG` outlives the process that set it. Before setting it on a process, the
   supervisor appends that life (its pid and `p_uniqueid` under `kern.bootsessionuuid`) to its group ledger (11_shell.md,
   "Supervisor recovery"). A supervisor's start clears it on every recorded life still running before it serves anything,
@@ -2143,9 +2153,11 @@ the order between classes is admission, not OS priority"), and the pool admits b
   given back, `job.darwinbg.set` with the window's CPU and the tokens it held, and `job.darwinbg.cleared`
   (13_telemetry.md, "Job span segments").
 - **Enforced by** reds of a background jobserver client whose CPU falls while a land's gate runs and recovers within a
-  heartbeat of its end; of a job that reads no token, set `PRIO_DARWIN_BG` after its window and cleared at the gate's
-  end, both read back; of a supervisor killed while a gate runs, whose successor clears every recorded life; and of a
-  gateway gone silent while a gate runs, after which every supervisor gives the tokens back and clears.
+  heartbeat of its end; of a job that reads no token and runs past its share, never set while the host has an idle core,
+  and set after its window while the host has none, then cleared at the first window with an idle core and at the gate's
+  end, each read back; the same pair for a non-Cargo leaf on its mbx grant; of a supervisor killed while a gate runs,
+  whose successor clears every recorded life; and of a gateway gone silent while a gate runs, after which every
+  supervisor gives the tokens back and clears.
 
 ### Memory pressure
 
@@ -2888,7 +2900,7 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   policy belongs to mbx and never preempts an admitted reservation or hold. Without mbx, the existing class placement
   applies. A gate has no quiet window and creates no additional hold. What a land's gate does take, for its span, is CPU
   from work already running: the jobserver tokens of every job it withdraws from, and `PRIO_DARWIN_BG` on macOS for a
-  job that runs on past them ("A land's gate takes tokens back"; the owner's ruling, 2026-11-25). No job waits for it,
+  job that runs on past them while the host has no idle core ("A land's gate takes tokens back"). No job waits for it,
   and every lease and hold stays as admitted.
 - **A job lives with its requester.** A foreground job's only consumer is the process that asked for it, so when that
   process is gone the job stops. A gate job's verdict moves main only through the `cowshed land` its lander runs next,
