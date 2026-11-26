@@ -465,6 +465,51 @@ files to guard its recorded identity, and its witness statted them again at each
 package per plugin load (3,681 distinct paths), which is the largest vnode churn ttsc puts on a busy host. With the
 patch it is about 660 (17 distinct paths). A `GOROOT` the project or host supplies keeps the full walk.
 
+Stock ttsc 0.38.1 builds every plugin host and its own compiler host against the TypeScript-Go revision it pins, so a
+project that checks with its own compiler (`TTSC_TSGO_BINARY`) got hosts built from a different compiler: on a
+consumer's test program a host from the pinned revision cost 21.1–21.6 s of CPU where our compiler takes 15.6–15.9 s.
+The patch lets a project declare the Go module directory its compiler was built from in `TTSC_TSGO_SOURCE`
+([samchon/ttsc#1889](https://github.com/samchon/ttsc/pull/1889); `ttsc-env.sh` sets it to the checkout profile's `tsc`
+source beside `TTSC_TSGO_BINARY`). `SourcePluginWorkspace.withCompilerSource` adds that directory to the build's overlay
+modules so it is hashed into the plugin cache key, copied and proven like the other overlays, written into the generated
+`go.work` as a workspace `replace` of the compiler module (`SourcePluginWorkspace.writeGoWork`), admitted only when its
+`go.mod` declares the compiler module of the build's line (`SourcePluginAdmission.requireCompilerSource`), and reported
+and watched as a plugin source (`loadProjectPlugins`); a declared path is resolved through symbolic links to its
+physical directory, and the scratch copy of a read-only tree (a Nix store path) is made writable by its owner. Our
+compiler source also provides `internal/batch` (`Begin() (programBound, end)`), the collector pacing its `tsc` command
+uses for one batch compilation, which a host built as a library did not get (3.44 s in Go's collector against 0.86 s for
+the compiler): when the declared source contains that package, `CompilerTarget.buildEnv` adds the `ttsc_compiler_batch`
+build tag and the compiler shim's `BeginBatchOnce` (`shim/compiler/batch.go`, `targets/7.1/bridge/compiler/batch.go`)
+calls it once per process from `driver.LoadProgram` (`driver/program.go`), only when the launcher marked the process
+one-shot with `TTSC_BATCH=1` (`BuildExecution.js`, `BATCH_ENV.js`); resident hosts (watch, serve, ttscserver) spawn with
+the marker cleared, `driver.Session` never begins a batch, and builds without the package take the no-op leg
+(`batch_noop.go`). Finally, on a warm start the launcher hashes, realpaths and stats each path once per load phase
+(`hashHostInputPaths`, `realpathHostInputPaths`, `PluginDescriptorInputObserver`, `PluginPackageResolution`,
+`WitnessedLoadAnswers`, `hashPluginBuildEnvironment`), removing host inputs listed twice, descriptor-input ancestor
+walks on every missing resolution candidate, per-directory realpaths of a non-bundled `GOROOT`, witness validation
+re-reading toolchain paths per directory, and probing the nearest `package.json` twice per ancestor, while sharing
+nothing across a load, a retry or a watch baseline. A plugin source or executable in a Nix store path proves its
+recorded content digest by the store path and its top directory's identity
+([samchon/ttsc#1902](https://github.com/samchon/ttsc/pull/1902)): a valid store path is immutable, and the store's
+volume, where ttsc cannot mint a clock reference, otherwise made every launch read the whole declared compiler source.
+Last, a one-shot `--noEmit` check (`TTSC_BATCH=1`, an effective `noEmit`) computes its diagnostics on the compiler's
+checker pool, as `tsc` does, while every type a transform or plugin reads still comes from `checkers[0]`
+([samchon/ttsc#1907](https://github.com/samchon/ttsc/pull/1907)); every other Program, a resident Session and any load
+that emits, stays on one checker, and a pooled Program refuses the emits that read a file's own checker. A host input
+that `lstat` finds missing is recorded as unresolved without a realpath walk
+([samchon/ttsc#1913](https://github.com/samchon/ttsc/pull/1913)): module-resolution candidates, every extension
+permutation of each specifier, are host inputs so that a file appearing there re-keys the load, and most of them never
+exist. The plugin build-environment record no longer keys on the per-invocation variables a jobserver, direnv or cowshed
+set (`MAKEFLAGS`, `CARGO_MAKEFLAGS`, `COWSHED_INSTALL_OBSERVED`, `DIRENV_DIFF`, `DIRENV_WATCHES`, `OLDPWD`, `SHLVL`;
+[samchon/ttsc#1912](https://github.com/samchon/ttsc/pull/1912)), so a warm launch replays it instead of running the Go
+tool again. A non-empty `NODE_OPTIONS` no longer turns off the descriptor-answer and capability caches when every
+`--require` target in it is listed in `TTSC_CACHE_TRUSTED_PRELOADS`
+([samchon/ttsc#1914](https://github.com/samchon/ttsc/pull/1914)): ttsc walks each listed preload's module graph through
+`module.children`, records its files as inputs of a descriptor answer and digests them into the capability keys, and
+whoever lists a preload vouches for everything it does beyond that graph. A descriptor evaluator loads the build chain
+only when it compiles a TypeScript source ([samchon/ttsc#1915](https://github.com/samchon/ttsc/pull/1915)), so a `.cjs`
+descriptor starts 28 modules instead of 251.
+
 A resident `driver.Session` whose `Session.Apply` installs a new program generation resets `pluginsApplied`,
 `pluginsApplyErr` and the per-generation plugin ledgers (`declarations`, `inputs`, `outputs` via
 `linkedPluginState.resetGeneration` in `driver/session.go` and `driver/plugins.go`,
