@@ -39,7 +39,7 @@ import type { NxArgs } from 'nx/src/utils/command-line-utils';
 import type * as NxPackageJson from 'nx/src/utils/package-json';
 import type * as NxPerfLogging from 'nx/src/utils/perf-logging';
 import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
-import { boundedReceiptRuntimes, type ProviderInputProof } from './ensure-built-receipt.js';
+import { boundedReceiptRuntimes, type ProviderInputProof, type ReceiptEvidence } from './ensure-built-receipt.js';
 import {
   type ArtifactWitness,
   censusStart,
@@ -56,6 +56,7 @@ import {
   recordedStamp,
   reusableGraph,
   snapshotsEqual,
+  type WorkspaceSnapshot,
   workspaceSnapshot,
   writeWitness,
 } from './ensure-built-witness.js';
@@ -887,10 +888,34 @@ async function buildPreparedTarget(
   return reason === null ? HIT : runViaCli(workspaceRoot, selector, reason);
 }
 
+/**
+ * What `probeBuilt` answers from the producer receipt read and, when that
+ * refused, any read-only daemon unavailability. A valid receipt always wins
+ * without consulting a daemon or the consumer's environment.
+ */
+export function probeReceiptVerdict(
+  workspaceRoot: string,
+  taskId: string,
+  receipt: ReceiptEvidence<EnsureBuiltReceipt>,
+  daemonMiss: Extract<MissReason, { kind: 'no-daemon' }> | null,
+): EnsureBuiltProbeResult {
+  if (receipt.ok) return { disposition: 'hit', receipt: receipt.value };
+  const detail =
+    daemonMiss === null
+      ? receipt.detail
+      : `${receipt.detail}; authoritative graph unavailable: ${describeMiss(daemonMiss)}`;
+  return {
+    disposition: 'failed',
+    reason: { kind: 'provider-proof', taskId, workspaceRoot, detail },
+    exitCode: 1,
+    signal: null,
+  };
+}
+
 async function probeBuiltInWorkspace(workspaceRoot: string, selector: TargetSelector): Promise<EnsureBuiltProbeResult> {
   const taskId = selectorTaskId(selector);
   const receipt = readProducerReceipt(workspaceRoot, taskId);
-  if (receipt.ok) return { disposition: 'hit', receipt: receipt.value };
+  if (receipt.ok) return probeReceiptVerdict(workspaceRoot, taskId, receipt, null);
   // A failed publication proof asks a serving Nx daemon for the authoritative
   // generation, but never hashes against the consumer environment, starts a
   // provider runner or starts the provider's daemon.
@@ -898,17 +923,16 @@ async function probeBuiltInWorkspace(workspaceRoot: string, selector: TargetSele
     () => prepareWorkspaceProbe(workspaceRoot, selector, 'read-only'),
     (): PreparedWorkspaceProbe => noDaemonProbe(selector),
   );
-  const detail =
-    prepared.kind === 'no-daemon'
-      ? `${receipt.detail}; authoritative graph unavailable: ${describeMiss(prepared.reason)}`
-      : receipt.detail;
-  process.stderr.write(`probeBuilt: ${workspaceRoot}: ${taskId}: ${detail}\n`);
-  return {
-    disposition: 'failed',
-    reason: { kind: 'provider-proof', taskId, workspaceRoot, detail },
-    exitCode: 1,
-    signal: null,
-  };
+  const verdict = probeReceiptVerdict(
+    workspaceRoot,
+    taskId,
+    receipt,
+    prepared.kind === 'no-daemon' ? prepared.reason : null,
+  );
+  if (verdict.disposition === 'failed') {
+    process.stderr.write(`probeBuilt: ${workspaceRoot}: ${taskId}: ${verdict.reason.detail}\n`);
+  }
+  return verdict;
 }
 
 /** Nx's native plan is the FILE selection oracle, not a second glob planner.
@@ -1078,6 +1102,63 @@ function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire)
   }
 }
 
+/**
+ * What an awaited daemon graph generation authorizes once both workspace and
+ * installation snapshots around it are known.
+ *
+ * `publish` means the workspace did not move across the await and the
+ * installation closure is proven and unchanged, so the witness may be saved.
+ * `accept-without-witness` means the workspace stayed stable, so the graph is
+ * current, but an unproved or changed installation forbids saving a witness.
+ * `reconcile-successor` means a workspace file changed or moved (including a
+ * write/revert with equal final bytes) during the await: no witness is written
+ * and the caller must reconcile the daemon's file table and await a successor.
+ */
+export type GraphGenerationDecision =
+  | { readonly kind: 'publish'; readonly witness: GraphWitness }
+  | { readonly kind: 'accept-without-witness' }
+  | { readonly kind: 'reconcile-successor' };
+
+export interface GraphGenerationInput {
+  readonly workspaceRoot: string;
+  readonly environment: string;
+  readonly before: WorkspaceSnapshot;
+  readonly after: WorkspaceSnapshot;
+  readonly movedBeforeNode: string | null;
+  readonly installation: string | null;
+  readonly finalInstallation: string | null;
+  readonly finalInstallationUnproven: readonly string[] | null;
+  readonly projectGraph: ProjectGraph;
+}
+
+export function graphGenerationDecision(input: GraphGenerationInput): GraphGenerationDecision {
+  // `after` re-hashed every node whose stamp does not prove it (its ctime alone moved, or `before` read it in the tick
+  // it changed in), and snapshotsEqual compares those hashes.
+  const stableGeneration = snapshotsEqual(input.before, input.after) && input.movedBeforeNode === null;
+  if (!stableGeneration) {
+    return { kind: 'reconcile-successor' };
+  }
+  if (
+    input.installation !== null &&
+    input.finalInstallationUnproven !== null &&
+    input.installation === input.finalInstallation
+  ) {
+    return {
+      kind: 'publish',
+      witness: {
+        version: 2,
+        workspaceRoot: input.workspaceRoot,
+        environment: input.environment,
+        installation: input.installation,
+        installationUnproven: input.finalInstallationUnproven,
+        snapshot: input.after,
+        projectGraph: input.projectGraph,
+      },
+    };
+  }
+  return { kind: 'accept-without-witness' };
+}
+
 /** An exact graph-input witness skips graph transfer, never task hashing.
  * Reconcile disk with the daemon BEFORE asking for a graph; publish evidence
  * only when the filesystem and plugin installation stay identical across the
@@ -1140,24 +1221,23 @@ async function currentProjectGraph(
     census ?? recorded,
   );
   const finalInstallation = finalCensus === null ? null : installationIdentityOf(finalCensus, finalInputs);
-  // `after` re-hashed every node whose stamp does not prove it (its ctime alone moved, or `before` read it in the tick
-  // it changed in), and snapshotsEqual compares those hashes.
-  const stableGeneration = snapshotsEqual(before, after) && movedNodes(before.nodes, () => true) === null;
-  if (installation !== null && finalCensus !== null && installation === finalInstallation && stableGeneration) {
-    const next: GraphWitness = {
-      version: 2,
-      workspaceRoot,
-      environment,
-      installation,
-      installationUnproven: finalCensus.unproven,
-      snapshot: after,
-      projectGraph,
-    };
-    writeWitness(witnessPath, next);
+  const decision = graphGenerationDecision({
+    workspaceRoot,
+    environment,
+    before,
+    after,
+    movedBeforeNode: movedNodes(before.nodes, () => true),
+    installation,
+    finalInstallation,
+    finalInstallationUnproven: finalCensus?.unproven ?? null,
+    projectGraph,
+  });
+  if (decision.kind === 'publish') {
+    writeWitness(witnessPath, decision.witness);
   }
   // A write during the await cannot authorize a saved graph. Feed the final
   // snapshot to Nx and await its successor before current task hashing.
-  if (!stableGeneration) {
+  if (decision.kind === 'reconcile-successor') {
     const currentDaemonFiles = await daemonClient.getWorkspaceContextFileData();
     const changes = workspaceFileChanges(currentDaemonFiles, after.files);
     await daemonClient.updateWorkspaceContext(changes.created, changes.updated, changes.deleted);

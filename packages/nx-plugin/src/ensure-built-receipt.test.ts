@@ -1,27 +1,59 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmodSync, lstatSync, writeFileSync } from 'node:fs';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { Task } from 'nx/src/config/task-graph';
 import { expandOutputs } from 'nx/src/native';
 import typia from 'typia';
+import { pastTick } from './__tests__/past-tick.js';
 import { runInRepositoryNx } from './__tests__/repository-nx.js';
 import { cargoRuntimeInput, cargoToolchainPathsInput } from './cargo-toolchain-policy.js';
-import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
+import {
+  createWorkspaceNxRequire,
+  type EnsureBuiltProducerReceipt,
+  type EnsureBuiltProducerTool,
+  type EnsureBuiltProducerToolNode,
+  type EnsureBuiltReceipt,
+  probeBuilt,
+  providerInputProof,
+} from './ensure-built.js';
 import {
   boundedReceiptRuntimes,
   captureProducerSource,
   captureProducerSources,
   dirtyProviderPaths,
+  type ProducerSourceObservation,
   type ProducerSourceWitness,
   type ProviderInputProof,
   producerOutputPaths,
   producerSourceUnchanged,
+  producerSourceVerdict,
   providerReceipt,
   removeOrphanedOutputs,
 } from './ensure-built-receipt.js';
+import { censusStart, type NodeWitness, nodeStamp, recordedStamp } from './ensure-built-witness.js';
+import {
+  movedToolNodes,
+  PRODUCER_RECORDS,
+  producerEnvironmentIdentity,
+  readProducerReceipt,
+} from './producer-receipts.js';
 import { runtimeInput } from './runtime-input.js';
 
 let root = '';
@@ -549,5 +581,384 @@ describe('a producer layout change', () => {
       );
     expect(await present(`${tool}/dist/bin/smoo-tool`)).toBe(false);
     for (const file of files.slice(1)) expect(await present(file), file).toBe(true);
+  });
+});
+
+describe('producerSourceVerdict', () => {
+  it('judges tracked source stability purely from the captured basis and observed source state', () => {
+    const baseTree = 'tree-before';
+    const baseOutputs = ['output/file', 'package.json'];
+    const clean: ProducerSourceObservation = {
+      headTree: baseTree,
+      dirtyPaths: [],
+      movedNode: null,
+      rewrittenOutputs: [],
+    };
+    const cases: readonly {
+      readonly name: string;
+      readonly observed: ProducerSourceObservation;
+      readonly ok: boolean;
+      readonly detailContains?: string;
+    }[] = [
+      {
+        name: 'matching tree with no dirty paths, moved nodes or rewritten outputs passes (empty commit keeps hit)',
+        observed: clean,
+        ok: true,
+      },
+      {
+        name: 'dirty non-configuration output is exempt',
+        observed: { ...clean, dirtyPaths: ['output/file'] },
+        ok: true,
+      },
+      {
+        name: 'different HEAD tree refuses naming both trees',
+        observed: { ...clean, headTree: 'tree-after' },
+        ok: false,
+        detailContains: "HEAD's tree is tree-after, not tree-before",
+      },
+      {
+        name: 'dirty tracked source refuses naming the dirty path',
+        observed: { ...clean, dirtyPaths: ['source.txt'] },
+        ok: false,
+        detailContains: 'source.txt differ from HEAD',
+      },
+      {
+        name: 'dirty graph configuration refuses even when listed as a task output',
+        observed: { ...clean, dirtyPaths: ['package.json'] },
+        ok: false,
+        detailContains: 'package.json differ from HEAD',
+      },
+      {
+        name: 'moved source node (write/revert) refuses naming the node',
+        observed: { ...clean, movedNode: '/provider/source.txt' },
+        ok: false,
+        detailContains: '/provider/source.txt',
+      },
+      {
+        name: 'rewritten tracked public output refuses naming the output',
+        observed: { ...clean, rewrittenOutputs: ['generated.txt'] },
+        ok: false,
+        detailContains: 'tracked public output generated.txt no longer holds HEAD',
+      },
+    ];
+    for (const entry of cases) {
+      const verdict = producerSourceVerdict(baseTree, baseOutputs, entry.observed);
+      expect(verdict.ok, entry.name).toBe(entry.ok);
+      if (!verdict.ok && entry.detailContains !== undefined) {
+        expect(verdict.detail, entry.name).toContain(entry.detailContains);
+      }
+    }
+  });
+});
+
+describe('published producer receipt validation', () => {
+  const repoRoot = dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url)))));
+  const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+  it('validates hit, daemonless hit, env/empty-commit reuse, tampered output, uncached source and tool moves in process', async () => {
+    const toolDir = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-receipt-tool-')));
+    const toolPath = join(toolDir, 'fixture-tool');
+    const originalToolBytes = '#!/bin/sh\nexit 0\n';
+    const savedEnv = {
+      NX_DAEMON: process.env.NX_DAEMON,
+      PRODUCER_CONSUMER_DIFFERENCE: process.env.PRODUCER_CONSUMER_DIFFERENCE,
+    };
+    try {
+      await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+      await writeFile(join(root, '.gitignore'), 'output/\nnode_modules/\n');
+      await writeFile(join(root, 'nx.json'), '{}');
+      await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'receipt-fixture' }));
+      await writeFile(
+        join(root, 'project.json'),
+        JSON.stringify({
+          name: 'app',
+          targets: {
+            build: {
+              executor: 'nx:run-commands',
+              cache: true,
+              inputs: ['{projectRoot}/source.txt'],
+              outputs: ['{projectRoot}/output'],
+              options: { command: 'true' },
+            },
+          },
+        }),
+      );
+      git('add', '.gitignore', 'nx.json', 'package.json', 'project.json');
+      git('-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '-qm', 'workspace');
+
+      await writeFile(toolPath, originalToolBytes);
+      await chmod(toolPath, 0o755);
+      await pastTick();
+      const toolStats = lstatSync(toolPath, { bigint: true });
+      const toolMode = Number(toolStats.mode & 0o7777n);
+      const toolSha = createHash('sha256').update(originalToolBytes).digest('hex');
+      const toolNode: Extract<EnsureBuiltProducerToolNode, { readonly type: 'file' }> = {
+        path: toolPath,
+        type: 'file',
+        mode: toolMode,
+        sha256: toolSha,
+        stamp: recordedStamp(toolStats, censusStart()),
+      };
+      const makeTool = (
+        node: Extract<EnsureBuiltProducerToolNode, { readonly type: 'file' }>,
+      ): EnsureBuiltProducerTool => ({
+        kind: 'executable',
+        name: 'fixture-tool',
+        from: root,
+        path: toolPath,
+        physicalPath: toolPath,
+        missing: [],
+        resolutions: [],
+        nodes: [node],
+        sha256: sha([{ path: node.path, type: 'file', mode: node.mode, sha256: node.sha256 }]),
+      });
+
+      const projectGraph: ProjectGraph = {
+        nodes: {
+          app: {
+            name: 'app',
+            type: 'app',
+            data: {
+              root: '.',
+              targets: {
+                build: {
+                  executor: 'nx:run-commands',
+                  cache: true,
+                  inputs: ['{projectRoot}/source.txt'],
+                  outputs: ['{projectRoot}/output'],
+                  options: { command: 'true' },
+                },
+              },
+            },
+          },
+        },
+        dependencies: { app: [] },
+      };
+      const load = createWorkspaceNxRequire(root);
+      const taskGraph = load('nx/src/tasks-runner/create-task-graph').createTaskGraph(
+        projectGraph,
+        {},
+        ['app'],
+        ['build'],
+        undefined,
+        {},
+        false,
+      );
+      const plannedTask = taskGraph.tasks['app:build'];
+      if (plannedTask === undefined) throw new Error('expected app:build in synthetic task graph');
+      const completedTask: Task = {
+        ...plannedTask,
+        hash: 'actual-hash',
+        hashDetails: { command: 'true', nodes: {} },
+      };
+      const completedGraph = { ...taskGraph, tasks: { 'app:build': completedTask } };
+      const inputProof = providerInputProof(root, {}, projectGraph, completedGraph, load);
+      const captured = captureProducerSource(root, producerOutputPaths(root, [completedTask], expandOutputs));
+      if (!captured.ok) throw new Error(captured.detail);
+      const expanded = inputProof.inputs['app:build'];
+      if (expanded === undefined || completedTask.hashDetails === undefined) {
+        throw new Error('expected expanded inputs and hashDetails for app:build');
+      }
+      const byPath = new Map(captured.value.files.map((file) => [file.path, file]));
+      const receiptInputs: EnsureBuiltProducerReceipt['inputs'] = [
+        {
+          taskId: 'app:build',
+          overrides: completedTask.overrides,
+          declared: ['{projectRoot}/source.txt'],
+          expanded,
+          hashDetails: completedTask.hashDetails,
+          files: expanded.files.map((path) => {
+            const file = byPath.get(path);
+            if (file === undefined) throw new Error(`missing HEAD-bound file ${path}`);
+            return file;
+          }),
+        },
+      ];
+      const published = providerReceipt(root, 'app:build', [completedTask], inputProof, expandOutputs, captured.value, {
+        version: 2,
+        target: 'app:build',
+        argv: ['nx', 'run', 'app:build'],
+        trackedTreeClean: true,
+        environmentIdentity: producerEnvironmentIdentity(receiptInputs),
+        inputs: receiptInputs,
+        tools: [makeTool(toolNode)],
+        wallTimeMs: 1,
+      });
+      if (published.disposition !== 'hit') throw new Error(published.reason.detail);
+      const recordsDir = join(root, PRODUCER_RECORDS);
+      await mkdir(recordsDir, { recursive: true });
+      await writeFile(join(recordsDir, '.gitignore'), '*\n');
+      const receiptPath = join(recordsDir, `producer-receipt-${sha('app:build')}.json`);
+      const writePublished = async (receipt: EnsureBuiltReceipt) => {
+        await writeFile(
+          receiptPath,
+          JSON.stringify({
+            version: 1,
+            disposition: 'published',
+            receipt,
+            projectGraph,
+            taskGraph: completedGraph,
+            nxJson: {},
+          }),
+        );
+      };
+      await writePublished(published.receipt);
+
+      const outputPath = join(root, 'output/file');
+      const sourcePath = join(root, 'source.txt');
+
+      // Baseline hit leaves the output stat untouched and validates cleanly.
+      const statBefore = await stat(outputPath, { bigint: true });
+      const baseline = readProducerReceipt(root, 'app:build');
+      const statAfter = await stat(outputPath, { bigint: true });
+      expect(baseline).toEqual({ ok: true, value: published.receipt });
+      expect({
+        ino: statAfter.ino,
+        mtimeNs: statAfter.mtimeNs,
+        ctimeNs: statAfter.ctimeNs,
+      }).toEqual({
+        ino: statBefore.ino,
+        mtimeNs: statBefore.mtimeNs,
+        ctimeNs: statBefore.ctimeNs,
+      });
+
+      // A proven unmoved tool node reuses its recorded hash without opening or re-hashing the file:
+      // a sentinel hash passes only when the validator trusts the matching stamp instead of reading bytes.
+      const sentinelReceipt: EnsureBuiltReceipt = {
+        ...published.receipt,
+        producer: {
+          ...published.receipt.producer,
+          tools: [makeTool({ ...toolNode, sha256: '0'.repeat(64) })],
+        },
+      };
+      await writePublished(sentinelReceipt);
+      expect(readProducerReceipt(root, 'app:build')).toEqual({ ok: true, value: sentinelReceipt });
+      await writePublished(published.receipt);
+
+      // Table of consumer-side receipt validation verdicts that previously ran through real Nx daemons.
+      const verdicts: readonly {
+        readonly name: string;
+        readonly run: () => Promise<void>;
+      }[] = [
+        {
+          name: 'daemonless probeBuilt hits directly from a valid published receipt',
+          run: async () => {
+            process.env.NX_DAEMON = 'false';
+            const result = await probeBuilt({ target: 'app:build', cwd: root });
+            expect(result).toEqual({ disposition: 'hit', receipt: published.receipt });
+          },
+        },
+        {
+          name: 'consumer environment differences keep the exact same receipt hit without hashing or inspecting modules',
+          run: async () => {
+            process.env.PRODUCER_CONSUMER_DIFFERENCE = 'consumer-only';
+            expect(readProducerReceipt(root, 'app:build')).toEqual({ ok: true, value: published.receipt });
+          },
+        },
+        {
+          name: 'an empty commit advancing HEAD at the same committed tree keeps the exact same receipt hit',
+          run: async () => {
+            git(
+              '-c',
+              'user.name=Receipt fixture',
+              '-c',
+              'user.email=receipt@example.invalid',
+              'commit',
+              '--allow-empty',
+              '-qm',
+              'same tree',
+            );
+            expect(readProducerReceipt(root, 'app:build')).toEqual({ ok: true, value: published.receipt });
+          },
+        },
+        {
+          name: 'a tampered public output refuses without overwriting the output',
+          run: async () => {
+            await writeFile(outputPath, 'tampered');
+            try {
+              expect(readProducerReceipt(root, 'app:build')).toEqual({
+                ok: false,
+                detail: 'Public product bytes differ from actual producer receipt',
+              });
+              expect(await readFile(outputPath, 'utf8')).toBe('tampered');
+            } finally {
+              await writeFile(outputPath, 'public bytes');
+            }
+          },
+        },
+        {
+          name: 'an uncached tracked source modification refuses without touching outputs',
+          run: async () => {
+            await writeFile(sourcePath, 'new uncached source');
+            try {
+              expect(readProducerReceipt(root, 'app:build')).toEqual({
+                ok: false,
+                detail: 'Tracked source bytes differ from HEAD: source.txt',
+              });
+              expect(await readFile(outputPath, 'utf8')).toBe('public bytes');
+            } finally {
+              await writeFile(sourcePath, 'source');
+            }
+          },
+        },
+        {
+          name: 'a ctime-only chmod on a tool node during validation keeps the hit, while a byte rewrite refuses naming the node',
+          run: async () => {
+            const past = new Date(Date.now() - 1000);
+            await utimes(toolPath, past, past);
+            const before = lstatSync(toolPath, { bigint: true });
+            const observed: NodeWitness[] = [
+              { path: toolPath, stamp: nodeStamp(Object.assign(before, { ctimeNs: before.mtimeNs })) },
+            ];
+            chmodSync(toolPath, toolMode);
+            expect(movedToolNodes(observed, published.receipt.producer.tools)).toBeNull();
+            // Same-mode chmod before validation also re-reads and keeps the hit.
+            expect(readProducerReceipt(root, 'app:build')).toEqual({ ok: true, value: published.receipt });
+            // A byte rewrite during validation refuses and names the tool node.
+            const native = load('nx/src/native');
+            const originalExpand = native.expandOutputs;
+            native.expandOutputs = (...args: Parameters<typeof originalExpand>) => {
+              writeFileSync(toolPath, '#!/bin/sh\nexit 1\n');
+              return originalExpand(...args);
+            };
+            try {
+              expect(readProducerReceipt(root, 'app:build')).toEqual({
+                ok: false,
+                detail: `Producer tool namespace changed during independent product validation: ${toolPath}`,
+              });
+            } finally {
+              native.expandOutputs = originalExpand;
+              await writeFile(toolPath, originalToolBytes);
+              await chmod(toolPath, toolMode);
+            }
+          },
+        },
+        {
+          name: 'a tool file rewritten in place before validation starts refuses naming the node',
+          run: async () => {
+            await writeFile(toolPath, '#!/bin/sh\nexit 2\n');
+            try {
+              expect(readProducerReceipt(root, 'app:build')).toEqual({
+                ok: false,
+                detail: `Producer tool/module bytes changed: fixture-tool (${toolPath})`,
+              });
+            } finally {
+              await writeFile(toolPath, originalToolBytes);
+              await chmod(toolPath, toolMode);
+            }
+          },
+        },
+      ];
+
+      for (const entry of verdicts) {
+        await entry.run();
+      }
+    } finally {
+      if (savedEnv.NX_DAEMON === undefined) delete process.env.NX_DAEMON;
+      else process.env.NX_DAEMON = savedEnv.NX_DAEMON;
+      if (savedEnv.PRODUCER_CONSUMER_DIFFERENCE === undefined) delete process.env.PRODUCER_CONSUMER_DIFFERENCE;
+      else process.env.PRODUCER_CONSUMER_DIFFERENCE = savedEnv.PRODUCER_CONSUMER_DIFFERENCE;
+      await rm(toolDir, { recursive: true, force: true });
+    }
   });
 });

@@ -23,6 +23,7 @@ import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
 import { pastTick } from './__tests__/past-tick.js';
+import { type GraphGenerationInput, graphGenerationDecision } from './ensure-built.js';
 import {
   censusStart,
   type GraphInstallationCensus,
@@ -154,11 +155,93 @@ describe('authoritative graph witness', () => {
     await chmod(path, 0);
     try {
       expect(readGraphWitness(path)).toBeNull();
+      // Atomic rename replaces an unreadable witness in a writable directory so the next read succeeds.
+      writeWitness(path, witness());
+      expect(readGraphWitness(path)?.projectGraph).toEqual(graph);
     } finally {
       await chmod(path, 0o600);
     }
     await writeFile(path, JSON.stringify({ ...witness(), version: 1 }));
     expect(readGraphWitness(path)).toBeNull();
+  });
+
+  it('decides witness publication and successor reconciliation purely from pre/post generation inputs', () => {
+    const baseSnapshot = snapshot();
+    const changedSnapshot = {
+      ...baseSnapshot,
+      files: baseSnapshot.files.map((entry, index) => (index === 0 ? { ...entry, hash: 'changed-hash' } : entry)),
+    };
+    const base: GraphGenerationInput = {
+      workspaceRoot: root,
+      environment: 'env',
+      before: baseSnapshot,
+      after: baseSnapshot,
+      movedBeforeNode: null,
+      installation: 'installed',
+      finalInstallation: 'installed',
+      finalInstallationUnproven: ['packages/plugin/dist/index.js'],
+      projectGraph: graph,
+    };
+    const cases: readonly {
+      readonly name: string;
+      readonly input: GraphGenerationInput;
+      readonly expected: ReturnType<typeof graphGenerationDecision>;
+    }[] = [
+      {
+        name: 'stable generation with matching proven installation publishes the witness',
+        input: base,
+        expected: {
+          kind: 'publish',
+          witness: {
+            version: 2,
+            workspaceRoot: root,
+            environment: 'env',
+            installation: 'installed',
+            installationUnproven: ['packages/plugin/dist/index.js'],
+            snapshot: baseSnapshot,
+            projectGraph: graph,
+          },
+        },
+      },
+      {
+        name: 'write/revert with equal pre/post hashes still revokes publication and demands a successor graph',
+        input: { ...base, movedBeforeNode: join(root, 'packages/app/source.txt') },
+        expected: { kind: 'reconcile-successor' },
+      },
+      {
+        name: 'workspace file change during await revokes publication and demands a successor graph',
+        input: { ...base, after: changedSnapshot },
+        expected: { kind: 'reconcile-successor' },
+      },
+      {
+        name: 'unstable pre snapshot revokes publication and demands a successor graph',
+        input: { ...base, before: { ...baseSnapshot, stable: false } },
+        expected: { kind: 'reconcile-successor' },
+      },
+      {
+        name: 'unstable post snapshot revokes publication and demands a successor graph',
+        input: { ...base, after: { ...baseSnapshot, stable: false } },
+        expected: { kind: 'reconcile-successor' },
+      },
+      {
+        name: 'unproved initial installation accepts the graph without writing a witness',
+        input: { ...base, installation: null },
+        expected: { kind: 'accept-without-witness' },
+      },
+      {
+        name: 'unproved final installation accepts the graph without writing a witness',
+        input: { ...base, finalInstallation: null, finalInstallationUnproven: null },
+        expected: { kind: 'accept-without-witness' },
+      },
+      {
+        name: 'installation that changed across the await accepts the graph without writing a witness',
+        input: { ...base, finalInstallation: 'installed-changed' },
+        expected: { kind: 'accept-without-witness' },
+      },
+    ];
+    for (const entry of cases) {
+      expect(graphGenerationDecision(entry.input), entry.name).toEqual(entry.expected);
+    }
   });
 });
 

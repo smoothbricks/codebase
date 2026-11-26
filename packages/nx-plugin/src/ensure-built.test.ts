@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,7 @@ import typia from 'typia';
 import { nxFixtureRoot, type OwnedNxFixture, openNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { pastTick } from './__tests__/past-tick.js';
-import type { EnsureBuiltProbeResult } from './ensure-built.js';
+import type { EnsureBuiltProbeResult, EnsureBuiltReceipt } from './ensure-built.js';
 import {
   assignEnvironment,
   callerOwnsWorkspace,
@@ -30,6 +30,7 @@ import {
   outputClaims,
   parseExecArguments,
   parseTargetSelector,
+  probeReceiptVerdict,
   recordedTasks,
   selectorTaskId,
   unvouched,
@@ -470,6 +471,90 @@ describe('cliExitOutcome', () => {
   });
 });
 
+describe('probeReceiptVerdict', () => {
+  const receipt: EnsureBuiltReceipt = {
+    workspaceRoot: '/provider',
+    head: '0'.repeat(40),
+    headTree: '1'.repeat(40),
+    fileInputProvenance: 'exact-file-inputs',
+    runtimeEnvironmentProvenance: 'nx-task-hash-only',
+    producer: {
+      version: 2,
+      target: 'app:build',
+      argv: ['nx', 'run', 'app:build'],
+      trackedTreeClean: true,
+      environmentIdentity: 'env-id',
+      inputs: [],
+      tools: [],
+      outputSha256: '2'.repeat(64),
+      wallTimeMs: 1,
+    },
+    tasks: [],
+  };
+
+  it('maps receipt evidence and daemon availability without consulting a daemon on a valid receipt', () => {
+    const noDaemon = { kind: 'no-daemon', taskId: 'app:build' } as const;
+    const cases: readonly {
+      readonly name: string;
+      readonly evidence:
+        | { readonly ok: true; readonly value: EnsureBuiltReceipt }
+        | { readonly ok: false; readonly detail: string };
+      readonly daemonMiss: typeof noDaemon | null;
+      readonly expected: EnsureBuiltProbeResult;
+    }[] = [
+      {
+        name: 'valid receipt with a serving daemon hits',
+        evidence: { ok: true, value: receipt } as const,
+        daemonMiss: null,
+        expected: { disposition: 'hit', receipt },
+      },
+      {
+        name: 'valid receipt without a daemon hits (daemonless probe)',
+        evidence: { ok: true, value: receipt } as const,
+        daemonMiss: noDaemon,
+        expected: { disposition: 'hit', receipt },
+      },
+      {
+        name: 'refused receipt with a serving daemon reports the receipt refusal verbatim',
+        evidence: { ok: false, detail: 'Public product bytes differ from actual producer receipt' } as const,
+        daemonMiss: null,
+        expected: {
+          disposition: 'failed',
+          reason: {
+            kind: 'provider-proof',
+            taskId: 'app:build',
+            workspaceRoot: '/provider',
+            detail: 'Public product bytes differ from actual producer receipt',
+          },
+          exitCode: 1,
+          signal: null,
+        },
+      },
+      {
+        name: 'refused receipt without a daemon appends the authoritative graph unavailability',
+        evidence: { ok: false, detail: 'No producer completion receipt' } as const,
+        daemonMiss: noDaemon,
+        expected: {
+          disposition: 'failed',
+          reason: {
+            kind: 'provider-proof',
+            taskId: 'app:build',
+            workspaceRoot: '/provider',
+            detail: `No producer completion receipt; authoritative graph unavailable: ${describeMiss(noDaemon)}`,
+          },
+          exitCode: 1,
+          signal: null,
+        },
+      },
+    ];
+    for (const entry of cases) {
+      expect(probeReceiptVerdict('/provider', 'app:build', entry.evidence, entry.daemonMiss), entry.name).toEqual(
+        entry.expected,
+      );
+    }
+  });
+});
+
 describe('the environment Nx runs under', () => {
   const caller = {
     PATH: '/usr/bin',
@@ -834,8 +919,6 @@ describe('smoo-nx-exec with a fresh daemon', () => {
     let builds = '';
     let providerSockets: string | null = null;
     let ownEnv: Record<string, string> = {};
-    let fixtureGit = '';
-    let expectedHit: EnsureBuiltProbeResult | undefined;
     let failedPhase: { readonly name: string; readonly error: unknown } | null = null;
 
     async function runPhase(name: string, body: () => Promise<void>): Promise<void> {
@@ -888,9 +971,9 @@ describe('smoo-nx-exec with a fresh daemon', () => {
 
     it('reports no-daemon and writes nothing when no daemon serves a provider without a receipt', async () => {
       await runPhase('no-daemon probe', async () => {
-        // A sandboxed consumer is granted its provider read-only, and starting a daemon writes the provider's workspace
-        // data (`.nx/workspace-data/d`): the read-only probe connects to a serving daemon or reports that none serves.
-        // It runs before any daemon starts and before any receipt is published, the state that case began in.
+        // Real-process boundary: proves a write-free refusal of a read-only consumer against a real provider
+        // directory when no daemon serves it. A sandboxed consumer is granted its provider read-only, and starting a
+        // daemon writes the provider's workspace data (`.nx/workspace-data/d`).
         const noDaemonLabel = 'reports no-daemon and writes nothing when no daemon serves a provider without a receipt';
         const listing = async () =>
           (await readdir(workspace, { recursive: true })).filter((entry) => !entry.startsWith('node_modules')).sort();
@@ -927,6 +1010,8 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
 
     it('builds and caches the workspace with daemonless Nx before publishing a receipt', async () => {
       await runPhase('daemonless seed build', async () => {
+        // Real-process boundary: seeds a cached build with daemonless Nx so the publish step below records a real
+        // cache-backed producer receipt without re-running lib:build.
         providerSockets = providerSocketDirectory(workspace);
         ownEnv = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
         const built = await run(
@@ -941,10 +1026,10 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
       });
     });
 
-    it('publishes a completion receipt from a committed workspace and owned git tool', async () => {
+    it('publishes a completion receipt from a committed workspace', async () => {
       await runPhase('receipt publish', async () => {
-        // Probe-only receipts use the real Nx keys/cache and independently
-        // census public output bytes without starting a task runner.
+        // Real-process boundary: runs real Nx with the producer-receipt task hooks enabled so the consumer hit test
+        // below validates an actually published v2 receipt end to end.
         const committed = spawnSync(
           'git',
           [
@@ -978,14 +1063,6 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           { encoding: 'utf8' },
         );
         expect(sourceCommit.status, sourceCommit.stdout + sourceCommit.stderr).toBe(0);
-        // The receipt binds the producer's executables. A `git` this fixture owns lets the consumer case below move
-        // one tool node's ctime alone, as a same-mode chmod by another checkout's install moves a shared store file.
-        const realGit = Bun.which('git');
-        if (realGit === null) throw new Error('git is not on PATH');
-        const fixtureBin = join(root, 'bin');
-        await mkdir(fixtureBin);
-        fixtureGit = join(fixtureBin, 'git');
-        await writeExecutable(fixtureGit, `#!/bin/sh\nexec ${JSON.stringify(realGit)} "$@"\n`);
         const published = await run(
           'node',
           nxEntry(workspace),
@@ -995,7 +1072,6 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
             NX_DAEMON: 'true',
             NX_WORKSPACE_ROOT_PATH: workspace,
             ...ownEnv,
-            PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
           },
         );
         expect(published.code, published.stdout + published.stderr).toBe(0);
@@ -1003,15 +1079,18 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
       });
     });
 
-    it('validates hit, daemonless hit, tampered output and uncached source without opening tool files or touching outputs', async () => {
-      await runPhase('receipt probe checks', async () => {
+    it('validates a published completion receipt without opening tool files or touching outputs', async () => {
+      await runPhase('receipt probe hit', async () => {
+        // Real-process boundary: one real validated hit over the receipt published above, proving the real installed
+        // tool closure is checked by stamp without opening any tool file and without writing outputs. Receipt
+        // refusals, daemonless/env/empty-commit reuse and tool-move verdicts live in ensure-built-receipt.test.ts.
         const modulesLink = join(workspace, 'node_modules');
         const modulesReal = await realpath(modulesLink);
         const probeEntry = join(root, 'probe-receipt.ts');
         await writeFile(
           probeEntry,
           `
-import { readFile, stat, writeFile } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 const fs = createRequire(import.meta.url)('node:fs');
@@ -1027,25 +1106,12 @@ fs.openSync = (...args: Parameters<typeof openSync>) => {
 };
 const { probeBuilt } = await import(${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))});
 const output = join(process.cwd(), 'packages/app/dist/marker.txt');
-const source = join(process.cwd(), 'packages/lib/source.txt');
-const originalOutput = await readFile(output, 'utf8');
-const originalSource = await readFile(source, 'utf8');
 const before = await stat(output, { bigint: true });
 countingToolOpens = true;
 const hit = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 countingToolOpens = false;
 const after = await stat(output, { bigint: true });
-process.env.NX_DAEMON = 'false';
-const daemonless = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-process.env.NX_DAEMON = 'true';
-await writeFile(output, 'tampered');
-const stale = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-await writeFile(output, originalOutput);
-await writeFile(source, 'new uncached source');
-const uncached = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-const outputAfterMiss = await readFile(output, 'utf8');
-await writeFile(source, originalSource);
-await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ hit, daemonless, stale, uncached, toolFileOpens, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }) + "\\n", error => error ? reject(error) : resolve()));
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ hit, toolFileOpens, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs }) + "\\n", error => error ? reject(error) : resolve()));
 `,
         );
         const probed = await run('bun', probeEntry, workspace, [], {
@@ -1055,181 +1121,23 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           ...ownEnv,
         });
         expect(probed.code, probed.stdout + probed.stderr).toBe(0);
-        const receipts = typia.json.assertParse<{
+        const receipt = typia.json.assertParse<{
           hit: EnsureBuiltProbeResult;
-          daemonless: EnsureBuiltProbeResult;
-          stale: EnsureBuiltProbeResult;
-          uncached: EnsureBuiltProbeResult;
           toolFileOpens: number;
           outputUnwritten: boolean;
-          outputAfterMiss: string;
         }>(probed.stdout);
-        expect(receipts.hit.disposition, probed.stderr).toBe('hit');
-        expect(receipts.toolFileOpens).toBe(0);
-        if (receipts.hit.disposition === 'hit') {
-          expect(receipts.hit.receipt.tasks.map(({ id }) => id).sort()).toEqual(['app:build', 'lib:build']);
+        expect(receipt.hit.disposition, probed.stderr).toBe('hit');
+        expect(receipt.toolFileOpens).toBe(0);
+        if (receipt.hit.disposition === 'hit') {
+          expect(receipt.hit.receipt.tasks.map(({ id }) => id).sort()).toEqual(['app:build', 'lib:build']);
           expect(
-            receipts.hit.receipt.tasks
+            receipt.hit.receipt.tasks
               .flatMap(({ outputs }) => outputs)
               .find(({ path }) => path === 'packages/app/dist/marker.txt'),
           ).toMatchObject({ type: 'file', sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
         }
-        expect(receipts.daemonless.disposition).toBe('hit');
-        expect(receipts.stale).toMatchObject({ disposition: 'failed', reason: { kind: 'provider-proof' } });
-        expect(receipts.uncached.disposition).toBe('failed');
-        expect(receipts.outputUnwritten).toBe(true);
-        expect(receipts.outputAfterMiss).toBe('built\nlib\n');
+        expect(receipt.outputUnwritten).toBe(true);
         expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-      });
-    });
-
-    it('reuses the receipt across consumer environment differences and empty commits without hashing or inspecting modules', async () => {
-      await runPhase('producer environment independence', async () => {
-        const producerEnvironmentEntry = join(root, 'producer-environment-independence.ts');
-        await writeFile(
-          producerEnvironmentEntry,
-          `
-import { createRequire } from 'node:module';
-import { spawnSync } from 'node:child_process';
-import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
-const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
-daemonClient.hashTasks = async () => { throw new Error('readonly consumer must not hash its own environment'); };
-const packageJson = createRequire(process.cwd() + '/package.json')('nx/src/utils/package-json');
-const readModulePackageJson = packageJson.readModulePackageJson;
-let moduleInspections = 0;
-packageJson.readModulePackageJson = (...args) => { moduleInspections += 1; return readModulePackageJson(...args); };
-process.env.PRODUCER_CONSUMER_DIFFERENCE = 'consumer-only';
-const first = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-const empty = spawnSync('git', ['-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '--allow-empty', '-qm', 'same tree'], { encoding: 'utf8' });
-if (empty.status !== 0) throw new Error(empty.stderr);
-const sameTree = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ first, sameTree, moduleInspections }) + "\\n", error => error ? reject(error) : resolve()));
-`,
-        );
-        const producerEnvironment = await run('bun', producerEnvironmentEntry, workspace, [], {
-          NX_DAEMON: 'true',
-          NX_USE_LOCAL: 'true',
-          NX_WORKSPACE_ROOT_PATH: workspace,
-          ...ownEnv,
-        });
-        expect(producerEnvironment.code, producerEnvironment.stdout + producerEnvironment.stderr).toBe(0);
-        const environmentResults = typia.json.assertParse<{
-          first: EnsureBuiltProbeResult;
-          sameTree: EnsureBuiltProbeResult;
-          moduleInspections: number;
-        }>(producerEnvironment.stdout);
-        expect(environmentResults.first.disposition, producerEnvironment.stderr).toBe('hit');
-        expect(environmentResults.sameTree).toEqual(environmentResults.first);
-        expect(environmentResults.moduleInspections).toBe(0);
-        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-        expectedHit = environmentResults.first;
-      });
-    });
-
-    it('keeps a hit on a tool ctime-only chmod during validation and refuses a byte rewrite', async () => {
-      await runPhase('tool-node move during validation', async () => {
-        // Between its readonly read of the receipt's tools and its last check of them, the consumer censuses the
-        // public outputs through Nx's expandOutputs. Moving the fixture `git` there is a tool node moving under the
-        // readonly validation: a same-mode chmod moves its ctime alone and keeps the hit, a byte change refuses and
-        // names the node.
-        const toolMoveEntry = join(root, 'tool-node-move.ts');
-        await writeFile(
-          toolMoveEntry,
-          `
-import { chmodSync, statSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
-const git = ${JSON.stringify(fixtureGit)};
-const native = createRequire(process.cwd() + '/package.json')('nx/src/native');
-const expand = native.expandOutputs;
-let move = () => {};
-let moves = 0;
-native.expandOutputs = (...args) => {
-  move();
-  moves += 1;
-  return expand(...args);
-};
-const before = statSync(git, { bigint: true });
-move = () => chmodSync(git, 0o755);
-const chmodded = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-const after = statSync(git, { bigint: true });
-const ctimeAlone = before.ino === after.ino && before.mode === after.mode && before.size === after.size && before.mtimeNs === after.mtimeNs && before.ctimeNs !== after.ctimeNs;
-const chmodMoves = moves;
-move = () => writeFileSync(git, '#!/bin/sh\\nexit 1\\n');
-const rewritten = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ chmodded, ctimeAlone, chmodMoves, rewritten }) + "\\n", error => error ? reject(error) : resolve()));
-`,
-        );
-        const toolMove = await run('bun', toolMoveEntry, workspace, [], {
-          NX_DAEMON: 'true',
-          NX_USE_LOCAL: 'true',
-          NX_WORKSPACE_ROOT_PATH: workspace,
-          ...ownEnv,
-        });
-        expect(toolMove.code, toolMove.stdout + toolMove.stderr).toBe(0);
-        const toolMoves = typia.json.assertParse<{
-          chmodded: EnsureBuiltProbeResult;
-          ctimeAlone: boolean;
-          chmodMoves: number;
-          rewritten: EnsureBuiltProbeResult;
-        }>(toolMove.stdout);
-        expect(toolMoves.chmodMoves).toBeGreaterThan(0);
-        expect(toolMoves.ctimeAlone).toBe(true);
-        if (expectedHit === undefined)
-          throw new Error('expected producer environment independence phase to record a hit');
-        expect(toolMoves.chmodded, toolMove.stderr).toEqual(expectedHit);
-        expect(toolMoves.rewritten).toMatchObject({
-          disposition: 'failed',
-          reason: {
-            kind: 'provider-proof',
-            detail: `Producer tool namespace changed during independent product validation: ${fixtureGit}`,
-          },
-        });
-      });
-    });
-
-    it('refuses a tool file rewritten in place before validation starts', async () => {
-      await runPhase('tool-node rewrite before validation', async () => {
-        // A tool file rewritten in place before the probe starts moves its stamp: readonly validation must read that
-        // file and refuse, naming the rewritten node.
-        const toolRewriteEntry = join(root, 'tool-node-rewrite.ts');
-        await writeFile(
-          toolRewriteEntry,
-          `
-import { createRequire } from 'node:module';
-const fs = createRequire(import.meta.url)('node:fs');
-const openSync = fs.openSync;
-const git = ${JSON.stringify(fixtureGit)};
-let gitOpens = 0;
-fs.openSync = (...args: Parameters<typeof openSync>) => {
-  if (args[0] === git) gitOpens += 1;
-  return openSync(...args);
-};
-const { probeBuilt } = await import(${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))});
-fs.writeFileSync(git, '#!/bin/sh\\nexit 2\\n');
-const refused = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ refused, gitOpens }) + "\\n", error => error ? reject(error) : resolve()));
-`,
-        );
-        const toolRewrite = await run('bun', toolRewriteEntry, workspace, [], {
-          NX_DAEMON: 'true',
-          NX_USE_LOCAL: 'true',
-          NX_WORKSPACE_ROOT_PATH: workspace,
-          ...ownEnv,
-        });
-        expect(toolRewrite.code, toolRewrite.stdout + toolRewrite.stderr).toBe(0);
-        const toolRewrites = typia.json.assertParse<{
-          refused: EnsureBuiltProbeResult;
-          gitOpens: number;
-        }>(toolRewrite.stdout);
-        expect(toolRewrites.gitOpens).toBeGreaterThan(0);
-        expect(toolRewrites.refused).toMatchObject({
-          disposition: 'failed',
-          reason: {
-            kind: 'provider-proof',
-            detail: expect.stringContaining(fixtureGit),
-          },
-        });
       });
     });
   });
@@ -1250,7 +1158,6 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
     let caller = '';
     let providerSockets: string | null = null;
     let ownEnv: Record<string, string> = {};
-    let reuseEntry = '';
     let raceEntry = '';
     const providerDirectories: string[] = [];
     let failedPhase: { readonly name: string; readonly error: unknown } | null = null;
@@ -1283,17 +1190,6 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
         fixtureSocketDir = fixture.socketDirectory;
         builds = join(root, 'lib-builds.log');
         await writeTwoProjectWorkspace(workspace, builds);
-        // The workspace takes its own copy of TypeScript, which the census resolves from the workspace root, so the
-        // installation the graph-witness steps write into is the fixture's, not the copy this file's fixtures share.
-        const shared = await realpath(join(workspace, 'node_modules'));
-        await rm(join(workspace, 'node_modules'));
-        await mkdir(join(workspace, 'node_modules'));
-        for (const entry of await readdir(shared)) {
-          if (entry !== 'typescript') await symlink(join(shared, entry), join(workspace, 'node_modules', entry));
-        }
-        await cp(await realpath(join(shared, 'typescript')), join(workspace, 'node_modules', 'typescript'), {
-          recursive: true,
-        });
         // What the provider binds for this workspace when the call is entered from another one's shell.
         providerSockets = providerSocketDirectory(workspace);
         if (providerSockets !== null) providerDirectories.push(providerSockets);
@@ -1346,7 +1242,7 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
 
     it('builds and caches the workspace with daemonless Nx', async () => {
       await runPhase('daemonless build', async () => {
-        // Built by daemonless Nx, as CI or a restarted daemon leaves a tree:
+        // Real-process boundary: built by daemonless Nx, as CI or a restarted daemon leaves a tree:
         // cached and on disk, recorded by no daemon.
         // Its plugin workers bind sockets too: Nx's default root is not admitted in a sandbox.
         const built = await run(
@@ -1363,7 +1259,7 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
 
     it('replays daemonless outputs from an external shell and binds the daemon in the provider socket directory', async () => {
       await runPhase('external shell replay and daemon socket', async () => {
-        // Entered from outside the root by a shell set up for another
+        // Real-process boundary: entered from outside the root by a shell set up for another
         // workspace, as a managed devenv's is: its socket directory belongs to
         // that workspace's daemon, and a second daemon listening there would
         // take the socket from it.
@@ -1391,12 +1287,11 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
 
     it('binds plugin workers in the provider socket directory under Bun', async () => {
       await runPhase('plugin worker sockets', async () => {
-        // Every plugin worker the call starts binds where the provider's Nx binds, never in the caller's directory: a
-        // socket there is a second Nx listening in another workspace's namespace. The call loads the provider's
-        // plugins in its own process for the task hooks, and under Bun an assignment to `process.env` does not reach
-        // the C environment Nx's native socket resolver reads. A Bun caller records the socket each plugin worker is
-        // spawned with (Nx passes it as the argument after the worker script), so the run is judged on every path it
-        // the workers have closed.
+        // Real-process boundary: every plugin worker the call starts binds where the provider's Nx binds, never in
+        // the caller's directory: a socket there is a second Nx listening in another workspace's namespace. The call
+        // loads the provider's plugins in its own process for the task hooks, and under Bun an assignment to
+        // `process.env` does not reach the C environment Nx's native socket resolver reads. A Bun caller records the
+        // socket each plugin worker is spawned with (Nx passes it as the argument after the worker script).
         const workerSocketsEntry = join(root, 'plugin-worker-sockets.ts');
         await writeFile(
           workerSocketsEntry,
@@ -1442,7 +1337,7 @@ console.log(JSON.stringify({ result, bound }));
 
     it('stays silent through the built Node wrapper once the daemon records outputs', async () => {
       await runPhase('built Node wrapper hit', async () => {
-        // That hit re-armed the daemon's records. The emitted wrapper, under
+        // Real-process boundary: that hit re-armed the daemon's records. The emitted wrapper, under
         // Node and with nothing to exec, is as silent.
         const again = await run('node', builtBinEntry, workspace, ['app:build'], {
           NX_DAEMON: 'true',
@@ -1456,7 +1351,7 @@ console.log(JSON.stringify({ result, bound }));
 
     it('revokes a stale graph generation race via node stamps and reconciles to a hit', async () => {
       await runPhase('graph generation race', async () => {
-        // An awaited daemon graph can see B while both disk snapshots see
+        // Real-process boundary: an awaited daemon graph can see B while both disk snapshots see
         // A. Node stamps revoke that generation; the fresh daemon file table
         // supplies the A reconciliation instead of an empty A-to-A diff.
         const generationRaceEntry = join(root, 'graph-generation-race.ts');
@@ -1508,42 +1403,31 @@ console.log(JSON.stringify({ result, requests }));
       });
     });
 
-    it('reuses an authoritative graph witness and invalidates it on workspace file and dependency changes', async () => {
-      await runPhase('workspace and dependency graph witness reuse', async () => {
-        // Graph witness steps of the case that reuses authoritative graphs without assuming an unstable generation
-        // republishes its witness. They run on this walk's daemon, through the directory the provider binds.
-        reuseEntry = join(root, 'graph-reuse.ts');
+    it('establishes and reuses an authoritative graph witness with zero daemon graph requests on reuse', async () => {
+      await runPhase('graph witness reuse smoke', async () => {
+        // Real-process boundary: the one daemon reuse smoke proving a published graph witness serves the next
+        // ensureBuilt call with 0 getProjectGraphAndSourceMaps RPCs. All invalidation decisions live in
+        // ensure-built-witness.test.ts.
+        const reuseEntry = join(root, 'graph-reuse.ts');
         const resultsPath = join(root, 'graph-checks-workspace.json');
         await writeFile(
           reuseEntry,
           `
-import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { chmod, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
-const mode = process.argv[2];
-const outputPath = process.argv[3];
+const outputPath = process.argv[2];
 const requireNx = createRequire(process.cwd() + '/package.json');
 const { daemonClient } = requireNx('nx/src/daemon/client/client');
 const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
 const witness = join(workspaceDataDirectoryForWorkspace(process.cwd()), 'ensure-built-graph.json');
-const savedWitness = ${JSON.stringify(join(root, 'authoritative-graph.json'))};
-const source = join(process.cwd(), 'packages/lib/source.txt');
-const text = await readFile(source, 'utf8');
 const request = daemonClient.getProjectGraphAndSourceMaps.bind(daemonClient);
 let requests = 0;
-let invalidateGeneration = false;
 daemonClient.getProjectGraphAndSourceMaps = async () => {
   requests += 1;
-  const response = await request();
-  if (invalidateGeneration) {
-    invalidateGeneration = false;
-    await writeFile(source, 'transient graph input');
-    await writeFile(source, text);
-  }
-  return response;
+  return request();
 };
 const results = [];
 async function check(label) {
@@ -1551,123 +1435,39 @@ async function check(label) {
   const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
   results.push({ label, requests: requests - before, disposition: result.disposition, witnessExists: existsSync(witness) });
 }
-if (mode === 'workspace') {
-  await check('establish');
-  await check('reuse');
-  const added = join(process.cwd(), 'new-graph-input.txt');
-  await writeFile(added, 'new');
-  await check('created');
-  await rm(added);
-  await check('deleted');
-  const project = join(process.cwd(), 'packages/app/project.json');
-  const original = await readFile(project, 'utf8');
-  const config = JSON.parse(original);
-  config.implicitDependencies = [];
-  await writeFile(project, JSON.stringify(config));
-  await check('dependency');
-  await writeFile(project, original);
-  await check('dependency-restored');
-} else if (mode === 'witness') {
-  // Every call censuses the installation again, taking the hashes of files whose stamps have not moved from the
-  // witness. A same-size rewrite that keeps its file's mtime moves its ctime: the next call reads it and sees the
-  // changed installation, and the call after that reuses the graph the changed installation was proved with.
-  const installed = join(process.cwd(), 'node_modules/typescript/README.md');
-  const readme = await readFile(installed);
-  const { atime, mtime } = await stat(installed);
-  readme[0] ^= 1;
-  await writeFile(installed, readme);
-  await utimes(installed, atime, mtime);
-  await check('installation');
-  await check('installation-reuse');
-  // Save only evidence the real daemon generation actually authorized, outside
-  // the workspace: the later missing-witness RPC is not obliged to replace it.
-  const authoritativeWitness = await readFile(witness, 'utf8');
-  const witnessMode = (await stat(witness)).mode & 0o7777;
-  await rename(witness, savedWitness);
-  // Equal pre/post bytes do not authorize publication after a write/revert.
-  // Count and return the actual RPC response, including the required successor.
-  invalidateGeneration = true;
-  await check('missing-witness');
-  assert.equal(invalidateGeneration, false);
-  assert.equal(existsSync(witness), false);
-  // Restore that same genuine witness, not synthesized evidence or a retry of
-  // the unstable generation, so the unreadable control always runs.
-  await rename(savedWitness, witness);
-  assert.equal(await readFile(witness, 'utf8'), authoritativeWitness);
-  await chmod(witness, 0);
-  try {
-    await assert.rejects(readFile(witness), { code: 'EACCES' });
-    await check('unreadable-witness');
-  } finally {
-    await chmod(witness, witnessMode);
-  }
-} else {
-  throw new Error(\`unknown graph-reuse mode: \${mode}\`);
-}
+await check('establish');
+await check('reuse');
 await writeFile(outputPath, JSON.stringify(results));
 `,
         );
-        const reused = await run('bun', reuseEntry, workspace, ['workspace', resultsPath], {
+        const reused = await run('bun', reuseEntry, workspace, [resultsPath], {
           NX_DAEMON: 'true',
           NX_USE_LOCAL: 'true',
           NX_WORKSPACE_ROOT_PATH: workspace,
           ...ownEnv,
         });
         expect(reused.code, reused.stdout + reused.stderr).toBe(0);
-        // A changed dependency configuration may legitimately run app:build;
-        // its streamed logs are not the graph-observation protocol.
         const graphChecks = typia.json.assertParse<
           { label: string; requests: number; disposition: string; witnessExists: boolean }[]
         >(await readFile(resultsPath, 'utf8'));
+        expect(graphChecks.find(({ label }) => label === 'establish')).toMatchObject({
+          label: 'establish',
+          disposition: 'hit',
+          witnessExists: true,
+        });
         expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
           label: 'reuse',
           requests: 0,
           disposition: 'hit',
           witnessExists: true,
         });
-        for (const label of ['created', 'deleted', 'dependency', 'dependency-restored']) {
-          expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
-        }
-      });
-    });
-
-    it('invalidates a graph witness on installation ctime, unstable missing witness and unreadable witness', async () => {
-      await runPhase('installation and witness invalidation', async () => {
-        const resultsPath = join(root, 'graph-checks-witness.json');
-        const reused = await run('bun', reuseEntry, workspace, ['witness', resultsPath], {
-          NX_DAEMON: 'true',
-          NX_USE_LOCAL: 'true',
-          NX_WORKSPACE_ROOT_PATH: workspace,
-          ...ownEnv,
-        });
-        expect(reused.code, reused.stdout + reused.stderr).toBe(0);
-        const graphChecks = typia.json.assertParse<
-          { label: string; requests: number; disposition: string; witnessExists: boolean }[]
-        >(await readFile(resultsPath, 'utf8'));
-        for (const label of ['installation', 'unreadable-witness']) {
-          expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
-        }
-        expect(graphChecks.find(({ label }) => label === 'missing-witness')).toEqual({
-          label: 'missing-witness',
-          requests: 2,
-          disposition: 'hit',
-          witnessExists: false,
-        });
-        expect(graphChecks.find(({ label }) => label === 'installation-reuse')).toEqual({
-          label: 'installation-reuse',
-          requests: 0,
-          disposition: 'hit',
-          witnessExists: true,
-        });
-        expect(graphChecks.find(({ label }) => label === 'unreadable-witness')?.disposition).toBe('hit');
-        expect(await readFile(builds, 'utf8')).toBe('lib\n');
-        expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
       });
     });
 
     it('refreshes a stale file snapshot on an unrelated edit without rebuilding', async () => {
       await runPhase('unrelated edit freshness race', async () => {
-        // Coordinate a real write after the real daemon returned its file
+        // Real-process boundary: coordinate a real write after the real daemon returned its file
         // table. The response is not substituted: this makes the
         // graph→snapshot race deterministic without relying on FSEvents.
         raceEntry = join(root, 'freshness-race.ts');
@@ -1703,7 +1503,7 @@ console.log(JSON.stringify(await ensureBuilt({ target: 'app:build', cwd: process
 
     it('misses and rebuilds when a declared input changes across the graph-to-snapshot boundary', async () => {
       await runPhase('declared input freshness race', async () => {
-        // STRICT-BY: the same boundary moving an actual declared input must
+        // Real-process boundary (STRICT-BY): the same boundary moving an actual declared input must
         // miss, run its producer, and rebuild the dependent artifact.
         const changed = await run(
           'bun',

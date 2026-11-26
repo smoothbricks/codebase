@@ -337,6 +337,40 @@ export function captureProducerSources(
     ),
   };
 }
+/** Observed source state compared with a producer's captured basis. */
+export interface ProducerSourceObservation {
+  readonly headTree: string;
+  readonly dirtyPaths: readonly string[];
+  readonly movedNode: string | null;
+  readonly rewrittenOutputs: readonly string[];
+}
+
+/**
+ * Pure verdict on whether a producer's tracked source stayed unchanged since
+ * `before`: the same committed tree (allowing a new HEAD at that tree), no
+ * dirty tracked files outside non-configuration outputs, no moved source node,
+ * and no tracked public output rewritten away from HEAD's bytes.
+ */
+export function producerSourceVerdict(
+  beforeHeadTree: string,
+  beforeOutputs: readonly string[],
+  observed: ProducerSourceObservation,
+): ReceiptEvidence<true> {
+  const outputs = new Set(beforeOutputs.filter((path) => !graphConfiguration(path)));
+  const changed = 'Producer HEAD/tracked source nodes changed across actual task execution';
+  if (observed.headTree !== beforeHeadTree)
+    return { ok: false, detail: `${changed}: HEAD's tree is ${observed.headTree}, not ${beforeHeadTree}` };
+  const dirty = observed.dirtyPaths.filter((path) => !outputs.has(path));
+  if (dirty.length !== 0) return { ok: false, detail: `${changed}: ${dirty.join(', ')} differ from HEAD` };
+  if (observed.movedNode !== null) return { ok: false, detail: `${changed}: ${observed.movedNode}` };
+  if (observed.rewrittenOutputs.length !== 0)
+    return {
+      ok: false,
+      detail: `${changed}: tracked public output ${observed.rewrittenOutputs.join(', ')} no longer holds HEAD's bytes`,
+    };
+  return { ok: true, value: true };
+}
+
 export function producerSourceUnchanged(root: string, before: ProducerSourceWitness): ReceiptEvidence<true> {
   const revision = receiptGit(root, ['rev-parse', '--verify', 'HEAD']);
   if (!revision.ok) return revision;
@@ -345,21 +379,15 @@ export function producerSourceUnchanged(root: string, before: ProducerSourceWitn
   const outputs = new Set(before.outputs.filter((path) => !graphConfiguration(path)));
   const tree = receiptGit(root, ['rev-parse', '--verify', `${revision.value.trim()}^{tree}`]);
   if (!tree.ok) return tree;
-  const changed = 'Producer HEAD/tracked source nodes changed across actual task execution';
-  if (tree.value.trim() !== before.headTree)
-    return { ok: false, detail: `${changed}: HEAD's tree is ${tree.value.trim()}, not ${before.headTree}` };
-  const dirty = dirtyProviderPaths(status.value).filter((path) => !outputs.has(path));
-  if (dirty.length !== 0) return { ok: false, detail: `${changed}: ${dirty.join(', ')} differ from HEAD` };
   const holds = recordedSource(root, before.files);
-  const moved = movedNodes(before.nodes, holds);
-  if (moved !== null) return { ok: false, detail: `${changed}: ${moved}` };
-  const rewritten = before.files.filter(({ path }) => outputs.has(path) && !holds(join(root, path)));
-  if (rewritten.length !== 0)
-    return {
-      ok: false,
-      detail: `${changed}: tracked public output ${rewritten.map(({ path }) => path).join(', ')} no longer holds HEAD's bytes`,
-    };
-  return { ok: true, value: true };
+  return producerSourceVerdict(before.headTree, before.outputs, {
+    headTree: tree.value.trim(),
+    dirtyPaths: dirtyProviderPaths(status.value),
+    movedNode: movedNodes(before.nodes, holds),
+    rewrittenOutputs: before.files
+      .filter(({ path }) => outputs.has(path) && !holds(join(root, path)))
+      .map(({ path }) => path),
+  });
 }
 /** Enumerate exact public nodes; never exempt a broad directory of tracked source. */
 export function producerOutputPaths(root: string, tasks: readonly Task[], expand: typeof expandOutputs): string[] {
