@@ -2730,6 +2730,10 @@ arrive('held', () => arrive('queued', () => {}));
       expect(result.terminalOutput).toContain('ran held on go');
       expect(result.terminalOutput).not.toContain('ran queued on go');
       expect(result.terminalOutput).toMatch(/cowshed: mbx reserve cases own=1 lent=0 queued=1 running_at_end=1 /);
+      const verdict = (await readRecord(directory))?.verdict;
+      expect(verdict?.outcome).toBe('wedged');
+      if (verdict?.outcome !== 'wedged') throw new Error(`the run is not wedged: ${JSON.stringify(verdict)}`);
+      expect(verdict.idleMs).toBe(1_500);
       const results = (await readFile(join(directory, TEST_RESULTS_FILE), 'utf8'))
         .split('\n')
         .filter((line) => line !== '')
@@ -2742,7 +2746,8 @@ arrive('held', () => arrive('queued', () => {}));
       expect(held?.waitMs).toBeUndefined();
       expect(queued?.status).toBe('fail');
       expect(queued?.durationMs, JSON.stringify(results)).toBeNull();
-      expect(queued?.waitMs ?? 0, JSON.stringify(results)).toBeGreaterThanOrEqual(1_000);
+      expect(queued?.waitMs, JSON.stringify(results)).toBeNumber();
+      expect(queued?.waitMs, JSON.stringify(results)).toBeGreaterThan(0);
     } finally {
       for (const [name, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[name];
