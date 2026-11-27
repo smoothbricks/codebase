@@ -1,6 +1,7 @@
 //! Behavioral tests for nested slots with inner `ORDERED_LIST` struct rows
 //! (`SLOT_NESTED` 0x1a with `inner_type = OrderedList` and `NESTED_LIST_APPEND_STRUCT` 0x93).
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use columine_types::types::{
@@ -10,6 +11,7 @@ use columine_types::types::{
 use columine_types::vo::{UnavailableVoAdmission, VoProgramMetadata};
 use columine_types::{InternedStr, PROGRAM_MAGIC};
 use columine_vm::bytes;
+use columine_vm::key_index::NoStrings;
 use columine_vm::logical_export::{
     InternLookup, Interner, LogicalSlot, SlotEncoding, SlotTransfer, export_slot, import_slot,
     rewrite_slot_set,
@@ -22,7 +24,10 @@ use columine_vm::state_init::{
     calculate_grown_state_size, calculate_state_size, compute_struct_row_layout_padded, init_state,
     validate_state,
 };
+use columine_vm::struct_map::Validity;
 use columine_vm::vm::{Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes};
+use proptest::prelude::*;
+use proptest::test_runner::{TestCaseError, TestRunner};
 
 const HALT: u8 = 0x00;
 const SLOT_NESTED: u8 = 0x1a;
@@ -442,59 +447,223 @@ fn appends_past_inner_initial_cap_grow_list_and_preserve_every_row_and_order() {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SplitRow {
+    key: u32,
+    f0: Option<u32>,
+    f1: Option<i64>,
+    f2: Option<bool>,
+}
+
+fn split_row_strategy() -> impl Strategy<Value = SplitRow> {
+    (
+        1u32..=4,
+        prop::option::of(any::<u32>()),
+        prop::option::of(any::<i64>()),
+        prop::option::of(any::<bool>()),
+    )
+        .prop_map(|(key, f0, f1, f2)| SplitRow { key, f0, f1, f2 })
+}
+
+fn rows_and_cuts_strategy() -> impl Strategy<Value = (Vec<SplitRow>, Vec<usize>)> {
+    prop::collection::vec(split_row_strategy(), 1..=64).prop_flat_map(|rows| {
+        let len = rows.len();
+        let cuts = if len <= 1 {
+            Just(Vec::new()).boxed()
+        } else {
+            let max_coarse = (len - 1).min(4);
+            prop_oneof![
+                prop::collection::vec(1..len, 0..=max_coarse),
+                prop::collection::vec(1..len, 0..len),
+            ]
+            .boxed()
+        };
+        (Just(rows), cuts)
+    })
+}
+
+fn validity_bitmap(valid: impl ExactSizeIterator<Item = bool>) -> Vec<u8> {
+    let mut bits = vec![0u8; valid.len().div_ceil(8)];
+    for (idx, is_valid) in valid.enumerate() {
+        if is_valid {
+            bits[idx / 8] |= 1u8 << (idx % 8);
+        }
+    }
+    bits
+}
+
+fn execute_rows_with_growth(
+    vm: &mut Vm,
+    state: &mut Vec<u8>,
+    prog: &[u8],
+    rows: &[SplitRow],
+) -> Result<(), String> {
+    let types = vec![TYPE_EVENT; rows.len()];
+    let keys: Vec<u32> = rows.iter().map(|r| r.key).collect();
+    // Non-zero dummy payloads for absent cells ensure a missed validity check is observable.
+    let f0: Vec<u32> = rows.iter().map(|r| r.f0.unwrap_or(0xDEAD_BEEF)).collect();
+    let f1: Vec<i64> = rows.iter().map(|r| r.f1.unwrap_or(-123_456_789)).collect();
+    let f2: Vec<u32> = rows
+        .iter()
+        .map(|r| u32::from(r.f2.unwrap_or(true)))
+        .collect();
+    let f0_valid = validity_bitmap(rows.iter().map(|r| r.f0.is_some()));
+    let f1_valid = validity_bitmap(rows.iter().map(|r| r.f1.is_some()));
+    let f2_valid = validity_bitmap(rows.iter().map(|r| r.f2.is_some()));
+
+    let cols = [
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&f0),
+        i64s_as_bytes(&f1),
+        u32s_as_bytes(&f2),
+    ];
+    let validity_cols = [
+        None,
+        None,
+        Some(f0_valid.as_slice()),
+        Some(f1_valid.as_slice()),
+        Some(f2_valid.as_slice()),
+    ];
+    let validity = Validity(&validity_cols);
+
+    loop {
+        let status = vm.execute_batch_in(
+            state,
+            prog,
+            &cols,
+            validity,
+            len_u32(rows.len()),
+            &NoStrings,
+        );
+        if status == ErrorCode::Ok as u32 {
+            return Ok(());
+        }
+        if status != ErrorCode::NeedsGrowth as u32 {
+            return Err(format!("unexpected execute_batch_in status: {status}"));
+        }
+        let room = vm
+            .needs_growth_room()
+            .ok_or_else(|| "NeedsGrowth without recorded growth room".to_owned())?;
+        let grown_size = calculate_grown_state_size(state, 0, room)
+            .map_err(|e| format!("calculate_grown_state_size failed: {e:?}"))?;
+        let mut next = vec![0u8; grown_size as usize];
+        vm.grow_state(state, &mut next, 0, room)
+            .map_err(|e| format!("grow_state failed: {e:?}"))?;
+        *state = next;
+    }
+}
+
 #[test]
-fn split_invariance_one_batch_and_row_by_row_produce_identical_lists() {
-    let init = nested_list_init(0, 16, 2, 0, &[UINT32, INT64, BOOL]);
+fn split_invariance_any_batch_partition_matches_the_reference_list_per_key() {
+    const INITIAL_INNER_CAP: u16 = 2;
+    const CASES: u32 = 256;
+
+    let init = nested_list_init(0, 16, INITIAL_INNER_CAP, 0, &[UINT32, INT64, BOOL]);
     let body = append_body(0, 1, &[(2, 0), (3, 1), (4, 2)]);
     let prog = program(1, 5, &init, &for_each(0, &body));
 
-    let keys = [1u32, 2, 1, 3, 2, 1, 1, 3, 2, 1, 4, 2];
-    let f0: Vec<u32> = (0..keys.len() as u32).map(|i| 1000 + i).collect();
-    let f1: Vec<i64> = (0..keys.len() as i64).map(|i| (i - 5) * 777).collect();
-    let f2: Vec<u32> = (0..keys.len() as u32).map(|i| i & 1).collect();
-    let types = vec![TYPE_EVENT; keys.len()];
+    let grew_inner_keys = Cell::new(0u32);
+    let multi_same_key_batches = Cell::new(0u32);
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(CASES));
+    let verdict = runner.run(&rows_and_cuts_strategy(), |(rows, mut cuts)| {
+        let mut whole_state = init_fresh(&prog);
+        let mut vm_whole = Vm::default();
+        execute_rows_with_growth(&mut vm_whole, &mut whole_state, &prog, &rows)
+            .map_err(TestCaseError::fail)?;
+        validate_state(&whole_state)
+            .map_err(|e| TestCaseError::fail(format!("whole state invalid: {e:?}")))?;
 
-    let mut whole_state = init_fresh(&prog);
-    let mut vm_whole = Vm::default();
-    let status = vm_whole.execute_batch(
-        &mut whole_state,
-        &prog,
-        &[
-            u32s_as_bytes(&types),
-            u32s_as_bytes(&keys),
-            u32s_as_bytes(&f0),
-            i64s_as_bytes(&f1),
-            u32s_as_bytes(&f2),
-        ],
-        len_u32(keys.len()),
+        cuts.sort_unstable();
+        cuts.dedup();
+        cuts.push(rows.len());
+
+        let mut split_state = init_fresh(&prog);
+        let mut vm_split = Vm::default();
+        let mut start = 0usize;
+        for end in cuts {
+            let batch = &rows[start..end];
+            let mut batch_counts = [0u32; 5];
+            for row in batch {
+                batch_counts[row.key as usize] += 1;
+            }
+            if batch_counts.iter().any(|&c| c > 1) {
+                multi_same_key_batches.set(multi_same_key_batches.get() + 1);
+            }
+            execute_rows_with_growth(&mut vm_split, &mut split_state, &prog, batch)
+                .map_err(TestCaseError::fail)?;
+            start = end;
+        }
+        validate_state(&split_state)
+            .map_err(|e| TestCaseError::fail(format!("split state invalid: {e:?}")))?;
+
+        let mut expected: BTreeMap<u32, Vec<Vec<Option<FieldVal>>>> = BTreeMap::new();
+        for row in &rows {
+            expected.entry(row.key).or_default().push(vec![
+                row.f0.map(FieldVal::U32),
+                row.f1.map(FieldVal::I64),
+                row.f2.map(FieldVal::Bool),
+            ]);
+        }
+
+        for key in 1u32..=5 {
+            let whole = read_list_raw(&whole_state, 0, key);
+            let split = read_list_raw(&split_state, 0, key);
+            prop_assert_eq!(
+                &whole,
+                &split,
+                "key {} differs between whole-batch and partitioned execution",
+                key
+            );
+            match expected.get(&key) {
+                Some(expected_rows) => {
+                    let Some((split_cap, split_rows)) = split else {
+                        return Err(TestCaseError::fail(format!(
+                            "key {key} present in input was absent from folded state"
+                        )));
+                    };
+                    prop_assert_eq!(
+                        &split_rows,
+                        expected_rows,
+                        "key {} list differs from input-order reference model",
+                        key
+                    );
+                    if expected_rows.len() > usize::from(INITIAL_INNER_CAP) {
+                        prop_assert!(
+                            split_cap > u32::from(INITIAL_INNER_CAP),
+                            "key {} with {} rows must grow past initial inner cap {}, got {}",
+                            key,
+                            expected_rows.len(),
+                            INITIAL_INNER_CAP,
+                            split_cap
+                        );
+                        grew_inner_keys.set(grew_inner_keys.get() + 1);
+                    }
+                }
+                None => {
+                    prop_assert_eq!(
+                        split,
+                        None,
+                        "key {} absent from input must be absent from folded state",
+                        key
+                    );
+                }
+            }
+        }
+        Ok(())
+    });
+
+    if let Err(failure) = verdict {
+        panic!("{failure}");
+    }
+    assert!(
+        grew_inner_keys.get() > 0,
+        "batch-by-batch fold must reach inner capacity growth past {INITIAL_INNER_CAP}"
     );
-    assert_eq!(status, ErrorCode::Ok as u32);
-
-    let mut split_state = init_fresh(&prog);
-    let mut vm_split = Vm::default();
-    for i in 0..keys.len() {
-        let status = vm_split.execute_batch(
-            &mut split_state,
-            &prog,
-            &[
-                u32s_as_bytes(&types[i..=i]),
-                u32s_as_bytes(&keys[i..=i]),
-                u32s_as_bytes(&f0[i..=i]),
-                i64s_as_bytes(&f1[i..=i]),
-                u32s_as_bytes(&f2[i..=i]),
-            ],
-            1,
-        );
-        assert_eq!(status, ErrorCode::Ok as u32);
-    }
-
-    for key in [1u32, 2, 3, 4, 5] {
-        assert_eq!(
-            read_list_raw(&whole_state, 0, key),
-            read_list_raw(&split_state, 0, key),
-            "key {key} differs between whole-batch and row-by-row execution"
-        );
-    }
+    assert!(
+        multi_same_key_batches.get() > 0,
+        "partitioned batches must exercise multiple same-key rows in a single batch"
+    );
 }
 
 #[test]
