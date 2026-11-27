@@ -291,7 +291,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]);
       expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']);
       // Where `tsc-js` is inferred, `typecheck` delegates to it without re-checking the lib program.
-      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
       // `typecheck-tests` runs the compiler devenv.smoo.nix pins (SMOO_TYPECHECK_TSC) itself, not through
       // ttsc, whose auto-loaded transform plugins would check with their own compiler; and it refuses
       // to fall back to another when the shell does not provide it.
@@ -401,7 +401,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(externalDependencies(targets['tsc-js'])).toEqual([
         [own, '@types/bun', '@typescript/native', 'tslib', 'ttsc'],
       ]);
-      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
       for (const name of ['typecheck-tests', 'lint']) {
         expect(externalDependencies(targets[name])).toEqual([[own, '@types/bun', 'tslib']]);
       }
@@ -465,7 +465,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = project?.targets ?? {};
 
       // When `tsc-js` is inferred, `typecheck` delegates to `tsc-js` (which already runs the dialect plugins).
-      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
       // The noop runs no compiler, so the project names no native compiler identity.
       expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
       expect(targets['typecheck-tests']?.options).toMatchObject({ command: 'ttsc -p tsconfig.test.json --noEmit' });
@@ -591,7 +591,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const environment = targets['tsc-js']?.inputs?.filter((input) => typeof input === 'object' && 'env' in input);
       expect(environment).toEqual([{ env: 'SMOO_TYPECHECK_TSC' }, { env: 'NODE_ENV' }, { env: 'LOWERING_MODE' }]);
-      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
     } finally {
       await workspace.cleanup();
     }
@@ -1001,7 +1001,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           { json: '{projectRoot}/package.json', excludeFields: ['version'] },
         ],
       });
-      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
       expect(targets['typecheck-tests']?.inputs).toEqual([
         'versionlessDefault',
         { input: 'versionlessProduction', dependencies: true },
@@ -1276,7 +1276,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
         { externalDependencies: ['bun-lock:packages/example'] },
       ];
-      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
       expect(targets['typecheck-tests']?.inputs).toEqual([
         'versionlessDefault',
         '^production',
@@ -4947,7 +4947,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = project?.targets ?? {};
 
       // `typecheck` delegates to `tsc-js` with no inputs or command of its own.
-      expect(targets.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
       expect(targets.typecheck?.inputs).toBeUndefined();
       expect(targets.typecheck?.options).toBeUndefined();
       expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
@@ -5042,7 +5042,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       await workspace.write('packages/extends-emit/src/index.ts', 'export const ok = 1;\n');
       const extending = await inferProject(workspace, 'packages/extends-emit/package.json');
-      expect(extending?.targets?.typecheck).toEqual({ executor: 'nx:noop', dependsOn: ['tsc-js'] });
+      expect(extending?.targets?.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
 
       // One that points the inferred emit at another tsconfig checks another program, so the real typecheck stays.
       await workspace.write(

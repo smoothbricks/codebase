@@ -1385,14 +1385,15 @@ Concrete targets come from concrete files:
   never reads inherited `SMOO_*` variables, so git hooks running outside the devenv shell resolve this checkout's own
   compiler and source rather than another workspace's.
 - `typecheck` is inferred from `tsconfig.lib.json`. Where the inferred `tsc-js` runs, `typecheck` is
-  `{ "executor": "nx:noop", "dependsOn": ["tsc-js"] }` with no inputs or command of its own: running it runs `tsc-js`,
-  which already checks `tsconfig.lib.json` (transform plugins included) and fails on type errors, so library sources are
-  type-checked once. A `tsc-js` declaration in `package.json#nx.targets` that only adds `dependsOn` or `inputs` keeps
-  the inferred emit, as Nx merges the two. Where a declaration replaces it (another executor, a top-level `command`,
-  `options.command`/`options.commands`, or `options.tsConfig` naming another tsconfig), `typecheck` runs
-  `SMOO_TYPECHECK_TSC` as `-p tsconfig.lib.json --noEmit`, directly rather than through `ttsc`. Every TypeScript source
-  file of a project belongs to at most one inferred checking target: graph inference resolves `tsconfig.lib.json` and
-  `tsconfig.test.json` through TypeScript's config loader and refuses any project whose two configs include the same
+  `{ "executor": "nx:noop", "inputs": [], "dependsOn": ["tsc-js"] }`, with no command of its own and an empty input list
+  rather than none (Nx hashes a cached target that names no inputs over every file under its project root): running it
+  runs `tsc-js`, which already checks `tsconfig.lib.json` (transform plugins included) and fails on type errors, so
+  library sources are type-checked once. A `tsc-js` declaration in `package.json#nx.targets` that only adds `dependsOn`
+  or `inputs` keeps the inferred emit, as Nx merges the two. Where a declaration replaces it (another executor, a
+  top-level `command`, `options.command`/`options.commands`, or `options.tsConfig` naming another tsconfig), `typecheck`
+  runs `SMOO_TYPECHECK_TSC` as `-p tsconfig.lib.json --noEmit`, directly rather than through `ttsc`. Every TypeScript
+  source file of a project belongs to at most one inferred checking target: graph inference resolves `tsconfig.lib.json`
+  and `tsconfig.test.json` through TypeScript's config loader and refuses any project whose two configs include the same
   file, naming the project, each shared file, both configs, and the fix. `src/test-suite-tracer.ts` is test-only and
   excluded from `tsconfig.lib.json`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them. A project
   whose direct dependency (`dependencies` or `devDependencies`, the ones ttsc discovers plugins on) declares a dialect

@@ -1989,7 +1989,11 @@ async function createProjectTargets(
           },
         }
       : {
+          // It runs nothing and reads nothing: tsc-js, which it depends on, checks tsconfig.lib.json and keys what it
+          // reads. A cached target with no inputs at all is hashed over every file under its project root, so it says
+          // so with an empty list.
           executor: 'nx:noop',
+          inputs: [],
           dependsOn: ['tsc-js'],
         };
     Object.assign(
