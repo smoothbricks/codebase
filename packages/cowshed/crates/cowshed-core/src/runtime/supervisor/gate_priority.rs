@@ -4,8 +4,8 @@
 
 use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
-#[cfg(target_os = "macos")]
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "macos")]
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
