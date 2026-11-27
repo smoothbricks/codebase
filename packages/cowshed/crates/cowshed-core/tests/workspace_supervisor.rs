@@ -13803,9 +13803,7 @@ s.recv(16)
             let SpawnCommand::Argv(argv) = &request.command else {
                 return Err(CowshedError::internal("BurnerSpawnSink expects Argv"));
             };
-            let is_burner = argv
-                .get(3)
-                .is_some_and(|arg| arg.as_os_str() == "cpu-burner");
+            let is_burner = argv.iter().any(|arg| arg.as_os_str() == "cpu-burner");
             let monitor = if is_burner {
                 cowshed_core::runtime::process_monitor::ProcessMonitor::prepare_with(
                     cowshed_core::runtime::process_tree::TreeOwner::Job(request.job_id),
@@ -14028,23 +14026,38 @@ for pid in children:
             label: &str,
             processes: usize,
         ) -> Self {
+            Self::start_clamped(handle, root, label, processes, None).await
+        }
+
+        async fn start_clamped(
+            handle: &WorkspaceSupervisorHandle,
+            root: &Path,
+            label: &str,
+            processes: usize,
+            qos_clamp: Option<&str>,
+        ) -> Self {
             let sock_path = root.join(format!("{label}.sock"));
             let _ = std::fs::remove_file(&sock_path);
             let listener = UnixListener::bind(&sock_path).unwrap();
+            let mut argv: Vec<CommandArg> = Vec::new();
+            if let Some(clamp) = qos_clamp {
+                argv.extend(["/usr/sbin/taskpolicy".into(), "-c".into(), clamp.into()]);
+            }
+            argv.extend([
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"exec python3 -c "$1" "$2" "$3""#.into(),
+                "cpu-burner".into(),
+                CPU_BURNER_PY.into(),
+                CommandArg::from(sock_path.into_os_string()),
+                processes.to_string().into(),
+            ]);
             let job_id = handle
                 .exec(
                     None,
                     None,
                     ExecRequest {
-                        command: ExecCommand::Argv(vec![
-                            "/bin/sh".into(),
-                            "-c".into(),
-                            r#"exec python3 -c "$1" "$2" "$3""#.into(),
-                            "cpu-burner".into(),
-                            CPU_BURNER_PY.into(),
-                            CommandArg::from(sock_path.into_os_string()),
-                            processes.to_string().into(),
-                        ]),
+                        command: ExecCommand::Argv(argv),
                         cwd: None,
                         scope: ExecScope::HostGate,
                         class: ExecClass::Background,
@@ -14110,6 +14123,26 @@ for pid in children:
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn observed_tree_ceiling(pids: &[u32], context: &str) -> i32 {
+        let mut expected = None;
+        for &pid in pids {
+            let priorities = procinfo::thread_max_priorities(pid.cast_signed())
+                .unwrap_or_else(|error| panic!("read thread max priorities for pid {pid}: {error}"))
+                .unwrap_or_else(|| panic!("pid {pid} exited unexpectedly ({context})"));
+            assert!(
+                !priorities.is_empty(),
+                "{context}: pid {pid} returned empty thread max priorities"
+            );
+            let ceiling = *expected.get_or_insert(priorities[0]);
+            assert!(
+                ceiling > 4 && priorities.iter().all(|&p| p == ceiling),
+                "{context}: pid {pid} expected consistent pre-set ceiling > 4 (tree ceiling {ceiling}), got {priorities:?}"
+            );
+        }
+        expected.expect("at least one pid")
+    }
+
     /// Red (b): a background job that reads no token and burns > 1.5 cores past its 1 s grace and
     /// 3 s window gets `PRIO_DARWIN_BG` on every process of its tree (read back via
     /// `PROC_PIDTHREADINFO` `pth_maxpriority == 4`) and loses it at the gate's end (`== 63`),
@@ -14119,7 +14152,7 @@ for pid in children:
     async fn land_gate_sets_and_clears_darwinbg_on_token_ignoring_burner() {
         let mut fixture = start_burner_fixture("gate-darwinbg");
         let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
-        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+        let initial_ceiling = observed_tree_ceiling(&burner.pids, "before land gate");
 
         let land_gate = GateJob::start(
             &fixture.handle,
@@ -14193,7 +14226,7 @@ for pid in children:
             cleared_ledger.get("darwinbg").is_none(),
             "darwinbg must be absent from group ledger after clear: {cleared_ledger}"
         );
-        assert_tree_max_priority(&burner.pids, 63, "after land gate");
+        assert_tree_max_priority(&burner.pids, initial_ceiling, "after land gate");
 
         let burner_id = burner.job_id;
         burner.stop(&fixture.handle).await;
@@ -14233,6 +14266,128 @@ for pid in children:
             .unwrap();
     }
 
+    /// Red (UTILITY clamp): a burner job clamped to UTILITY starts at `pth_maxpriority == 20`,
+    /// records `ceiling: 20` in the ledger when `PRIO_DARWIN_BG` is applied, and returns to `20`
+    /// on clear with zero `job.darwinbg.unconfirmed` warning rows.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn land_gate_sets_and_clears_darwinbg_on_utility_clamped_burner() {
+        let mut fixture = start_burner_fixture("gate-darwinbg-utility");
+        let burner = CpuBurner::start_clamped(
+            &fixture.handle,
+            &fixture.root,
+            "burner-utility",
+            3,
+            Some("utility"),
+        )
+        .await;
+        assert_tree_max_priority(&burner.pids, 20, "before land gate");
+
+        let land_gate = GateJob::start(
+            &fixture.handle,
+            &fixture.root,
+            "land-gate",
+            Some(JobLander {
+                pid: std::process::id(),
+                start: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-start").await,
+            GateWatchEvent::GateStart {
+                job_id: land_gate.job_id.get(),
+            }
+        );
+
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg active on published liveness",
+            cowshed_os::test_backstop::NO_PROGRESS,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| state.darwinbg_active)
+            },
+        )
+        .await;
+        let ledger_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.ledger).expect("read group ledger"))
+                .expect("parse group ledger");
+        let recorded_lives = ledger_value
+            .get("darwinbg")
+            .and_then(|bg| bg.get("lives"))
+            .and_then(|lives| lives.as_array())
+            .unwrap_or_else(|| panic!("missing darwinbg.lives in ledger: {ledger_value}"));
+        for &pid in &burner.pids {
+            assert!(
+                recorded_lives.iter().any(|life| {
+                    life["pid"].as_u64() == Some(u64::from(pid))
+                        && life["ceiling"].as_i64() == Some(20)
+                }),
+                "pid {pid} missing ceiling 20 in darwinbg.lives: {recorded_lives:?}"
+            );
+        }
+        assert_tree_max_priority(&burner.pids, 4, "during land gate");
+
+        let gate_id = land_gate.job_id;
+        land_gate.finish(&fixture.handle).await;
+        assert_eq!(
+            fixture.gateway.recv_event("land gate-end").await,
+            GateWatchEvent::GateEnd {
+                job_id: gate_id.get(),
+            }
+        );
+        wait_for_liveness(
+            &fixture.handle,
+            "darwinbg cleared on published liveness",
+            cowshed_os::test_backstop::NO_PROGRESS,
+            |liveness| {
+                liveness
+                    .job_gate_priority(burner.job_id)
+                    .is_some_and(|state| !state.darwinbg_active && state.darwinbg_cleared >= 1)
+            },
+        )
+        .await;
+        let cleared_ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.ledger).expect("read group ledger"))
+                .expect("parse group ledger");
+        assert!(
+            cleared_ledger.get("darwinbg").is_none(),
+            "darwinbg must be absent from group ledger after clear: {cleared_ledger}"
+        );
+        assert_tree_max_priority(&burner.pids, 20, "after land gate");
+
+        let burner_id = burner.job_id;
+        burner.stop(&fixture.handle).await;
+        let _ = fixture.handle.trace_health().await.unwrap();
+        let rows = gate_span_rows(&fixture.telemetry, burner_id);
+        assert!(
+            rows.iter()
+                .any(|row| row.entry_type == "info" && row.message == "job.darwinbg.set"),
+            "missing job.darwinbg.set row: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.entry_type == "info" && row.message == "job.darwinbg.cleared"),
+            "missing job.darwinbg.cleared row: {rows:?}"
+        );
+        let unconfirmed: Vec<&GateSpanRow> = rows
+            .iter()
+            .filter(|row| row.message == "job.darwinbg.unconfirmed")
+            .collect();
+        assert!(
+            unconfirmed.is_empty(),
+            "UTILITY-clamped burner must confirm clear at 20 with zero unconfirmed rows: {unconfirmed:?}"
+        );
+
+        fixture
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
+    }
+
     /// Red (idle host): a background job that ignores tokens and burns > 1.5 cores is never set
     /// `PRIO_DARWIN_BG` while the driven host CPU source reports at least one idle core across
     /// several 3 s windows (`pth_maxpriority == 63`, no ledger entry, no `job.darwinbg.set` row).
@@ -14242,7 +14397,7 @@ for pid in children:
         let (_host_cpu_tx, host_cpu) = driven_host_cpu(2_000);
         let mut fixture = start_burner_fixture_with_host_cpu("gate-darwinbg-idle", host_cpu);
         let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
-        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+        let initial_ceiling = observed_tree_ceiling(&burner.pids, "before land gate");
 
         let land_gate = GateJob::start(
             &fixture.handle,
@@ -14283,7 +14438,11 @@ for pid in children:
             !state.darwinbg_active && state.darwinbg_cleared == 0,
             "burner must never be backgrounded while an idle core exists: {state:?}"
         );
-        assert_tree_max_priority(&burner.pids, 63, "during land gate with idle core");
+        assert_tree_max_priority(
+            &burner.pids,
+            initial_ceiling,
+            "during land gate with idle core",
+        );
         if let Ok(bytes) = std::fs::read(&fixture.ledger) {
             let ledger_value: serde_json::Value =
                 serde_json::from_slice(&bytes).expect("parse group ledger");
@@ -14333,7 +14492,7 @@ for pid in children:
         let (host_cpu_tx, host_cpu) = driven_host_cpu(500);
         let mut fixture = start_burner_fixture_with_host_cpu("gate-darwinbg-toggle", host_cpu);
         let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
-        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+        let initial_ceiling = observed_tree_ceiling(&burner.pids, "before land gate");
 
         let land_gate = GateJob::start(
             &fixture.handle,
@@ -14389,7 +14548,11 @@ for pid in children:
             cleared_ledger.get("darwinbg").is_none(),
             "darwinbg must be absent from group ledger after idle-core clear: {cleared_ledger}"
         );
-        assert_tree_max_priority(&burner.pids, 63, "restored when idle core returns");
+        assert_tree_max_priority(
+            &burner.pids,
+            initial_ceiling,
+            "restored when idle core returns",
+        );
 
         // 3. Host loses its idle core again (250 mcores) while the gate still runs: the cleared
         // job is judged again from its next window and backgrounded again.
@@ -14429,7 +14592,7 @@ for pid in children:
             },
         )
         .await;
-        assert_tree_max_priority(&burner.pids, 63, "cleared when land gate ends");
+        assert_tree_max_priority(&burner.pids, initial_ceiling, "cleared when land gate ends");
 
         let burner_id = burner.job_id;
         burner.stop(&fixture.handle).await;
@@ -14577,10 +14740,17 @@ os.read(0, 1)
         std::io::BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut ready)
             .expect("read burner ready line");
-        assert_eq!(
-            ready.trim(),
-            "ready 63",
-            "burner self-check reads 63 before PRIO_DARWIN_BG"
+        let initial: Vec<i32> = ready
+            .trim()
+            .strip_prefix("ready ")
+            .unwrap_or_else(|| panic!("unexpected ready line: {ready:?}"))
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let initial_ceiling = initial[0];
+        assert!(
+            initial_ceiling > 4 && initial.iter().all(|&p| p == initial_ceiling),
+            "burner self-check must read a non-BG ceiling before PRIO_DARWIN_BG, got {initial:?}"
         );
 
         let leader = GroupLeader::observe(pid).expect("observe burner group leader");
@@ -14617,7 +14787,15 @@ os.read(0, 1)
                         "birth": record.unique_id,
                     }]
                 }
-            }]
+            }],
+            "darwinbg": {
+                "bootSession": boot_session,
+                "lives": [{
+                    "pid": pid,
+                    "birth": record.unique_id,
+                    "ceiling": initial_ceiling,
+                }]
+            }
         });
         std::fs::write(&ledger, serde_json::to_vec(&payload).unwrap()).unwrap();
 
@@ -14637,8 +14815,8 @@ os.read(0, 1)
             .map(|value| value.parse().unwrap())
             .collect();
         assert!(
-            !observed.is_empty() && observed.iter().all(|&p| p == 63),
-            "SIGTERM handler must observe pth_maxpriority == 63 (darwinbg cleared before TERM), got {observed:?}"
+            !observed.is_empty() && observed.iter().all(|&p| p == initial_ceiling),
+            "SIGTERM handler must observe pth_maxpriority == {initial_ceiling} (darwinbg cleared before TERM), got {observed:?}"
         );
         assert!(
             recovered.darwinbg_cleared.iter().any(|cleared| {
@@ -14672,6 +14850,8 @@ os.read(0, 1)
         .await;
         #[cfg(target_os = "macos")]
         let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
+        #[cfg(target_os = "macos")]
+        let initial_ceiling = observed_tree_ceiling(&burner.pids, "before gateway silence");
 
         let land_gate = GateJob::start(
             &fixture.handle,
@@ -14735,7 +14915,7 @@ os.read(0, 1)
                 cleared_ledger.get("darwinbg").is_none(),
                 "darwinbg must be absent from ledger after gateway silence: {cleared_ledger}"
             );
-            assert_tree_max_priority(&burner.pids, 63, "after gateway silence");
+            assert_tree_max_priority(&burner.pids, initial_ceiling, "after gateway silence");
             let burner_id = burner.job_id;
             burner.stop(&fixture.handle).await;
             let _ = fixture.handle.trace_health().await.unwrap();
@@ -15249,7 +15429,7 @@ os.read(0, 1)
         let (mut fixture, entered_rx, mut release_guard) =
             start_stalling_fixture("gate-stall-bg", BurnerSpawnSink, true);
         let burner = CpuBurner::start(&fixture.handle, &fixture.root, "burner", 3).await;
-        assert_tree_max_priority(&burner.pids, 63, "before land gate");
+        let initial_ceiling = observed_tree_ceiling(&burner.pids, "before land gate");
 
         let lander = Some(JobLander {
             pid: std::process::id(),
@@ -15322,7 +15502,9 @@ os.read(0, 1)
                     procinfo::thread_max_priorities(pid.cast_signed())
                         .ok()
                         .flatten()
-                        .is_some_and(|prios| !prios.is_empty() && prios.iter().all(|&p| p == 63))
+                        .is_some_and(|prios| {
+                            !prios.is_empty() && prios.iter().all(|&p| p == initial_ceiling)
+                        })
                 });
                 if all_cleared {
                     return;
@@ -15344,7 +15526,11 @@ os.read(0, 1)
                 );
             }
         }
-        assert_tree_max_priority(&burner.pids, 63, "cleared while actor spawn still stalled");
+        assert_tree_max_priority(
+            &burner.pids,
+            initial_ceiling,
+            "cleared while actor spawn still stalled",
+        );
 
         // Release the stall; the actor finishes the turn, flushes `.groups`, and records the row.
         release_guard.release();

@@ -184,6 +184,10 @@ struct Snapshot {
     /// Every life the fold holds with no folded exit, by its kernel unique id. Shared with the
     /// ledger's claims, so a publication never copies it.
     running: Arc<[ProcessIdentity]>,
+    /// `(child, parent)` identity links in this job's retained tree, shared when membership is
+    /// unchanged so ancestor ceiling walks need no writer round-trip.
+    #[cfg(target_os = "macos")]
+    parents: Arc<[(ProcessIdentity, ProcessIdentity)]>,
     /// Monotonic timestamp of the latest process-tree rusage sample folded into `attribution`.
     #[cfg(target_os = "macos")]
     sampled_at: Instant,
@@ -277,6 +281,8 @@ impl ProcessMonitor {
             },
             attribution: AttributionSummary::from_observed(std::iter::empty()),
             running: Arc::from([]),
+            #[cfg(target_os = "macos")]
+            parents: Arc::from([]),
             #[cfg(target_os = "macos")]
             sampled_at: Instant::now(),
         }));
@@ -512,6 +518,13 @@ impl ProcessMonitor {
     /// members the fold never adopted are not here; a retirement's membership read adopts them.
     pub fn running_lives(&self) -> Arc<[ProcessIdentity]> {
         Arc::clone(&self.driver.snapshot.load().running)
+    }
+
+    /// Lock-free read of `(child, parent)` identity links in this job's retained process tree,
+    /// used when resolving the pre-set `PRIO_DARWIN_BG` ceiling of a child born while backgrounded.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn parent_links(&self) -> Arc<[(ProcessIdentity, ProcessIdentity)]> {
+        Arc::clone(&self.driver.snapshot.load().parents)
     }
 
     /// Lock-free read of the latest process-tree cumulative CPU sample (`(sampled_at, observed_cpu)`),
@@ -786,11 +799,19 @@ impl<P: ProcessReads> Writer<P> {
         } else {
             Arc::clone(&previous.running)
         };
+        #[cfg(target_os = "macos")]
+        let parents = if membership_changed {
+            self.observer.fold().parent_links().collect()
+        } else {
+            Arc::clone(&previous.parents)
+        };
         drop(previous);
         self.snapshot.store(Arc::new(Snapshot {
             tree,
             attribution: self.observer.attribution_summary(),
             running,
+            #[cfg(target_os = "macos")]
+            parents,
             #[cfg(target_os = "macos")]
             sampled_at: self.last_sampled_at,
         }));

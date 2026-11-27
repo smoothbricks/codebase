@@ -29,7 +29,7 @@ use macos as platform;
 #[cfg(target_os = "macos")]
 pub use platform::{
     DARWIN_BG_MAX_PRIORITY, DARWIN_NORMAL_MAX_PRIORITY, DarwinBgOutcome, clear_darwinbg,
-    has_darwinbg, set_darwinbg,
+    set_darwinbg, thread_ceiling,
 };
 pub use platform::{decay_group, placed_nice};
 

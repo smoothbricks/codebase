@@ -19,8 +19,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::api::dto::JobId;
-use crate::runtime::job_groups::{JobGroupClaim, Recorder, UnresolvedGroup};
-use crate::runtime::process_tree::ProcessIdentity;
+use crate::runtime::job_groups::{JobGroupClaim, RecordedDarwinBgLife, Recorder, UnresolvedGroup};
 use crate::runtime::supervisor_socket::PublicationLease;
 
 use super::JobStateRecord;
@@ -35,7 +34,7 @@ const MIN_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 /// reloaded here.
 struct Cut {
     claims: Vec<JobGroupClaim>,
-    darwinbg: Vec<ProcessIdentity>,
+    darwinbg: Vec<RecordedDarwinBgLife>,
     /// Optional completion reply when a caller requires the cut on disk before acting (such as
     /// persisting lives before setting `PRIO_DARWIN_BG`).
     ack: Option<tokio::sync::oneshot::Sender<io::Result<()>>>,
@@ -387,7 +386,7 @@ impl GroupLedgerWriter {
     pub(super) fn publish(
         &self,
         claims: impl Iterator<Item = JobGroupClaim>,
-        darwinbg: &[ProcessIdentity],
+        darwinbg: &[RecordedDarwinBgLife],
     ) -> io::Result<()> {
         let mut cut = std::mem::replace(&mut self.shared.lock().spare, Cut::new());
         cut.claims.extend(claims);
@@ -427,7 +426,7 @@ impl GroupLedgerWriter {
     pub(super) fn publish_immediate(
         &self,
         claims: impl Iterator<Item = JobGroupClaim>,
-        darwinbg: &[ProcessIdentity],
+        darwinbg: &[RecordedDarwinBgLife],
     ) -> tokio::sync::oneshot::Receiver<io::Result<()>> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let mut cut = std::mem::replace(&mut self.shared.lock().spare, Cut::new());
@@ -644,7 +643,7 @@ fn write_ledger(
 fn record(
     recorder: &mut Recorder,
     claims: impl Iterator<Item = JobGroupClaim> + Clone,
-    darwinbg: &[ProcessIdentity],
+    darwinbg: &[RecordedDarwinBgLife],
     inherited: &mut Vec<UnresolvedGroup>,
 ) -> io::Result<bool> {
     match recorder.record_with_darwinbg(claims, inherited, darwinbg) {

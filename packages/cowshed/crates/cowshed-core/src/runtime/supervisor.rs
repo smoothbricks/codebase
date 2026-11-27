@@ -7348,8 +7348,9 @@ impl SupervisorActor {
         }
     }
 
-    /// Collect every live process identity currently held at `PRIO_DARWIN_BG` across all jobs.
-    fn active_darwinbg_lives(&self) -> Vec<super::process_tree::ProcessIdentity> {
+    /// Collect every live process identity and pre-set ceiling currently held at `PRIO_DARWIN_BG`
+    /// across all jobs, sorted for deterministic ledger serialization.
+    fn active_darwinbg_lives(&self) -> Vec<super::job_groups::RecordedDarwinBgLife> {
         #[cfg(target_os = "macos")]
         {
             let mut lives = Vec::new();
@@ -7360,6 +7361,7 @@ impl SupervisorActor {
                     lives.extend(bg.snapshot_applied());
                 }
             }
+            lives.sort_unstable_by_key(|entry| (entry.pid, entry.birth.0));
             lives
         }
         #[cfg(not(target_os = "macos"))]
@@ -9737,6 +9739,12 @@ impl SupervisorActor {
                 held: u32,
                 host_idle_millicores: u32,
                 lives: Vec<super::process_tree::ProcessIdentity>,
+                parent_links: Arc<
+                    [(
+                        super::process_tree::ProcessIdentity,
+                        super::process_tree::ProcessIdentity,
+                    )],
+                >,
             },
             Clear {
                 active_clear: gate_priority::ActiveClear,
@@ -9814,24 +9822,23 @@ impl SupervisorActor {
                     let Some(cpu_millicores) = cpu_millicores else {
                         return;
                     };
-                    let mut lives: Vec<super::process_tree::ProcessIdentity> = job
-                        .monitor
-                        .as_ref()
-                        .map(|monitor| monitor.running_lives().to_vec())
-                        .unwrap_or_default();
+                    let Some(monitor) = job.monitor.as_ref() else {
+                        return;
+                    };
+                    let mut lives: Vec<super::process_tree::ProcessIdentity> =
+                        monitor.running_lives().to_vec();
                     if lives.is_empty() {
                         return;
                     }
                     lives.sort_unstable_by_key(|life| (life.pid, life.birth.0));
                     lives.dedup();
-                    bg.active = true;
-                    bg.record_applied(&lives);
-                    bg.arm_clear_task(job.monitor.clone(), span);
+                    let parent_links = monitor.parent_links();
                     Some(WindowAction::Set {
                         cpu_millicores,
                         held,
                         host_idle_millicores,
                         lives,
+                        parent_links,
                     })
                 }
                 gate_priority::DarwinBgStep::Clear => {
@@ -9852,8 +9859,40 @@ impl SupervisorActor {
                 held,
                 host_idle_millicores,
                 lives,
+                parent_links,
             }) => {
-                // Persist every life to `.groups` BEFORE calling `setpriority(PRIO_DARWIN_BG)`.
+                // Observe each candidate life's pre-set `pth_maxpriority` ceiling off-actor before
+                // persisting the ledger or setting `PRIO_DARWIN_BG`.
+                let observed =
+                    off_actor::run(move || gate_priority::observe_pre_set_ceilings(lives)).await;
+                if !self.gate_watch.span_active() {
+                    return;
+                }
+                let (resolved, skipped) = gate_priority::resolve_batch_ceilings(
+                    &observed,
+                    &std::collections::HashMap::new(),
+                    &parent_links,
+                );
+                if resolved.is_empty() {
+                    return;
+                }
+                {
+                    let Some(job) = self.jobs.get_mut(&job_id) else {
+                        return;
+                    };
+                    if job.terminal() {
+                        return;
+                    }
+                    let Some(bg) = &mut job.darwinbg else {
+                        return;
+                    };
+                    bg.active = true;
+                    bg.record_applied(&resolved);
+                    bg.record_skipped(&skipped);
+                    bg.arm_clear_task(job.monitor.clone(), span);
+                }
+                // Persist every life and its pre-set ceiling to `.groups` BEFORE calling
+                // `setpriority(PRIO_DARWIN_BG)`.
                 self.flush_groups_darwinbg().await;
                 // Re-check the live span watch before applying: if span-off happened during the
                 // flush, do not apply `PRIO_DARWIN_BG` and remove the unpublished entry from
@@ -9865,15 +9904,16 @@ impl SupervisorActor {
                     self.flush_groups_darwinbg().await;
                     return;
                 }
-                let applied_lives = lives.clone();
+                let to_apply: Vec<_> = resolved.iter().map(|&(life, _)| life).collect();
+                let applied_with_ceilings = resolved;
                 let outcomes =
-                    off_actor::run(move || gate_priority::apply_darwinbg_to_lives(lives)).await;
+                    off_actor::run(move || gate_priority::apply_darwinbg_to_lives(to_apply)).await;
                 // If span-off happened while `apply_darwinbg_to_lives` was executing on the
                 // blocking pool (potentially racing ahead of the out-of-turn clear task), clear
-                // those lives immediately so no process is left backgrounded past span-off.
+                // those lives immediately against their recorded ceilings.
                 if !self.gate_watch.span_active() {
                     let clear_outcomes = off_actor::run(move || {
-                        gate_priority::clear_darwinbg_from_lives(applied_lives)
+                        gate_priority::clear_darwinbg_from_lives(applied_with_ceilings)
                     })
                     .await;
                     self.record_darwinbg_unconfirmed(job_id, &clear_outcomes);
@@ -9927,8 +9967,42 @@ impl SupervisorActor {
         if !self.gate_active || !self.gate_watch.span_active() {
             return;
         }
-        let mut additions: Vec<(JobId, Vec<super::process_tree::ProcessIdentity>)> = Vec::new();
-        for (&job_id, job) in &mut self.jobs {
+        let mut pending_jobs = Vec::new();
+        for (&job_id, job) in &self.jobs {
+            if job.terminal() {
+                continue;
+            }
+            let Some(bg) = &job.darwinbg else {
+                continue;
+            };
+            if !bg.active {
+                continue;
+            }
+            let Some(monitor) = &job.monitor else {
+                continue;
+            };
+            let unseen = bg.unseen_lives(&monitor.running_lives());
+            if !unseen.is_empty() {
+                pending_jobs.push((job_id, unseen, monitor.parent_links()));
+            }
+        }
+        if pending_jobs.is_empty() {
+            return;
+        }
+        let mut additions: Vec<(JobId, Vec<(super::process_tree::ProcessIdentity, i32)>)> =
+            Vec::new();
+        for (job_id, unseen, parent_links) in pending_jobs {
+            if !self.gate_watch.span_active() {
+                return;
+            }
+            let observed =
+                off_actor::run(move || gate_priority::observe_pre_set_ceilings(unseen)).await;
+            if !self.gate_watch.span_active() {
+                return;
+            }
+            let Some(job) = self.jobs.get_mut(&job_id) else {
+                continue;
+            };
             if job.terminal() {
                 continue;
             }
@@ -9938,17 +10012,13 @@ impl SupervisorActor {
             if !bg.active {
                 continue;
             }
-            let Some(monitor) = &job.monitor else {
-                continue;
-            };
-            let mut new_lives = Vec::new();
-            for &life in monitor.running_lives().iter() {
-                if bg.insert_if_new(life) {
-                    new_lives.push(life);
-                }
-            }
-            if !new_lives.is_empty() {
-                additions.push((job_id, new_lives));
+            let recorded = bg.applied_map();
+            let (resolved, skipped) =
+                gate_priority::resolve_batch_ceilings(&observed, &recorded, &parent_links);
+            bg.record_skipped(&skipped);
+            if !resolved.is_empty() {
+                bg.record_applied(&resolved);
+                additions.push((job_id, resolved));
             }
         }
         if additions.is_empty() {
@@ -9962,12 +10032,13 @@ impl SupervisorActor {
             if !self.gate_watch.span_active() {
                 break;
             }
-            let applied = new_lives.clone();
+            let to_apply: Vec<_> = new_lives.iter().map(|&(life, _)| life).collect();
             let outcomes =
-                off_actor::run(move || gate_priority::apply_darwinbg_to_lives(new_lives)).await;
+                off_actor::run(move || gate_priority::apply_darwinbg_to_lives(to_apply)).await;
             if !self.gate_watch.span_active() {
                 let clear_outcomes =
-                    off_actor::run(move || gate_priority::clear_darwinbg_from_lives(applied)).await;
+                    off_actor::run(move || gate_priority::clear_darwinbg_from_lives(new_lives))
+                        .await;
                 self.record_darwinbg_unconfirmed(job_id, &clear_outcomes);
                 break;
             }

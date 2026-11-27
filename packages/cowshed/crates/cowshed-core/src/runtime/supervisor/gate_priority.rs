@@ -4,8 +4,8 @@
 
 use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
-use std::collections::HashSet;
 #[cfg(target_os = "macos")]
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -176,7 +176,7 @@ pub(super) struct DarwinBgWindowStart {
 /// alive when clearing mid-span.
 #[cfg(target_os = "macos")]
 pub(super) struct ActiveClear {
-    applied: Arc<Mutex<HashSet<ProcessIdentity>>>,
+    applied: Arc<Mutex<HashMap<ProcessIdentity, i32>>>,
     clear_stop: Option<oneshot::Sender<bool>>,
     clear_task: Option<tokio::task::JoinHandle<DarwinBgClearResult>>,
 }
@@ -185,7 +185,8 @@ pub(super) struct ActiveClear {
 impl ActiveClear {
     /// Complete clearing for the detached active lives: joins the out-of-turn clear task
     /// (triggering it now if still waiting), clears any residual life added after that task
-    /// snapshotted, and returns all readback outcomes for actor span recording.
+    /// snapshotted (and any child whose ancestor is in the recorded map), and returns all readback
+    /// outcomes for actor span recording.
     pub(super) async fn finish(
         mut self,
         monitor: Option<&ProcessMonitor>,
@@ -195,16 +196,24 @@ impl ActiveClear {
         }
         let (already_cleared, mut outcomes) = match self.clear_task.take() {
             Some(task) => task.await.unwrap_or_default(),
-            None => (HashSet::new(), Vec::new()),
+            None => (HashMap::new(), Vec::new()),
         };
-        let mut remaining: HashSet<ProcessIdentity> =
+        let mut remaining: HashMap<ProcessIdentity, i32> =
             std::mem::take(&mut *self.applied.lock().expect("darwinbg applied lock poisoned"));
         if let Some(monitor) = monitor {
+            let mut known = already_cleared.clone();
+            known.extend(remaining.iter().map(|(&life, &ceiling)| (life, ceiling)));
+            let parents = parent_map(&monitor.parent_links());
             for &life in monitor.running_lives().iter() {
-                remaining.insert(life);
+                if !known.contains_key(&life)
+                    && let Some(ceiling) = nearest_recorded_ancestor_ceiling(life, &known, &parents)
+                {
+                    known.insert(life, ceiling);
+                    remaining.insert(life, ceiling);
+                }
             }
         }
-        remaining.retain(|life| !already_cleared.contains(life));
+        remaining.retain(|life, _| !already_cleared.contains_key(life));
         if !remaining.is_empty() {
             let to_clear: Vec<_> = remaining.into_iter().collect();
             let extra = super::off_actor::run(move || clear_darwinbg_from_lives(to_clear)).await;
@@ -215,10 +224,10 @@ impl ActiveClear {
 }
 
 /// Result of one per-job out-of-turn `PRIO_DARWIN_BG` clear task: the exact lives already cleared
-/// and each life's `PROC_PIDTHREADINFO` readback outcome.
+/// with their recorded ceilings, and each life's `PROC_PIDTHREADINFO` readback outcome.
 #[cfg(target_os = "macos")]
 type DarwinBgClearResult = (
-    HashSet<ProcessIdentity>,
+    HashMap<ProcessIdentity, i32>,
     Vec<(u32, crate::runtime::placement::DarwinBgOutcome)>,
 );
 
@@ -228,7 +237,10 @@ pub(super) struct JobDarwinBg {
     window_task: Option<tokio::task::JoinHandle<()>>,
     pub(super) window_start: Option<DarwinBgWindowStart>,
     pub(super) active: bool,
-    applied: Arc<Mutex<HashSet<ProcessIdentity>>>,
+    applied: Arc<Mutex<HashMap<ProcessIdentity, i32>>>,
+    /// Lives observed already at ceiling 4 with no recorded ancestor (not cowshed's); never set,
+    /// recorded, or re-probed while this backgrounding span holds.
+    skipped: HashSet<ProcessIdentity>,
     clear_stop: Option<oneshot::Sender<bool>>,
     clear_task: Option<tokio::task::JoinHandle<DarwinBgClearResult>>,
 }
@@ -262,7 +274,8 @@ impl JobDarwinBg {
             window_task: Some(task),
             window_start: None,
             active: false,
-            applied: Arc::new(Mutex::new(HashSet::new())),
+            applied: Arc::new(Mutex::new(HashMap::new())),
+            skipped: HashSet::new(),
             clear_stop: None,
             clear_task: None,
         }
@@ -274,33 +287,53 @@ impl JobDarwinBg {
         }
     }
 
-    pub(super) fn record_applied(&self, lives: &[ProcessIdentity]) {
+    pub(super) fn record_applied(&self, lives: &[(ProcessIdentity, i32)]) {
         let mut guard = self.applied.lock().expect("darwinbg applied lock poisoned");
-        for &life in lives {
-            guard.insert(life);
+        for &(life, ceiling) in lives {
+            guard.entry(life).or_insert(ceiling);
         }
     }
 
-    pub(super) fn insert_if_new(&self, life: ProcessIdentity) -> bool {
+    pub(super) fn record_skipped(&mut self, lives: &[ProcessIdentity]) {
+        for &life in lives {
+            self.skipped.insert(life);
+        }
+    }
+
+    pub(super) fn unseen_lives(&self, running: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
+        let guard = self.applied.lock().expect("darwinbg applied lock poisoned");
+        running
+            .iter()
+            .copied()
+            .filter(|life| !guard.contains_key(life) && !self.skipped.contains(life))
+            .collect()
+    }
+
+    pub(super) fn applied_map(&self) -> HashMap<ProcessIdentity, i32> {
         self.applied
             .lock()
             .expect("darwinbg applied lock poisoned")
-            .insert(life)
+            .clone()
     }
 
-    pub(super) fn snapshot_applied(&self) -> Vec<ProcessIdentity> {
-        self.applied
+    pub(super) fn snapshot_applied(&self) -> Vec<crate::runtime::job_groups::RecordedDarwinBgLife> {
+        let mut entries: Vec<_> = self
+            .applied
             .lock()
             .expect("darwinbg applied lock poisoned")
             .iter()
-            .copied()
-            .collect()
+            .map(|(&life, &ceiling)| {
+                crate::runtime::job_groups::RecordedDarwinBgLife::new(life, ceiling)
+            })
+            .collect();
+        entries.sort_unstable_by_key(|entry| (entry.pid, entry.birth.0));
+        entries
     }
 
     /// Spawn the per-job out-of-turn clear task once `PRIO_DARWIN_BG` is first applied to this
     /// job. When the gate span watch turns off (without waiting for an actor turn), or when the
-    /// actor signals `finish_clear`, the task clears every applied life plus `monitor`'s
-    /// `running_lives()` on the blocking pool via [`super::off_actor::run`].
+    /// actor signals `finish_clear`, the task clears every applied life plus any running child
+    /// whose ancestor is in `applied`, on the blocking pool via [`super::off_actor::run`].
     pub(super) fn arm_clear_task(
         &mut self,
         monitor: Option<ProcessMonitor>,
@@ -318,23 +351,38 @@ impl JobDarwinBg {
                 () = wait_span_off(&mut span) => true,
             };
             if !should_clear {
-                return (HashSet::new(), Vec::new());
+                return (HashMap::new(), Vec::new());
             }
-            let mut lives: HashSet<ProcessIdentity> = {
+            let mut lives: HashMap<ProcessIdentity, i32> = {
                 applied
                     .lock()
                     .expect("darwinbg applied lock poisoned")
                     .clone()
             };
             if let Some(monitor) = &monitor {
-                for &life in monitor.running_lives().iter() {
-                    lives.insert(life);
+                let parents = parent_map(&monitor.parent_links());
+                let mut progress = true;
+                let running = monitor.running_lives();
+                while progress {
+                    progress = false;
+                    for &life in running.iter() {
+                        if !lives.contains_key(&life)
+                            && let Some(ceiling) =
+                                nearest_recorded_ancestor_ceiling(life, &lives, &parents)
+                        {
+                            lives.insert(life, ceiling);
+                            progress = true;
+                        }
+                    }
                 }
             }
             if lives.is_empty() {
-                return (HashSet::new(), Vec::new());
+                return (HashMap::new(), Vec::new());
             }
-            let to_clear: Vec<_> = lives.iter().copied().collect();
+            let to_clear: Vec<_> = lives
+                .iter()
+                .map(|(&life, &ceiling)| (life, ceiling))
+                .collect();
             let outcomes = super::off_actor::run(move || clear_darwinbg_from_lives(to_clear)).await;
             (lives, outcomes)
         });
@@ -346,7 +394,8 @@ impl JobDarwinBg {
     /// leaving `window_task` running so the job is judged again from its next window.
     pub(super) fn take_active_clear(&mut self) -> ActiveClear {
         self.active = false;
-        let applied = std::mem::replace(&mut self.applied, Arc::new(Mutex::new(HashSet::new())));
+        self.skipped.clear();
+        let applied = std::mem::replace(&mut self.applied, Arc::new(Mutex::new(HashMap::new())));
         ActiveClear {
             applied,
             clear_stop: self.clear_stop.take(),
@@ -377,6 +426,112 @@ impl Drop for JobDarwinBg {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn parent_map(
+    parent_links: &[(ProcessIdentity, ProcessIdentity)],
+) -> HashMap<ProcessIdentity, ProcessIdentity> {
+    parent_links.iter().copied().collect()
+}
+
+#[cfg(target_os = "macos")]
+fn nearest_recorded_ancestor_ceiling(
+    life: ProcessIdentity,
+    recorded: &HashMap<ProcessIdentity, i32>,
+    parents: &HashMap<ProcessIdentity, ProcessIdentity>,
+) -> Option<i32> {
+    let mut current = life;
+    let mut steps = 0usize;
+    while let Some(&parent) = parents.get(&current) {
+        steps += 1;
+        if steps > parents.len() {
+            break;
+        }
+        if let Some(&ceiling) = recorded.get(&parent) {
+            return Some(ceiling);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Pure ceiling resolution for a batch of candidate lives (05_gateway.md "A land's gate takes
+/// tokens back"):
+/// - A live process whose observed `pth_maxpriority` is strictly above `4` keeps that ceiling.
+/// - A live process observed at `4` (or below) inherits its nearest recorded ancestor's ceiling
+///   (walking `parent_links`, including any ancestor resolved earlier in the same batch).
+/// - With no recorded ancestor, a process observed at `4` is skipped (already BACKGROUND-clamped
+///   or self-BG, not cowshed's) and returned in the second vector so it is never set, recorded, or
+///   cleared.
+/// - An exited process (`None`) is ignored.
+#[cfg(target_os = "macos")]
+pub(super) fn resolve_batch_ceilings(
+    observed: &[(ProcessIdentity, Option<i32>)],
+    already_recorded: &HashMap<ProcessIdentity, i32>,
+    parent_links: &[(ProcessIdentity, ProcessIdentity)],
+) -> (Vec<(ProcessIdentity, i32)>, Vec<ProcessIdentity>) {
+    let parents = parent_map(parent_links);
+    let mut known = already_recorded.clone();
+    let mut resolved = Vec::new();
+    let mut pending_at_bg = Vec::new();
+    for &(life, ceiling) in observed {
+        let Some(ceiling) = ceiling else {
+            continue;
+        };
+        if ceiling > crate::runtime::placement::DARWIN_BG_MAX_PRIORITY {
+            known.entry(life).or_insert(ceiling);
+            resolved.push((life, ceiling));
+        } else {
+            pending_at_bg.push(life);
+        }
+    }
+    loop {
+        let mut next_pending = Vec::new();
+        let mut progress = false;
+        for life in pending_at_bg {
+            if let Some(ceiling) = nearest_recorded_ancestor_ceiling(life, &known, &parents) {
+                known.entry(life).or_insert(ceiling);
+                resolved.push((life, ceiling));
+                progress = true;
+            } else {
+                next_pending.push(life);
+            }
+        }
+        pending_at_bg = next_pending;
+        if !progress {
+            break;
+        }
+    }
+    (resolved, pending_at_bg)
+}
+
+/// Read the live pre-set `pth_maxpriority` ceiling of each verified life on the blocking pool,
+/// before writing the ledger or calling `setpriority(PRIO_DARWIN_BG)`.
+#[cfg(target_os = "macos")]
+pub(super) fn observe_pre_set_ceilings(
+    lives: Vec<ProcessIdentity>,
+) -> Vec<(ProcessIdentity, Option<i32>)> {
+    let mut observed = Vec::with_capacity(lives.len());
+    for life in lives {
+        let Ok(pid_i32) = i32::try_from(life.pid) else {
+            continue;
+        };
+        match crate::runtime::job_groups::life_of(pid_i32) {
+            Ok(Some(uid)) if uid == life.birth.0 => {}
+            _ => continue,
+        }
+        match crate::runtime::placement::thread_ceiling(life.pid) {
+            Ok(ceiling) => observed.push((life, ceiling)),
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: reading pre-set priority ceiling of pid {} failed: {error}",
+                    life.pid
+                );
+            }
+        }
+    }
+    observed
+}
+
 /// Apply `PRIO_DARWIN_BG` to each verified live process in `lives` on the blocking pool, reading
 /// back each via `PROC_PIDTHREADINFO`.
 #[cfg(target_os = "macos")]
@@ -405,14 +560,14 @@ pub(super) fn apply_darwinbg_to_lives(
     outcomes
 }
 
-/// Clear `PRIO_DARWIN_BG` from each verified live process in `lives` on the blocking pool, reading
-/// back each via `PROC_PIDTHREADINFO`.
+/// Clear `PRIO_DARWIN_BG` from each verified live process in `lives` on the blocking pool,
+/// confirming each via `PROC_PIDTHREADINFO` against its recorded pre-set ceiling.
 #[cfg(target_os = "macos")]
 pub(super) fn clear_darwinbg_from_lives(
-    lives: Vec<ProcessIdentity>,
+    lives: Vec<(ProcessIdentity, i32)>,
 ) -> Vec<(u32, crate::runtime::placement::DarwinBgOutcome)> {
     let mut outcomes = Vec::with_capacity(lives.len());
-    for life in lives {
+    for (life, ceiling) in lives {
         let Ok(pid_i32) = i32::try_from(life.pid) else {
             continue;
         };
@@ -420,7 +575,7 @@ pub(super) fn clear_darwinbg_from_lives(
             Ok(Some(uid)) if uid == life.birth.0 => {}
             _ => continue,
         }
-        match crate::runtime::placement::clear_darwinbg(life.pid) {
+        match crate::runtime::placement::clear_darwinbg(life.pid, Some(ceiling)) {
             Ok(outcome) => outcomes.push((life.pid, outcome)),
             Err(error) => {
                 cowshed_os::eprintln!(
@@ -828,5 +983,51 @@ mod tests {
                 "set={set} over_budget={over_budget} host_idle={host_idle}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_batch_ceilings_records_observed_inherits_from_ancestor_and_skips_pre_bg() {
+        use crate::runtime::process_tree::BirthToken;
+
+        let id = |pid, birth| ProcessIdentity {
+            pid,
+            birth: BirthToken(birth),
+        };
+        let root = id(10, 1);
+        let child = id(11, 2);
+        let grandchild = id(12, 3);
+        let pre_bg = id(20, 4);
+        let pre_bg_child = id(21, 5);
+        let exited = id(30, 6);
+
+        let links = vec![(child, root), (grandchild, child), (pre_bg_child, pre_bg)];
+
+        // Initial set: unclamped/utility lives keep their ceiling; a pre-BG process and its child
+        // are skipped; an exited process is ignored.
+        let (resolved, skipped) = resolve_batch_ceilings(
+            &[
+                (root, Some(20)),
+                (pre_bg, Some(4)),
+                (pre_bg_child, Some(4)),
+                (exited, None),
+            ],
+            &HashMap::new(),
+            &links,
+        );
+        assert_eq!(resolved, vec![(root, 20)]);
+        assert_eq!(skipped, vec![pre_bg, pre_bg_child]);
+
+        // Later wake while active: grandchild born at 4 walks past exited/unrecorded `child` to
+        // `root`'s recorded ceiling 20; a child of skipped `pre_bg` has no recorded ancestor and is
+        // skipped.
+        let recorded = HashMap::from([(root, 20)]);
+        let (resolved_later, skipped_later) = resolve_batch_ceilings(
+            &[(grandchild, Some(4)), (pre_bg_child, Some(4))],
+            &recorded,
+            &links,
+        );
+        assert_eq!(resolved_later, vec![(grandchild, 20)]);
+        assert_eq!(skipped_later, vec![pre_bg_child]);
     }
 }

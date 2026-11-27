@@ -537,6 +537,14 @@ async fn real_gateway_clears_darwinbg_from_ledger_on_watch_eof() {
     let leader = GroupLeader::observe(pid).unwrap();
     let record = Darwin.record(pid).unwrap().unwrap();
     let boot_session = cowshed_apfs::attach_budget::boot().unwrap().session;
+    let before = procinfo::thread_max_priorities(pid.cast_signed())
+        .unwrap()
+        .expect("child running");
+    let initial_ceiling = before[0];
+    assert!(
+        initial_ceiling > 4 && before.iter().all(|&p| p == initial_ceiling),
+        "expected non-BG initial ceiling, got {before:?}"
+    );
     // SAFETY: `pid` is our live child.
     let set = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) };
     assert_eq!(set, 0, "set PRIO_DARWIN_BG");
@@ -565,6 +573,7 @@ async fn real_gateway_clears_darwinbg_from_ledger_on_watch_eof() {
             "lives": [{
                 "pid": pid,
                 "birth": record.unique_id,
+                "ceiling": initial_ceiling,
             }]
         }
     });
@@ -630,8 +639,8 @@ async fn real_gateway_clears_darwinbg_from_ledger_on_watch_eof() {
         .unwrap()
         .expect("child still running");
     assert!(
-        !priorities.is_empty() && priorities.iter().all(|&p| p == 63),
-        "expected PRIO_DARWIN_BG cleared (63) after gate-watch EOF, got {priorities:?}"
+        !priorities.is_empty() && priorities.iter().all(|&p| p == initial_ceiling),
+        "expected PRIO_DARWIN_BG cleared ({initial_ceiling}) after gate-watch EOF, got {priorities:?}"
     );
 
     drop(child.stdin.take());

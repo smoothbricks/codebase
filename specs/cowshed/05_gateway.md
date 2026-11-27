@@ -2050,9 +2050,9 @@ against a baseline, with each arm's host load recorded:
 A thread can opt itself out of its QoS: `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_IMPORTANT)` strips
 it, the thread keeps disk tier 0 and then honours nice (priority 21, CPU 2.7 : 1). Only the process itself can do that.
 Two readbacks do not report what the kernel applies, so neither verifies a lever:
-`getpriority(PRIO_DARWIN_PROCESS, pid)` reads the process's own setting and returns 0 for a process another one
-backgrounded, and `getiopolicy_np` reports the requested disk policy, not the tier a QoS clamp imposes. A thread's
-priority and ceiling from `PROC_PIDTHREADINFO` show both.
+`getpriority(PRIO_DARWIN_PROCESS, pid)` reads the caller's own task policy rather than the target process and returns 0
+for a process another one backgrounded, and `getiopolicy_np` reports the requested disk policy, not the tier a QoS clamp
+imposes. A thread's priority and ceiling from `PROC_PIDTHREADINFO` show both.
 
 **On macOS nothing cowshed starts is throttled for I/O, but for one case.** No process cowshed spawns that opens a path
 under the store or a workspace runs under `PRIO_DARWIN_BG`, a QoS clamp (`taskpolicy -b`,
@@ -2142,18 +2142,22 @@ priority"), and the pool admits but never takes back what it admitted.
   cgroup weight is unchanged and nothing is set; whether a cgroup's `cpu.idle` should serve there is open with the Linux
   question above.
 - **What a crash leaves.** `PRIO_DARWIN_BG` outlives the process that set it. Before setting it on a process, the
-  supervisor appends that life (its pid and `p_uniqueid` under `kern.bootsessionuuid`) to its group ledger (11_shell.md,
-  "Supervisor recovery"). A supervisor's start clears it on every recorded life still running before it serves anything,
-  as it reads the same ledger to end a dead supervisor's groups; and the gateway, which sees a dead supervisor's watch
-  end, clears that ledger's recorded lives at once, so no job of a supervisor that is not started again stays
+  supervisor reads its threads' pre-set priority ceiling from `PROC_PIDTHREADINFO` and appends that life (its pid,
+  `p_uniqueid` under `kern.bootsessionuuid`, and pre-set ceiling) to its group ledger (11_shell.md, "Supervisor
+  recovery"). A process already reading 4 before any set is not one cowshed backgrounded and is never set, recorded or
+  cleared; a child first seen at 4 while its job is backgrounded takes its nearest recorded ancestor's ceiling, or is
+  skipped if it has none. A supervisor's start clears it on every recorded `darwinbg` life still running before it
+  serves anything, as it reads the same ledger to end a dead supervisor's groups; and the gateway, which sees a dead
+  supervisor's watch end, clears those recorded lives at once, so no job of a supervisor that is not started again stays
   backgrounded until it ends. The taken tokens need no recovery: they are bytes the dead supervisor held, its jobs'
   fifos go with it, and its next start ends those jobs.
 - **Read back, never assumed.** A set or a clear is checked on each process by its threads' priority ceiling from
-  `PROC_PIDTHREADINFO` (`pth_maxpriority` 4 while set, 63 after clearing); `getpriority(PRIO_DARWIN_PROCESS)` and
-  `getiopolicy_np` misreport it (above). One that does not read back is a `warn` row of the job's span. The job's span
-  records the span's effects as `info` rows: `job.tokens.withdrawn` and `job.tokens.restored` with the bytes taken and
-  given back, `job.darwinbg.set` with the window's CPU and the tokens it held, and `job.darwinbg.cleared`
-  (13_telemetry.md, "Job span segments").
+  `PROC_PIDTHREADINFO` (`pth_maxpriority` 4 while set, and back at its recorded pre-set ceiling after clearing — not 63,
+  because a QoS-clamped process returns to its clamp's ceiling, e.g. 20 under `UTILITY` — or every thread above 4 for a
+  ledger life written without a ceiling); `getpriority(PRIO_DARWIN_PROCESS)` and `getiopolicy_np` misreport it (above).
+  One that does not read back is a `warn` row of the job's span. The job's span records the span's effects as `info`
+  rows: `job.tokens.withdrawn` and `job.tokens.restored` with the bytes taken and given back, `job.darwinbg.set` with
+  the window's CPU and the tokens it held, and `job.darwinbg.cleared` (13_telemetry.md, "Job span segments").
 - **Enforced by** reds of a background jobserver client whose CPU falls while a land's gate runs and recovers within a
   heartbeat of its end; of a job that reads no token and runs past its share, never set while the host has an idle core,
   and set after its window while the host has none, then cleared at the first window with an idle core and at the gate's

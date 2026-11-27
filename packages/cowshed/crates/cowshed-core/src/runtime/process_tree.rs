@@ -427,6 +427,16 @@ impl ProcessTreeFold {
             .map(|&index| self.lives[index].identity)
     }
 
+    /// Every retained life with a parent inside this job's tree (exited lives included), so an
+    /// ancestor walk can still reach a recorded ancestor past an exited intermediate parent.
+    #[cfg(target_os = "macos")]
+    pub fn parent_links(&self) -> impl Iterator<Item = (ProcessIdentity, ProcessIdentity)> + '_ {
+        self.lives.iter().filter_map(|life| {
+            let parent = self.lives[life.parent?].identity;
+            Some((life.identity, parent))
+        })
+    }
+
     #[cfg(test)]
     pub fn tree(
         &self,

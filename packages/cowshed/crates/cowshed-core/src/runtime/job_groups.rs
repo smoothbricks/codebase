@@ -75,7 +75,37 @@ struct Ledger {
     /// runs (05_gateway.md "A land's gate takes tokens back"). Cleared before ending any group on
     /// supervisor recovery and cleared at once by the gateway when the supervisor's watch ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    darwinbg: Option<RecordedMembers>,
+    darwinbg: Option<RecordedDarwinBg>,
+}
+
+/// One process life held at `PRIO_DARWIN_BG` together with its pre-set `pth_maxpriority` ceiling
+/// (05_gateway.md "A land's gate takes tokens back").
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordedDarwinBgLife {
+    pub pid: u32,
+    pub birth: super::process_tree::BirthToken,
+    /// Pre-set `pth_maxpriority` ceiling observed before setting `PRIO_DARWIN_BG`; `None` only for
+    /// ledger entries written by earlier builds before ceilings were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<i32>,
+}
+
+impl RecordedDarwinBgLife {
+    pub fn new(life: ProcessIdentity, ceiling: i32) -> Self {
+        Self {
+            pid: life.pid,
+            birth: life.birth,
+            ceiling: Some(ceiling),
+        }
+    }
+
+    pub fn identity(self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            birth: self.birth,
+        }
+    }
 }
 
 /// One process life whose `PRIO_DARWIN_BG` recovery cleared before ending any group
@@ -85,7 +115,8 @@ pub struct ClearedDarwinBg {
     /// The job that owned this life when recorded under a group, if known.
     pub job_id: Option<u64>,
     pub life: ProcessIdentity,
-    /// Whether `PROC_PIDTHREADINFO` read back `pth_maxpriority == 63` after clearing.
+    /// Whether `PROC_PIDTHREADINFO` read back the recorded pre-set ceiling after clearing (or
+    /// `> 4` for a legacy ledger life written without a ceiling).
     pub confirmed: bool,
 }
 
@@ -125,6 +156,15 @@ struct Group {
 struct RecordedMembers {
     boot_session: String,
     lives: Vec<ProcessIdentity>,
+}
+
+/// Boot-fenced lives held at `PRIO_DARWIN_BG`, each carrying the pre-set ceiling to confirm its
+/// clear against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordedDarwinBg {
+    boot_session: String,
+    lives: Vec<RecordedDarwinBgLife>,
 }
 
 /// One job's group and observed lives, written by the supervisor that already owns both. The
@@ -360,7 +400,7 @@ impl Recorder {
         &mut self,
         groups: I,
         inherited: &[UnresolvedGroup],
-        darwinbg: &[ProcessIdentity],
+        darwinbg: &[RecordedDarwinBgLife],
     ) -> io::Result<Recorded>
     where
         I: Iterator<Item = JobGroupClaim> + Clone,
@@ -380,7 +420,7 @@ impl Recorder {
         let darwinbg = if darwinbg.is_empty() {
             None
         } else {
-            Some(MembersView {
+            Some(DarwinBgView {
                 boot_session: boot_session(&self.boot_session)?,
                 lives: darwinbg,
             })
@@ -423,7 +463,7 @@ struct Publication<'a, G> {
     #[serde(skip_serializing_if = "<[UnresolvedGroup]>::is_empty")]
     unresolved: &'a [UnresolvedGroup],
     #[serde(skip_serializing_if = "Option::is_none")]
-    darwinbg: Option<MembersView<'a>>,
+    darwinbg: Option<DarwinBgView<'a>>,
 }
 
 struct Groups<'a, I> {
@@ -474,6 +514,14 @@ struct GroupView<'a> {
 struct MembersView<'a> {
     boot_session: &'a str,
     lives: &'a [ProcessIdentity],
+}
+
+/// [`RecordedDarwinBg`] borrowed from the recorder's publication cut.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DarwinBgView<'a> {
+    boot_session: &'a str,
+    lives: &'a [RecordedDarwinBgLife],
 }
 
 /// The boot session, read from the kernel once per recorder: it cannot change while this
@@ -560,12 +608,18 @@ pub fn clear_recorded_darwinbg(path: &Path) -> io::Result<Vec<ClearedDarwinBg>> 
 
 #[cfg(target_os = "macos")]
 fn clear_recorded_darwinbg_in(ledger: &Ledger) -> io::Result<Vec<ClearedDarwinBg>> {
-    use crate::runtime::placement::{DarwinBgOutcome, clear_darwinbg, has_darwinbg};
+    use crate::runtime::placement::{DarwinBgOutcome, clear_darwinbg};
     use std::collections::HashMap;
 
     let boot = platform::boot_session()?;
-    // Map each recorded life to `(job_id, explicit_darwinbg)`.
-    let mut targets: HashMap<ProcessIdentity, (Option<u64>, bool)> = HashMap::new();
+    let Some(darwinbg) = ledger
+        .darwinbg
+        .as_ref()
+        .filter(|members| members.boot_session == boot)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut job_by_life: HashMap<ProcessIdentity, u64> = HashMap::new();
     for group in ledger
         .groups
         .iter()
@@ -577,51 +631,35 @@ fn clear_recorded_darwinbg_in(ledger: &Ledger) -> io::Result<Vec<ClearedDarwinBg
             .filter(|members| members.boot_session == boot)
         {
             for &life in &members.lives {
-                targets
-                    .entry(life)
-                    .and_modify(|(job, _)| {
-                        if job.is_none() {
-                            *job = Some(group.job_id);
-                        }
-                    })
-                    .or_insert((Some(group.job_id), false));
+                job_by_life.entry(life).or_insert(group.job_id);
             }
         }
     }
-    if let Some(darwinbg) = ledger
-        .darwinbg
-        .as_ref()
-        .filter(|members| members.boot_session == boot)
-    {
-        for &life in &darwinbg.lives {
-            targets
-                .entry(life)
-                .and_modify(|(_, explicit)| *explicit = true)
-                .or_insert((None, true));
-        }
+    let mut targets: HashMap<ProcessIdentity, Option<i32>> = HashMap::new();
+    for &entry in &darwinbg.lives {
+        targets
+            .entry(entry.identity())
+            .and_modify(|ceiling| {
+                if ceiling.is_none() {
+                    *ceiling = entry.ceiling;
+                }
+            })
+            .or_insert(entry.ceiling);
     }
     let mut cleared = Vec::new();
-    for (life, (job_id, explicit)) in targets {
+    for (life, ceiling) in targets {
         if recorded_life(life)?.is_none() {
             continue;
         }
-        let needs_clear = explicit || has_darwinbg(life.pid)?;
-        if !needs_clear {
-            continue;
-        }
-        // Re-verify life identity right before clearing so a recycled pid is never touched.
-        if recorded_life(life)?.is_none() {
-            continue;
-        }
-        match clear_darwinbg(life.pid)? {
+        match clear_darwinbg(life.pid, ceiling)? {
             DarwinBgOutcome::Exited => {}
             DarwinBgOutcome::Confirmed => cleared.push(ClearedDarwinBg {
-                job_id,
+                job_id: job_by_life.get(&life).copied(),
                 life,
                 confirmed: true,
             }),
             DarwinBgOutcome::Unconfirmed => cleared.push(ClearedDarwinBg {
-                job_id,
+                job_id: job_by_life.get(&life).copied(),
                 life,
                 confirmed: false,
             }),
@@ -2552,6 +2590,219 @@ os._exit(0)
             None
         );
         drop(job);
+    }
+
+    /// Red: recovery clears a UTILITY-clamped life recorded in `darwinbg` and confirms it at its
+    /// recorded ceiling (20), not 63.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clear_recorded_darwinbg_confirms_a_utility_clamped_life() {
+        use std::io::Read as _;
+        let (_dir, ledger) = scratch();
+        let mut child = Command::new("/usr/sbin/taskpolicy")
+            .args(["-c", "utility", "/bin/sh", "-c", "printf r; read _; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn utility child");
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .expect("stdout")
+            .read_exact(&mut ready)
+            .expect("ready byte");
+        let pid = child.id();
+        let before = procinfo::thread_max_priorities(pid.cast_signed())
+            .expect("read pre-set priorities")
+            .expect("child live");
+        assert!(
+            !before.is_empty() && before.iter().all(|&p| p == 20),
+            "{before:?}"
+        );
+
+        let leader = GroupLeader::observe(pid).expect("observe leader");
+        let birth = super::life_of(pid.cast_signed())
+            .expect("read birth")
+            .expect("live child");
+        let boot = super::platform::boot_session().expect("boot session");
+        // SAFETY: `pid` is our live child.
+        assert_eq!(
+            unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) },
+            0
+        );
+        let payload = serde_json::json!({
+            "supervisor": 1,
+            "groups": [{
+                "jobId": 1,
+                "pgid": leader.pgid(),
+                "leaderStart": leader.start(),
+                "members": {
+                    "bootSession": boot,
+                    "lives": [{ "pid": pid, "birth": birth }]
+                }
+            }],
+            "darwinbg": {
+                "bootSession": boot,
+                "lives": [{ "pid": pid, "birth": birth, "ceiling": 20 }]
+            }
+        });
+        std::fs::write(&ledger, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let cleared = super::clear_recorded_darwinbg(&ledger).expect("clear recorded darwinbg");
+        assert_eq!(
+            cleared,
+            vec![super::ClearedDarwinBg {
+                job_id: Some(1),
+                life: super::ProcessIdentity {
+                    pid,
+                    birth: crate::runtime::process_tree::BirthToken(birth),
+                },
+                confirmed: true,
+            }]
+        );
+        let after = procinfo::thread_max_priorities(pid.cast_signed())
+            .expect("read post-clear priorities")
+            .expect("child live");
+        assert!(
+            !after.is_empty() && after.iter().all(|&p| p == 20),
+            "{after:?}"
+        );
+        drop(child.stdin.take());
+        assert!(child.wait_bounded().expect("reap child").success());
+    }
+
+    /// A legacy `darwinbg` ledger entry written without a `ceiling` confirms when every thread
+    /// returns strictly above 4 (e.g. 20 under UTILITY).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clear_recorded_darwinbg_confirms_legacy_entry_without_ceiling_above_4() {
+        use std::io::Read as _;
+
+        let (_dir, ledger) = scratch();
+        let mut child = Command::new("/usr/sbin/taskpolicy")
+            .args(["-c", "utility", "/bin/sh", "-c", "printf r; read _; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn utility child");
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .expect("stdout")
+            .read_exact(&mut ready)
+            .expect("ready byte");
+        let pid = child.id();
+        let leader = GroupLeader::observe(pid).expect("observe leader");
+        let birth = super::life_of(pid.cast_signed())
+            .expect("read birth")
+            .expect("live child");
+        let boot = super::platform::boot_session().expect("boot session");
+        // SAFETY: `pid` is our live child.
+        assert_eq!(
+            unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) },
+            0
+        );
+        let payload = serde_json::json!({
+            "supervisor": 1,
+            "groups": [{
+                "jobId": 1,
+                "pgid": leader.pgid(),
+                "leaderStart": leader.start(),
+                "members": {
+                    "bootSession": boot,
+                    "lives": [{ "pid": pid, "birth": birth }]
+                }
+            }],
+            "darwinbg": {
+                "bootSession": boot,
+                "lives": [{ "pid": pid, "birth": birth }]
+            }
+        });
+        std::fs::write(&ledger, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let cleared = super::clear_recorded_darwinbg(&ledger).expect("clear recorded darwinbg");
+        assert_eq!(
+            cleared,
+            vec![super::ClearedDarwinBg {
+                job_id: Some(1),
+                life: super::ProcessIdentity {
+                    pid,
+                    birth: crate::runtime::process_tree::BirthToken(birth),
+                },
+                confirmed: true,
+            }]
+        );
+        drop(child.stdin.take());
+        assert!(child.wait_bounded().expect("reap child").success());
+    }
+
+    /// Control 3: a process already clamped to BACKGROUND (ceiling 4) that is recorded in
+    /// `groups.members` but NOT in `darwinbg` is not cowshed's and must not be cleared or
+    /// reported.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clear_recorded_darwinbg_ignores_background_clamped_member_not_in_darwinbg() {
+        use std::io::Read as _;
+        let (_dir, ledger) = scratch();
+        let mut child = Command::new("/usr/sbin/taskpolicy")
+            .args([
+                "-c",
+                "background",
+                "/bin/sh",
+                "-c",
+                "printf r; read _; exit 0",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn background-clamped child");
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .expect("stdout")
+            .read_exact(&mut ready)
+            .expect("ready byte");
+        let pid = child.id();
+        let before = procinfo::thread_max_priorities(pid.cast_signed())
+            .expect("read priorities")
+            .expect("child live");
+        assert!(
+            !before.is_empty() && before.iter().all(|&p| p == 4),
+            "{before:?}"
+        );
+
+        let leader = GroupLeader::observe(pid).expect("observe leader");
+        let birth = super::life_of(pid.cast_signed())
+            .expect("read birth")
+            .expect("live child");
+        let boot = super::platform::boot_session().expect("boot session");
+        let payload = serde_json::json!({
+            "supervisor": 1,
+            "groups": [{
+                "jobId": 1,
+                "pgid": leader.pgid(),
+                "leaderStart": leader.start(),
+                "members": {
+                    "bootSession": boot,
+                    "lives": [{ "pid": pid, "birth": birth }]
+                }
+            }]
+        });
+        std::fs::write(&ledger, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let cleared = super::clear_recorded_darwinbg(&ledger).expect("clear recorded darwinbg");
+        assert!(
+            cleared.is_empty(),
+            "BACKGROUND-clamped member not in darwinbg must not be reported as cleared: {cleared:?}"
+        );
+        drop(child.stdin.take());
+        assert!(child.wait_bounded().expect("reap child").success());
     }
 }
 
