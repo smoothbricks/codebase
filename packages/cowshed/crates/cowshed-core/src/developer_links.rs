@@ -3246,4 +3246,71 @@ mod tests {
         let next = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
         assert!(!Arc::ptr_eq(&first, &next), "the replaced link is an input");
     }
+
+    /// Git lock churn under `.git` (`index.lock` created and removed) moves `.git` while the
+    /// absent `.git/commondir` remains absent: the kept snapshot stands. Editing a
+    /// `node_modules/.bin` link recaptures, and creating `.git/commondir` invalidates the
+    /// listing input and recaptures.
+    #[test]
+    fn git_lock_churn_keeps_the_kept_snapshot_while_bin_edit_and_commondir_invalidate() {
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &std::env::temp_dir(),
+            "developer-links-git-lock-churn",
+        );
+        let (root, original) = settled_checkout(&scratch);
+        let first = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        let again = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the kept snapshot");
+
+        let lock = root.join(".git/index.lock");
+        fs::write(&lock, b"").unwrap();
+        fs::remove_file(&lock).unwrap();
+        let after_lock = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &after_lock),
+            "git index.lock churn keeps the kept snapshot"
+        );
+
+        // Control: editing a node_modules/.bin link recaptures.
+        fs::write(original.join("bin/dev2"), "#!/bin/sh\necho dev2\n").unwrap();
+        let bin_link = root.join("node_modules/.bin/dev");
+        fs::remove_file(&bin_link).unwrap();
+        symlink("../@scope/dev/bin/dev2", &bin_link).unwrap();
+        let edited = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &edited),
+            "edited node_modules/.bin link must recapture"
+        );
+        assert!(edited.links.iter().any(|link| {
+            link.at == Path::new("node_modules/.bin/dev")
+                && link.target == Path::new("../@scope/dev/bin/dev2")
+        }));
+
+        // Control: creating .git/commondir invalidates the listing input and recaptures.
+        for settled in [
+            root.join(".git"),
+            root.join("node_modules/.bin"),
+            original.join("bin"),
+            original.join("bin/dev2"),
+        ] {
+            crate::input_memo::settle(&settled);
+        }
+        let before_commondir = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        let before_commondir_again =
+            DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(
+            Arc::ptr_eq(&before_commondir, &before_commondir_again),
+            "settled snapshot before commondir"
+        );
+        fs::write(root.join(".git/commondir"), ".\n").unwrap();
+        assert!(
+            crate::capabilities::kept_listing_inputs(&root).is_none(),
+            ".git/commondir invalidates kept_listing_inputs"
+        );
+        let after_commondir = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(
+            !Arc::ptr_eq(&before_commondir, &after_commondir),
+            ".git/commondir creation must recapture"
+        );
+    }
 }
