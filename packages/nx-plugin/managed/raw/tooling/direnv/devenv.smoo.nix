@@ -139,9 +139,11 @@ in {
       # cargo whose libcurl load command points directly at Nix curl, then
       # ad-hoc re-sign for arm64.
       #
-      # When a repository disables devenv's C tools on Darwin
-      # (`languages.c.enable = false`, selecting Xcode's Apple linker), also
-      # strip Nix's stdenv.cc from target and build-script propagation.
+      # When a repository opts in via `smoo.rust.stripStdenvCc = true` (Darwin
+      # Apple linker with languages.c disabled), also strip Nix's stdenv.cc
+      # from target and build-script propagation.
+      options.smoo.rust.stripStdenvCc =
+        lib.mkEnableOption "stripping Nix stdenv.cc from the Darwin Rust toolchain (for Apple linker with languages.c disabled)";
       options.languages.rust.toolchainPackage = lib.mkOption {
         apply = toolchain:
           if pkgs.stdenv.hostPlatform.isDarwin
@@ -184,7 +186,7 @@ in {
                     fi
                   '';
               }
-              // lib.optionalAttrs (!config.languages.c.enable) {
+              // lib.optionalAttrs (config.smoo.rust.stripStdenvCc) {
                 propagatedBuildInputs = lib.remove pkgs.stdenv.cc (previous.propagatedBuildInputs or []);
                 depsHostHostPropagated = lib.remove pkgs.stdenv.cc (previous.depsHostHostPropagated or []);
               })

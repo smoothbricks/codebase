@@ -141,6 +141,8 @@ in {
     lsp.enable = false;
     debugger = null;
   };
+  # Keep Nix's stdenv.cc out of the Darwin Rust toolchain's propagated inputs too.
+  smoo.rust.stripStdenvCc = true;
 
   # The managed module supplies fleet-wide WASM and Linux targets, including
   # every Linux artifact triple (its linux toolchain). Add only the macOS
