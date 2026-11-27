@@ -1095,6 +1095,8 @@ pub enum Opcode {
     SlotOrderedList = 0x19,
     /// slot:index, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8, inner_type:u8,
     /// inner_cap_lo:u8, inner_cap_hi:u8, inner_agg_type:u8
+    /// \[, num_fields:u8, field_type:u8 × num_fields\] (required when inner_type == OrderedList;
+    /// inner_agg_type must be 0)
     SlotNested = 0x1a,
     /// slot:index, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8,
     /// [field_type:u8 × num_fields]
@@ -1103,6 +1105,9 @@ pub enum Opcode {
     NestedSetInsert = 0x90,
     /// slot:index, outer_key_col:index, inner_key_col:index, val_col:index (body opcode)
     NestedMapUpsertLast = 0x92,
+    /// slot:index, outer_key_col:index, num_vals:u8, \[(val_col:index, field_idx:u8) × N\]
+    /// (body opcode; appends one struct row into outer_key's inner ordered list)
+    NestedListAppendStruct = 0x93,
     /// slot:index, outer_key_col:index, val_col:index (body opcode)
     NestedAggUpdate = 0x95,
     /// col:index, match_count:index, match_ids:u32le\[match_count\], body_len:u16le
@@ -1187,6 +1192,7 @@ impl Opcode {
             0x8f => Self::BatchStructMapUpsertLastIf,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
+            0x93 => Self::NestedListAppendStruct,
             0x95 => Self::NestedAggUpdate,
             0xa0 => Self::BatchStructMap2UpsertLastArrays,
             0xe0 => Self::ForEach,

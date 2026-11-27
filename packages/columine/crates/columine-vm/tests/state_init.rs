@@ -1121,6 +1121,8 @@ proptest! {
             inner_capacity,
             inner_type,
             inner_agg as u8,
+            0,
+            0,
         );
         let primary_offset = align8(STATE_HEADER_SIZE + SLOT_META_SIZE);
         let meta = SlotMetaView::read(&state, 0);

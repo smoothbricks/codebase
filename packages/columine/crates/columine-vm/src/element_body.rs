@@ -423,6 +423,13 @@ pub(crate) fn walk_operands<S: OperandSink>(
         }
         Opcode::NestedSetInsert => &[I, I, I],
         Opcode::NestedMapUpsertLast => &[I, I, I, I],
+        Opcode::NestedListAppendStruct => {
+            // slot, outer_key_col, then the ListAppendStruct value-pair tail.
+            index(r, sink)?;
+            index(r, sink)?;
+            pairs(r, sink, MAX_STRUCT_SCALAR_OPERANDS)?;
+            &[]
+        }
         Opcode::NestedAggUpdate => &[I, I, I],
         Opcode::ForEach => {
             // type_col, match_count, match_ids:u32 × match_count,

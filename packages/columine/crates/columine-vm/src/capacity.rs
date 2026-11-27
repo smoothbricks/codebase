@@ -445,15 +445,24 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
             routed(o, 5 + 2 * guards, at(0)?, at(2)?, out)?;
         }
         Opcode::ListAppend | Opcode::ListAppendStruct => out(Effect::Entry { slot: at(0)? }),
-        Opcode::NestedSetInsert | Opcode::NestedMapUpsertLast | Opcode::NestedAggUpdate => {
+        Opcode::NestedSetInsert
+        | Opcode::NestedMapUpsertLast
+        | Opcode::NestedListAppendStruct
+        | Opcode::NestedAggUpdate => {
             out(Effect::Nested {
                 slot: at(0)?,
                 outer_col: at(1)?,
-                inner_col: at(2)?,
+                inner_col: match op {
+                    Opcode::NestedSetInsert | Opcode::NestedMapUpsertLast => at(2)?,
+                    Opcode::NestedListAppendStruct | Opcode::NestedAggUpdate => 0,
+                    _ => unreachable!(),
+                },
                 inner: match op {
                     Opcode::NestedSetInsert => SlotType::HashSet,
                     Opcode::NestedMapUpsertLast => SlotType::HashMap,
-                    _ => SlotType::Aggregate,
+                    Opcode::NestedListAppendStruct => SlotType::OrderedList,
+                    Opcode::NestedAggUpdate => SlotType::Aggregate,
+                    _ => unreachable!(),
                 },
             });
         }
@@ -989,7 +998,7 @@ impl CapacityScratch {
                     nested_type = Some(inner);
                     for_rows(domain, cols, batch_len, &mut |row| {
                         let outer = cell(cols, outer_col, row)?;
-                        let key = if inner == SlotType::Aggregate {
+                        let key = if matches!(inner, SlotType::Aggregate | SlotType::OrderedList) {
                             0
                         } else {
                             cell(cols, inner_col, row)?

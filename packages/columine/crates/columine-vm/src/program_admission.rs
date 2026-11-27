@@ -10,7 +10,9 @@
 //! [`declares_vo`] is the capability-free question an owner asks first.
 
 use columine_types::operand::Operands;
-use columine_types::types::{ErrorCode, Opcode, ProgramHeader, SlotTypeFlags, StructFieldType};
+use columine_types::types::{
+    ErrorCode, Opcode, ProgramHeader, SlotType, SlotTypeFlags, StructFieldType,
+};
 use columine_types::vo::{
     VoCountsProof, VoPreparationError, VoProgramAdmission, VoProgramMetadata, VoProgramRefusal,
     certify_counts, prepare_each,
@@ -576,9 +578,18 @@ fn visit_fields(
                 }
             }
             Opcode::SlotNested => {
-                r.bytes(4).ok_or(ProgramAdmissionError::InvalidProgram(
+                let nested = r.bytes(4).ok_or(ProgramAdmissionError::InvalidProgram(
                     state_init::ProgramInvalidCause::MalformedProgram,
                 ))?;
+                if SlotType::from_u8(nested[0] & 0x0f) == Some(SlotType::OrderedList) {
+                    let count = r.byte().ok_or(ProgramAdmissionError::InvalidProgram(
+                        state_init::ProgramInvalidCause::MalformedProgram,
+                    ))?;
+                    r.bytes(usize::from(count))
+                        .ok_or(ProgramAdmissionError::InvalidProgram(
+                            state_init::ProgramInvalidCause::MalformedProgram,
+                        ))?;
+                }
             }
             _ => {
                 return Err(ProgramAdmissionError::InvalidProgram(

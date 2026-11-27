@@ -614,6 +614,23 @@ fn walk_op(
             ops.index()?;
             reads(ops, 3, visit)?;
         }
+        Opcode::NestedListAppendStruct => {
+            // slot, outer_key_col, num_vals, (val_col, field_idx) × num_vals:
+            // outer key reads u32; each value fills its field of the inner list's rows.
+            let slot = ops.index()?;
+            reads(ops, 1, visit)?;
+            let num_vals = ops.byte()?;
+            for _ in 0..num_vals {
+                let column = ops.index()?;
+                let field = ops.byte()?;
+                cell(
+                    visit,
+                    column,
+                    ColumnUse::Read,
+                    OperandLane::Field { slot, field },
+                );
+            }
+        }
         Opcode::BatchStructMapUpsertLast
         | Opcode::BatchStructMapUpsertFirst
         | Opcode::BatchStructMapUpsertMax
@@ -863,8 +880,17 @@ fn slot_record(init: &[u8], slot: u32) -> Result<SlotRecord<'_>, ErrorCode> {
             }
             Opcode::SlotNested => {
                 let nested = r.bytes(4).ok_or(ErrorCode::InvalidProgram)?;
-                if SlotType::from_u8(nested[0] & 0x0f) == Some(SlotType::Aggregate) {
-                    record.inner_agg = Some(nested[3]);
+                match SlotType::from_u8(nested[0] & 0x0f) {
+                    Some(SlotType::Aggregate) => {
+                        record.inner_agg = Some(nested[3]);
+                    }
+                    Some(SlotType::OrderedList) => {
+                        let count = r.byte().ok_or(ErrorCode::InvalidProgram)?;
+                        record.fields = r
+                            .bytes(usize::from(count))
+                            .ok_or(ErrorCode::InvalidProgram)?;
+                    }
+                    _ => {}
                 }
             }
             _ => return Err(ErrorCode::InvalidProgram),

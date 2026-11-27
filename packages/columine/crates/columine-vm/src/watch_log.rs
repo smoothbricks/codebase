@@ -1114,7 +1114,7 @@ impl<'a, I: KeyIndex> Reader<'a, I> {
             SlotType::Aggregate => Self::Aggregate(meta.offset),
             SlotType::Scalar => Self::Scalar(meta.offset),
             SlotType::OrderedList => Self::List(meta.size(state)),
-            _ => Self::Keyless,
+            SlotType::Array | SlotType::ConditionTree | SlotType::Nested => Self::Keyless,
         })
     }
 

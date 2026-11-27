@@ -481,8 +481,8 @@ fn a_corrupt_host_state_is_refused_at_entry_in_both_modes() {
     assert_eq!(OK, Vm::default().execute_batch(&mut whole, &prog, &cols, 1));
     assert_eq!(Ok(()), validate_state(&whole));
     let meta = SlotMetaView::read(&whole, 0);
-    let keys_at = outer_keys_offset(meta.offset);
-    let ptrs_at = outer_ptrs_offset(meta.offset, meta.capacity);
+    let keys_at = outer_keys_offset(meta.offset, 0);
+    let ptrs_at = outer_ptrs_offset(meta.offset, 0, meta.capacity);
     let live = (0..meta.capacity)
         .find(|&pos| columine_vm::bytes::read_u32(&whole, keys_at + pos * 4) == 5)
         .expect("outer key 5 is live");
@@ -542,8 +542,8 @@ fn a_corrupt_host_state_is_refused_at_entry_in_both_modes() {
     ];
     assert_eq!(OK, Vm::default().execute_batch(&mut whole, &prog, &cols, 1));
     let meta = SlotMetaView::read(&whole, 0);
-    let keys_at = outer_keys_offset(meta.offset);
-    let ptrs_at = outer_ptrs_offset(meta.offset, meta.capacity);
+    let keys_at = outer_keys_offset(meta.offset, 0);
+    let ptrs_at = outer_ptrs_offset(meta.offset, 0, meta.capacity);
     let live = (0..meta.capacity)
         .find(|&pos| columine_vm::bytes::read_u32(&whole, keys_at + pos * 4) == 5)
         .expect("outer key 5 is live");

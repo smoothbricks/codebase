@@ -199,6 +199,49 @@ describe('parseReducerProgram', () => {
     });
   });
 
+  it('parses SLOT_NESTED with inner ORDERED_LIST and refuses invalid descriptors', () => {
+    const nestedList = (aggByte: number, fields: readonly number[]) =>
+      buildProgram(
+        [
+          Opcode.SLOT_NESTED,
+          0,
+          SlotType.NESTED,
+          8,
+          0,
+          SlotType.ORDERED_LIST,
+          4,
+          0,
+          aggByte,
+          fields.length,
+          ...fields,
+          Opcode.HALT,
+        ],
+        1,
+      );
+
+    expect(parseReducerProgram(nestedList(0, [StructFieldType.UINT32, StructFieldType.INT64])).slotDefs[0]).toEqual({
+      type: SlotType.NESTED,
+      outerCapacity: 8,
+      innerType: SlotType.ORDERED_LIST,
+      innerInitialCapacity: 4,
+      fieldTypes: [StructFieldType.UINT32, StructFieldType.INT64],
+    });
+
+    expect(() => parseReducerProgram(nestedList(0, []))).toThrow(
+      'Invalid program: nested ordered-list requires at least one field',
+    );
+    expect(() => parseReducerProgram(nestedList(1, [StructFieldType.UINT32]))).toThrow(
+      'Invalid program: nested ordered-list inner agg type must be 0',
+    );
+    expect(() => parseReducerProgram(nestedList(0, [StructFieldType.VO]))).toThrow(
+      'Invalid program: nested ordered-list field type 10 is not supported',
+    );
+    expect(() => parseReducerProgram(nestedList(0, [StructFieldType.ARRAY_U32]))).toThrow(
+      'Invalid program: nested ordered-list field type 5 is not supported',
+    );
+    expect(() => parseReducerProgram(nestedList(0, [11]))).toThrow('Invalid program: unknown struct field type 11');
+  });
+
   it('requires each specialized slot opcode to name its actual native kind', () => {
     const declarations: readonly (readonly [
       Opcode,

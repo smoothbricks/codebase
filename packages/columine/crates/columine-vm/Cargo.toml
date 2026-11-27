@@ -124,6 +124,11 @@ item = "log_import"
 consumer = "private"
 why = "a host restoring a checkpoint rebuilds each watched slot's log from the record stored with the image"
 
+[[package.metadata.wiring.external]]
+item = "nested_list_lookup"
+consumer = "private"
+why = "an embedder reads an outer key's nested ordered-list rows directly from the state image"
+
 
 [dependencies]
 bitmosaic = { workspace = true }

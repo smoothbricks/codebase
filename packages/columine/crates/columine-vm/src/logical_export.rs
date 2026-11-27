@@ -1044,16 +1044,30 @@ fn export_slot_inner<I: KeyIndex>(
         }
         SlotType::Nested => {
             let prefix = nested::read_nested_prefix(state, offset);
-            out.agg_type = prefix.inner_agg_type_byte;
-            let keys = nested::outer_keys_offset(offset);
-            let pointers = nested::outer_ptrs_offset(offset, capacity);
+            let desc_size = prefix.descriptor_size();
+            let descriptor = if prefix.inner_type == SlotType::OrderedList {
+                let d = descriptor_of(
+                    state,
+                    nested::NestedPrefix::descriptor_offset(offset),
+                    prefix.num_fields,
+                )?;
+                out.field_types = d.clone();
+                out.agg_type = 0;
+                Some(d)
+            } else {
+                out.agg_type = prefix.inner_agg_type_byte;
+                None
+            };
+            let keys = nested::outer_keys_offset(offset, desc_size);
+            let pointers = nested::outer_ptrs_offset(offset, desc_size, capacity);
             for pos in 0..capacity {
                 let outer = bytes::read_u32(state, keys + pos * 4);
                 if outer == EMPTY_KEY || outer == TOMBSTONE {
                     continue;
                 }
                 let pointer = bytes::read_u32(state, pointers + pos * 4);
-                let inner = export_inner(state, pointer, &prefix, enc, lookup)?;
+                let inner =
+                    export_inner(state, pointer, &prefix, descriptor.as_deref(), enc, lookup)?;
                 out.nested.push(LogicalNestedEntry {
                     outer_key: decode_u32(outer, enc.key, lookup)?,
                     inner,
@@ -1092,6 +1106,7 @@ fn export_inner(
     state: &[u8],
     pointer: u32,
     prefix: &NestedPrefix,
+    descriptor: Option<&[StructFieldType]>,
     enc: &SlotEncoding,
     lookup: &dyn InternLookup,
 ) -> CauseResult<LogicalInner<'static>> {
@@ -1140,6 +1155,33 @@ fn export_inner(
         }
         SlotType::Aggregate => {
             inner.aggregate = Some(aggregate_value(state, pointer, prefix.inner_agg_type_byte)?);
+        }
+        SlotType::OrderedList => {
+            let descriptor = descriptor.ok_or(LogicalExportCause::Vm(ErrorCode::InvalidState))?;
+            let count = bytes::read_u32(state, pointer);
+            let rows_base = pointer + nested::LIST_HDR_BYTES;
+            let row_size = u32::from(prefix.row_size);
+            let bitset_bytes = prefix.bitset_bytes();
+            for index in 0..count {
+                let fields = decode_row_fields(
+                    state,
+                    rows_base + index * row_size,
+                    bitset_bytes,
+                    descriptor,
+                    lookup,
+                    |_field| {
+                        Err(LogicalExportCause::InvalidRow(
+                            "arena field set in a nested ordered-list row, which has no arena",
+                        ))
+                    },
+                )?;
+                inner.rows.push(LogicalRow {
+                    key: LogicalValue::U32(index),
+                    key2: None,
+                    fields,
+                    cmp_ts: None,
+                });
+            }
         }
         _ => return Err(LogicalExportCause::Vm(ErrorCode::InvalidState)),
     }
@@ -2068,12 +2110,25 @@ fn write_scalar_cell(
     Ok(())
 }
 
-fn chosen_inner_capacity(prefix: &NestedPrefix, rows: usize) -> u32 {
+fn chosen_inner_capacity(prefix: &NestedPrefix, rows: usize) -> CauseResult<u32> {
+    if prefix.inner_type == SlotType::OrderedList {
+        let mut cap = nested::effective_inner_cap(SlotType::OrderedList, prefix.inner_initial_cap);
+        while (cap as usize) < rows {
+            cap = cap.checked_mul(2).ok_or(LogicalExportCause::Capacity {
+                needed: rows as u64,
+                capacity: u64::from(u32::MAX),
+            })?;
+        }
+        return Ok(cap);
+    }
     let mut cap = next_power_of_2(u32::from(prefix.inner_initial_cap).max(16));
     while (max_load_for_cap(cap) as usize) < rows.max(1) {
-        cap *= 2;
+        cap = cap.checked_mul(2).ok_or(LogicalExportCause::Capacity {
+            needed: rows as u64,
+            capacity: u64::from(u32::MAX),
+        })?;
     }
-    cap
+    Ok(cap)
 }
 
 fn import_nested<I: KeyIndex>(
@@ -2085,6 +2140,17 @@ fn import_nested<I: KeyIndex>(
     let slot = logical.slot;
     let meta0 = SlotMetaView::read(image, slot);
     let prefix = nested::read_nested_prefix(image, meta0.offset);
+    let descriptor = if prefix.inner_type == SlotType::OrderedList {
+        let d = descriptor_of(
+            image,
+            nested::NestedPrefix::descriptor_offset(meta0.offset),
+            prefix.num_fields,
+        )?;
+        require_descriptor(logical, &d)?;
+        Some(d)
+    } else {
+        None
+    };
     for entry in &logical.nested {
         if entry.inner.kind != prefix.inner_type {
             return Err(LogicalExportCause::KindMismatch {
@@ -2104,41 +2170,60 @@ fn import_nested<I: KeyIndex>(
             ));
         }
     }
-    let arena_needed: u64 = logical
-        .nested
-        .iter()
-        .map(|entry| {
-            let rows = entry.inner.rows.len();
-            let cap = chosen_inner_capacity(&prefix, rows);
-            u64::from(align8(nested::inner_container_size(
+    let mut arena_needed = 0u64;
+    for entry in &logical.nested {
+        let cap = chosen_inner_capacity(&prefix, entry.inner.rows.len())?;
+        let container_bytes = if prefix.inner_type == SlotType::OrderedList {
+            nested::inner_list_byte_size(cap, prefix.row_size).ok_or(
+                LogicalExportCause::Capacity {
+                    needed: entry.inner.rows.len() as u64,
+                    capacity: u64::from(u32::MAX),
+                },
+            )?
+        } else {
+            nested::inner_container_size(
                 prefix.inner_type,
                 cap,
                 prefix.inner_agg_type_byte,
-            )))
-        })
-        .sum();
+                prefix.row_size,
+            )
+        };
+        arena_needed = arena_needed.saturating_add(u64::from(align8(container_bytes)));
+    }
+    let desc_size = prefix.descriptor_size();
     let outer_rows = logical.nested.len() as u32;
     grow_until::<I>(image, slot, |img| {
         let m = SlotMetaView::read(img, slot);
         if outer_rows > max_load_for_cap(m.capacity) {
             return Ok(false);
         }
-        let arena = nested::Arena::bind(nested::arena_header_offset(m.offset, m.capacity));
+        let arena =
+            nested::Arena::bind(nested::arena_header_offset(m.offset, desc_size, m.capacity));
         Ok(u64::from(arena.capacity(img)) >= arena_needed)
     })?;
     let meta = bind_target::<I>(image, logical)?;
     let prefix = nested::read_nested_prefix(image, meta.offset);
+    let desc_size = prefix.descriptor_size();
     let outer = FlatTable::bind_external(
-        nested::outer_keys_offset(meta.offset),
+        nested::outer_keys_offset(meta.offset, desc_size),
         meta.capacity,
         meta.meta_base + SlotMetaOffset::SIZE,
         ENTRY_U32,
     );
-    let arena = nested::Arena::bind(nested::arena_header_offset(meta.offset, meta.capacity));
+    let arena = nested::Arena::bind(nested::arena_header_offset(
+        meta.offset,
+        desc_size,
+        meta.capacity,
+    ));
     for entry in &logical.nested {
         let outer_key = key_u32(&entry.outer_key, enc.key, interner)?;
-        let cap = chosen_inner_capacity(&prefix, entry.inner.rows.len());
-        let size = nested::inner_container_size(prefix.inner_type, cap, prefix.inner_agg_type_byte);
+        let cap = chosen_inner_capacity(&prefix, entry.inner.rows.len())?;
+        let size = nested::inner_container_size(
+            prefix.inner_type,
+            cap,
+            prefix.inner_agg_type_byte,
+            prefix.row_size,
+        );
         let pointer = arena
             .alloc(image, size)
             .ok_or(LogicalExportCause::Capacity {
@@ -2193,6 +2278,36 @@ fn import_nested<I: KeyIndex>(
                         ))?;
                 bytes::zero(image, pointer, size);
                 write_aggregate(image, pointer, prefix.inner_agg_type_byte, &aggregate)?;
+            }
+            SlotType::OrderedList => {
+                let descriptor = descriptor
+                    .as_deref()
+                    .ok_or(LogicalExportCause::Vm(ErrorCode::InvalidState))?;
+                let rows_count = u32::try_from(entry.inner.rows.len()).map_err(|_| {
+                    LogicalExportCause::Capacity {
+                        needed: entry.inner.rows.len() as u64,
+                        capacity: u64::from(u32::MAX),
+                    }
+                })?;
+                bytes::write_u32(image, pointer, rows_count);
+                bytes::write_u32(image, pointer + 4, cap);
+                let rows_base = pointer + nested::LIST_HDR_BYTES;
+                let row_size = u32::from(prefix.row_size);
+                let bitset_bytes = prefix.bitset_bytes();
+                for (index, row) in entry.inner.rows.iter().enumerate() {
+                    no_cmp_ts(row)?;
+                    let row_off = rows_base + index as u32 * row_size;
+                    bytes::zero(image, row_off, row_size);
+                    write_row_fields(
+                        image,
+                        row_off,
+                        bitset_bytes,
+                        descriptor,
+                        &row.fields,
+                        None,
+                        interner,
+                    )?;
+                }
             }
             _ => return Err(LogicalExportCause::Vm(ErrorCode::InvalidState)),
         }
@@ -2686,9 +2801,11 @@ fn primary_size<I: KeyIndex>(state: &[u8], meta: &SlotMetaView) -> CauseResult<u
             let prefix = nested::read_nested_prefix(state, meta.offset);
             nested::nested_slot_data_size(
                 capacity,
-                next_power_of_2(u32::from(prefix.inner_initial_cap)),
+                nested::effective_inner_cap(prefix.inner_type, prefix.inner_initial_cap),
                 prefix.inner_type,
                 prefix.inner_agg_type_byte,
+                prefix.num_fields,
+                prefix.row_size,
             )
         }
         kind => crate::slot_growth::slot_data_size(

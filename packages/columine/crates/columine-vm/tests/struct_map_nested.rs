@@ -259,21 +259,23 @@ fn mk_nested_state(
             inner_initial_cap,
             inner_agg_type_byte: agg_byte,
             depth: 1,
+            num_fields: 0,
+            row_size: 0,
         },
     );
 
     // Outer keys → EMPTY_KEY
     for j in 0..outer_cap {
-        let off = (outer_keys_offset(SLOT_OFFSET) + j * 4) as usize;
+        let off = (outer_keys_offset(SLOT_OFFSET, 0) + j * 4) as usize;
         state[off..off + 4].copy_from_slice(&EMPTY_KEY.to_le_bytes());
     }
 
     // Arena over the remainder of the buffer ()
-    let arena_start = arena_data_offset(SLOT_OFFSET, outer_cap);
+    let arena_start = arena_data_offset(SLOT_OFFSET, 0, outer_cap);
     let arena_cap = state_len as u32 - arena_start;
     Arena::init_at(
         &mut state,
-        arena_header_offset(SLOT_OFFSET, outer_cap),
+        arena_header_offset(SLOT_OFFSET, 0, outer_cap),
         arena_cap,
     );
 
@@ -445,7 +447,7 @@ fn stress_arena_accounting() {
     }
 
     assert_eq!(meta.size(&state), 10);
-    let arena = Arena::bind(arena_header_offset(SLOT_OFFSET, 64));
+    let arena = Arena::bind(arena_header_offset(SLOT_OFFSET, 0, 64));
     assert!(arena.used(&state) > 0);
 }
 
@@ -545,7 +547,7 @@ fn stress_inner_growth_cascade_fragmentation() {
         assert!(inner_set_contains(&state, inner, i));
     }
 
-    let arena = Arena::bind(arena_header_offset(SLOT_OFFSET, 16));
+    let arena = Arena::bind(arena_header_offset(SLOT_OFFSET, 0, 16));
     assert!(arena.used(&state) > 0);
 
     // Abandoned capacities plus the live table bound arena usage from below.
@@ -862,7 +864,7 @@ proptest! {
                 "struct-map cell {} diverged from the flat table", pos
             );
             prop_assert_eq!(
-                bytes::read_u32(&nested_state, outer_keys_offset(SLOT_OFFSET) + pos * 4),
+                bytes::read_u32(&nested_state, outer_keys_offset(SLOT_OFFSET, 0) + pos * 4),
                 expected,
                 "nested outer cell {} diverged from the flat table", pos
             );
@@ -1074,9 +1076,9 @@ fn nested_retained_plans_cover_every_written_byte_without_mutating_during_prepar
     for inner_type in [SlotType::HashSet, SlotType::HashMap] {
         let mut state = mk_nested_state(8192, 16, inner_type, 4, 1);
         let meta = meta_of(&state);
-        let arena_start = arena_data_offset(meta.offset, meta.capacity) as usize;
+        let arena_start = arena_data_offset(meta.offset, 0, meta.capacity) as usize;
         let arena_capacity =
-            Arena::bind(arena_header_offset(meta.offset, meta.capacity)).capacity(&state);
+            Arena::bind(arena_header_offset(meta.offset, 0, meta.capacity)).capacity(&state);
         state[arena_start..].fill(0xa5);
         let mut scratch = NestedScratch::default();
         for key in (1u32..24).chain([5, 8, 5]) {
@@ -1120,7 +1122,7 @@ fn nested_retained_plans_cover_every_written_byte_without_mutating_during_prepar
 #[test]
 fn nested_refused_plan_leaves_outer_keys_flags_and_arena_unchanged() {
     let outer_cap = 4;
-    let len = arena_data_offset(SLOT_OFFSET, outer_cap) as usize;
+    let len = arena_data_offset(SLOT_OFFSET, 0, outer_cap) as usize;
     let mut state = mk_nested_state(len, outer_cap, SlotType::HashMap, 4, 1);
     let meta = meta_of(&state);
     let before = state.clone();

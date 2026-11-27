@@ -99,6 +99,21 @@ function parseOrderedListFieldType(value: number): StructFieldType {
   return fieldType;
 }
 
+/** Nested ordered-list struct rows hold only inline scalar fields (no array or VO arena fields). */
+function parseNestedOrderedListFieldType(value: number): StructFieldType {
+  const fieldType = parseStructFieldType(value);
+  switch (fieldType) {
+    case StructFieldType.UINT32:
+    case StructFieldType.INT64:
+    case StructFieldType.FLOAT64:
+    case StructFieldType.BOOL:
+    case StructFieldType.STRING:
+      return fieldType;
+    default:
+      throw new Error(`Invalid program: nested ordered-list field type ${value} is not supported`);
+  }
+}
+
 function parseTtlStartOf(value: number): TtlStartOf {
   switch (value) {
     case 0:
@@ -340,6 +355,66 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
             capacity,
             elemType: parseOrderedListFieldType(elemTypeByte),
           };
+        }
+        defineSlot(slotDefs, expectedSlots, slot, slotDef);
+        break;
+      }
+
+      case Opcode.SLOT_NESTED: {
+        const { value: slot, next } = readIndex(initCode, pc);
+        pc = next;
+        requireInitBytes(initCode, pc, 7, 'SLOT_NESTED operands');
+        const outerTypeFlags = initCode[pc];
+        if ((outerTypeFlags & SLOT_TYPE_MASK) !== SlotType.NESTED) {
+          throw new Error('Invalid program: nested opcode and declared slot kind disagree');
+        }
+        if ((outerTypeFlags & HAS_TTL_FLAG) !== 0) {
+          throw new Error('Invalid program: nested TTL is not supported');
+        }
+        const outerCapacity = (initCode[pc + 2] << 8) | initCode[pc + 1] || defaultCapacity;
+        const innerType = initCode[pc + 3] & SLOT_TYPE_MASK;
+        const innerInitialCapacity = (initCode[pc + 5] << 8) | initCode[pc + 4] || 16;
+        const innerAggByte = initCode[pc + 6];
+        pc += 7;
+        let slotDef: SlotDef;
+        if (innerType === SlotType.ORDERED_LIST) {
+          if (innerAggByte !== 0) {
+            throw new Error('Invalid program: nested ordered-list inner agg type must be 0');
+          }
+          requireInitBytes(initCode, pc, 1, 'nested ordered-list field count');
+          const numFields = initCode[pc++];
+          if (numFields === 0) {
+            throw new Error('Invalid program: nested ordered-list requires at least one field');
+          }
+          requireInitBytes(initCode, pc, numFields, 'nested ordered-list field metadata');
+          const fieldTypes: StructFieldType[] = [];
+          for (let i = 0; i < numFields; i++) {
+            fieldTypes.push(parseNestedOrderedListFieldType(initCode[pc++]));
+          }
+          slotDef = {
+            type: SlotType.NESTED,
+            outerCapacity,
+            innerType: SlotType.ORDERED_LIST,
+            innerInitialCapacity,
+            fieldTypes,
+          };
+        } else if (innerType === SlotType.AGGREGATE) {
+          slotDef = {
+            type: SlotType.NESTED,
+            outerCapacity,
+            innerType: SlotType.AGGREGATE,
+            innerInitialCapacity,
+            innerAggType: parseAggType(innerAggByte || AggType.SUM),
+          };
+        } else if (innerType === SlotType.HASHMAP || innerType === SlotType.HASHSET) {
+          slotDef = {
+            type: SlotType.NESTED,
+            outerCapacity,
+            innerType,
+            innerInitialCapacity,
+          };
+        } else {
+          throw new Error(`Invalid program: unsupported nested inner type ${innerType}`);
         }
         defineSlot(slotDefs, expectedSlots, slot, slotDef);
         break;

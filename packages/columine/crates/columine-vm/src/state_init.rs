@@ -529,6 +529,29 @@ fn check_init_code(
                     return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 pc += 7;
+                if inner_type == SlotType::OrderedList {
+                    if operands[6] != 0 {
+                        return Err(ProgramInvalidCause::MalformedProgram);
+                    }
+                    let Some(&num_fields) = code.get(pc) else {
+                        return Err(ProgramInvalidCause::MalformedProgram);
+                    };
+                    if num_fields == 0 {
+                        return Err(ProgramInvalidCause::MalformedProgram);
+                    }
+                    pc += 1;
+                    let Some(field_types) =
+                        code.get(pc..pc.saturating_add(usize::from(num_fields)))
+                    else {
+                        return Err(ProgramInvalidCause::MalformedProgram);
+                    };
+                    if field_types.iter().any(|&field_type| {
+                        StructFieldType::from_u8(field_type).is_none_or(is_arena_field_type)
+                    }) {
+                        return Err(ProgramInvalidCause::MalformedProgram);
+                    }
+                    pc += usize::from(num_fields);
+                }
             }
             _ => return Err(ProgramInvalidCause::MalformedProgram),
         }
@@ -792,19 +815,41 @@ fn calculate_state_size_from_view<I: KeyIndex>(
             let Some(inner_type) = SlotType::from_u8(inner_type_byte & 0x0f) else {
                 return Err(ProgramInvalidCause::MalformedProgram);
             };
+            let (descriptor_size, row_size) = if inner_type == SlotType::OrderedList {
+                let num_fields = init_code[pc];
+                let field_types = &init_code[pc + 1..pc + 1 + usize::from(num_fields)];
+                pc += 1 + usize::from(num_fields);
+                let layout = compute_struct_row_layout_padded(num_fields, field_types);
+                let row_size = u16::try_from(layout.row_size)
+                    .map_err(|_| ProgramInvalidCause::MalformedProgram)?;
+                (layout.descriptor_size, row_size)
+            } else {
+                (0, 0)
+            };
             // Only interpret as AggType for AGGREGATE inner containers.
             let inner_agg = if inner_type == SlotType::Aggregate && inner_agg_type_byte >= 1 {
                 inner_agg_type_byte
+            } else if inner_type == SlotType::OrderedList {
+                0
             } else {
                 1 // SUM
             };
 
-            let inner_size = u64::from(nested::inner_container_size(
+            let inner_cap = nested::effective_inner_cap(
                 inner_type,
-                next_power_of_2(inner_initial_cap),
-                inner_agg,
-            ));
-            size += u64::from(nested::NESTED_PREFIX_SIZE + ARENA_HEADER_SIZE)
+                u16::try_from(inner_initial_cap)
+                    .map_err(|_| ProgramInvalidCause::MalformedProgram)?,
+            );
+            let inner_size = if inner_type == SlotType::OrderedList {
+                u64::from(nested::LIST_HDR_BYTES) + u64::from(inner_cap) * u64::from(row_size)
+            } else {
+                u64::from(nested::inner_container_size(
+                    inner_type, inner_cap, inner_agg, row_size,
+                ))
+            };
+            size += u64::from(nested::NESTED_PREFIX_SIZE)
+                + u64::from(descriptor_size)
+                + u64::from(ARENA_HEADER_SIZE)
                 + u64::from(outer_cap) * (8 + ((inner_size + 7) & !7));
             size = (size + 7) & !7;
         } else {
@@ -1270,12 +1315,28 @@ fn init_state_from_view<I: KeyIndex>(
             if inner_initial_cap == 0 {
                 inner_initial_cap = 16;
             }
-            let inner_cap = next_power_of_2(inner_initial_cap);
             let Some(inner_type) = SlotType::from_u8(inner_type_byte & 0x0f) else {
                 return Err(ErrorCode::InvalidProgram);
             };
+            let (num_fields, field_types, descriptor_size, row_size) = if inner_type
+                == SlotType::OrderedList
+            {
+                let nf = init_code[pc];
+                let fields = &init_code[pc + 1..pc + 1 + usize::from(nf)];
+                pc += 1 + usize::from(nf);
+                let layout = compute_struct_row_layout_padded(nf, fields);
+                let rs = u16::try_from(layout.row_size).map_err(|_| ErrorCode::InvalidProgram)?;
+                (nf, fields, layout.descriptor_size, rs)
+            } else {
+                (0, &[][..], 0, 0)
+            };
+            let inner_initial_cap_u16 = u16::try_from(inner_initial_cap)
+                .unwrap_or_else(|_| columine_types::die!("nested inner capacity fits u16"));
+            let inner_cap = nested::effective_inner_cap(inner_type, inner_initial_cap_u16);
             let inner_agg = if inner_type == SlotType::Aggregate && inner_agg_type_byte >= 1 {
                 inner_agg_type_byte
+            } else if inner_type == SlotType::OrderedList {
+                0
             } else {
                 1 // SUM
             };
@@ -1295,20 +1356,27 @@ fn init_state_from_view<I: KeyIndex>(
                 data_offset,
                 nested::NestedPrefix {
                     inner_type,
-                    inner_initial_cap: u16::try_from(inner_initial_cap)
-                        .unwrap_or_else(|_| columine_types::die!("nested inner capacity fits u16")),
+                    inner_initial_cap: inner_initial_cap_u16,
                     inner_agg_type_byte: inner_agg,
                     depth: 1,
+                    num_fields,
+                    row_size,
                 },
             );
+            if num_fields > 0 {
+                let desc_off = nested::NestedPrefix::descriptor_offset(data_offset);
+                bytes::zero(state, desc_off, descriptor_size);
+                bytes::copy(state, desc_off, field_types, 0, u32::from(num_fields));
+            }
 
-            let keys_off = nested::outer_keys_offset(data_offset);
+            let keys_off = nested::outer_keys_offset(data_offset, descriptor_size);
             bytes::fill_u32(state, keys_off, outer_cap, EMPTY_KEY);
 
-            let arena_hdr = nested::arena_header_offset(data_offset, outer_cap);
-            let arena_start = nested::arena_data_offset(data_offset, outer_cap);
-            let slot_data_size =
-                nested::nested_slot_data_size(outer_cap, inner_cap, inner_type, inner_agg);
+            let arena_hdr = nested::arena_header_offset(data_offset, descriptor_size, outer_cap);
+            let arena_start = nested::arena_data_offset(data_offset, descriptor_size, outer_cap);
+            let slot_data_size = nested::nested_slot_data_size(
+                outer_cap, inner_cap, inner_type, inner_agg, num_fields, row_size,
+            );
             let arena_cap = slot_data_size - (arena_start - data_offset);
             nested::write_arena_header(state, arena_hdr, arena_cap);
 
@@ -1774,17 +1842,34 @@ fn checked_primary_size<I: KeyIndex>(
                 .get(m.offset as usize..end as usize)
                 .ok_or(ErrorCode::InvalidState)?;
             let kind = SlotType::from_u8(prefix[0] & 0x0f).ok_or(ErrorCode::InvalidState)?;
-            let inner_cap = u32::from(u16::from_le_bytes([prefix[1], prefix[2]]))
-                .max(16)
-                .checked_next_power_of_two()
-                .ok_or(ErrorCode::InvalidState)?;
-            let inner_size = match kind {
-                SlotType::HashMap => 8 + u64::from(inner_cap) * 8,
-                SlotType::HashSet => 8 + u64::from(inner_cap) * 4,
-                SlotType::Aggregate => u64::from(aggregates::agg_slot_byte_size(prefix[3])),
-                _ => 0,
+            let raw_inner_cap = u16::from_le_bytes([prefix[1], prefix[2]]);
+            let num_fields = prefix[5];
+            let stored_row_size = u16::from_le_bytes([prefix[6], prefix[7]]);
+            let (descriptor_size, inner_size) = if kind == SlotType::OrderedList {
+                let nested_prefix = nested::read_nested_prefix(state, m.offset);
+                let layout = nested::check_ordered_list_prefix(state, m.offset, &nested_prefix)?;
+                let inner_bytes = u64::from(nested::LIST_HDR_BYTES)
+                    + u64::from(raw_inner_cap) * u64::from(layout.row_size);
+                (u64::from(layout.descriptor_size), inner_bytes)
+            } else {
+                if num_fields != 0 || stored_row_size != 0 {
+                    return Err(ErrorCode::InvalidState);
+                }
+                let inner_cap = u32::from(raw_inner_cap)
+                    .max(16)
+                    .checked_next_power_of_two()
+                    .ok_or(ErrorCode::InvalidState)?;
+                let inner_bytes = match kind {
+                    SlotType::HashMap => 8 + u64::from(inner_cap) * 8,
+                    SlotType::HashSet => 8 + u64::from(inner_cap) * 4,
+                    SlotType::Aggregate => u64::from(aggregates::agg_slot_byte_size(prefix[3])),
+                    _ => return Err(ErrorCode::InvalidState),
+                };
+                (0u64, inner_bytes)
             };
-            u64::from(nested::NESTED_PREFIX_SIZE + ARENA_HEADER_SIZE)
+            u64::from(nested::NESTED_PREFIX_SIZE)
+                + descriptor_size
+                + u64::from(ARENA_HEADER_SIZE)
                 + capacity * (8 + ((inner_size + 7) & !7))
         }
         SlotType::HashMap => capacity * if m.has_hashmap_timestamps { 16 } else { 8 },
@@ -1871,9 +1956,28 @@ fn validate_slot_geometry<I: KeyIndex>(
         )?;
     }
     if kind == SlotType::Nested {
+        // The prefix names the inner kind every kernel reads; one no
+        // kernel builds is no valid geometry.
+        let inner = state
+            .get(m.offset as usize)
+            .and_then(|byte| SlotType::from_u8(byte & 0x0f))
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    SlotType::HashMap
+                        | SlotType::HashSet
+                        | SlotType::Aggregate
+                        | SlotType::OrderedList
+                )
+            })
+            .ok_or(ErrorCode::InvalidState)?;
+        let prefix = nested::read_nested_prefix(state, m.offset);
+        debug_assert_eq!(prefix.inner_type, inner);
+        let desc_size = prefix.descriptor_size();
         let header = m
             .offset
             .checked_add(nested::NESTED_PREFIX_SIZE)
+            .and_then(|off| off.checked_add(desc_size))
             .and_then(|off| off.checked_add(m.capacity.checked_mul(8)?))
             .ok_or(ErrorCode::InvalidState)?;
         let arena = ArenaRegion::bind(state, header)?;
@@ -1883,22 +1987,8 @@ fn validate_slot_geometry<I: KeyIndex>(
         {
             return Err(ErrorCode::InvalidState);
         }
-        // The prefix names the inner kind every kernel reads; one no
-        // kernel builds is no valid geometry.
-        let inner = state
-            .get(m.offset as usize)
-            .and_then(|byte| SlotType::from_u8(byte & 0x0f))
-            .filter(|kind| {
-                matches!(
-                    kind,
-                    SlotType::HashMap | SlotType::HashSet | SlotType::Aggregate
-                )
-            })
-            .ok_or(ErrorCode::InvalidState)?;
-        let prefix = nested::read_nested_prefix(state, m.offset);
-        debug_assert_eq!(prefix.inner_type, inner);
-        let keys = nested::outer_keys_offset(m.offset);
-        let pointers = nested::outer_ptrs_offset(m.offset, m.capacity);
+        let keys = nested::outer_keys_offset(m.offset, desc_size);
+        let pointers = nested::outer_ptrs_offset(m.offset, desc_size, m.capacity);
         let walked = if outer == OuterPointers::Walk {
             m.capacity
         } else {
@@ -2021,15 +2111,16 @@ fn ordered_list_primary_size_from_meta(old_state: &[u8], meta_base: u32, cap: u3
 }
 
 /// Nested-slot primary size from the prefix written at init. Inner capacity
-/// is power-of-two'd the same way `init_state` / `calculate_state_size` do
-/// before calling `nested_slot_data_size`.
+/// uses [`nested::effective_inner_cap`], matching `init_state` and `calculate_state_size`.
 fn nested_primary_size_from_prefix(old_state: &[u8], slot_offset: u32, outer_cap: u32) -> u32 {
     let prefix = nested::read_nested_prefix(old_state, slot_offset);
     nested::nested_slot_data_size(
         outer_cap,
-        next_power_of_2(u32::from(prefix.inner_initial_cap)),
+        nested::effective_inner_cap(prefix.inner_type, prefix.inner_initial_cap),
         prefix.inner_type,
         prefix.inner_agg_type_byte,
+        prefix.num_fields,
+        prefix.row_size,
     )
 }
 
@@ -2626,6 +2717,11 @@ enum DeclaredShape {
         fields: (usize, usize),
         layout: columine_types::types::StructRowLayout,
     },
+    /// A nested slot whose inner container is an `OrderedList` of struct rows.
+    NestedList {
+        fields: (usize, usize),
+        layout: columine_types::types::StructRowLayout,
+    },
 }
 
 /// A program's init declarations, decoded once per init section and compared
@@ -2786,10 +2882,38 @@ impl Declarations {
                     DeclaredShape::Kind
                 }
                 Opcode::SlotNested => {
-                    if r.bytes(4).is_none() {
+                    let Some(nested_bytes) = r.bytes(4) else {
                         return Ok(false);
+                    };
+                    let Some(inner_type) = SlotType::from_u8(nested_bytes[0] & 0x0f) else {
+                        return Ok(false);
+                    };
+                    if inner_type == SlotType::OrderedList {
+                        if nested_bytes[3] != 0 {
+                            return Ok(false);
+                        }
+                        let Some(nf) = r.byte() else {
+                            return Ok(false);
+                        };
+                        if nf == 0 {
+                            return Ok(false);
+                        }
+                        let start = r.pos();
+                        let Some(fields) = r.bytes(usize::from(nf)) else {
+                            return Ok(false);
+                        };
+                        if fields.iter().any(|&field| {
+                            StructFieldType::from_u8(field).is_none_or(is_arena_field_type)
+                        }) {
+                            return Ok(false);
+                        }
+                        DeclaredShape::NestedList {
+                            fields: (start, r.pos()),
+                            layout: compute_struct_row_layout_padded(nf, fields),
+                        }
+                    } else {
+                        DeclaredShape::Kind
                     }
-                    DeclaredShape::Kind
                 }
                 _ => return Ok(false),
             };
@@ -2849,6 +2973,27 @@ impl Declarations {
                                 false,
                             )
                             <= state.len() as u64
+                }
+                DeclaredShape::NestedList {
+                    fields: (start, end),
+                    layout,
+                } => {
+                    let fields = &self.init[start..end];
+                    let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
+                    let prefix_end = off.checked_add(nested::NESTED_PREFIX_SIZE);
+                    if prefix_end.is_none_or(|e| e as usize > state.len()) {
+                        return false;
+                    }
+                    let prefix = nested::read_nested_prefix(state, off);
+                    let desc_off = nested::NestedPrefix::descriptor_offset(off);
+                    let descriptor = u32::try_from(fields.len())
+                        .ok()
+                        .and_then(|len| desc_off.checked_add(len))
+                        .and_then(|e| state.get(desc_off as usize..e as usize));
+                    prefix.inner_type == SlotType::OrderedList
+                        && usize::from(prefix.num_fields) == fields.len()
+                        && u32::from(prefix.row_size) == layout.row_size
+                        && descriptor == Some(fields)
                 }
             }
         })
@@ -2940,15 +3085,23 @@ fn copy_nested_slot(
 ) -> Result<(), ErrorCode> {
     let old_offset = m.offset;
     let old_cap = m.capacity;
-    let old_header = nested::arena_header_offset(old_offset, old_cap);
+    let prefix = nested::read_nested_prefix(old, old_offset);
+    let desc_size = prefix.descriptor_size();
+    let old_header = nested::arena_header_offset(old_offset, desc_size, old_cap);
     let old_arena = ArenaRegion::bind(old, old_header)?;
-    let new_header = nested::arena_header_offset(new_offset, new_cap);
+    let new_header = nested::arena_header_offset(new_offset, desc_size, new_cap);
     let new_data = new_header + ARENA_HEADER_SIZE;
     let new_arena_cap = new_size - (new_data - new_offset);
     if old_arena.used > new_arena_cap {
         return Err(ErrorCode::InvalidState);
     }
-    bytes::copy(new, new_offset, old, old_offset, nested::NESTED_PREFIX_SIZE);
+    bytes::copy(
+        new,
+        new_offset,
+        old,
+        old_offset,
+        nested::NESTED_PREFIX_SIZE + desc_size,
+    );
     bytes::write_u32(new, new_header, new_arena_cap);
     bytes::write_u32(new, new_header + 4, old_arena.used);
     bytes::copy(
@@ -2958,10 +3111,10 @@ fn copy_nested_slot(
         old_header + ARENA_HEADER_SIZE,
         old_arena.used,
     );
-    let old_keys = nested::outer_keys_offset(old_offset);
-    let old_ptrs = nested::outer_ptrs_offset(old_offset, old_cap);
-    let new_keys = nested::outer_keys_offset(new_offset);
-    let new_ptrs = nested::outer_ptrs_offset(new_offset, new_cap);
+    let old_keys = nested::outer_keys_offset(old_offset, desc_size);
+    let old_ptrs = nested::outer_ptrs_offset(old_offset, desc_size, old_cap);
+    let new_keys = nested::outer_keys_offset(new_offset, desc_size);
+    let new_ptrs = nested::outer_ptrs_offset(new_offset, desc_size, new_cap);
     let table =
         hash_table::FlatTable::bind_external(new_keys, new_cap, size_off, hash_table::ENTRY_U32);
     if new_cap == old_cap {

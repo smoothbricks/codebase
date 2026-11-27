@@ -3917,6 +3917,71 @@ fn validate_scalar_fields(
     Ok(())
 }
 
+/// Write a validated struct-list row's scalar fields at `row_off`: zeroes the
+/// full `row_size` bytes first so unset fields and alignment padding are
+/// deterministic zeros, then sets each valid provided field's bit and cell.
+/// Caller must have validated every operand with [`validate_scalar_fields`].
+#[allow(clippy::too_many_arguments)]
+fn write_struct_list_row(
+    state: &mut [u8],
+    descriptor_off: u32,
+    num_fields: u8,
+    row_off: u32,
+    row_size: u32,
+    val_cols: &[u32],
+    field_idxs: &[u8],
+    cols: &[&[u8]],
+    valid: &[ColumnValidity<'_>],
+    element_idx: u32,
+) {
+    bytes::zero(state, row_off, row_size);
+
+    for vi in 0..val_cols.len() {
+        let field_idx = field_idxs[vi];
+        let field_type_byte = state[(descriptor_off + u32::from(field_idx)) as usize];
+        let Some(field_type) = StructFieldType::from_u8(field_type_byte) else {
+            columine_types::die!(
+                "invariant: ordered-list descriptor contains an invalid field type"
+            );
+        };
+        if !valid[vi].holds(element_idx) {
+            continue;
+        }
+        let f_offset = row_off + {
+            let descriptor =
+                &state[descriptor_off as usize..(descriptor_off + u32::from(num_fields)) as usize];
+            state_init::struct_field_offset(num_fields, descriptor, field_idx)
+        };
+        state[(row_off + u32::from(field_idx) / 8) as usize] |= 1 << (field_idx % 8);
+
+        match field_type {
+            StructFieldType::UInt32 | StructFieldType::String => {
+                bytes::write_u32(
+                    state,
+                    f_offset,
+                    bytes::read_u32(cols[val_cols[vi] as usize], element_idx * 4),
+                );
+            }
+            StructFieldType::Int64 | StructFieldType::Float64 => {
+                let v = bytes::read_u64(cols[val_cols[vi] as usize], element_idx * 8);
+                bytes::write_u64(state, f_offset, v);
+            }
+            StructFieldType::Bool => {
+                let v = bytes::read_u32(cols[val_cols[vi] as usize], element_idx * 4);
+                state[f_offset as usize] = u8::from(v != 0);
+            }
+            StructFieldType::ArrayU32
+            | StructFieldType::ArrayI64
+            | StructFieldType::ArrayF64
+            | StructFieldType::ArrayString
+            | StructFieldType::ArrayBool
+            | StructFieldType::Vo => {
+                columine_types::die!("invariant: validate_scalar_fields refused arena field types");
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct ArenaWrite {
     field_idx: u8,
@@ -8608,9 +8673,6 @@ impl<I: KeyIndex> Vm<I> {
                     let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
                     let mut count = bytes::read_u32(state, meta_base + SlotMetaOffset::SIZE);
                     let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
-                    let bitset_bytes = u32::from(
-                        state[(meta_base + SlotMetaOffset::STRUCT_BITSET_BYTES) as usize],
-                    );
                     let row_size = u32::from(bytes::read_u16(
                         state,
                         meta_base + SlotMetaOffset::TTL_SECONDS,
@@ -8655,58 +8717,18 @@ impl<I: KeyIndex> Vm<I> {
                         Err(error) => return error as u32,
                     };
 
-                    bytes::zero(state, row_off, bitset_bytes);
-
-                    for vi in 0..num_vals {
-                        let field_idx = fi[vi];
-                        let field_type_byte = state[(slot_offset + u32::from(field_idx)) as usize];
-                        let Some(field_type) = StructFieldType::from_u8(field_type_byte) else {
-                            columine_types::die!(
-                                "invariant: ordered-list descriptor contains an invalid field type"
-                            );
-                        };
-                        let f_offset = row_off + {
-                            let descriptor = &state[slot_offset as usize
-                                ..(slot_offset + u32::from(num_fields)) as usize];
-                            state_init::struct_field_offset(num_fields, descriptor, field_idx)
-                        };
-
-                        if !valid.as_slice()[vi].holds(child_idx) {
-                            bytes::zero(state, f_offset, struct_field_size(field_type));
-                            continue;
-                        }
-                        state[(row_off + u32::from(field_idx) / 8) as usize] |=
-                            1 << (field_idx % 8);
-
-                        match field_type {
-                            StructFieldType::UInt32 | StructFieldType::String => {
-                                bytes::write_u32(
-                                    state,
-                                    f_offset,
-                                    cell_u32(cols, vc[vi], child_idx),
-                                );
-                            }
-                            StructFieldType::Int64 => {
-                                let v = bytes::read_u64(cols[vc[vi] as usize], child_idx * 8);
-                                bytes::write_u64(state, f_offset, v);
-                            }
-                            StructFieldType::Float64 => {
-                                let v = bytes::read_u64(cols[vc[vi] as usize], child_idx * 8);
-                                bytes::write_u64(state, f_offset, v);
-                            }
-                            StructFieldType::Bool => {
-                                let v = cell_u32(cols, vc[vi], child_idx);
-                                state[f_offset as usize] = u8::from(v != 0);
-                            }
-                            // Array fields in ordered-list rows are unsupported.
-                            StructFieldType::ArrayU32
-                            | StructFieldType::ArrayI64
-                            | StructFieldType::ArrayF64
-                            | StructFieldType::ArrayString
-                            | StructFieldType::ArrayBool => {}
-                            StructFieldType::Vo => return INVALID_PROGRAM,
-                        }
-                    }
+                    write_struct_list_row(
+                        state,
+                        slot_offset,
+                        num_fields,
+                        row_off,
+                        row_size,
+                        vc,
+                        fi,
+                        cols,
+                        valid.as_slice(),
+                        child_idx,
+                    );
 
                     count += 1;
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
@@ -8816,6 +8838,89 @@ impl<I: KeyIndex> Vm<I> {
                     };
                     let marks = plan.marks();
                     let (state, _) = plan.apply();
+                    self.undo.finish_capture(delta_mode, state, capture);
+                    // An inner container write names no key of the slot; one
+                    // that changed nothing marked and logs nothing.
+                    if marks {
+                        self.rec.changed_whole(state, slot);
+                    }
+                }
+
+                // NESTED_LIST_APPEND_STRUCT (0x93)
+                Opcode::NestedListAppendStruct => {
+                    let slot = operand!(r.index());
+                    let outer_key_col = operand!(r.index());
+                    let num_vals = usize::from(operand!(r.byte()));
+                    let vals = &mut self.element_list_vals;
+                    if vals.decode_into(&mut r, num_vals, 0).is_none() {
+                        return INVALID_PROGRAM;
+                    }
+                    bpc = r.pos();
+                    let (vc, fi) = (vals.cols(), vals.fields());
+                    let valid = vals.validity(validity);
+                    if slot >= state_num_slots(state) {
+                        return INVALID_PROGRAM;
+                    }
+                    let meta = SlotMetaView::read(state, slot);
+                    if meta.slot_type() != SlotType::Nested {
+                        return INVALID_PROGRAM;
+                    }
+                    let prefix = nested::read_nested_prefix(state, meta.offset);
+                    if prefix.inner_type != SlotType::OrderedList {
+                        return INVALID_PROGRAM;
+                    }
+                    let Some(key_end) = child_idx.checked_add(1).and_then(|n| n.checked_mul(4))
+                    else {
+                        return ErrorCode::ColumnUnderrun as u32;
+                    };
+                    let key_bytes = col_at(cols, outer_key_col as usize);
+                    if key_end as usize > key_bytes.len() {
+                        return ErrorCode::ColumnUnderrun as u32;
+                    }
+                    let outer_key = bytes::read_u32(key_bytes, child_idx * 4);
+                    let desc_off = nested::NestedPrefix::descriptor_offset(meta.offset);
+                    if let Err(error) = validate_scalar_fields(
+                        state,
+                        desc_off,
+                        prefix.num_fields,
+                        vc,
+                        fi,
+                        cols,
+                        valid.as_slice(),
+                        child_idx,
+                    ) {
+                        return error as u32;
+                    }
+                    let plan = match nested::prepare_nested_list_append_struct(
+                        state,
+                        &meta,
+                        outer_key,
+                        &mut self.nested_scratch,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => return self.signal_growth(slot, error),
+                    };
+                    let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
+                        Ok(capture) => capture,
+                        Err(error) => return error as u32,
+                    };
+                    let marks = plan.marks();
+                    let row_off = plan.list_row_offset().unwrap_or_else(|| {
+                        columine_types::die!("invariant: list append plan carries row offset")
+                    });
+                    let (state, _) = plan.apply();
+                    write_struct_list_row(
+                        state,
+                        desc_off,
+                        prefix.num_fields,
+                        row_off,
+                        u32::from(prefix.row_size),
+                        vc,
+                        fi,
+                        cols,
+                        valid.as_slice(),
+                        child_idx,
+                    );
                     self.undo.finish_capture(delta_mode, state, capture);
                     // An inner container write names no key of the slot; one
                     // that changed nothing marked and logs nothing.

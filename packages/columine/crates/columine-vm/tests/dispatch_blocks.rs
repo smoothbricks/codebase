@@ -989,7 +989,7 @@ fn nested_set_delta_restores_outer_inner_arena_and_growth() {
     let mut state = init(&prog);
     let before = state.clone();
     let meta = SlotMetaView::read(&state, 0);
-    let arena_header = arena_header_offset(meta.offset, meta.capacity);
+    let arena_header = arena_header_offset(meta.offset, 0, meta.capacity);
     assert_eq!(bytes::read_u32(&state, arena_header + 4), 0);
 
     let mut vm = Vm::default();
@@ -1061,7 +1061,7 @@ fn nested_map_update_delta_restores_prior_value_and_container_state() {
     let before_inner = get_inner_offset(&before, &before_meta, 9);
     let before_arena_used = bytes::read_u32(
         &before,
-        arena_header_offset(before_meta.offset, before_meta.capacity) + 4,
+        arena_header_offset(before_meta.offset, 0, before_meta.capacity) + 4,
     );
     vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
@@ -1084,7 +1084,7 @@ fn nested_map_update_delta_restores_prior_value_and_container_state() {
     assert_eq!(
         bytes::read_u32(
             &state,
-            arena_header_offset(after_meta.offset, after_meta.capacity) + 4,
+            arena_header_offset(after_meta.offset, 0, after_meta.capacity) + 4,
         ),
         before_arena_used,
     );
@@ -1116,7 +1116,7 @@ fn nested_aggregate_delta_restores_prior_value_count_and_arena_pointer() {
     let before_inner = get_inner_offset(&before, &before_meta, 5);
     let before_used = bytes::read_u32(
         &before,
-        arena_header_offset(before_meta.offset, before_meta.capacity) + 4,
+        arena_header_offset(before_meta.offset, 0, before_meta.capacity) + 4,
     );
     assert_eq!(inner_agg_get_f64(&before, before_inner), 11.75);
     assert_eq!(inner_agg_get_count(&before, before_inner, 1), 2);
@@ -1139,7 +1139,7 @@ fn nested_aggregate_delta_restores_prior_value_count_and_arena_pointer() {
     assert_eq!(
         bytes::read_u32(
             &state,
-            arena_header_offset(after_meta.offset, after_meta.capacity) + 4,
+            arena_header_offset(after_meta.offset, 0, after_meta.capacity) + 4,
         ),
         before_used,
     );
@@ -1155,7 +1155,7 @@ fn nested_set_insert_over_stale_arena_bytes_rolls_back_to_full_image() {
     let meta = SlotMetaView::read(&state, 0);
 
     // Stale allocated arena bytes: nonzero words where inner sets are placed.
-    let arena_data = arena_data_offset(meta.offset, meta.capacity);
+    let arena_data = arena_data_offset(meta.offset, 0, meta.capacity);
     for word in 0..8u32 {
         bytes::write_u32(&mut state, arena_data + word * 4, 0xD00D_0000 | word);
     }

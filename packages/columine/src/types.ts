@@ -217,6 +217,14 @@ export type SlotDef =
       capacity: number;
       elemType?: StructFieldType;
       fieldTypes?: readonly StructFieldType[];
+    }
+  | {
+      type: SlotType.NESTED;
+      outerCapacity: number;
+      innerType: SlotType;
+      innerInitialCapacity: number;
+      innerAggType?: AggType;
+      fieldTypes?: readonly StructFieldType[];
     };
 
 // =============================================================================
@@ -507,13 +515,14 @@ export enum Opcode {
 
   // Ordered list ops
   SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]
-  SLOT_NESTED = 0x1a, // slot, outer_type_flags, outer_cap_lo, outer_cap_hi, inner_type, inner_cap_lo, inner_cap_hi, inner_agg_type
+  SLOT_NESTED = 0x1a, // slot, outer_type_flags, outer_cap_lo, outer_cap_hi, inner_type, inner_cap_lo, inner_cap_hi, inner_agg_type [, num_fields, field_type × num_fields when inner_type == ORDERED_LIST]
   LIST_APPEND = 0x84, // slot, val_col
   LIST_APPEND_STRUCT = 0x85, // slot, num_vals, [(val_col, field_idx) × N]
 
   // Nested container ops (body opcodes inside FOR_EACH blocks)
   NESTED_SET_INSERT = 0x90, // slot, outer_key_col, elem_col
   NESTED_MAP_UPSERT_LAST = 0x92, // slot, outer_key_col, inner_key_col, val_col
+  NESTED_LIST_APPEND_STRUCT = 0x93, // slot, outer_key_col, num_vals, [(val_col, field_idx) × N]
   NESTED_AGG_UPDATE = 0x95, // slot, outer_key_col, val_col
 
   // Block-based reduce opcodes (body opcodes use same values as BATCH_* but process one element)

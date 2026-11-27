@@ -1,9 +1,53 @@
-//! Nested container slots: arena-allocated inner maps, sets, and aggregates.
+//! Nested container slots: arena-allocated inner maps, sets, aggregates, and
+//! ordered struct lists.
 //!
-//! `Map<K, Set<V>>`, `Map<K, Map<K2, V>>`, and `Map<K, Agg>` use an outer hash
-//! table whose values are offsets into a bump arena. Inner containers are
-//! initialized on first sight of an outer key and grow by rehashing into a new
-//! arena allocation.
+//! `Map<K, Set<V>>`, `Map<K, Map<K2, V>>`, `Map<K, Agg>`, and
+//! `Map<K, List<StructRow>>` use an outer open-addressed hash table whose
+//! values are absolute byte offsets into a slot-owned bump arena. Inner
+//! containers are initialized on first sight of an outer key and grow by
+//! allocating a doubled container in the arena, copying live contents, and
+//! re-pointing the outer entry.
+//!
+//! # Image Byte Layout (Little-Endian)
+//!
+//! Embedders reading the state image directly must match this layout:
+//!
+//! - **Slot metadata** (`STATE_HEADER_SIZE + slot * SLOT_META_SIZE`):
+//!   `OFFSET` (`+0`, `u32`) is `slot_offset`; `CAPACITY` (`+4`, `u32`) is
+//!   `outer_cap` (power of two); `SIZE` (`+8`, `u32`) is the outer live key
+//!   count; `TYPE_FLAGS` (`+12`, `u8`) has low nibble `SlotType::Nested` (`9`).
+//! - **Prefix** (`slot_offset .. slot_offset + 8`, [`NESTED_PREFIX_SIZE`]):
+//!   - `+0` `inner_type: u8` — low nibble is `SlotType` (`0` HashMap, `1` HashSet,
+//!     `2` Aggregate, `7` OrderedList).
+//!   - `+1..3` `inner_initial_cap: u16` — declared initial inner capacity
+//!     (default `16` when `0` in bytecode).
+//!   - `+3` `inner_agg_type: u8` — raw `AggType` for `Aggregate`, `0` for `OrderedList`.
+//!   - `+4` `depth: u8` — nesting depth (`1`).
+//!   - `+5` `num_fields: u8` — field count for `OrderedList` (`1..=255`), `0` otherwise.
+//!   - `+6..8` `row_size: u16` — 4-byte-padded struct row width for `OrderedList`, `0` otherwise.
+//! - **Field descriptor** (`slot_offset + 8 .. slot_offset + 8 + align8(num_fields)`):
+//!   present only when `num_fields > 0` (`OrderedList`); `num_fields` bytes of
+//!   [`columine_types::types::StructFieldType`] followed by zero padding to an
+//!   8-byte boundary. Zero bytes for `HashMap`, `HashSet`, and `Aggregate`.
+//! - **Outer key table** (`outer_keys_off = slot_offset + 8 + align8(num_fields)`):
+//!   `outer_cap` little-endian `u32` keys (`0xffff_ffff` empty, `0xffff_fffe`
+//!   tombstone), probed linearly starting at `hash_key(outer_key, outer_cap)`.
+//! - **Outer pointer table** (`outer_ptrs_off = outer_keys_off + outer_cap * 4`):
+//!   `outer_cap` little-endian `u32` absolute byte offsets into the state image
+//!   (`0` when absent).
+//! - **Arena header** (`arena_hdr_off = outer_ptrs_off + outer_cap * 4`):
+//!   `[arena_capacity: u32][arena_used: u32]` ([`ARENA_HDR_SIZE`] = 8).
+//! - **Arena data** (`arena_data_off = arena_hdr_off + 8`):
+//!   8-byte-aligned bump allocations.
+//! - **Inner `OrderedList` container** (at `ptr` in arena data):
+//!   `[count: u32 @ +0][capacity: u32 @ +4][rows: row_size × capacity @ +8]`
+//!   ([`LIST_HDR_BYTES`] = 8). Row `i` (`0 <= i < count`) starts at
+//!   `ptr + 8 + i * row_size` and is byte-identical to a top-level
+//!   `ORDERED_LIST` struct row:
+//!   `[bitset: ceil(num_fields / 8) bytes][field_0][field_1]...` padded to a
+//!   4-byte multiple. Bit `f` (`bitset[f / 8] & (1 << (f % 8))`) is 1 iff
+//!   field `f` was provided; `UInt32` and interned `String` are 4-byte `u32`,
+//!   `Int64` is 8-byte `i64`, `Float64` is 8-byte `f64`, and `Bool` is 1 byte.
 //!
 //! Preparation retains the original mutable image, one outer/inner probe, and
 //! any rehash destinations. A caller captures the plan's actual overwritten
@@ -15,26 +59,54 @@
 //! Raw public writers are unjournaled caller-owned storage operations.
 //! The VM's speculative entrypoints capture these paid plans before applying.
 
-use crate::meta::SlotMetaView;
+use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::{aggregates, bytes, hash_table};
 use columine_types::types::{
-    AggType, ChangeFlag, EMPTY_KEY, ErrorCode, SlotType, TOMBSTONE, hash_key, next_power_of_2,
+    AggType, ChangeFlag, EMPTY_KEY, ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
+    SlotType, SlotTypeFlags, StructFieldType, StructRowLayout, TOMBSTONE, align8, hash_key,
+    is_arena_field_type, next_power_of_2, state_num_slots,
 };
 
 /// Prefix stored at the start of a nested slot's data:
-/// `[inner_type:u8][inner_initial_cap:u16 le][inner_agg_type:u8][depth:u8][reserved:3]`.
+/// `[inner_type:u8][inner_initial_cap:u16 le][inner_agg_type:u8][depth:u8][num_fields:u8][row_size:u16 le]`.
 pub const NESTED_PREFIX_SIZE: u32 = 8;
 
 /// Arena header: `[capacity:u32][used:u32]`.
 pub const ARENA_HDR_SIZE: u32 = 8;
+
+/// Inner ordered-list container header: `[count:u32][capacity:u32]`.
+pub const LIST_HDR_BYTES: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NestedPrefix {
     pub inner_type: SlotType,
     pub inner_initial_cap: u16,
     /// Raw AggType byte (see `aggregates` on why raw bytes are the contract).
+    /// Must be `0` when `inner_type == SlotType::OrderedList`.
     pub inner_agg_type_byte: u8,
     pub depth: u8,
+    /// Number of struct fields for `SlotType::OrderedList`; `0` for other inner kinds.
+    pub num_fields: u8,
+    /// Four-byte-padded struct row size for `SlotType::OrderedList`; `0` for other inner kinds.
+    pub row_size: u16,
+}
+
+impl NestedPrefix {
+    /// Byte length of the 8-byte-aligned field-type descriptor following the prefix.
+    /// Zero for inner kinds without a field descriptor.
+    pub const fn descriptor_size(self) -> u32 {
+        align8(self.num_fields as u32)
+    }
+
+    /// Byte offset of the field-type descriptor within the state image.
+    pub const fn descriptor_offset(slot_offset: u32) -> u32 {
+        slot_offset + NESTED_PREFIX_SIZE
+    }
+
+    /// Byte width of one presence bitset in an inner struct row.
+    pub const fn bitset_bytes(self) -> u32 {
+        (self.num_fields as u32).div_ceil(8)
+    }
 }
 
 /// Write a nested-slot prefix without journaling.
@@ -45,7 +117,10 @@ pub fn write_nested_prefix(state: &mut [u8], slot_offset: u32, prefix: NestedPre
     state[base + 2] = (prefix.inner_initial_cap >> 8) as u8;
     state[base + 3] = prefix.inner_agg_type_byte;
     state[base + 4] = prefix.depth;
-    state[base + 5..base + 8].fill(0);
+    state[base + 5] = prefix.num_fields;
+    let [rs_lo, rs_hi] = prefix.row_size.to_le_bytes();
+    state[base + 6] = rs_lo;
+    state[base + 7] = rs_hi;
 }
 
 /// Read a nested-slot prefix. The stored inner type is an invariant this
@@ -62,43 +137,77 @@ pub fn read_nested_prefix(state: &[u8], slot_offset: u32) -> NestedPrefix {
         // Raw byte: `nested_agg_update` fails closed via AggType::from_u8.
         inner_agg_type_byte: agg_byte,
         depth: state[base + 4],
+        num_fields: state[base + 5],
+        row_size: u16::from_le_bytes([state[base + 6], state[base + 7]]),
     }
 }
 
-/// Offset of the outer key table.
-pub const fn outer_keys_offset(slot_offset: u32) -> u32 {
-    slot_offset + NESTED_PREFIX_SIZE
+/// Initial capacity of one inner container for `inner_type`.
+/// Hash tables normalize to a power of two (minimum 16); ordered lists use the
+/// exact declared `inner_initial_cap` (defaulting `0` to `16`).
+pub const fn effective_inner_cap(inner_type: SlotType, inner_initial_cap: u16) -> u32 {
+    let cap = inner_initial_cap as u32;
+    match inner_type {
+        SlotType::OrderedList => {
+            if cap == 0 {
+                16
+            } else {
+                cap
+            }
+        }
+        _ => next_power_of_2(cap),
+    }
+}
+
+/// Checked byte size of one inner `OrderedList` container (`[count][capacity][rows]`).
+pub const fn inner_list_byte_size(capacity: u32, row_size: u16) -> Option<u32> {
+    match capacity.checked_mul(row_size as u32) {
+        Some(rows) => rows.checked_add(LIST_HDR_BYTES),
+        None => None,
+    }
+}
+
+/// Offset of the outer key table, after the prefix and optional aligned descriptor.
+pub const fn outer_keys_offset(slot_offset: u32, descriptor_size: u32) -> u32 {
+    slot_offset + NESTED_PREFIX_SIZE + descriptor_size
 }
 
 /// Offset of the outer pointer table.
-pub const fn outer_ptrs_offset(slot_offset: u32, capacity: u32) -> u32 {
-    outer_keys_offset(slot_offset) + capacity * 4
+pub const fn outer_ptrs_offset(slot_offset: u32, descriptor_size: u32, capacity: u32) -> u32 {
+    outer_keys_offset(slot_offset, descriptor_size) + capacity * 4
 }
 
 /// Offset of the arena header.
-pub const fn arena_header_offset(slot_offset: u32, capacity: u32) -> u32 {
-    outer_ptrs_offset(slot_offset, capacity) + capacity * 4
+pub const fn arena_header_offset(slot_offset: u32, descriptor_size: u32, capacity: u32) -> u32 {
+    outer_ptrs_offset(slot_offset, descriptor_size, capacity) + capacity * 4
 }
 
 /// Offset of arena data.
-pub const fn arena_data_offset(slot_offset: u32, capacity: u32) -> u32 {
-    arena_header_offset(slot_offset, capacity) + ARENA_HDR_SIZE
+pub const fn arena_data_offset(slot_offset: u32, descriptor_size: u32, capacity: u32) -> u32 {
+    arena_header_offset(slot_offset, descriptor_size, capacity) + ARENA_HDR_SIZE
 }
 
 /// Compute inline-header size for an inner container.
-pub fn inner_container_size(inner_type: SlotType, capacity: u32, inner_agg_type_byte: u8) -> u32 {
+pub fn inner_container_size(
+    inner_type: SlotType,
+    capacity: u32,
+    inner_agg_type_byte: u8,
+    row_size: u16,
+) -> u32 {
     match inner_type {
         SlotType::HashMap => hash_table::hashmap_byte_size(capacity),
         SlotType::HashSet => hash_table::hashset_byte_size(capacity),
         SlotType::Aggregate => aggregates::agg_slot_byte_size(inner_agg_type_byte),
+        SlotType::OrderedList => LIST_HDR_BYTES + capacity * u32::from(row_size),
         _ => 0,
     }
 }
 
 /// Check the inner container at `pointer` lies whole in an arena whose data
 /// starts at `data` and whose used bytes are `used`: a table's capacity is a
-/// power of two, its size within its load, and its whole extent (header,
-/// keys and entries, or an aggregate's cells) inside the used bytes. A
+/// power of two, its size within its load; an ordered list's capacity is
+/// nonzero with `count <= capacity`; and its whole extent (header, keys and
+/// entries, rows, or an aggregate's cells) lies inside the used bytes. A
 /// container that reached past them would let an insert probe or write into
 /// another slot's storage.
 pub(crate) fn check_inner(
@@ -131,6 +240,17 @@ pub(crate) fn check_inner(
         SlotType::Aggregate => {
             u64::from(aggregates::agg_slot_byte_size(prefix.inner_agg_type_byte))
         }
+        SlotType::OrderedList => {
+            if room < LIST_HDR_BYTES || prefix.num_fields == 0 || prefix.row_size == 0 {
+                return Err(invalid);
+            }
+            let count = bytes::read_u32(state, pointer);
+            let cap = bytes::read_u32(state, pointer.checked_add(4).ok_or(invalid)?);
+            if cap == 0 || count > cap {
+                return Err(invalid);
+            }
+            u64::from(LIST_HDR_BYTES) + u64::from(cap) * u64::from(prefix.row_size)
+        }
         _ => return Err(invalid),
     };
     if extent > u64::from(room) {
@@ -139,20 +259,70 @@ pub(crate) fn check_inner(
     Ok(())
 }
 
-/// Compute nested slot data size: prefix + outer keys + outer pointers + arena
-/// header + pre-sized inner containers, each rounded to eight-byte alignment.
+/// Validate the prefix and field-type descriptor of a nested `OrderedList`
+/// slot and return its computed struct row layout.
+///
+/// Shared between state validation (`state_init::validate_state`) and embedder
+/// lookups (`nested_list_lookup`): requires `inner_initial_cap >= 1`,
+/// `inner_agg_type == 0`, `num_fields >= 1`, every descriptor byte to be a
+/// valid non-arena [`StructFieldType`], and `row_size` to equal
+/// `compute_struct_row_layout_padded(num_fields, descriptor).row_size`.
+pub(crate) fn check_ordered_list_prefix(
+    state: &[u8],
+    slot_offset: u32,
+    prefix: &NestedPrefix,
+) -> Result<StructRowLayout, ErrorCode> {
+    if prefix.inner_type != SlotType::OrderedList
+        || prefix.inner_initial_cap == 0
+        || prefix.inner_agg_type_byte != 0
+        || prefix.num_fields == 0
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    let desc_start = NestedPrefix::descriptor_offset(slot_offset);
+    let desc_end = desc_start
+        .checked_add(u32::from(prefix.num_fields))
+        .ok_or(ErrorCode::InvalidState)?;
+    let descriptor = state
+        .get(desc_start as usize..desc_end as usize)
+        .ok_or(ErrorCode::InvalidState)?;
+    if descriptor
+        .iter()
+        .any(|&ft| StructFieldType::from_u8(ft).is_none_or(is_arena_field_type))
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    let layout = crate::state_init::compute_struct_row_layout_padded(prefix.num_fields, descriptor);
+    if u32::from(prefix.row_size) != layout.row_size {
+        return Err(ErrorCode::InvalidState);
+    }
+    Ok(layout)
+}
+
+/// Compute nested slot data size: prefix + aligned field descriptor + outer
+/// keys + outer pointers + arena header + pre-sized inner containers, each
+/// rounded to eight-byte alignment.
 pub fn nested_slot_data_size(
     outer_cap: u32,
     inner_initial_cap: u32,
     inner_type: SlotType,
     inner_agg_type_byte: u8,
+    num_fields: u8,
+    row_size: u16,
 ) -> u32 {
-    let per_inner = columine_types::types::align8(inner_container_size(
+    let descriptor_size = align8(u32::from(num_fields));
+    let per_inner = align8(inner_container_size(
         inner_type,
         inner_initial_cap,
         inner_agg_type_byte,
+        row_size,
     ));
-    NESTED_PREFIX_SIZE + outer_cap * 4 + outer_cap * 4 + ARENA_HDR_SIZE + outer_cap * per_inner
+    NESTED_PREFIX_SIZE
+        + descriptor_size
+        + outer_cap * 4
+        + outer_cap * 4
+        + ARENA_HDR_SIZE
+        + outer_cap * per_inner
 }
 
 /// Initialize a nested slot's arena header without journaling.
@@ -236,16 +406,24 @@ pub struct OuterTable {
 }
 
 impl OuterTable {
-    /// Bind to a nested slot's outer table.
-    pub fn bind(meta: &SlotMetaView) -> Self {
+    /// Bind to a nested slot's outer table, reading the prefix to skip any
+    /// field-type descriptor.
+    pub fn bind(state: &[u8], meta: &SlotMetaView) -> Self {
+        let prefix = read_nested_prefix(state, meta.offset);
+        Self::bind_with_prefix(meta, &prefix)
+    }
+
+    /// Bind to a nested slot's outer table from an already-read prefix.
+    pub const fn bind_with_prefix(meta: &SlotMetaView, prefix: &NestedPrefix) -> Self {
         let slot_off = meta.offset;
         let cap = meta.capacity;
+        let desc = prefix.descriptor_size();
         Self {
             cap,
             size_off: meta.meta_base + columine_types::types::SlotMetaOffset::SIZE,
-            keys_off: outer_keys_offset(slot_off),
-            ptrs_off: outer_ptrs_offset(slot_off, cap),
-            arena: Arena::bind(arena_header_offset(slot_off, cap)),
+            keys_off: outer_keys_offset(slot_off, desc),
+            ptrs_off: outer_ptrs_offset(slot_off, desc, cap),
+            arena: Arena::bind(arena_header_offset(slot_off, desc, cap)),
         }
     }
 
@@ -477,6 +655,10 @@ enum Initialization {
         offset: u32,
         len: u32,
     },
+    List {
+        offset: u32,
+        capacity: u32,
+    },
 }
 
 enum InnerMutation {
@@ -499,6 +681,15 @@ enum InnerMutation {
     SumI64 {
         offset: u32,
         total: i64,
+    },
+    /// Append one struct row to an inner ordered list, copying existing rows
+    /// when the list doubled into a new arena allocation.
+    ListAppend {
+        list_offset: u32,
+        copy_from: Option<(u32, u32)>,
+        row_off: u32,
+        row_size: u32,
+        next_count: u32,
     },
 }
 
@@ -532,6 +723,14 @@ impl<'state, 'work> NestedMutation<'state, 'work> {
 
     pub fn ranges(&self) -> &[(u32, u32)] {
         &self.scratch.ranges
+    }
+
+    /// Absolute byte offset of the appended struct row for a list-append plan.
+    pub fn list_row_offset(&self) -> Option<u32> {
+        match self.mutation {
+            InnerMutation::ListAppend { row_off, .. } => Some(row_off),
+            _ => None,
+        }
     }
 
     fn push_range(&mut self, offset: u32, len: u32) {
@@ -581,6 +780,7 @@ impl<'state, 'work> NestedMutation<'state, 'work> {
                 self.push_range(offset, hash_table::HDR_BYTES + capacity * 4);
             }
             Initialization::Aggregate { offset, len } => self.push_range(offset, len),
+            Initialization::List { offset, .. } => self.push_range(offset, LIST_HDR_BYTES),
         }
     }
 
@@ -597,6 +797,10 @@ impl<'state, 'work> NestedMutation<'state, 'work> {
                     hash_table::FlatTable::init(state, offset, capacity, entry_size);
                 }
                 Initialization::Aggregate { offset, len } => bytes::zero(state, offset, len),
+                Initialization::List { offset, capacity } => {
+                    bytes::write_u32(state, offset, 0);
+                    bytes::write_u32(state, offset + 4, capacity);
+                }
             }
         }
         if let Some(used) = self.next_used {
@@ -684,6 +888,21 @@ impl<'state, 'work> NestedMutation<'state, 'work> {
                 bytes::write_i64(state, offset, total);
                 bytes::write_u64(state, offset + 8, count + 1);
             }
+            InnerMutation::ListAppend {
+                list_offset,
+                copy_from,
+                row_off,
+                row_size,
+                next_count,
+            } => {
+                if let Some((old_rows_off, copy_bytes)) = copy_from {
+                    let src = old_rows_off as usize;
+                    let dst = (list_offset + LIST_HDR_BYTES) as usize;
+                    state.copy_within(src..src + copy_bytes as usize, dst);
+                }
+                bytes::zero(state, row_off, row_size);
+                bytes::write_u32(state, list_offset, next_count);
+            }
         }
         if self.flags != 0 {
             self.meta.mark(state, self.flags);
@@ -704,7 +923,7 @@ fn prepare_outer<'state, 'work>(
     if prefix.inner_type != inner_type {
         return Err(ErrorCode::InvalidProgram);
     }
-    let outer = OuterTable::bind(meta);
+    let outer = OuterTable::bind_with_prefix(meta, &prefix);
     // A sentinel names no key: no growth could place it.
     if outer_key >= TOMBSTONE {
         return Err(ErrorCode::InvalidKey);
@@ -748,24 +967,43 @@ fn prepare_outer<'state, 'work>(
         flags: if probe.found { 0 } else { ChangeFlag::INSERTED },
     };
     if !probe.found {
-        let capacity = next_power_of_2(u32::from(prefix.inner_initial_cap));
-        let len = inner_container_size(inner_type, capacity, prefix.inner_agg_type_byte);
+        let capacity = effective_inner_cap(inner_type, prefix.inner_initial_cap);
+        let len = if inner_type == SlotType::OrderedList {
+            if prefix.num_fields == 0 || prefix.row_size == 0 {
+                return Err(ErrorCode::InvalidState);
+            }
+            inner_list_byte_size(capacity, prefix.row_size).ok_or(ErrorCode::CapacityExceeded)?
+        } else {
+            inner_container_size(
+                inner_type,
+                capacity,
+                prefix.inner_agg_type_byte,
+                prefix.row_size,
+            )
+        };
         let offset = plan.allocate(len)?;
         plan.inner_offset = offset;
         plan.push_range(outer.keys_off + probe.pos * 4, 4);
         plan.push_range(outer.size_off, 4);
-        if inner_type == SlotType::Aggregate {
-            plan.initialize(Initialization::Aggregate { offset, len });
-        } else {
-            plan.initialize(Initialization::Table {
-                offset,
-                capacity,
-                entry_size: if inner_type == SlotType::HashMap {
-                    hash_table::ENTRY_U32
-                } else {
-                    hash_table::ENTRY_NONE
-                },
-            });
+        match inner_type {
+            SlotType::Aggregate => {
+                plan.initialize(Initialization::Aggregate { offset, len });
+            }
+            SlotType::OrderedList => {
+                plan.initialize(Initialization::List { offset, capacity });
+            }
+            SlotType::HashMap | SlotType::HashSet => {
+                plan.initialize(Initialization::Table {
+                    offset,
+                    capacity,
+                    entry_size: if inner_type == SlotType::HashMap {
+                        hash_table::ENTRY_U32
+                    } else {
+                        hash_table::ENTRY_NONE
+                    },
+                });
+            }
+            _ => return Err(ErrorCode::InvalidProgram),
         }
     }
     Ok(plan)
@@ -1014,6 +1252,100 @@ pub fn prepare_nested_agg_update<'state, 'work>(
     Ok(plan)
 }
 
+/// Plan appending one struct row to `outer_key`'s inner ordered list.
+///
+/// On apply, the caller captures [`NestedMutation::ranges`], calls
+/// [`NestedMutation::apply`], and then writes the row's scalar fields at
+/// [`NestedMutation::list_row_offset`] before finishing the capture.
+pub fn prepare_nested_list_append_struct<'state, 'work>(
+    state: &'state mut [u8],
+    meta: &SlotMetaView,
+    outer_key: u32,
+    scratch: &'work mut NestedScratch,
+) -> Result<NestedMutation<'state, 'work>, ErrorCode> {
+    let mut plan = prepare_outer(state, meta, outer_key, scratch, SlotType::OrderedList)?;
+    let prefix = read_nested_prefix(plan.state, meta.offset);
+    if prefix.num_fields == 0 || prefix.row_size == 0 {
+        return Err(ErrorCode::InvalidState);
+    }
+    let row_size = u32::from(prefix.row_size);
+
+    if plan.outer_new {
+        let row_off = plan
+            .inner_offset
+            .checked_add(LIST_HDR_BYTES)
+            .ok_or(ErrorCode::InvalidState)?;
+        plan.push_range(row_off, row_size);
+        plan.mutation = InnerMutation::ListAppend {
+            list_offset: plan.inner_offset,
+            copy_from: None,
+            row_off,
+            row_size,
+            next_count: 1,
+        };
+        plan.flags |= ChangeFlag::INSERTED;
+        finish_plan(&mut plan);
+        return Ok(plan);
+    }
+
+    let count = bytes::read_u32(plan.state, plan.inner_offset);
+    let capacity = bytes::read_u32(plan.state, plan.inner_offset + 4);
+    if count < capacity {
+        let row_off = count
+            .checked_mul(row_size)
+            .and_then(|off| {
+                plan.inner_offset
+                    .checked_add(LIST_HDR_BYTES)?
+                    .checked_add(off)
+            })
+            .ok_or(ErrorCode::InvalidState)?;
+        plan.push_range(plan.inner_offset, 4);
+        plan.push_range(row_off, row_size);
+        plan.mutation = InnerMutation::ListAppend {
+            list_offset: plan.inner_offset,
+            copy_from: None,
+            row_off,
+            row_size,
+            next_count: count + 1,
+        };
+        plan.flags |= ChangeFlag::INSERTED;
+        finish_plan(&mut plan);
+        return Ok(plan);
+    }
+
+    let new_cap = capacity.checked_mul(2).ok_or(ErrorCode::CapacityExceeded)?;
+    let new_len =
+        inner_list_byte_size(new_cap, prefix.row_size).ok_or(ErrorCode::CapacityExceeded)?;
+    let old_offset = plan.inner_offset;
+    let new_offset = plan.allocate(new_len)?;
+    let copy_bytes = count.checked_mul(row_size).ok_or(ErrorCode::InvalidState)?;
+    let new_rows_off = new_offset
+        .checked_add(LIST_HDR_BYTES)
+        .ok_or(ErrorCode::InvalidState)?;
+    let row_off = new_rows_off
+        .checked_add(copy_bytes)
+        .ok_or(ErrorCode::InvalidState)?;
+    let written_bytes = copy_bytes
+        .checked_add(row_size)
+        .ok_or(ErrorCode::InvalidState)?;
+    plan.inner_offset = new_offset;
+    plan.initialize(Initialization::List {
+        offset: new_offset,
+        capacity: new_cap,
+    });
+    plan.push_range(new_rows_off, written_bytes);
+    plan.mutation = InnerMutation::ListAppend {
+        list_offset: new_offset,
+        copy_from: (copy_bytes > 0).then_some((old_offset + LIST_HDR_BYTES, copy_bytes)),
+        row_off,
+        row_size,
+        next_count: count + 1,
+    };
+    plan.flags |= ChangeFlag::INSERTED;
+    finish_plan(&mut plan);
+    Ok(plan)
+}
+
 /// Insert into an outer-keyed inner set without journaling, planning in the
 /// caller's retained `scratch`.
 pub fn nested_set_insert(
@@ -1107,19 +1439,24 @@ pub(crate) fn batch_demand(
     let entry_size = match inner_type {
         SlotType::HashMap => hash_table::ENTRY_U32,
         SlotType::HashSet => hash_table::ENTRY_NONE,
-        SlotType::Aggregate => 0,
+        SlotType::Aggregate | SlotType::OrderedList => 0,
         _ => return None,
     };
     let aggregate = inner_type == SlotType::Aggregate;
-    if aggregate {
+    let ordered_list = inner_type == SlotType::OrderedList;
+    if aggregate || ordered_list {
         for pair in pairs.iter_mut() {
             pair.1 = 0;
         }
     }
     pairs.sort_unstable();
-    pairs.dedup();
-    let outer = OuterTable::bind(meta);
-    let initial_cap = next_power_of_2(u32::from(prefix.inner_initial_cap));
+    // Ordered lists append once per row even for repeated outer keys; sets,
+    // maps, and aggregates collapse duplicate `(outer, inner)` pairs.
+    if !ordered_list {
+        pairs.dedup();
+    }
+    let outer = OuterTable::bind_with_prefix(meta, &prefix);
+    let initial_cap = effective_inner_cap(inner_type, prefix.inner_initial_cap);
     let mut demand = NestedDemand::default();
     let mut bytes = 0u64;
     let align = |len: u64| (len + 7) & !7;
@@ -1127,10 +1464,40 @@ pub(crate) fn batch_demand(
     while at < pairs.len() {
         let key = pairs[at].0;
         let end = at + pairs[at..].iter().take_while(|pair| pair.0 == key).count();
-        if key >= TOMBSTONE || (!aggregate && pairs[at..end].iter().any(|p| p.1 >= TOMBSTONE)) {
+        if key >= TOMBSTONE
+            || (!aggregate && !ordered_list && pairs[at..end].iter().any(|p| p.1 >= TOMBSTONE))
+        {
             return None;
         }
         let offset = outer.lookup_checked(state, key, &prefix).ok()?;
+        if ordered_list {
+            if prefix.num_fields == 0 || prefix.row_size == 0 {
+                return None;
+            }
+            let (mut cap, mut count) = if offset != 0 {
+                (
+                    bytes::read_u32(state, offset + 4),
+                    bytes::read_u32(state, offset),
+                )
+            } else {
+                demand.outer_keys += 1;
+                let init_bytes = u64::from(LIST_HDR_BYTES)
+                    .checked_add(u64::from(initial_cap).checked_mul(u64::from(prefix.row_size))?)?;
+                bytes = bytes.checked_add(align(init_bytes))?;
+                (initial_cap, 0)
+            };
+            for _ in at..end {
+                if count >= cap {
+                    cap = cap.checked_mul(2)?;
+                    let grown = u64::from(LIST_HDR_BYTES)
+                        .checked_add(u64::from(cap).checked_mul(u64::from(prefix.row_size))?)?;
+                    bytes = bytes.checked_add(align(grown))?;
+                }
+                count = count.checked_add(1)?;
+            }
+            at = end;
+            continue;
+        }
         let existing = (offset != 0 && !aggregate)
             .then(|| hash_table::FlatTable::bind(state, offset, entry_size));
         let (mut cap, mut size) = match existing {
@@ -1143,6 +1510,7 @@ pub(crate) fn batch_demand(
                 inner_type,
                 initial_cap,
                 prefix.inner_agg_type_byte,
+                prefix.row_size,
             )));
         }
         if !aggregate {
@@ -1174,9 +1542,122 @@ pub(crate) fn batch_demand(
     Some(demand)
 }
 
+/// Geometry of one outer key's inner ordered list inside a state image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NestedListView {
+    /// Absolute byte offset of row `0` in the state image (after `[count:u32][capacity:u32]`).
+    pub rows_offset: u32,
+    /// Number of appended rows currently stored (`0..=capacity`).
+    pub count: u32,
+    /// Allocated row capacity of this inner list container.
+    pub capacity: u32,
+    /// Four-byte-padded byte width of one struct row.
+    pub row_size: u32,
+    /// Absolute byte offset of the slot's field-type descriptor (`num_fields` bytes).
+    pub descriptor_offset: u32,
+    /// Number of fields per struct row (`1..=255`).
+    pub num_fields: u8,
+    /// Byte width of the per-row presence bitset (`ceil(num_fields / 8)`).
+    pub bitset_bytes: u32,
+}
+
+/// Look up `outer_key`'s inner ordered list in nested `slot`.
+///
+/// Returns `Ok(Some(view))` when `outer_key` is present in a well-formed nested
+/// `OrderedList` slot, or `Ok(None)` when `outer_key` is absent.
+///
+/// # Errors
+///
+/// - [`ErrorCode::InvalidSlot`] when `slot` is at or past the image's slot count.
+/// - [`ErrorCode::InvalidProgram`] when `slot` is another valid slot kind or a
+///   nested slot whose valid inner kind is not [`SlotType::OrderedList`].
+/// - [`ErrorCode::InvalidState`] when the image, slot metadata, prefix, arena
+///   bounds, or matched inner list container (checked via [`check_inner`]) is
+///   malformed.
+pub fn nested_list_lookup(
+    state: &[u8],
+    slot: u32,
+    outer_key: u32,
+) -> Result<Option<NestedListView>, ErrorCode> {
+    if state.len() < STATE_HEADER_SIZE as usize {
+        return Err(ErrorCode::InvalidState);
+    }
+    if slot >= state_num_slots(state) {
+        return Err(ErrorCode::InvalidSlot);
+    }
+    let meta_base = slot_meta_base(slot);
+    if meta_base
+        .checked_add(SLOT_META_SIZE)
+        .is_none_or(|end| end as usize > state.len())
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    let flags = SlotTypeFlags::from_byte(state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize]);
+    match flags.slot_type() {
+        Some(SlotType::Nested) => {}
+        Some(_) => return Err(ErrorCode::InvalidProgram),
+        None => return Err(ErrorCode::InvalidState),
+    }
+    let meta = SlotMetaView::read(state, slot);
+    if meta.capacity == 0 || !meta.capacity.is_power_of_two() {
+        return Err(ErrorCode::InvalidState);
+    }
+    if meta
+        .offset
+        .checked_add(NESTED_PREFIX_SIZE)
+        .is_none_or(|end| end as usize > state.len())
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    match SlotType::from_u8(state[meta.offset as usize] & 0x0f) {
+        Some(SlotType::OrderedList) => {}
+        Some(_) => return Err(ErrorCode::InvalidProgram),
+        None => return Err(ErrorCode::InvalidState),
+    }
+    let prefix = read_nested_prefix(state, meta.offset);
+    let layout = check_ordered_list_prefix(state, meta.offset, &prefix)?;
+    let arena_hdr = meta
+        .offset
+        .checked_add(NESTED_PREFIX_SIZE)
+        .and_then(|off| off.checked_add(layout.descriptor_size))
+        .and_then(|off| off.checked_add(meta.capacity.checked_mul(8)?))
+        .ok_or(ErrorCode::InvalidState)?;
+    let arena_data = arena_hdr
+        .checked_add(ARENA_HDR_SIZE)
+        .ok_or(ErrorCode::InvalidState)?;
+    if arena_data as usize > state.len() {
+        return Err(ErrorCode::InvalidState);
+    }
+    let arena_cap = bytes::read_u32(state, arena_hdr);
+    let arena_used = bytes::read_u32(state, arena_hdr + ARENA_HDR_USED);
+    if arena_used > arena_cap
+        || arena_data
+            .checked_add(arena_cap)
+            .is_none_or(|end| end as usize > state.len())
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    let outer = OuterTable::bind_with_prefix(&meta, &prefix);
+    let ptr = outer.lookup_checked(state, outer_key, &prefix)?;
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let count = bytes::read_u32(state, ptr);
+    let capacity = bytes::read_u32(state, ptr + 4);
+    Ok(Some(NestedListView {
+        rows_offset: ptr + LIST_HDR_BYTES,
+        count,
+        capacity,
+        row_size: layout.row_size,
+        descriptor_offset: NestedPrefix::descriptor_offset(meta.offset),
+        num_fields: prefix.num_fields,
+        bitset_bytes: layout.bitset_bytes,
+    }))
+}
+
 /// Return zero when the outer key is absent.
 pub fn get_inner_offset(state: &[u8], meta: &SlotMetaView, outer_key: u32) -> u32 {
-    OuterTable::bind(meta).lookup(state, outer_key)
+    OuterTable::bind(state, meta).lookup(state, outer_key)
 }
 
 /// Return the size of an inner set, or zero when absent.
@@ -1235,7 +1716,7 @@ mod tests {
     use columine_types::types::Opcode;
 
     fn program(inner: SlotType, inner_cap: u8, body: &[u8]) -> Vec<u8> {
-        let init = [
+        let mut init = vec![
             Opcode::SlotNested as u8,
             0,
             SlotType::Nested as u8,
@@ -1245,8 +1726,12 @@ mod tests {
             inner_cap,
             0,
             0,
-            Opcode::Halt as u8,
         ];
+        if inner == SlotType::OrderedList {
+            init.push(1);
+            init.push(columine_types::types::StructFieldType::UInt32 as u8);
+        }
+        init.push(Opcode::Halt as u8);
         let mut reduce = vec![Opcode::ForEach as u8, 2, 1];
         reduce.extend(1u32.to_le_bytes());
         reduce.extend((body.len() as u16).to_le_bytes());
@@ -1276,10 +1761,13 @@ mod tests {
         };
         let set_body = [Opcode::NestedSetInsert as u8, 0, 0, 1];
         let map_body = [Opcode::NestedMapUpsertLast as u8, 0, 0, 1, 1];
+        let list_body = [Opcode::NestedListAppendStruct as u8, 0, 0, 1, 1, 0];
         for (inner, cap, body) in [
             (SlotType::HashSet, 1u8, &set_body[..]),
             (SlotType::HashSet, 4, &set_body[..]),
             (SlotType::HashMap, 2, &map_body[..]),
+            (SlotType::OrderedList, 2, &list_body[..]),
+            (SlotType::OrderedList, 5, &list_body[..]),
         ] {
             let prog = program(inner, cap, body);
             let size = state_init::calculate_state_size(
@@ -1305,7 +1793,7 @@ mod tests {
                 pairs.clear();
                 pairs.extend(outer.iter().copied().zip(inner_keys.iter().copied()));
                 let demand = batch_demand(&state, &meta, inner, &mut pairs).unwrap();
-                let table = OuterTable::bind(&meta);
+                let table = OuterTable::bind(&state, &meta);
                 let (used, keys) = (table.arena.used(&state), table.size(&state));
                 let status = vm.execute_batch(
                     &mut state,
