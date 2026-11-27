@@ -986,7 +986,7 @@ index 506026f3b4cc57e6ebc7df150fdf254eca503f57..95c89046414997a78dee8627859d5b3e
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
 diff --git a/dist/src/daemon/client/daemon-environment.d.ts b/dist/src/daemon/client/daemon-environment.d.ts
-index 8e26fabee0312a273db08607758b25a8773e7660..ef5fd6f5fb1d94793db68ac5d1423df796718500 100644
+index 8e26fabee0312a273db08607758b25a8773e7660..23fb5bc139687cbc7cfde53cf2636ab524dbbdf4 100644
 --- a/dist/src/daemon/client/daemon-environment.d.ts
 +++ b/dist/src/daemon/client/daemon-environment.d.ts
 @@ -3,7 +3,9 @@
@@ -1000,7 +1000,7 @@ index 8e26fabee0312a273db08607758b25a8773e7660..ef5fd6f5fb1d94793db68ac5d1423df7
   */
  export declare function hashDaemonClientEnv(): string;
  export declare function getDaemonEnv(): NodeJS.ProcessEnv & {
-@@ -62,12 +64,34 @@ export declare function getAppliedDaemonClientEnv(): {
+@@ -62,12 +64,40 @@ export declare function getAppliedDaemonClientEnv(): {
   */
  export declare function applyDaemonEnvFromClient(newEnv: NodeJS.ProcessEnv): string[];
  /**
@@ -1032,17 +1032,23 @@ index 8e26fabee0312a273db08607758b25a8773e7660..ef5fd6f5fb1d94793db68ac5d1423df7
 + *   `bun-node-<hash>` directory whose `node` is Bun, puts it on PATH and names
 + *   it in NODE; that directory leaves PATH with NODE when its `node` is the one
 + *   PATH resolves. Any other NODE stays, and so does every other PATH entry.
-+ * - A run's mbx reservation endpoint (`MBX_RESERVATIONS_SOCKET`, or
-+ *   `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when it did not start): the endpoint
-+ *   of one Nx run, fresh for each, which every task inherits and no plugin
-+ *   reads. It leaves the identity; the daemon still receives it.
++ * - Per-job and per-task runtime variables read by no graph plugin: a run's
++ *   mbx reservation endpoint (`MBX_RESERVATIONS_SOCKET`), cowshed/mbx per-job
++ *   variables (`MAKEFLAGS`, `CARGO_MAKEFLAGS`, `COWSHED_INSTALL_OBSERVED`,
++ *   `MBX_SCHEDULER_JOB_STARTED_MS`, `MBX_SCHEDULER_JOB_ID`,
++ *   `COWSHED_MBX_SCHEDULER_PRIORITY`, `MBX_SCHEDULER_PRIORITY`), task-process
++ *   variables (`RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS`,
++ *   `MBX_SCHED_DISABLE`, `MBX_SCHED_DIR`, `MBX_RESERVE_CPUS`,
++ *   `NX_INVOCATION_ANCESTOR_PIDS`, `LERNA_PACKAGE_NAME`, `NX_WORKSPACE_ROOT`,
++ *   `DEVENV_TASK_FILE`), and the `BOUNDED_EXEC_` task-time namespace. They
++ *   leave graph identity; the daemon and its plugin workers still receive them.
 + * The order of the remaining PATH entries is kept. Returns a copy; never
 + * mutates runtime env.
   */
  export declare function normalizeDaemonEnvironmentForGraph(env: NodeJS.ProcessEnv, platform?: NodeJS.Platform): NodeJS.ProcessEnv;
  export declare function getChangedEnvKeys(before: NodeJS.ProcessEnv, after: NodeJS.ProcessEnv): string[];
 diff --git a/dist/src/daemon/client/daemon-environment.js b/dist/src/daemon/client/daemon-environment.js
-index 19295c8b71ab433f35b959ded9b92e97bc40c724..fb248c72156ca81d87874a78340f08cf1b0eccb4 100644
+index 19295c8b71ab433f35b959ded9b92e97bc40c724..bc2d816265ffba18676d113c8c5c4d35ab4e576a 100644
 --- a/dist/src/daemon/client/daemon-environment.js
 +++ b/dist/src/daemon/client/daemon-environment.js
 @@ -18,8 +18,11 @@ exports.getLiveClientBerryEnv = getLiveClientBerryEnv;
@@ -1077,7 +1083,7 @@ index 19295c8b71ab433f35b959ded9b92e97bc40c724..fb248c72156ca81d87874a78340f08cf
  }
  /**
   * `NX_LOAD_DOT_ENV_FILES` as its meaning rather than its spelling. `run-command`
-@@ -403,35 +408,187 @@ function applyDaemonEnvFromClient(newEnv) {
+@@ -403,35 +408,234 @@ function applyDaemonEnvFromClient(newEnv) {
  }
  const BERRY_BIN_FOLDER_GRAPH_IDENTITY = '<YARN_BERRY_BIN_FOLDER>';
  /**
@@ -1087,10 +1093,48 @@ index 19295c8b71ab433f35b959ded9b92e97bc40c724..fb248c72156ca81d87874a78340f08cf
 - * project-graph identity: two invocations whose environments differ only by it
 - * would compute the same graph. Strips the folder from PATH and pins the var to a sentinel so such
 - * environments compare equal. Returns a copy; never mutates runtime env.
-+ * What a run's task hooks publish for its tasks: the endpoint of the run's mbx
-+ * reservations, or why it has none. Fresh for each run, and read by no plugin.
++ * Per-job and per-task runtime variables that are read by no graph plugin:
++ * - A run's mbx reservation endpoint (`MBX_RESERVATIONS_SOCKET`), fresh per
++ *   Nx run and published by task hooks for its tasks.
++ * - Per-job cowshed/mbx variables that vary per invocation (`MAKEFLAGS`,
++ *   `CARGO_MAKEFLAGS`, `COWSHED_INSTALL_OBSERVED`,
++ *   `MBX_SCHEDULER_JOB_STARTED_MS`, `MBX_SCHEDULER_JOB_ID`,
++ *   `COWSHED_MBX_SCHEDULER_PRIORITY`, `MBX_SCHEDULER_PRIORITY`).
++ * - Per-task variables inherited by nested clients (`RUST_TEST_THREADS`,
++ *   `NEXTEST_TEST_THREADS`, `MBX_SCHED_DISABLE`, `MBX_SCHED_DIR`,
++ *   `MBX_RESERVE_CPUS`, `NX_INVOCATION_ANCESTOR_PIDS`, `LERNA_PACKAGE_NAME`,
++ *   `NX_WORKSPACE_ROOT`, `DEVENV_TASK_FILE`). Nx resolves its workspace root
++ *   from `NX_WORKSPACE_ROOT_PATH`, never `NX_WORKSPACE_ROOT`.
++ * Each leaves graph identity; the daemon and its plugin workers still receive
++ * the full runtime environment.
 + */
-+const RUN_RESERVATION_ENV = ['MBX_RESERVATIONS_SOCKET', 'BOUNDED_EXEC_RESERVATIONS_UNSERVED'];
++const RUN_NON_GRAPH_ENV = new Set([
++    'MBX_RESERVATIONS_SOCKET',
++    'MAKEFLAGS',
++    'CARGO_MAKEFLAGS',
++    'COWSHED_INSTALL_OBSERVED',
++    'MBX_SCHEDULER_JOB_STARTED_MS',
++    'MBX_SCHEDULER_JOB_ID',
++    'COWSHED_MBX_SCHEDULER_PRIORITY',
++    'MBX_SCHEDULER_PRIORITY',
++    'RUST_TEST_THREADS',
++    'NEXTEST_TEST_THREADS',
++    'MBX_SCHED_DISABLE',
++    'MBX_SCHED_DIR',
++    'MBX_RESERVE_CPUS',
++    'NX_INVOCATION_ANCESTOR_PIDS',
++    'LERNA_PACKAGE_NAME',
++    'NX_WORKSPACE_ROOT',
++    'DEVENV_TASK_FILE',
++]);
++/**
++ * Prefix of the `bounded-exec` task-time contract (`BOUNDED_EXEC_*`, including
++ * `BOUNDED_EXEC_RESERVATIONS_UNSERVED`, CPU pool/token descriptors, JUnit,
++ * progress, fixture, template, and mutation-report paths): every key under this
++ * prefix is task-time only, and a graph-time read of a `BOUNDED_EXEC_` key
++ * would be a defect.
++ */
++const RUN_NON_GRAPH_ENV_PREFIXES = ['BOUNDED_EXEC_'];
 +/** The directory Bun makes for one run when it finds no `node` on PATH. */
 +const BUN_NODE_SHIM = /^bun-node-[0-9a-f]+$/;
 +/** Errors that prove a path names nothing; any other leaves it unknown. */
@@ -1196,10 +1240,16 @@ index 19295c8b71ab433f35b959ded9b92e97bc40c724..fb248c72156ca81d87874a78340f08cf
 + *   `bun-node-<hash>` directory whose `node` is Bun, puts it on PATH and names
 + *   it in NODE; that directory leaves PATH with NODE when its `node` is the one
 + *   PATH resolves. Any other NODE stays, and so does every other PATH entry.
-+ * - A run's mbx reservation endpoint (`MBX_RESERVATIONS_SOCKET`, or
-+ *   `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when it did not start): the endpoint
-+ *   of one Nx run, fresh for each, which every task inherits and no plugin
-+ *   reads. It leaves the identity; the daemon still receives it.
++ * - Per-job and per-task runtime variables read by no graph plugin: a run's
++ *   mbx reservation endpoint (`MBX_RESERVATIONS_SOCKET`), cowshed/mbx per-job
++ *   variables (`MAKEFLAGS`, `CARGO_MAKEFLAGS`, `COWSHED_INSTALL_OBSERVED`,
++ *   `MBX_SCHEDULER_JOB_STARTED_MS`, `MBX_SCHEDULER_JOB_ID`,
++ *   `COWSHED_MBX_SCHEDULER_PRIORITY`, `MBX_SCHEDULER_PRIORITY`), task-process
++ *   variables (`RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS`,
++ *   `MBX_SCHED_DISABLE`, `MBX_SCHED_DIR`, `MBX_RESERVE_CPUS`,
++ *   `NX_INVOCATION_ANCESTOR_PIDS`, `LERNA_PACKAGE_NAME`, `NX_WORKSPACE_ROOT`,
++ *   `DEVENV_TASK_FILE`), and the `BOUNDED_EXEC_` task-time namespace. They
++ *   leave graph identity; the daemon and its plugin workers still receive them.
 + * The order of the remaining PATH entries is kept. Returns a copy; never
 + * mutates runtime env.
   */
@@ -1231,8 +1281,11 @@ index 19295c8b71ab433f35b959ded9b92e97bc40c724..fb248c72156ca81d87874a78340f08cf
 -            return platform === 'win32'
 -                ? withPlatformSeparators.toLowerCase()
 -                : withPlatformSeparators;
-+    for (const key of RUN_RESERVATION_ENV) {
-+        delete normalized[key];
++    for (const key of Object.keys(normalized)) {
++        if (RUN_NON_GRAPH_ENV.has(key) ||
++            RUN_NON_GRAPH_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
++            delete normalized[key];
++        }
 +    }
 +    if (normalized.NODE && facts.resolvedNode !== undefined) {
 +        const node = canonicalize(normalized.NODE);

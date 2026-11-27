@@ -970,16 +970,31 @@ stay, one above the workspace must go while proved absent and stay once a lookup
 <a id="smoo!n/nx-run-endpoint-graph-identity"></a>A run's `preTasksExecution` publishes the endpoint of its tasks' mbx
 reservations in the environment every task inherits
 (`packages/nx-plugin/src/executors/bounded-exec/mbx-reservations.ts`): `MBX_RESERVATIONS_SOCKET`, a fresh socket
-directory per run, or `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when the endpoint did not start. No plugin reads either.
-Stock Nx 24.0.3 counts both as project-graph identity, so the first request carrying a run's endpoint discarded the
-daemon's graph and built it again: 6.1 to 6.7 s of every dev boot of a consumer ("Graph recompute necessary due to env
-variable refresh. Changed keys: MBX_RESERVATIONS_SOCKET"). `normalizeDaemonEnvironmentForGraph` leaves both out beside
-the package-manager scaffolding above. The daemon and its plugin workers still receive them, and `hashDaemonClientEnv`,
-which keys a plugin's cache, follows the identity.
+directory per run, or `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when the endpoint did not start. Beside it, cowshed jobs and
+task processes vary per-invocation runtime variables that no graph plugin reads:
+
+- **Per-job variables:** `MAKEFLAGS`, `CARGO_MAKEFLAGS`, `COWSHED_INSTALL_OBSERVED`, `MBX_SCHEDULER_JOB_STARTED_MS`,
+  `MBX_SCHEDULER_JOB_ID`, `COWSHED_MBX_SCHEDULER_PRIORITY` and `MBX_SCHEDULER_PRIORITY`.
+- **Per-task variables:** `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS`, `MBX_SCHED_DISABLE`, `MBX_SCHED_DIR`,
+  `MBX_RESERVE_CPUS`, `NX_INVOCATION_ANCESTOR_PIDS`, `LERNA_PACKAGE_NAME`, `NX_WORKSPACE_ROOT` (Nx resolves its
+  workspace root from `NX_WORKSPACE_ROOT_PATH`, never `NX_WORKSPACE_ROOT`) and `DEVENV_TASK_FILE`.
+- **The `bounded-exec` task-time namespace:** every `BOUNDED_EXEC_*` key (including
+  `BOUNDED_EXEC_RESERVATIONS_UNSERVED`), whose contract is strictly task-time — a graph-time read of a `BOUNDED_EXEC_`
+  key would be a defect.
+
+Stock Nx 24.0.3 counts all of them as project-graph identity, so every request carrying a run's endpoint or a fresh
+cowshed job's environment discarded the daemon's graph and built it again: 6.1 to 6.7 s on a consumer's dev boot ("Graph
+recompute necessary due to env variable refresh. Changed keys: MBX_RESERVATIONS_SOCKET"), and measured 2026-11-27 in a
+fresh consumer shed, about 3 s of plugin work and 25–82k file lookups on every command.
+`normalizeDaemonEnvironmentForGraph` (`graphIdentity`) leaves `RUN_NON_GRAPH_ENV` and `RUN_NON_GRAPH_ENV_PREFIXES` out
+beside the package-manager scaffolding above. The daemon and its plugin workers still receive the full runtime
+environment, and `hashDaemonClientEnv`, which keys a plugin's cache, follows the identity.
 
 `packages/nx-plugin/src/nx-run-env-identity.test.ts` requires the installed normalization to give the same identity with
-and without either variable, whatever the socket's path, the daemon's env to still carry the socket, and any other
-variable a client sets to stay identity.
+and without each excluded variable (and `BOUNDED_EXEC_*`), the daemon's env to still carry per-job and run-endpoint
+variables, control variables a client or plugin reads to stay identity, and a real fixture daemon to keep its cached
+graph across per-job changes (`MBX_SCHEDULER_JOB_ID`, `CARGO_MAKEFLAGS`) while recomputing when a variable read by a
+fixture plugin changes.
 
 ## Sync generators run when a client asks
 
