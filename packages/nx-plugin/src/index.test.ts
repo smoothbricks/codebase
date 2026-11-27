@@ -4946,9 +4946,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const project = await inferProject(workspace, 'packages/example/package.json');
       const targets = project?.targets ?? {};
 
-      // `typecheck` delegates to `tsc-js` with no inputs or command of its own.
+      // `typecheck` delegates to `tsc-js`: it reads nothing (an empty input list) and runs no command of its own.
       expect(targets.typecheck).toEqual({ executor: 'nx:noop', inputs: [], dependsOn: ['tsc-js'] });
-      expect(targets.typecheck?.inputs).toBeUndefined();
       expect(targets.typecheck?.options).toBeUndefined();
       expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
 
