@@ -14145,7 +14145,7 @@ for pid in children:
 
     /// Red (b): a background job that reads no token and burns > 1.5 cores past its 1 s grace and
     /// 3 s window gets `PRIO_DARWIN_BG` on every process of its tree (read back via
-    /// `PROC_PIDTHREADINFO` `pth_maxpriority == 4`) and loses it at the gate's end (`== 63`),
+    /// `PROC_PIDTHREADINFO` `pth_maxpriority == 4`) and loses it at the gate's end (back to its pre-set ceiling),
     /// with `job.darwinbg.set` and `job.darwinbg.cleared` span rows.
     #[cfg(target_os = "macos")]
     #[tokio::test]
@@ -14390,7 +14390,7 @@ for pid in children:
 
     /// Red (idle host): a background job that ignores tokens and burns > 1.5 cores is never set
     /// `PRIO_DARWIN_BG` while the driven host CPU source reports at least one idle core across
-    /// several 3 s windows (`pth_maxpriority == 63`, no ledger entry, no `job.darwinbg.set` row).
+    /// several 3 s windows (keeps its pre-set ceiling, no ledger entry, no `job.darwinbg.set` row).
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_job_past_its_tokens_is_not_backgrounded_while_the_host_has_an_idle_core() {
@@ -14482,7 +14482,7 @@ for pid in children:
     /// Red (busy -> idle -> busy -> span-off): a token-ignoring burner is backgrounded when the
     /// driven host CPU source shows < 1 idle core (readback 4, `job.darwinbg.set` carries
     /// `host_idle_millicores`), restored within one window as soon as an idle core returns while
-    /// the gate still runs (readback 63, ledger cleared, `job.darwinbg.cleared` carries
+    /// the gate still runs (back to its pre-set ceiling, ledger cleared, `job.darwinbg.cleared` carries
     /// `host_idle_millicores`), judged again from its next window when the host loses its idle
     /// core again (readback 4), and cleared again when the gate ends (`host_idle_millicores` null).
     #[cfg(target_os = "macos")]
@@ -14526,7 +14526,7 @@ for pid in children:
         assert_tree_max_priority(&burner.pids, 4, "backgrounded without an idle core");
 
         // 2. An idle core returns (2000 mcores) while the gate still runs: cleared within one
-        // window (pth_maxpriority == 63, ledger cleared).
+        // window (back to its pre-set ceiling, ledger cleared).
         host_cpu_tx
             .send(host_cpu_reading(2_000))
             .expect("send idle host CPU reading");
@@ -14654,7 +14654,7 @@ for pid in children:
     /// (sending `SIGTERM`). Proven without a race by trapping `SIGTERM` in the burner: its
     /// handler reads its own threads' `pth_maxpriority` through `PROC_PIDTHREADINFO` and writes
     /// the values to a file before exiting. Today's code sends `SIGTERM` with `PRIO_DARWIN_BG`
-    /// still set so the handler records `4`; fixed, it records `63`.
+    /// still set so the handler records `4`; fixed, it records the process's pre-set ceiling.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn supervisor_recovery_clears_darwinbg_before_sending_sigterm() {
@@ -14833,7 +14833,7 @@ os.read(0, 1)
     /// Red (d): a gateway that goes silent while a land's gate runs (without closing the socket).
     /// Waiting the real 15 s `deadline::HEARTBEAT_SILENCE` bound (no test knob), the supervisor
     /// treats gate state as off, restores every drained token byte (`job.tokens.restored`), and
-    /// on macOS clears `PRIO_DARWIN_BG` (`pth_maxpriority == 63`, `job.darwinbg.cleared`).
+    /// on macOS clears `PRIO_DARWIN_BG` (back to its pre-set ceiling, `job.darwinbg.cleared`).
     #[tokio::test]
     async fn gateway_silence_restores_tokens_and_clears_darwinbg_within_silence_bound() {
         #[cfg(target_os = "macos")]
@@ -15492,7 +15492,7 @@ os.read(0, 1)
             .expect("stalled spawn entered channel closed");
 
         // Gateway goes silent while the actor is stalled. Every process of `burner`'s tree must
-        // read back `pth_maxpriority == 63` within the silence bound, BEFORE releasing the stall.
+        // read back its pre-set ceiling within the silence bound, BEFORE releasing the stall.
         fixture.gateway.go_silent();
         let bound = deadline::HEARTBEAT_SILENCE + deadline::HEARTBEAT;
         let pids = burner.pids.clone();

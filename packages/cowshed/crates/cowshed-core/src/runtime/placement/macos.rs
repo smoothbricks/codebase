@@ -131,10 +131,6 @@ pub fn decay_group(pgid: i32, nice: i32) -> io::Result<()> {
 /// `PRIO_DARWIN_BG` is active on a process (05_gateway.md "A land's gate takes tokens back").
 pub const DARWIN_BG_MAX_PRIORITY: i32 = 4;
 
-/// Thread priority ceiling reported by `PROC_PIDTHREADINFO` (`pth_maxpriority`) when unclamped
-/// and `PRIO_DARWIN_BG` is not active on a process.
-pub const DARWIN_NORMAL_MAX_PRIORITY: i32 = 63;
-
 /// Result of setting or clearing `PRIO_DARWIN_BG` on one process, checked via `PROC_PIDTHREADINFO`
 /// (`procinfo::thread_max_priorities`) — never `getpriority` or `getiopolicy_np`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,9 +295,9 @@ mod tests {
         assert!(child.wait_bounded().expect("reap child").success());
     }
 
-    /// Control 1: an unclamped child still confirms at 63 when cleared.
+    /// Control 1: a plain child confirms at whatever non-BG ceiling it inherited when cleared.
     #[test]
-    fn clear_darwinbg_confirms_an_unclamped_child_at_63() {
+    fn clear_darwinbg_confirms_a_child_at_its_inherited_ceiling() {
         use cowshed_os::test_backstop::ChildBackstop as _;
 
         let mut child = spawn_held_shell("/bin/sh", &["-c", "printf r; read _; exit 0"]);
@@ -309,24 +305,26 @@ mod tests {
         let before = procinfo::thread_max_priorities(pid.cast_signed())
             .expect("read pre-set ceiling")
             .expect("child is live");
+        assert!(!before.is_empty(), "expected at least one thread");
+        let baseline = before[0];
         assert!(
-            !before.is_empty() && before.iter().all(|&p| p == DARWIN_NORMAL_MAX_PRIORITY),
-            "expected unclamped ceiling 63, got {before:?}"
+            baseline > DARWIN_BG_MAX_PRIORITY && before.iter().all(|&p| p == baseline),
+            "expected consistent inherited ceiling > 4, got {before:?}"
         );
         assert_eq!(
             set_darwinbg(pid).expect("set darwinbg"),
             DarwinBgOutcome::Confirmed
         );
         assert_eq!(
-            clear_darwinbg(pid, Some(DARWIN_NORMAL_MAX_PRIORITY)).expect("clear darwinbg"),
+            clear_darwinbg(pid, Some(baseline)).expect("clear darwinbg"),
             DarwinBgOutcome::Confirmed
         );
         let after = procinfo::thread_max_priorities(pid.cast_signed())
             .expect("read post-clear ceiling")
             .expect("child is live");
         assert!(
-            !after.is_empty() && after.iter().all(|&p| p == DARWIN_NORMAL_MAX_PRIORITY),
-            "expected restored ceiling 63, got {after:?}"
+            !after.is_empty() && after.iter().all(|&p| p == baseline),
+            "expected restored ceiling {baseline}, got {after:?}"
         );
         drop(child.stdin.take());
         assert!(child.wait_bounded().expect("reap child").success());
@@ -337,6 +335,16 @@ mod tests {
     #[test]
     fn clear_darwinbg_is_unconfirmed_while_bg_remains_held() {
         use cowshed_os::test_backstop::ChildBackstop as _;
+
+        let own = procinfo::thread_max_priorities(std::process::id().cast_signed())
+            .expect("read own ceiling")
+            .expect("test process is live");
+        assert!(!own.is_empty(), "expected at least one thread");
+        let own_ceiling = own[0];
+        assert!(
+            own_ceiling > DARWIN_BG_MAX_PRIORITY,
+            "expected test process ceiling > 4, got {own:?}"
+        );
 
         let mut child = spawn_held_shell(
             "/usr/sbin/taskpolicy",
@@ -355,7 +363,7 @@ mod tests {
             DarwinBgOutcome::Confirmed
         );
         assert_eq!(
-            clear_darwinbg(pid, Some(DARWIN_NORMAL_MAX_PRIORITY)).expect("clear darwinbg"),
+            clear_darwinbg(pid, Some(own_ceiling)).expect("clear darwinbg"),
             DarwinBgOutcome::Unconfirmed
         );
         assert_eq!(
