@@ -27,28 +27,17 @@ export function overlappingTsconfigFiles(libFiles: Iterable<string>, testFiles: 
   return [...shared].sort();
 }
 
-/** Typed graph-time refusal when a project's library and test tsconfigs include the same file. */
-export class TsconfigOverlapError extends Error {
+/** A project whose library and test tsconfigs include the same files, as `smoo monorepo check` reports it. */
+export interface TsconfigOverlap {
   readonly projectName: string;
   readonly libConfig: string;
   readonly testConfig: string;
+  /** The shared files, project-relative with forward slashes, sorted. */
   readonly files: readonly string[];
-
-  constructor(projectName: string, libConfig: string, testConfig: string, files: readonly string[]) {
-    super(
-      `${projectName}: ${libConfig} and ${testConfig} both include ${files.join(', ')}. ` +
-        'Each source file must belong to exactly one tsconfig so it is type-checked once; ' +
-        `exclude each shared file from ${libConfig} or ${testConfig}.`,
-    );
-    this.name = 'TsconfigOverlapError';
-    this.projectName = projectName;
-    this.libConfig = libConfig;
-    this.testConfig = testConfig;
-    this.files = files;
-  }
+  readonly message: string;
 }
 
-export interface RefuseOverlappingTsconfigFilesInput {
+export interface TsconfigOverlapInput {
   readonly projectName: string;
   readonly projectRoot: string;
   readonly libConfig: string;
@@ -73,10 +62,24 @@ export function resolveTsconfigFileNames(configPath: string): readonly string[] 
   return parsed.fileNames;
 }
 
-/** Refuse a project whose library and test tsconfigs resolve any file in common. */
-export function refuseOverlappingTsconfigFiles(input: RefuseOverlappingTsconfigFilesInput): void {
+/**
+ * The overlap of a project whose library and test tsconfigs resolve any file in common, or undefined when they are
+ * disjoint. A finding of `smoo monorepo check`, never a graph-time refusal: a consuming workspace whose configs still
+ * overlap keeps a project graph (inference infers both checking targets, and the shared file is checked twice) while
+ * its check names each file to exclude.
+ */
+export function tsconfigOverlap(input: TsconfigOverlapInput): TsconfigOverlap | undefined {
   const shared = overlappingTsconfigFiles(input.libFiles, input.testFiles);
-  if (shared.length === 0) return;
-  const projectRelative = shared.map((file) => relative(input.projectRoot, file).split(sep).join('/')).sort();
-  throw new TsconfigOverlapError(input.projectName, input.libConfig, input.testConfig, projectRelative);
+  if (shared.length === 0) return undefined;
+  const files = shared.map((file) => relative(input.projectRoot, file).split(sep).join('/')).sort();
+  return {
+    projectName: input.projectName,
+    libConfig: input.libConfig,
+    testConfig: input.testConfig,
+    files,
+    message:
+      `${input.projectName}: ${input.libConfig} and ${input.testConfig} both include ${files.join(', ')}. ` +
+      'Each source file must belong to exactly one tsconfig so it is type-checked once; ' +
+      `exclude each shared file from ${input.libConfig} or ${input.testConfig}.`,
+  };
 }

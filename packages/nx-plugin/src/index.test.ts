@@ -5063,7 +5063,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('refuses a project whose tsconfig.lib.json and tsconfig.test.json include the same file', async () => {
+  it('infers both checking targets for a project whose tsconfig.lib.json and tsconfig.test.json include the same file', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/overlap/package.json', '{"name":"overlap"}\n');
@@ -5086,19 +5086,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/overlap/src/index.test.ts', 'export const ok = 1;\n');
       await workspace.write('packages/overlap/src/test-suite-tracer.ts', 'export const tracer = 1;\n');
 
-      const failure = await inferProjectTargets(workspace, 'packages/overlap/package.json').then(
-        () => undefined,
-        (error: unknown) => error,
-      );
-      if (!(failure instanceof AggregateCreateNodesError)) {
-        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
-      }
-      const message = failure.errors[0]?.[1]?.message ?? '';
-      expect(message).toContain('overlap');
-      expect(message).toContain('src/test-suite-tracer.ts');
-      expect(message).toContain('tsconfig.lib.json');
-      expect(message).toContain('tsconfig.test.json');
-      expect(message).toMatch(/exclude/i);
+      // The overlap is smoo monorepo check's finding (validateDisjointTsconfigs), never a graph-time refusal: a
+      // consuming workspace whose configs still overlap keeps a project graph to fix them in.
+      const targets = await inferProjectTargets(workspace, 'packages/overlap/package.json');
+      expect(targets['tsc-js']).toBeDefined();
+      expect(targets['typecheck-tests']).toBeDefined();
     } finally {
       await workspace.cleanup();
     }

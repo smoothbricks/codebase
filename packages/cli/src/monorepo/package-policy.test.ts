@@ -25,6 +25,7 @@ import {
   listValidCommitScopes,
   validateAggregateMemberCache,
   validateCacheOnlyAggregatesUncached,
+  validateDisjointTsconfigs,
   validateExplicitTaskInputs,
   validateNoStaleTestOutput,
   validateNxProjectNames,
@@ -590,6 +591,43 @@ describe('root smoo monorepo policy', () => {
       expect(errors.join('\n')).toContain('plugins must not configure @nx/js/typescript');
       expect(errors.join('\n')).toContain('Smoo owns transformer-aware TypeScript targets');
       expect(errors.join('\n')).not.toContain('Fix:');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('disjoint tsconfig policy', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('finds a package whose tsconfig.lib.json and tsconfig.test.json include the same file', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app' }],
+    });
+    try {
+      const app = join(root, 'packages/app');
+      await writeSource(join(app, 'src/index.ts'));
+      await writeSource(join(app, 'src/index.test.ts'));
+      await writeSource(join(app, 'src/test-suite-tracer.ts'));
+      const lib = { compilerOptions: { types: [] }, include: ['src/**/*.ts'], exclude: ['src/**/*.test.ts'] };
+      await writeFile(join(app, 'tsconfig.lib.json'), JSON.stringify(lib));
+      await writeFile(
+        join(app, 'tsconfig.test.json'),
+        JSON.stringify({ compilerOptions: { types: [] }, include: ['src/**/*.test.ts'] }),
+      );
+      expect(validateDisjointTsconfigs(root)).toBe(0);
+
+      await writeFile(
+        join(app, 'tsconfig.test.json'),
+        JSON.stringify({ compilerOptions: { types: [] }, include: ['src/**/*.test.ts', 'src/test-suite-tracer.ts'] }),
+      );
+      const errors = captureConsoleErrors();
+      expect(validateDisjointTsconfigs(root)).toBe(1);
+      expect(errors.join('\\n')).toContain('src/test-suite-tracer.ts');
+      expect(errors.join('\\n')).toContain('exclude each shared file');
     } finally {
       await rm(root, { recursive: true, force: true });
     }

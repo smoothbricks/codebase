@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { overlappingTsconfigFiles, refuseOverlappingTsconfigFiles, TsconfigOverlapError } from './tsconfig-overlap.js';
+import { overlappingTsconfigFiles, tsconfigOverlap } from './tsconfig-overlap.js';
 
 describe('overlappingTsconfigFiles', () => {
   it('returns an empty list when either set is empty or the sets are disjoint', () => {
@@ -28,40 +28,31 @@ describe('overlappingTsconfigFiles', () => {
   });
 });
 
-describe('refuseOverlappingTsconfigFiles', () => {
-  it('throws a typed error naming the project, each shared file, both configs and the fix', () => {
-    let caught: unknown;
-    try {
-      refuseOverlappingTsconfigFiles({
-        projectName: 'example',
-        projectRoot: '/ws/packages/example',
-        libConfig: 'tsconfig.lib.json',
-        testConfig: 'tsconfig.test.json',
-        libFiles: ['/ws/packages/example/src/index.ts', '/ws/packages/example/src/test-suite-tracer.ts'],
-        testFiles: ['/ws/packages/example/src/index.test.ts', '/ws/packages/example/src/test-suite-tracer.ts'],
-      });
-    } catch (error) {
-      caught = error;
-    }
+describe('tsconfigOverlap', () => {
+  it('names the project, each shared file, both configs and the fix', () => {
+    const overlap = tsconfigOverlap({
+      projectName: 'example',
+      projectRoot: '/ws/packages/example',
+      libConfig: 'tsconfig.lib.json',
+      testConfig: 'tsconfig.test.json',
+      libFiles: ['/ws/packages/example/src/index.ts', '/ws/packages/example/src/test-suite-tracer.ts'],
+      testFiles: ['/ws/packages/example/src/index.test.ts', '/ws/packages/example/src/test-suite-tracer.ts'],
+    });
 
-    expect(caught).toBeInstanceOf(TsconfigOverlapError);
-    if (!(caught instanceof TsconfigOverlapError)) {
-      throw new Error(`expected TsconfigOverlapError, got ${String(caught)}`);
-    }
-    expect(caught.projectName).toBe('example');
-    expect(caught.libConfig).toBe('tsconfig.lib.json');
-    expect(caught.testConfig).toBe('tsconfig.test.json');
-    expect(caught.files).toEqual(['src/test-suite-tracer.ts']);
-    expect(caught.message).toContain('example');
-    expect(caught.message).toContain('src/test-suite-tracer.ts');
-    expect(caught.message).toContain('tsconfig.lib.json');
-    expect(caught.message).toContain('tsconfig.test.json');
-    expect(caught.message).toMatch(/exclude/i);
+    expect(overlap?.projectName).toBe('example');
+    expect(overlap?.libConfig).toBe('tsconfig.lib.json');
+    expect(overlap?.testConfig).toBe('tsconfig.test.json');
+    expect(overlap?.files).toEqual(['src/test-suite-tracer.ts']);
+    expect(overlap?.message).toContain('example');
+    expect(overlap?.message).toContain('src/test-suite-tracer.ts');
+    expect(overlap?.message).toContain('tsconfig.lib.json');
+    expect(overlap?.message).toContain('tsconfig.test.json');
+    expect(overlap?.message).toMatch(/exclude/i);
   });
 
-  it('does not throw when lib and test file sets are disjoint', () => {
-    expect(() =>
-      refuseOverlappingTsconfigFiles({
+  it('is undefined when lib and test file sets are disjoint', () => {
+    expect(
+      tsconfigOverlap({
         projectName: 'example',
         projectRoot: '/ws/packages/example',
         libConfig: 'tsconfig.lib.json',
@@ -69,6 +60,6 @@ describe('refuseOverlappingTsconfigFiles', () => {
         libFiles: ['/ws/packages/example/src/index.ts'],
         testFiles: ['/ws/packages/example/src/index.test.ts'],
       }),
-    ).not.toThrow();
+    ).toBeUndefined();
   });
 });

@@ -1,4 +1,4 @@
-import { type Dirent, readdirSync, readFileSync, statSync } from 'node:fs';
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import {
   applyWorkspaceBoundedTestTargetPolicy,
@@ -23,6 +23,7 @@ import {
   SMOO_NX_RELEASE_TAG_PATTERN,
   SMOO_NX_VERSION_ACTIONS,
 } from '@smoothbricks/nx-plugin/release-config-policy';
+import { resolveTsconfigFileNames, tsconfigOverlap } from '@smoothbricks/nx-plugin/tsconfig-overlap';
 import { checkTypecheckTestPolicy } from '@smoothbricks/nx-plugin/typecheck-test-policy';
 import {
   applyWorkspaceConfigPolicy,
@@ -544,6 +545,34 @@ export function validateTestFileLocations(root: string): number {
       );
       failures++;
     }
+  }
+  return failures;
+}
+
+/**
+ * Every TypeScript source file of a package belongs to at most one of its checking tsconfigs: a file that both
+ * `tsconfig.lib.json` and `tsconfig.test.json` include is type-checked twice, by `tsc-js`/`typecheck` and by
+ * `typecheck-tests`. Each config resolves through TypeScript's own loader. The finding lives here rather than in graph
+ * inference, so a consuming workspace whose configs still overlap keeps a project graph to fix them in.
+ */
+export function validateDisjointTsconfigs(root: string): number {
+  let failures = 0;
+  for (const pkg of getWorkspacePackages(root)) {
+    const projectRoot = join(root, pkg.path);
+    const libConfig = join(projectRoot, 'tsconfig.lib.json');
+    const testConfig = join(projectRoot, 'tsconfig.test.json');
+    if (!existsSync(libConfig) || !existsSync(testConfig)) continue;
+    const overlap = tsconfigOverlap({
+      projectName: pkg.projectName,
+      projectRoot,
+      libConfig: 'tsconfig.lib.json',
+      testConfig: 'tsconfig.test.json',
+      libFiles: resolveTsconfigFileNames(libConfig),
+      testFiles: resolveTsconfigFileNames(testConfig),
+    });
+    if (overlap === undefined) continue;
+    console.error(overlap.message);
+    failures++;
   }
   return failures;
 }

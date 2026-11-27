@@ -32,6 +32,7 @@ import {
   listValidCommitScopes,
   validateAggregateMemberCache,
   validateCacheOnlyAggregatesUncached,
+  validateDisjointTsconfigs,
   validateExplicitTaskInputs,
   validateNoStaleTestOutput,
   validateNxProjectNames,
@@ -215,6 +216,7 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     validatePublicPackageMetadata(root) +
     validateSingletonPeerDependencies(root) +
     validateTestFileLocations(root) +
+    validateDisjointTsconfigs(root) +
     validateNoStaleTestOutput(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargetsByProject(projectTargets) }) +
     validateDevenvModuleImport(root) +

@@ -173,6 +173,12 @@
       "import": "./dist/workspace-package-policy.js",
       "default": "./dist/workspace-package-policy.js"
     },
+    "./tsconfig-overlap": {
+      "types": "./dist/tsconfig-overlap.d.ts",
+      "development": "./src/tsconfig-overlap.ts",
+      "import": "./dist/tsconfig-overlap.js",
+      "default": "./dist/tsconfig-overlap.js"
+    },
     "./deploy-policy": {
       "types": "./dist/deploy-policy.d.ts",
       "development": "./src/deploy-policy.ts",

@@ -130,7 +130,6 @@ import {
   pluginBuildDependsOn,
   resolveNativeTools,
 } from './tool-bins.js';
-import { refuseOverlappingTsconfigFiles, resolveTsconfigFileNames } from './tsconfig-overlap.js';
 import { typecheckRoute } from './typecheck-route.js';
 import {
   isBuildOutputTargetName,
@@ -1864,18 +1863,6 @@ async function createProjectTargets(
     [...(hasLibTsconfig ? [libTsconfigPath] : []), ...(hasTestTsconfig ? [testTsconfigPath] : [])],
     workspaceRoot,
   );
-  // Every source file belongs to at most one inferred checking target: resolve both tsconfigs once at inference
-  // and refuse any file included by both tsconfig.lib.json and tsconfig.test.json.
-  if (hasLibTsconfig && hasTestTsconfig) {
-    refuseOverlappingTsconfigFiles({
-      projectName,
-      projectRoot: absoluteProjectRoot,
-      libConfig: 'tsconfig.lib.json',
-      testConfig: 'tsconfig.test.json',
-      libFiles: resolveTsconfigFileNames(libTsconfigPath),
-      testFiles: resolveTsconfigFileNames(testTsconfigPath),
-    });
-  }
   // The packages a TypeScript task loads by name beyond its sources' imports, each keyed by the lock scope that
   // declares it where it loads (bun-lock-scope.ts): the project's own node keys its own declarations, and a root
   // declaration is named by itself, so no task is keyed on root tooling it never loads. A check reads the @types and

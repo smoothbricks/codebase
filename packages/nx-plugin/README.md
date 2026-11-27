@@ -1397,31 +1397,34 @@ Concrete targets come from concrete files:
   or `inputs` keeps the inferred emit, as Nx merges the two. Where a declaration replaces it (another executor, a
   top-level `command`, `options.command`/`options.commands`, or `options.tsConfig` naming another tsconfig), `typecheck`
   runs `SMOO_TYPECHECK_TSC` as `-p tsconfig.lib.json --noEmit`, directly rather than through `ttsc`. Every TypeScript
-  source file of a project belongs to at most one inferred checking target: graph inference resolves `tsconfig.lib.json`
-  and `tsconfig.test.json` through TypeScript's config loader and refuses any project whose two configs include the same
-  file, naming the project, each shared file, both configs, and the fix. `src/test-suite-tracer.ts` is test-only and
-  excluded from `tsconfig.lib.json`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them. A project
-  whose direct dependency (`dependencies` or `devDependencies`, the ones ttsc discovers plugins on) declares a dialect
-  runs `ttsc` instead of `SMOO_TYPECHECK_TSC` on `typecheck-tests`, `typecheck-tests:watch`, and (where `tsc-js` is
-  declared) `typecheck`. A dialect is a construct the stock checker refuses and the package's ttsc plugin lowers before
-  emit; its refusal is withdrawn through the driver's `DiagnosticPlugin` seam (the managed ttsc patch:
-  `LoweredDiagnostics` names the checker diagnostics whose cause the plugin's `ProgramPlugin` removes, and every lane
-  that gates on the program's diagnostics drops exactly those). When a transform host fails, stock ttsc checks the
-  project again with the stock compiler, which loads no plugin and reads each referenced project's declaration outputs
-  where the host read its sources, and appends whatever the host had not printed. The managed patch limits that pass in
-  two ways. A host that printed an error diagnostic of its own has reported its program, so ttsc skips the pass
-  (`PluginFailureDiagnostics.transformHostReported`; ttsc 0.38's own acknowledgement of a complete report comes from its
-  utility host only, not from typia's): no withdrawn refusal and no error of a reference that is not built yet comes
-  back after the real error. A host that printed none (a panic, or a hook or write error after a program that came out
-  clean once its refusals were withdrawn) still gets the pass, and there the host's record of what it withdrew, in the
-  file `TTSC_WITHDRAWN_DIAGNOSTICS_PATH` names, keeps the refusal out of it. The standalone compiler cannot judge such a
-  project without the plugin. The declaring package says so in its manifest,
-  `"smoo": { "typecheck": { "compiler": "ttsc", "dependsOn": ["<project>:<target>"] } }`, where `dependsOn` names the
-  targets that prepare the plugin binaries ttsc loads. The routed typecheck depends on them, so it loads built plugins
-  and never compiles one, and the inference guesses no workspace target. A declaration of another shape refuses the
-  inference by its manifest path. The routed `ttsc` runs the same pinned native compiler and builds its plugin hosts
-  against the same compiler source (`TTSC_TSGO_BINARY` and `TTSC_TSGO_SOURCE`), alongside `ttsc` in `bun.lock` and the
-  managed patch. A project that depends only on typia stays on the direct `SMOO_TYPECHECK_TSC` invocation.
+  source file of a project belongs to at most one inferred checking target: `smoo monorepo check` resolves
+  `tsconfig.lib.json` and `tsconfig.test.json` through TypeScript's config loader and fails on any project whose two
+  configs include the same file, naming the project, each shared file, both configs, and the fix. It is the check's
+  finding rather than a graph-time refusal so that a consuming workspace whose configs still overlap keeps a project
+  graph to fix them in; inference infers both checking targets there, and the shared file is checked twice.
+  `src/test-suite-tracer.ts` is test-only and excluded from `tsconfig.lib.json`. Transform plugins' diagnostics are
+  enforced by `tsc-js`, which runs them. A project whose direct dependency (`dependencies` or `devDependencies`, the
+  ones ttsc discovers plugins on) declares a dialect runs `ttsc` instead of `SMOO_TYPECHECK_TSC` on `typecheck-tests`,
+  `typecheck-tests:watch`, and (where `tsc-js` is declared) `typecheck`. A dialect is a construct the stock checker
+  refuses and the package's ttsc plugin lowers before emit; its refusal is withdrawn through the driver's
+  `DiagnosticPlugin` seam (the managed ttsc patch: `LoweredDiagnostics` names the checker diagnostics whose cause the
+  plugin's `ProgramPlugin` removes, and every lane that gates on the program's diagnostics drops exactly those). When a
+  transform host fails, stock ttsc checks the project again with the stock compiler, which loads no plugin and reads
+  each referenced project's declaration outputs where the host read its sources, and appends whatever the host had not
+  printed. The managed patch limits that pass in two ways. A host that printed an error diagnostic of its own has
+  reported its program, so ttsc skips the pass (`PluginFailureDiagnostics.transformHostReported`; ttsc 0.38's own
+  acknowledgement of a complete report comes from its utility host only, not from typia's): no withdrawn refusal and no
+  error of a reference that is not built yet comes back after the real error. A host that printed none (a panic, or a
+  hook or write error after a program that came out clean once its refusals were withdrawn) still gets the pass, and
+  there the host's record of what it withdrew, in the file `TTSC_WITHDRAWN_DIAGNOSTICS_PATH` names, keeps the refusal
+  out of it. The standalone compiler cannot judge such a project without the plugin. The declaring package says so in
+  its manifest, `"smoo": { "typecheck": { "compiler": "ttsc", "dependsOn": ["<project>:<target>"] } }`, where
+  `dependsOn` names the targets that prepare the plugin binaries ttsc loads. The routed typecheck depends on them, so it
+  loads built plugins and never compiles one, and the inference guesses no workspace target. A declaration of another
+  shape refuses the inference by its manifest path. The routed `ttsc` runs the same pinned native compiler and builds
+  its plugin hosts against the same compiler source (`TTSC_TSGO_BINARY` and `TTSC_TSGO_SOURCE`), alongside `ttsc` in
+  `bun.lock` and the managed patch. A project that depends only on typia stays on the direct `SMOO_TYPECHECK_TSC`
+  invocation.
 - Every target that runs the pinned native compiler or a `ttsc` plugin host built from it is keyed on
   `{ "env": "SMOO_TYPECHECK_TSC" }`: inferred `tsc-js`, every `scriptc-<arch>-<family>` target, `typecheck-tests`
   (direct or ttsc-routed), a `typecheck` that runs a command (direct or ttsc-routed; the noop that delegates to `tsc-js`
