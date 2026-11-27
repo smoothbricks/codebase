@@ -2120,6 +2120,35 @@ mod tests {
         }
     }
 
+    /// A FIFO beside a test's log that nothing writes, removed on every exit path: opening it to
+    /// read blocks until a writer comes, which none does.
+    struct Fifo(std::path::PathBuf);
+
+    impl Fifo {
+        fn beside(log: &LogFile) -> Self {
+            let path = log.0.with_extension("fifo");
+            let name =
+                std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
+                    .expect("a temporary path holds no NUL");
+            // SAFETY: `name` is NUL-terminated and lives through mkfifo.
+            let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+            assert_eq!(
+                made,
+                0,
+                "mkfifo {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            );
+            Self(path)
+        }
+    }
+
+    impl Drop for Fifo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn a_run_to_log_appends_both_streams_and_answers_the_exit() {
         let log = LogFile::new("exit");
@@ -2142,14 +2171,22 @@ mod tests {
     #[test]
     fn a_run_to_log_that_goes_silent_fails_naming_its_hung_process_and_is_ended() {
         let log = LogFile::new("silent");
+        // The process that hangs is the one that wrote: the shell, blocked in the `read` builtin
+        // opening a FIFO nothing writes. A builtin's redirection forks nothing, so the command the
+        // silence names was exec'd before the run began. A forked `sleep 600` could still be
+        // `/bin/sh` between its fork and its exec when the bound spends, on a loaded host.
+        let fifo = Fifo::beside(&log);
+        let script = format!("echo started; read line < '{}'", fifo.0.display());
         let failure = run_to_log(
             "probe command",
-            std::process::Command::new("/bin/sh").args(["-c", "echo started; sleep 600"]),
+            std::process::Command::new("/bin/sh").args(["-c", &script]),
             Members::OwnGroup,
             log.create(),
             Duration::from_millis(50),
         )
-        .expect_err("sleep 600 writes nothing and computes nothing within 50 ms");
+        .expect_err(
+            "a shell blocked opening an unwritten FIFO writes nothing and computes nothing",
+        );
         let RunError::Silent(run) = &failure else {
             panic!("expected SILENT, got {failure}");
         };
@@ -2158,12 +2195,16 @@ mod tests {
         assert_eq!(run.silent.holder.role, "probe command");
         assert_eq!(run.silent.last, Progress::Received { bytes: 8 });
         let members = run.group.as_ref().expect("the silent run's group");
+        let holder = libc::pid_t::try_from(run.silent.holder.pid).expect("a pid");
+        let hung = format!("/bin/sh -c {script}");
         assert!(
-            members.iter().any(|member| member.command == "sleep 600"),
+            members
+                .iter()
+                .any(|member| member.pid == holder && member.command == hung),
             "the hung process is named: {failure}"
         );
         assert_eq!(
-            procinfo::run_state(libc::pid_t::try_from(run.silent.holder.pid).expect("a pid")),
+            procinfo::run_state(holder),
             RunState::Gone,
             "the silent child was ended and reaped"
         );
