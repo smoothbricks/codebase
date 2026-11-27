@@ -325,7 +325,7 @@ async fn start_after<S: CliService>(
     service: &mut S,
     request: &AfterRequest,
     step: &crate::install_basis::StepStart,
-) -> std::result::Result<u64, String> {
+) -> std::result::Result<AdmittedAfter, String> {
     let program = service
         .background_program()
         .map_err(|error| error.message)?
@@ -344,22 +344,59 @@ async fn start_after<S: CliService>(
     })
     .await
 }
+/// Outcome of admitting the after-land job.
+#[derive(Debug, Eq, PartialEq)]
+struct AdmittedAfter {
+    job: u64,
+    /// Present when the installed copy printed a valid job id (proving admission) and then exited
+    /// non-zero (for example, a teardown failure after admission).
+    post_admission_exit: Option<PostAdmissionExit>,
+}
+
+/// A non-zero exit from the installed cowshed copy after it had already printed the admitted job
+/// id on stdout.
+#[derive(Debug, Eq, PartialEq)]
+struct PostAdmissionExit {
+    program: String,
+    status: String,
+    stderr: String,
+}
 
 fn record_after_outcome<W: Write + Send, E: Write + Send>(
     output: &mut Output<W, E>,
     turn_directory: &Path,
     head: &GitOid,
     pushing: bool,
-    started: std::result::Result<u64, String>,
+    started: std::result::Result<AdmittedAfter, String>,
 ) -> Result<()> {
     match started {
-        Ok(job) => say(
-            output,
-            &format!(
-                "the push and after-land commands run as job {job} of main, never awaited; their outcomes go to {}",
-                turn_directory.join(declared::LANDS_LOG).display(),
-            ),
-        ),
+        Ok(AdmittedAfter {
+            job,
+            post_admission_exit,
+        }) => {
+            say(
+                output,
+                &format!(
+                    "the push and after-land commands run as job {job} of main, never awaited; their outcomes go to {}",
+                    turn_directory.join(declared::LANDS_LOG).display(),
+                ),
+            )?;
+            if let Some(exited) = post_admission_exit {
+                let message = if exited.stderr.is_empty() {
+                    format!(
+                        "the installed cowshed ({}) {} after admitting job {job}",
+                        exited.program, exited.status
+                    )
+                } else {
+                    format!(
+                        "the installed cowshed ({}) {} after admitting job {job}: {}",
+                        exited.program, exited.status, exited.stderr
+                    )
+                };
+                output.warning(&message).map_err(output_error)?;
+            }
+            Ok(())
+        }
         Err(reason) => {
             let detail = format!(
                 "the after-land job was not admitted: {reason}; neither the push nor any after-land command ran"
@@ -390,7 +427,7 @@ async fn start_after_with<F, Fut>(
     request: &AfterRequest,
     step: &crate::install_basis::StepStart,
     submit: F,
-) -> std::result::Result<u64, String>
+) -> std::result::Result<AdmittedAfter, String>
 where
     F: FnOnce(crate::runtime::ExecCommand) -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
@@ -434,7 +471,10 @@ where
     // any other refusal, an unreplaced stable name, or a failed hand-off records push-failed with
     // the by-hand command.
     match submit(command).await {
-        Ok(job) => Ok(job),
+        Ok(job) => Ok(AdmittedAfter {
+            job,
+            post_admission_exit: None,
+        }),
         Err(error) if error.other_build_source().is_some() && step.replaced() => {
             submit_after_as_installed(step.support(), request, &argv, &rerun).await
         }
@@ -450,7 +490,7 @@ async fn submit_after_as_installed(
     request: &AfterRequest,
     argv: &[OsString],
     rerun: &str,
-) -> std::result::Result<u64, String> {
+) -> std::result::Result<AdmittedAfter, String> {
     let mut command = crate::install_basis::installed_command(support)
         .map_err(|error| not_admitted(&error, rerun))?;
     let program = command.get_program().to_string_lossy().into_owned();
@@ -476,6 +516,18 @@ async fn submit_after_as_installed(
     let (status, stdout, stderr) = crate::doc_commit::run_split(command, None, None)
         .await
         .map_err(|error| not_admitted(&error, rerun))?;
+    let output = String::from_utf8_lossy(&stdout);
+    if let Some(job) = parse_admitted_job_id(&output) {
+        let post_admission_exit = (!status.success()).then(|| PostAdmissionExit {
+            program,
+            status: describe(status),
+            stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+        });
+        return Ok(AdmittedAfter {
+            job,
+            post_admission_exit,
+        });
+    }
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
         let reason = if detail.is_empty() {
@@ -491,13 +543,19 @@ async fn submit_after_as_installed(
         };
         return Err(format!("{reason}; run it by hand: {rerun}"));
     }
-    let output = String::from_utf8_lossy(&stdout);
-    output.trim().parse::<u64>().map_err(|_| {
-        format!(
-            "the installed cowshed ({program}) did not report a job id (stdout: {}); run it by hand: {rerun}",
-            output.trim()
-        )
-    })
+    Err(format!(
+        "the installed cowshed ({program}) did not report a job id (stdout: {}); run it by hand: {rerun}",
+        output.trim()
+    ))
+}
+
+/// Parse stdout from `cowshed exec --background` as one bare unsigned job id: non-empty ASCII
+/// digits alone (after trimming surrounding whitespace), rejecting signs, extra lines, or prose.
+fn parse_admitted_job_id(stdout: &str) -> Option<u64> {
+    let trimmed = stdout.trim();
+    (!trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| trimmed.parse::<u64>().ok())
+        .flatten()
 }
 
 /// Why the after-land job was not admitted, and the command that runs it by hand: `rerun`, the
@@ -1673,7 +1731,10 @@ mod tests {
         .await;
         assert_eq!(
             started,
-            Ok(77),
+            Ok(super::AdmittedAfter {
+                job: 77,
+                post_admission_exit: None,
+            }),
             "installed copy must admit the after-land job"
         );
 
@@ -1861,5 +1922,59 @@ mod tests {
                 && detail.contains(crate::land_after::VERB),
             "{detail}"
         );
+    }
+
+    /// Red: if the installed copy prints a valid job id (proving admission) and then exits nonzero
+    /// (e.g. a teardown failure in bridge.shutdown()), the land treats the job as admitted, records
+    /// no push-failed, and warns with the exit status and stderr detail.
+    #[tokio::test]
+    async fn an_after_job_admitted_before_teardown_failure_returns_job_and_warns_without_push_failed()
+     {
+        let (_scratch, support, request) = after_fixture("teardown-fail");
+        let step = crate::install_basis::StepStart::at(&support);
+        let stable = support
+            .join("bin")
+            .join(crate::launchd::COWSHED_BINARY_NAME);
+        replace_stable_with_script(
+            &support,
+            "#!/bin/sh\nprintf '77\\n'\necho 'bridge shutdown failed' >&2\nexit 1\n",
+        );
+
+        let started = super::start_after_with(&stable, &request, &step, |_| async {
+            Err(other_build_refusal())
+        })
+        .await;
+        let admitted = started
+            .as_ref()
+            .expect("valid job id on stdout proves admission despite nonzero teardown exit");
+        assert_eq!(admitted.job, 77);
+        let post_exit = admitted
+            .post_admission_exit
+            .as_ref()
+            .expect("nonzero teardown exit must be preserved for caller warning");
+        assert_eq!(post_exit.status, "exited 1");
+        assert_eq!(post_exit.stderr, "bridge shutdown failed");
+        let mut output = super::Output::new(Vec::new(), Vec::new(), false);
+        super::record_after_outcome(&mut output, &request.turn, &request.head, true, started)
+            .expect("record admitted job with teardown warning");
+        let (_, stderr) = output.into_inner();
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(
+            stderr
+                .contains("the push and after-land commands run as job 77 of main, never awaited"),
+            "expected admitted job line on stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("exited 1 after admitting job 77: bridge shutdown failed"),
+            "expected post-admission exit warning on stderr: {stderr}"
+        );
+        assert!(
+            read_lands(&request.turn).is_empty(),
+            "must not record push-failed once the job id was admitted"
+        );
+        assert_eq!(super::parse_admitted_job_id("77\n"), Some(77));
+        assert_eq!(super::parse_admitted_job_id("+77\n"), None);
+        assert_eq!(super::parse_admitted_job_id("77\nextra\n"), None);
+        assert_eq!(super::parse_admitted_job_id(""), None);
     }
 }
