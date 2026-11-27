@@ -484,8 +484,10 @@ with their gates running, an exec in flight survives a restart with its result d
 overtook before its turn ends its turn unmoved and goes on as the installed cowshed ("A land step waits for an install
 in progress"). So the after-land install waits for the turns to fence in its order, before the slot, and runs once the
 gateway has fenced them for it ("The read fences the turns"), with no announcement, and records itself as an `installed`
-event in the land's `lands.log` (02_workspaces.md, "A declared land", step 6). The one window left, between a land's
-turn and its after-land job, is named in that job's `push-failed` record with the command to run by hand.
+event in the land's `lands.log` (02_workspaces.md, "A declared land", step 6). An after-land submit refused as another
+build after an install replaced the stable name goes on as the installed cowshed over the written request ("A land step
+waits for an install in progress"); any other refusal, or a failed hand-off, is named in `push-failed` with the command
+to run by hand.
 
 `land --preflight` only reads the pre-check fences (02_workspaces.md): it is not a land step, waits for no install,
 requires no matching daemon build and never re-execs the installed cowshed.

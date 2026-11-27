@@ -151,15 +151,10 @@ pub async fn wait_for_install(support_directory: &Path) -> Result<bool> {
     .map_err(|error| slot_error(&path, "lock", &error))
 }
 
-/// The command that carries a land step on as the installed cowshed, with this process's own
-/// arguments (05_gateway.md, "A land step waits for an install in progress"). A step that waited
-/// for an install is still the build it started as, and the daemon the install left refuses that
-/// build: measured 2026-10-21, a land's gate passed in 1,503 s, its next step waited for an
-/// install, and the daemon refused it as another build (exit 4), throwing the green gate away.
-/// So the step execs the stored copy the stable name says now, in place: the same pid, cwd,
-/// environment and descriptors, so the land's watchdog and log go on with it. The stable name is
-/// read once, here: the copy it names is the one this exec runs, whatever renames it afterwards.
-pub fn continue_as_installed(support_directory: &Path) -> Result<std::process::Command> {
+/// The stored copy the stable name in `support_directory` points to, as a command with `argv[0]`
+/// set to `cowshed` and no arguments yet. Reads the stable symlink once so a later rename does not
+/// change what runs.
+pub fn installed_command(support_directory: &Path) -> Result<std::process::Command> {
     let bin = support_directory.join("bin");
     let stable = bin.join(crate::launchd::COWSHED_BINARY_NAME);
     let named = std::fs::read_link(&stable).map_err(|error| {
@@ -178,6 +173,19 @@ pub fn continue_as_installed(support_directory: &Path) -> Result<std::process::C
         use std::os::unix::process::CommandExt as _;
         command.arg0(crate::launchd::COWSHED_BINARY_NAME);
     }
+    Ok(command)
+}
+
+/// The command that carries a land step on as the installed cowshed, with this process's own
+/// arguments (05_gateway.md, "A land step waits for an install in progress"). A step that waited
+/// for an install is still the build it started as, and the daemon the install left refuses that
+/// build: measured 2026-10-21, a land's gate passed in 1,503 s, its next step waited for an
+/// install, and the daemon refused it as another build (exit 4), throwing the green gate away.
+/// So the step execs the stored copy the stable name says now, in place: the same pid, cwd,
+/// environment and descriptors, so the land's watchdog and log go on with it. The stable name is
+/// read once, here: the copy it names is the one this exec runs, whatever renames it afterwards.
+pub fn continue_as_installed(support_directory: &Path) -> Result<std::process::Command> {
+    let mut command = installed_command(support_directory)?;
     command.args(std::env::args_os().skip(1));
     Ok(command)
 }

@@ -87,6 +87,7 @@ pub(crate) async fn land<S, W, E>(
     main: &Path,
     declaration: &LandDeclaration,
     land: DeclaredLand<'_>,
+    step: Option<&crate::install_basis::StepStart>,
     output: &mut Output<W, E>,
 ) -> Result<LandReport>
 where
@@ -94,6 +95,14 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    let fallback_step;
+    let step = match step {
+        Some(step) => step,
+        None => {
+            fallback_step = crate::install_basis::StepStart::at(&service.support_directory()?);
+            &fallback_step
+        }
+    };
     let root = service.land_turn_root()?;
     let turn_directory = root.join(declaration.turn().as_str());
     let environment = pure_environment(|name| std::env::var_os(name))?;
@@ -260,37 +269,8 @@ where
                 })
                 .collect(),
         };
-        match start_after(service, &request).await {
-            Ok(job) => say(
-                output,
-                &format!(
-                    "the push and after-land commands run as job {job} of main, never awaited; their outcomes go to {}",
-                    turn_directory.join(declared::LANDS_LOG).display(),
-                ),
-            )?,
-            Err(reason) => {
-                let detail = format!(
-                    "the after-land job was not admitted: {reason}; neither the push nor any after-land command ran"
-                );
-                note(
-                    output,
-                    &turn_directory,
-                    LandRecord::now(
-                        if pushing {
-                            LandEvent::PushFailed
-                        } else {
-                            LandEvent::AfterExited
-                        },
-                        routed.head.clone(),
-                        None,
-                        Some(detail.clone()),
-                    ),
-                )?;
-                output
-                    .warning(&format!("landed {}, but {detail}", routed.head.as_str()))
-                    .map_err(output_error)?;
-            }
-        }
+        let started = start_after(service, &request, step).await;
+        record_after_outcome(output, &turn_directory, &routed.head, pushing, started)?;
     }
     let landed = routed.retire?;
     if landed.retired {
@@ -344,12 +324,78 @@ where
 async fn start_after<S: CliService>(
     service: &mut S,
     request: &AfterRequest,
+    step: &crate::install_basis::StepStart,
 ) -> std::result::Result<u64, String> {
     let program = service
         .background_program()
         .map_err(|error| error.message)?
         .ok_or_else(|| "this store names no cowshed executable for background work".to_owned())?;
-    let argv = crate::land_after::argv(&program, request).map_err(|error| error.message)?;
+    start_after_with(&program, request, step, |command| async move {
+        service.require_daemon_of_this_build().await?;
+        service
+            .exec(
+                command,
+                crate::runtime::ExecPresentation::Control,
+                &mut std::io::sink(),
+                &mut std::io::sink(),
+            )
+            .await
+            .map(|result| result.info.job_id.get())
+    })
+    .await
+}
+
+fn record_after_outcome<W: Write + Send, E: Write + Send>(
+    output: &mut Output<W, E>,
+    turn_directory: &Path,
+    head: &GitOid,
+    pushing: bool,
+    started: std::result::Result<u64, String>,
+) -> Result<()> {
+    match started {
+        Ok(job) => say(
+            output,
+            &format!(
+                "the push and after-land commands run as job {job} of main, never awaited; their outcomes go to {}",
+                turn_directory.join(declared::LANDS_LOG).display(),
+            ),
+        ),
+        Err(reason) => {
+            let detail = format!(
+                "the after-land job was not admitted: {reason}; neither the push nor any after-land command ran"
+            );
+            note(
+                output,
+                turn_directory,
+                LandRecord::now(
+                    if pushing {
+                        LandEvent::PushFailed
+                    } else {
+                        LandEvent::AfterExited
+                    },
+                    head.clone(),
+                    None,
+                    Some(detail.clone()),
+                ),
+            )?;
+            output
+                .warning(&format!("landed {}, but {detail}", head.as_str()))
+                .map_err(output_error)
+        }
+    }
+}
+
+async fn start_after_with<F, Fut>(
+    program: &Path,
+    request: &AfterRequest,
+    step: &crate::install_basis::StepStart,
+    submit: F,
+) -> std::result::Result<u64, String>
+where
+    F: FnOnce(crate::runtime::ExecCommand) -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    let argv = crate::land_after::argv(program, request).map_err(|error| error.message)?;
     let rerun = argv
         .iter()
         .map(|word| shell_word(&word.to_string_lossy()))
@@ -359,7 +405,8 @@ async fn start_after<S: CliService>(
         workspace: cowshed_core::git::MAIN_REMOTE.to_owned(),
         request: cowshed_core::api::ExecRequest {
             command: cowshed_core::api::ExecCommand::Argv(
-                argv.into_iter()
+                argv.iter()
+                    .cloned()
                     .map(cowshed_core::api::CommandArg::from)
                     .collect(),
             ),
@@ -382,18 +429,75 @@ async fn start_after<S: CliService>(
         background: true,
         timeout: None,
     };
-    // The request is written, so a job refused now, by a daemon an install restarted onto another
-    // build after this land's turn ended, can be run by hand as the installed cowshed.
-    let result = service
-        .exec(
-            command,
-            crate::runtime::ExecPresentation::Control,
-            &mut std::io::sink(),
-            &mut std::io::sink(),
-        )
+    // The request is written. If the daemon became another build after an install replaced the
+    // stable name since this land began, hand the submission off once to the installed copy;
+    // any other refusal, an unreplaced stable name, or a failed hand-off records push-failed with
+    // the by-hand command.
+    match submit(command).await {
+        Ok(job) => Ok(job),
+        Err(error) if error.other_build_source().is_some() && step.replaced() => {
+            submit_after_as_installed(step.support(), request, &argv, &rerun).await
+        }
+        Err(error) => Err(not_admitted(&error, &rerun)),
+    }
+}
+
+/// Submit the already-written after-land request once through the installed cowshed's `exec`
+/// verb (`--host --background`, carrying `request.environment` verbatim). Never loops: a failure
+/// here returns the reason plus the by-hand rerun command.
+async fn submit_after_as_installed(
+    support: &Path,
+    request: &AfterRequest,
+    argv: &[OsString],
+    rerun: &str,
+) -> std::result::Result<u64, String> {
+    let mut command = crate::install_basis::installed_command(support)
+        .map_err(|error| not_admitted(&error, rerun))?;
+    let program = command.get_program().to_string_lossy().into_owned();
+    command
+        .arg("--project")
+        .arg(&request.main)
+        .arg("--quiet")
+        .args([
+            "exec",
+            cowshed_core::git::MAIN_REMOTE,
+            "--host",
+            "--background",
+            "--",
+        ])
+        .args(argv)
+        .env_clear()
+        .envs(
+            request
+                .environment
+                .iter()
+                .map(|(name, value)| (name, value)),
+        );
+    let (status, stdout, stderr) = crate::doc_commit::run_split(command, None, None)
         .await
-        .map_err(|error| not_admitted(&error, &rerun))?;
-    Ok(result.info.job_id.get())
+        .map_err(|error| not_admitted(&error, rerun))?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+        let reason = if detail.is_empty() {
+            format!(
+                "the installed cowshed ({program}) failed to submit the after-land job ({})",
+                describe(status)
+            )
+        } else {
+            format!(
+                "the installed cowshed ({program}) failed to submit the after-land job ({}): {detail}",
+                describe(status)
+            )
+        };
+        return Err(format!("{reason}; run it by hand: {rerun}"));
+    }
+    let output = String::from_utf8_lossy(&stdout);
+    output.trim().parse::<u64>().map_err(|_| {
+        format!(
+            "the installed cowshed ({program}) did not report a job id (stdout: {}); run it by hand: {rerun}",
+            output.trim()
+        )
+    })
 }
 
 /// Why the after-land job was not admitted, and the command that runs it by hand: `rerun`, the
@@ -1466,6 +1570,296 @@ mod tests {
             "the cowshed daemon is build installed-build; this cowshed is build landing-build; \
              run it by hand: '/Users/someone/Library/Application Support/dev.cowshed/bin/cowshed' \
              __land-after /tmp/lands/head.json"
+        );
+    }
+
+    fn after_fixture(
+        label: &str,
+    ) -> (
+        crate::temp_root::TempRoot,
+        std::path::PathBuf,
+        super::AfterRequest,
+    ) {
+        use cowshed_core::api::dto::GitOid;
+        use cowshed_core::declared_land::RemoteName;
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            &format!("cs-after-{label}"),
+        );
+        let support = scratch.join("support");
+        let bin = support.join("bin");
+        std::fs::create_dir_all(&bin).expect("create support bin");
+        let old = format!("cowshed-{}", "a".repeat(64));
+        std::fs::write(bin.join(&old), b"#!/bin/sh\nexit 99\n").expect("write old copy");
+        std::os::unix::fs::symlink(&old, bin.join(crate::launchd::COWSHED_BINARY_NAME))
+            .expect("link stable name");
+        let main = scratch.join("main");
+        std::fs::create_dir_all(&main).expect("create main");
+        let turn = scratch.join("turn");
+        let request = super::AfterRequest {
+            main,
+            turn,
+            branch: "main".to_owned(),
+            before: GitOid::new("1".repeat(40)).expect("before oid"),
+            head: GitOid::new("2".repeat(40)).expect("head oid"),
+            push: Some(RemoteName::parse("origin".to_owned()).expect("remote")),
+            after: vec![vec!["true".to_owned()]],
+            environment: vec![
+                ("HOME".to_owned(), scratch.display().to_string()),
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ],
+        };
+        (scratch, support, request)
+    }
+
+    fn replace_stable_with_script(support: &std::path::Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = support.join("bin");
+        let new_name = format!("cowshed-{}", "b".repeat(64));
+        let new_path = bin.join(&new_name);
+        std::fs::write(&new_path, script).expect("write new copy");
+        std::fs::set_permissions(&new_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod new copy");
+        let stable = bin.join(crate::launchd::COWSHED_BINARY_NAME);
+        std::fs::remove_file(&stable).expect("remove old stable symlink");
+        std::os::unix::fs::symlink(&new_name, &stable).expect("link new stable name");
+        new_path
+    }
+
+    fn other_build_refusal() -> cowshed_core::CowshedError {
+        use cowshed_core::error::OtherBuild;
+        cowshed_core::CowshedError::other_build(OtherBuild {
+            daemon: serde_json::from_value(serde_json::json!("installed-build")).unwrap(),
+            caller: Some(serde_json::from_value(serde_json::json!("landing-build")).unwrap()),
+        })
+    }
+
+    fn read_lands(turn: &std::path::Path) -> Vec<super::LandRecord> {
+        let path = turn.join(cowshed_core::declared_land::LANDS_LOG);
+        if !path.exists() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(&path)
+            .expect("read lands.log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse lands.log record"))
+            .collect()
+    }
+
+    /// Red: an after-land submit refused as another build after an install replaced the stable
+    /// name goes on as the installed copy over the written request and returns the admitted job id.
+    #[tokio::test]
+    async fn an_after_job_refused_as_another_build_after_an_install_goes_on_as_the_installed_copy()
+    {
+        let (scratch, support, request) = after_fixture("admitted");
+        let step = crate::install_basis::StepStart::at(&support);
+        let stable = support
+            .join("bin")
+            .join(crate::launchd::COWSHED_BINARY_NAME);
+        let argv_file = scratch.join("argv.txt");
+        let env_file = scratch.join("env.txt");
+        replace_stable_with_script(
+            &support,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nenv > '{}'\nprintf '77\\n'\n",
+                argv_file.display(),
+                env_file.display(),
+            ),
+        );
+
+        let started = super::start_after_with(&stable, &request, &step, |_| async {
+            Err(other_build_refusal())
+        })
+        .await;
+        assert_eq!(
+            started,
+            Ok(77),
+            "installed copy must admit the after-land job"
+        );
+
+        let mut output = super::Output::new(Vec::new(), Vec::new(), false);
+        super::record_after_outcome(&mut output, &request.turn, &request.head, true, started)
+            .expect("record job line");
+        let (_, stderr) = output.into_inner();
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(
+            stderr
+                .contains("the push and after-land commands run as job 77 of main, never awaited"),
+            "expected job line on stderr: {stderr}"
+        );
+        assert!(
+            read_lands(&request.turn).is_empty(),
+            "no push-failed record when installed copy admitted the job"
+        );
+
+        let request_path =
+            super::after_directory(&request.turn).join(format!("{}.json", request.head.as_str()));
+        assert!(request_path.is_file(), "request JSON must be written");
+        let passed_argv: Vec<String> = std::fs::read_to_string(&argv_file)
+            .expect("read recorded argv")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            passed_argv,
+            vec![
+                "--project",
+                &request.main.display().to_string(),
+                "--quiet",
+                "exec",
+                "main",
+                "--host",
+                "--background",
+                "--",
+                &stable.display().to_string(),
+                crate::land_after::VERB,
+                &request_path.display().to_string(),
+            ]
+        );
+        let passed_env = std::fs::read_to_string(&env_file).expect("read recorded env");
+        assert!(
+            passed_env
+                .lines()
+                .any(|line| line == format!("HOME={}", scratch.display()))
+                && passed_env.lines().any(|line| line == "PATH=/usr/bin:/bin"),
+            "installed copy must run with request.environment: {passed_env}"
+        );
+    }
+
+    /// Control: a refusal of any other kind never invokes the installed copy, even if the stable
+    /// name changed, and records `push-failed` with the by-hand command.
+    #[tokio::test]
+    async fn an_after_job_with_another_refusal_records_push_failed_without_handoff() {
+        let (scratch, support, request) = after_fixture("other-err");
+        let step = crate::install_basis::StepStart::at(&support);
+        let stable = support
+            .join("bin")
+            .join(crate::launchd::COWSHED_BINARY_NAME);
+        let invoked = scratch.join("invoked");
+        replace_stable_with_script(
+            &support,
+            &format!(
+                "#!/bin/sh\necho ran > '{}'\nprintf '77\\n'\n",
+                invoked.display()
+            ),
+        );
+
+        let started = super::start_after_with(&stable, &request, &step, |_| async {
+            Err(cowshed_core::CowshedError::environment_missing(
+                "daemon unreachable",
+                "start gateway",
+            ))
+        })
+        .await;
+        assert!(
+            started.is_err(),
+            "non-other-build refusal must not hand off"
+        );
+        assert!(!invoked.exists(), "installed copy must not be invoked");
+
+        let mut output = super::Output::new(Vec::new(), Vec::new(), false);
+        super::record_after_outcome(&mut output, &request.turn, &request.head, true, started)
+            .expect("record push-failed");
+        let lands = read_lands(&request.turn);
+        assert_eq!(lands.len(), 1);
+        assert_eq!(lands[0].event, super::LandEvent::PushFailed);
+        let detail = lands[0].detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("daemon unreachable")
+                && detail.contains("run it by hand:")
+                && detail.contains(crate::land_after::VERB),
+            "{detail}"
+        );
+    }
+
+    /// Control: another-build refusal when the stable name was not replaced since the land began
+    /// never invokes the installed copy and records `push-failed` with the by-hand command.
+    #[tokio::test]
+    async fn an_after_job_other_build_without_replaced_stable_name_records_push_failed() {
+        let (scratch, support, request) = after_fixture("unreplaced");
+        let step = crate::install_basis::StepStart::at(&support);
+        let stable = support
+            .join("bin")
+            .join(crate::launchd::COWSHED_BINARY_NAME);
+        let invoked = scratch.join("invoked");
+        // Overwrite the target in place without moving the stable symlink so StepStart::replaced is false.
+        let target = support
+            .join("bin")
+            .join(std::fs::read_link(&stable).expect("stable target"));
+        std::fs::write(
+            &target,
+            format!(
+                "#!/bin/sh\necho ran > '{}'\nprintf '77\\n'\n",
+                invoked.display()
+            ),
+        )
+        .expect("update target");
+
+        let started = super::start_after_with(&stable, &request, &step, |_| async {
+            Err(other_build_refusal())
+        })
+        .await;
+        assert!(started.is_err(), "unreplaced stable name must not hand off");
+        assert!(!invoked.exists(), "unchanged copy must not be invoked");
+
+        let mut output = super::Output::new(Vec::new(), Vec::new(), false);
+        super::record_after_outcome(&mut output, &request.turn, &request.head, true, started)
+            .expect("record push-failed");
+        let lands = read_lands(&request.turn);
+        assert_eq!(lands.len(), 1);
+        assert_eq!(lands[0].event, super::LandEvent::PushFailed);
+        let detail = lands[0].detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("installed-build")
+                && detail.contains("run it by hand:")
+                && detail.contains(crate::land_after::VERB),
+            "{detail}"
+        );
+    }
+
+    /// Control: when the installed copy itself fails (e.g., refused as another build again), the
+    /// submit does not retry and records `push-failed` with the failure and by-hand command.
+    #[tokio::test]
+    async fn an_after_job_whose_installed_copy_fails_records_push_failed_with_rerun() {
+        let (scratch, support, request) = after_fixture("installed-fails");
+        let step = crate::install_basis::StepStart::at(&support);
+        let stable = support
+            .join("bin")
+            .join(crate::launchd::COWSHED_BINARY_NAME);
+        let count_file = scratch.join("calls.log");
+        replace_stable_with_script(
+            &support,
+            &format!(
+                "#!/bin/sh\necho call >> '{}'\necho 'the cowshed daemon is build third-build; this cowshed is build second-build' >&2\nexit 4\n",
+                count_file.display(),
+            ),
+        );
+
+        let started = super::start_after_with(&stable, &request, &step, |_| async {
+            Err(other_build_refusal())
+        })
+        .await;
+        assert!(started.is_err(), "failed installed copy must return Err");
+        let calls = std::fs::read_to_string(&count_file)
+            .expect("installed copy must have been invoked once");
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "must invoke installed copy once, never loop"
+        );
+
+        let mut output = super::Output::new(Vec::new(), Vec::new(), false);
+        super::record_after_outcome(&mut output, &request.turn, &request.head, true, started)
+            .expect("record push-failed");
+        let lands = read_lands(&request.turn);
+        assert_eq!(lands.len(), 1);
+        assert_eq!(lands[0].event, super::LandEvent::PushFailed);
+        let detail = lands[0].detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("third-build")
+                && detail.contains("run it by hand:")
+                && detail.contains(crate::land_after::VERB),
+            "{detail}"
         );
     }
 }

@@ -220,6 +220,8 @@ pub trait CliService: Send {
     /// `<support>/bin/cowshed` (05_gateway.md "The installed cowshed"), the gateway's own program.
     /// `None` when this store's home has none installed.
     fn background_program(&self) -> Result<Option<PathBuf>>;
+    /// The support directory of this project's store (`<home>/Library/Application Support/dev.cowshed`).
+    fn support_directory(&self) -> Result<PathBuf>;
     /// Whether the daemon of this project's store runs this build: `Err` with the daemon's
     /// refusal, carrying both builds, when it runs another (`supervisor_manager::require_same_build`).
     async fn require_daemon_of_this_build(&self) -> Result<()>;
@@ -949,6 +951,12 @@ impl CliService for ActorBridge {
         Ok(program.is_file().then_some(program))
     }
 
+    fn support_directory(&self) -> Result<PathBuf> {
+        Ok(cowshed_core::host_dirs::support_directory(
+            self.storage()?.home(),
+        ))
+    }
+
     async fn require_daemon_of_this_build(&self) -> Result<()> {
         cowshed_core::runtime::supervisor_manager::require_same_build(self.storage()?.store()).await
     }
@@ -1673,6 +1681,22 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    dispatch_with_step(service, cli, stdin, None, output).await
+}
+
+async fn dispatch_with_step<S, R, W, E>(
+    service: &mut S,
+    cli: Cli,
+    stdin: R,
+    step: Option<&crate::install_basis::StepStart>,
+    output: &mut Output<W, E>,
+) -> Result<DispatchExit>
+where
+    S: CliService,
+    R: AsyncRead + Send + 'static,
+    W: Write + Send,
+    E: Write + Send,
+{
     let json = cli.global.json;
     match cli.command {
         Command::Adopt(args) => {
@@ -2291,6 +2315,7 @@ where
                         push: args.push,
                         gate_only: args.gate_only,
                     },
+                    step,
                     output,
                 )
                 .await?;
@@ -5417,9 +5442,25 @@ where
 }
 
 pub async fn dispatch_and_shutdown<S, R, W, E>(
+    service: S,
+    cli: Cli,
+    stdin: R,
+    output: &mut Output<W, E>,
+) -> Result<DispatchExit>
+where
+    S: CliService,
+    R: AsyncRead + Send + 'static,
+    W: Write + Send,
+    E: Write + Send,
+{
+    dispatch_and_shutdown_with_step(service, cli, stdin, None, output).await
+}
+
+async fn dispatch_and_shutdown_with_step<S, R, W, E>(
     mut service: S,
     cli: Cli,
     stdin: R,
+    step: Option<&crate::install_basis::StepStart>,
     output: &mut Output<W, E>,
 ) -> Result<DispatchExit>
 where
@@ -5431,7 +5472,7 @@ where
     let primary = cowshed_os::timing::spanned(
         "cli",
         "dispatch",
-        dispatch(&mut service, cli, stdin, output),
+        dispatch_with_step(&mut service, cli, stdin, step, output),
     )
     .await;
     finish_dispatch(service, primary).await
@@ -5511,6 +5552,7 @@ pub(crate) async fn run_bridge_command<R, W, E>(
     cli: Cli,
     prepared: PreparedProject,
     stdin: R,
+    step: Option<&crate::install_basis::StepStart>,
     output: &mut Output<W, E>,
 ) -> Result<DispatchExit>
 where
@@ -5624,7 +5666,7 @@ where
         .await;
         finish_dispatch(bridge, primary).await
     } else {
-        dispatch_and_shutdown(bridge, cli, stdin, output).await
+        dispatch_and_shutdown_with_step(bridge, cli, stdin, step, output).await
     }
 }
 

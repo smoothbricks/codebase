@@ -528,7 +528,8 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             match runtime_dispatch(&parsed.command) {
                 RuntimeDispatch::Host => runtime::run_host_command(parsed, &mut output).await,
                 RuntimeDispatch::Project => {
-                    runtime::run_bridge_command(parsed, prepared, stdin, &mut output).await
+                    runtime::run_bridge_command(parsed, prepared, stdin, step.as_ref(), &mut output)
+                        .await
                 }
             }
             .map(|exit| exit.code)

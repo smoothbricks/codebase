@@ -10734,6 +10734,164 @@ async fn directory_a_declared_land_whose_daemon_changed_build_mid_gate_hands_ste
     fixture.stop_gateway().await;
 }
 
+/// End-to-end wiring check (05_gateway.md "A land step waits for an install in progress",
+/// 02_workspaces.md "A declared land" step 6): when a declared land's turn spans a gateway build
+/// upgrade that replaces the stable `cowshed` symlink, step 6's after-land submit refused by the
+/// new daemon as another build goes on as the installed copy over the written request, prints the
+/// admitted job line, and records no `push-failed` in `lands.log`.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_whose_daemon_changed_build_mid_gate_admits_after_land_as_installed_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-drift-after-{}", std::process::id());
+    let main = fixture.checkout.clone();
+    let scratch = fixture.granted.clone();
+    let remote = scratch.join("remote.git");
+    git(
+        &scratch,
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    let gate_ready = scratch.join("gate.ready");
+    let gate_release = scratch.join("gate.release");
+    let after_submit_argv = scratch.join("installed-after.argv");
+    for fifo in [&gate_ready, &gate_release] {
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .expect("fifo path has no NUL");
+        // SAFETY: mkfifo(3) on a test-owned scratch path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+    git(&main, &["config", "user.name", "fixture"]);
+    git(&main, &["config", "user.email", "fixture@example.invalid"]);
+    git(
+        &main,
+        &["remote", "add", "landing", remote.to_str().unwrap()],
+    );
+    fs::write(
+        main.join("gate.sh"),
+        format!(
+            "echo ready > '{ready}'\n\
+             read x < '{release}'\n\
+             exit 0\n",
+            ready = gate_ready.display(),
+            release = gate_release.display(),
+        ),
+    )
+    .expect("write gate.sh");
+    fs::write(
+        main.join(".cowshed.toml"),
+        format!(
+            "[land]\nturn = \"{turn}\"\ngate = [\"sh\", \"gate.sh\", \"{{workspace}}\"]\npush = \"landing\"\nafter = [[\"true\"]]\n"
+        ),
+    )
+    .expect("write .cowshed.toml");
+    git(&main, &["add", ".cowshed.toml", "gate.sh"]);
+    git(&main, &["commit", "-q", "-m", "declare land"]);
+
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write topic.txt");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    let socket = fixture.storage.control_socket();
+    let installed_dir = cowshed_core::host_dirs::installed_binary_directory(fixture.storage.home());
+    let installed_bin = installed_dir.join("cowshed");
+    let new_copy_name = format!("cowshed-{}", "c".repeat(64));
+    let new_copy = installed_dir.join(&new_copy_name);
+
+    let (land_out, _daemon_guard) = tokio::join!(run(&mut service, ["land", "topic"]), async {
+        let ready = tokio::task::spawn_blocking({
+            let gate_ready = gate_ready.clone();
+            move || fs::read_to_string(gate_ready).expect("read gate ready fifo")
+        })
+        .await
+        .expect("join gate ready");
+        assert_eq!(ready.trim(), "ready");
+
+        let install_fence = await_fenced_wait(&socket).await;
+
+        // Simulate a real install: store a new copy beside the stable name and repoint the
+        // `cowshed` symlink at it. The fake installed copy handles both `__land-step5` and
+        // step 6's `exec main --host --background -- ... __land-after <request.json>`.
+        fs::write(
+            &new_copy,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"__land-step5\" ]; then\n\
+                   git -C '{main}' fetch -q '{topic}' '{head}' && git -C '{main}' merge --ff-only '{head}' >/dev/null\n\
+                   exit 0\n\
+                 fi\n\
+                 printf '%s\\n' \"$@\" > '{argv}'\n\
+                 printf '42\\n'\n",
+                main = main.display(),
+                topic = topic.display(),
+                head = topic_head,
+                argv = after_submit_argv.display(),
+            ),
+        )
+        .expect("write new installed copy");
+        fs::set_permissions(&new_copy, fs::Permissions::from_mode(0o755))
+            .expect("chmod new installed copy");
+        let _ = fs::remove_file(&installed_bin);
+        std::os::unix::fs::symlink(&new_copy_name, &installed_bin)
+            .expect("repoint stable symlink at new copy");
+
+        fixture.stop_gateway().await;
+        drop(install_fence);
+        let daemon = OtherBuildDaemon::serve(fixture.storage.store()).await;
+        fixture.start_gateway().await;
+
+        tokio::task::spawn_blocking({
+            let gate_release = gate_release.clone();
+            move || fs::write(gate_release, b"go\n").expect("release gate fifo")
+        })
+        .await
+        .expect("join gate release");
+        daemon
+    });
+
+    let (result, _, stderr) = land_out;
+    let stderr_text = String::from_utf8_lossy(&stderr);
+    assert!(
+        matches!(result, Ok(0)),
+        "declared land must succeed: result={result:?}, stderr={stderr_text}"
+    );
+    assert!(
+        stderr_text
+            .contains("the push and after-land commands run as job 42 of main, never awaited"),
+        "expected admitted job line on stderr: {stderr_text}"
+    );
+    let submitted_argv = fs::read_to_string(&after_submit_argv)
+        .expect("installed copy must have been invoked to submit the after-land job");
+    assert!(
+        submitted_argv.contains("exec\nmain\n--host\n--background\n--\n")
+            && submitted_argv.contains(&format!("{}\n", cowshed_cli::land_after::VERB))
+            && submitted_argv.contains(&format!("{topic_head}.json\n")),
+        "installed copy must receive exec --host --background over the written request: {submitted_argv}"
+    );
+    let lands_log = fixture
+        .storage
+        .land_turn_root()
+        .join(&turn)
+        .join(cowshed_core::declared_land::LANDS_LOG);
+    let records: Vec<cowshed_core::declared_land::LandRecord> = fs::read_to_string(&lands_log)
+        .expect("read lands.log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse lands.log record"))
+        .collect();
+    assert_eq!(
+        records.iter().map(|r| r.event).collect::<Vec<_>>(),
+        [cowshed_core::declared_land::LandEvent::Landed],
+        "lands.log must record Landed and no PushFailed: {records:?}"
+    );
+
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+    fixture.stop_gateway().await;
+}
+
 /// Build-drift fail-closed red (05_gateway.md "A land step waits for an install in progress",
 /// 02_workspaces.md "A declared land" step 5): if the installed build refuses the explicit step-5
 /// proof format after a build-crossing resume, the land fails closed through the lost-turn path
