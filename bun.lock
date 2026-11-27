@@ -65,7 +65,7 @@
     },
     "packages/build-inputs": {
       "name": "@smoothbricks/build-inputs",
-      "version": "0.0.5-next.0",
+      "version": "0.0.5-0",
       "bin": {
         "smoo-nx-build-inputs": "./dist/ts/bin/smoo-nx-build-inputs.js",
       },
@@ -83,7 +83,7 @@
     },
     "packages/cargo-retain": {
       "name": "@smoothbricks/cargo-retain",
-      "version": "0.0.4-next.0",
+      "version": "0.0.4-0",
       "bin": {
         "smoo-nx-cargo-retain": "./dist/ts/node-cli.js",
       },
@@ -102,7 +102,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.26-next.0",
+      "version": "0.13.26",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -332,7 +332,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.25-next.0",
+      "version": "0.7.25-0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
@@ -384,7 +384,7 @@
     },
     "packages/procinfo": {
       "name": "@smoothbricks/procinfo",
-      "version": "0.1.2-next.0",
+      "version": "0.1.2-0",
       "devDependencies": {
         "@napi-rs/cli": "3.7.3",
         "@types/node": "catalog:",
