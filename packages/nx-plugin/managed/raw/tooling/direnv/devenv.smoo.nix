@@ -124,6 +124,75 @@ in {
   # importing the same Go inputs again and repeating package-set evaluation.
   _module.args.goPkgs = goPkgs;
 
+  imports = [
+    {
+      # Apply after devenv assembles the pinned components: changing component
+      # pins or PATH would create a second toolchain instead of patching it.
+      #
+      # On Darwin, oxalica/rust-overlay's mk-aggregated wraps $out/bin/cargo
+      # with `--prefix DYLD_LIBRARY_PATH : ${curl.out}/lib` so cargo uses Nix
+      # curl instead of Apple's /usr/lib/libcurl.4.dylib (which reads
+      # /private/etc/ssl/openssl.cnf and fails inside sandboxes). Every child
+      # cargo spawns — rustc, build scripts, cargo-nextest, git, mbx, python —
+      # inherits DYLD_LIBRARY_PATH and probes the curl dir on every library
+      # load. Replace the DYLD wrapper with a writable copy of the unwrapped
+      # cargo whose libcurl load command points directly at Nix curl, then
+      # ad-hoc re-sign for arm64.
+      #
+      # When a repository disables devenv's C tools on Darwin
+      # (`languages.c.enable = false`, selecting Xcode's Apple linker), also
+      # strip Nix's stdenv.cc from target and build-script propagation.
+      options.languages.rust.toolchainPackage = lib.mkOption {
+        apply = toolchain:
+          if pkgs.stdenv.hostPlatform.isDarwin
+          then
+            toolchain.overrideAttrs (previous:
+              {
+                nativeBuildInputs =
+                  (previous.nativeBuildInputs or [])
+                  ++ [
+                    (lib.getBin pkgs.darwin.cctools)
+                    pkgs.darwin.sigtool
+                  ];
+                buildCommand =
+                  (previous.buildCommand or "")
+                  + ''
+                    cargo="$out/bin/cargo"
+                    if [ -f "$cargo" ] && [ ! -L "$cargo" ] && grep -qF "DYLD_LIBRARY_PATH" "$cargo"; then
+                      cargoOriginal="$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$cargo")"
+                      if [ -z "$cargoOriginal" ] || [ ! -x "$cargoOriginal" ]; then
+                        echo "devenv.smoo.nix: could not locate unwrapped cargo binary from DYLD wrapper $cargo" >&2
+                        exit 1
+                      fi
+                      rm "$cargo"
+                      cp "$cargoOriginal" "$cargo"
+                      chmod u+w "$cargo"
+                      if ! install_name_tool -change \
+                        /usr/lib/libcurl.4.dylib \
+                        "${pkgs.curl.out}/lib/libcurl.4.dylib" \
+                        "$cargo"
+                      then
+                        echo "devenv.smoo.nix: install_name_tool refused to rewrite /usr/lib/libcurl.4.dylib on $cargo (if Mach-O header padding is too short for the store path, switch to @rpath/libcurl.4.dylib with a symlink at \$out/lib/libcurl.4.dylib -> ${pkgs.curl.out}/lib/libcurl.4.dylib)" >&2
+                        exit 1
+                      fi
+                      if ! otool -L "$cargo" | grep -qF "${pkgs.curl.out}/lib/libcurl.4.dylib"; then
+                        echo "devenv.smoo.nix: install_name_tool succeeded on $cargo but otool -L does not reference ${pkgs.curl.out}/lib/libcurl.4.dylib" >&2
+                        exit 1
+                      fi
+                      codesign -f -s - "$cargo"
+                      chmod u-w "$cargo"
+                    fi
+                  '';
+              }
+              // lib.optionalAttrs (!config.languages.c.enable) {
+                propagatedBuildInputs = lib.remove pkgs.stdenv.cc (previous.propagatedBuildInputs or []);
+                depsHostHostPropagated = lib.remove pkgs.stdenv.cc (previous.depsHostHostPropagated or []);
+              })
+          else toolchain;
+      };
+    }
+  ];
+
   # nixpkgs carries actionlint, not the jdx fork. Supply the immutable upstream
   # release as a normal package, with the same pin in developer shells and CI.
   # Nix fetches/verifies it once; validation never installs or compiles a tool.

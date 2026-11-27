@@ -31,23 +31,7 @@ let
 in {
   # The SmoothBricks shell contract: PATH, toolchain, compiler-cache policy, and
   # the enterShell prologue/epilogue every repo shares. Managed by `smoo monorepo`.
-  imports = [
-    ./devenv.smoo.nix
-    {
-      # Apply after devenv assembles the pinned components: changing component
-      # pins or PATH would create a second toolchain instead of removing its cc.
-      options.languages.rust.toolchainPackage = lib.mkOption {
-        apply = toolchain:
-          if pkgs.stdenv.isDarwin
-          then
-            toolchain.overrideAttrs (previous: {
-              propagatedBuildInputs = lib.remove pkgs.stdenv.cc (previous.propagatedBuildInputs or []);
-              depsHostHostPropagated = lib.remove pkgs.stdenv.cc (previous.depsHostHostPropagated or []);
-            })
-          else toolchain;
-      };
-    }
-  ];
+  imports = [./devenv.smoo.nix];
 
   # https://devenv.sh/overlays/
   overlays = [
