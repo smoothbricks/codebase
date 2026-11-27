@@ -249,9 +249,10 @@ fn observe_with(
     mut state: impl FnMut(&std::path::Path) -> FileState,
 ) -> (Vec<PathBuf>, Vec<FileState>) {
     let mut identities: Vec<FileState> = inputs.iter().map(|path| state(path)).collect();
+    let mut directories = HashMap::new();
     let mut watcher_identities = Vec::new();
     let watched = watched(inputs, &identities, |directory| {
-        let found = state(directory);
+        let found = lookup_directory(&mut directories, directory, &mut state);
         if !matches!(found, FileState::Missing) {
             watcher_identities.push(found);
         }
@@ -259,6 +260,21 @@ fn observe_with(
     });
     identities.extend(watcher_identities);
     (watched, identities)
+}
+
+/// Look up `directory` at most once per call by memoising into `directories`.
+fn lookup_directory(
+    directories: &mut HashMap<PathBuf, FileState>,
+    directory: &std::path::Path,
+    state: &mut impl FnMut(&std::path::Path) -> FileState,
+) -> FileState {
+    if let Some(&cached) = directories.get(directory) {
+        cached
+    } else {
+        let found = state(directory);
+        directories.insert(directory.to_path_buf(), found);
+        found
+    }
 }
 
 /// The paths whose identities decide an answer read from `inputs`, which had `identities`: every
@@ -334,6 +350,7 @@ fn stands(
     checked_at_ns: Option<i128>,
     mut state: impl FnMut(&std::path::Path) -> FileState,
 ) -> Standing {
+    let mut directories = HashMap::new();
     let mut updated: Option<Vec<WatchedInput>> = None;
     for (index, entry) in kept.iter().enumerate() {
         match entry {
@@ -343,26 +360,16 @@ fn stands(
                 }
             }
             WatchedInput::Absent { path, watcher } => {
-                let moved_watcher = match watcher {
-                    Some((dir, dir_identity)) => {
-                        let now_dir = state(dir);
-                        if dir_identity.same_as(now_dir) {
-                            continue;
-                        }
-                        Some((dir.as_path(), now_dir))
-                    }
-                    None => None,
-                };
+                if let Some((dir, dir_identity)) = watcher
+                    && dir_identity.same_as(lookup_directory(&mut directories, dir, &mut state))
+                {
+                    continue;
+                }
                 if !matches!(state(path), FileState::Missing) {
                     return Standing::Invalid;
                 }
                 let new_watcher = path.ancestors().skip(1).find_map(|directory| {
-                    let found = match moved_watcher {
-                        Some((checked_dir, checked_state)) if directory == checked_dir => {
-                            checked_state
-                        }
-                        _ => state(directory),
-                    };
+                    let found = lookup_directory(&mut directories, directory, &mut state);
                     (!matches!(found, FileState::Missing)).then(|| (directory.to_path_buf(), found))
                 });
                 if let Some((_, new_identity)) = &new_watcher
@@ -619,6 +626,97 @@ mod tests {
         );
         // N = 3 present inputs + 1 absent input + 1 watcher directory = N + 2 lookups.
         assert_eq!(lookups.get(), inputs.len() + 1);
+    }
+
+    #[test]
+    fn observe_reads_shared_watcher_once_for_multiple_absent_inputs() {
+        let dir_state = FileState::Present {
+            dev: 1,
+            ino: 100,
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        };
+        let inputs = vec![PathBuf::from("/m/absent1"), PathBuf::from("/m/absent2")];
+        let lookups = Cell::new(0_usize);
+        let (watched, identities) = observe_with(&inputs, |path| {
+            lookups.set(lookups.get() + 1);
+            match path.to_str() {
+                Some("/m/absent1" | "/m/absent2") => FileState::Missing,
+                Some("/m") => dir_state,
+                other => panic!("unexpected path {other:?}"),
+            }
+        });
+        assert_eq!(
+            watched,
+            vec![
+                PathBuf::from("/m/absent1"),
+                PathBuf::from("/m/absent2"),
+                PathBuf::from("/m"),
+                PathBuf::from("/m"),
+            ]
+        );
+        let expected = [FileState::Missing, FileState::Missing, dir_state, dir_state];
+        assert_eq!(identities.len(), expected.len());
+        assert!(
+            identities
+                .iter()
+                .zip(expected)
+                .all(|(got, want)| got.same_as(want))
+        );
+        // 2 absent inputs + 1 shared watcher directory = 3 lookups.
+        assert_eq!(lookups.get(), 3);
+    }
+
+    #[test]
+    fn stands_reads_shared_moved_watcher_once_for_multiple_absent_inputs() {
+        let at = |stamp| FileState::Present {
+            dev: 1,
+            ino: 100,
+            size: 1,
+            mtime_ns: stamp,
+            ctime_ns: stamp,
+        };
+        let old_dir = at(0);
+        let moved_dir = at(1_000_000_000);
+        let checked_at = 5_000_000_000_i128;
+        let kept = [
+            WatchedInput::Absent {
+                path: PathBuf::from("/m/absent1"),
+                watcher: Some((PathBuf::from("/m"), old_dir)),
+            },
+            WatchedInput::Absent {
+                path: PathBuf::from("/m/absent2"),
+                watcher: Some((PathBuf::from("/m"), old_dir)),
+            },
+        ];
+        let lookups = Cell::new(0_usize);
+        let standing = stands(&kept, Some(checked_at), |path| {
+            lookups.set(lookups.get() + 1);
+            match path.to_str() {
+                Some("/m") => moved_dir,
+                Some("/m/absent1" | "/m/absent2") => FileState::Missing,
+                other => panic!("unexpected path {other:?}"),
+            }
+        });
+        let Standing::Reanchored(reanchored) = standing else {
+            panic!("expected re-anchored standing");
+        };
+        assert_eq!(reanchored.len(), 2);
+        // 1 shared watcher lookup + 1 by-name lookup per absent input = 3 lookups.
+        assert_eq!(lookups.get(), 3);
+
+        // Once re-anchored, an unchanged shared watcher is also looked up once.
+        lookups.set(0);
+        let standing = stands(&reanchored, Some(checked_at), |path| {
+            lookups.set(lookups.get() + 1);
+            match path.to_str() {
+                Some("/m") => moved_dir,
+                other => panic!("unexpected path {other:?}"),
+            }
+        });
+        assert!(matches!(standing, Standing::Valid));
+        assert_eq!(lookups.get(), 1);
     }
 
     /// An unrelated sibling created and removed under an absent input's watcher directory (such
