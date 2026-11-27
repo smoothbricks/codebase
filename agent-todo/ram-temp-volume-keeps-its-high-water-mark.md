@@ -29,3 +29,13 @@ Owed, by the owner of the RAM temp volume (nx-plugin bounded-exec's lease and th
 
 Evidence commands: `vmmap --summary <helper pid>`, `hdiutil info` (`image-path : ram://…`), and `df` and `ls -la` on the
 volume.
+
+Measured again 2026-11-27 21:40, from swap alert 20261127-213327 (host swap 8.76 of 9.2 GiB):
+
+- diskimages-helper pid 67840, attached ~18.6 h, serves `ram://16777219` at `ram3`. `vmmap --summary 67840` gives a
+  physical footprint of 8.0 GB, about 7.2 GB of it compressed.
+- `df` shows 29 MB in use. The only lease is `64670-SWRyyY` (07:45, 3.4 MB), and pid 64670 no longer exists.
+- So the volume isn't held by overlapping live leases but by a dead owner's lease. A lease whose pid has exited isn't
+  reaped, so "detached when the last live lease ends" never fires even on an idle host.
+- Also owed: a lease whose owner pid is gone counts as ended, and it's archived or removed by the same path as a normal
+  end. Red: take a lease in a child, kill the child with SIGKILL, and the volume detaches within one idle interval.
