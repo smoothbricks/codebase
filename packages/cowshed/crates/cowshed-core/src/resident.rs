@@ -311,10 +311,9 @@ pub fn lifecycle_settled(journal: &Path, workspace: &WorkspaceName) -> Result<()
 /// Whether a job may be admitted onto the build state of the checkout mounted at `mount`, whose
 /// build volume is `volume`, as it is: exactly when the controller's refresh (16_build_volumes.md,
 /// "Refresh") would change nothing. Every link the volume's state names is in place, and the
-/// tracked build inputs still have the fingerprint it records. Reads only; the fingerprint costs
-/// the checkout's Git listings (one `git ls-files`, one more per declared pattern, kept while the
-/// index keeps its identity) plus a hash of the tracked manifests. A pending discard is left to
-/// the next controller refresh and `cowshed gc`.
+/// tracked build inputs still have the fingerprint it records. Reads only; the fingerprint is kept
+/// in this process while its recorded inputs keep their identity (11_shell.md, "Kept readings").
+/// A pending discard is left to the next controller refresh and `cowshed gc`.
 pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), AsIsDecline> {
     use crate::build_volume::{BuildVolumeState, link};
     let volume = volume.ok_or(AsIsDecline::Unrecorded)?;
@@ -332,9 +331,9 @@ pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), As
     {
         return Err(AsIsDecline::LinkDisplaced);
     }
-    let fingerprint = crate::capabilities::tracked_manifest_fingerprint(mount)
+    let fingerprint = crate::capabilities::tracked_manifest_fingerprint_kept(mount)
         .map_err(|_| AsIsDecline::InputsUnreadable)?;
-    if fingerprint != recorded {
+    if fingerprint.as_ref() != recorded {
         return Err(AsIsDecline::InputsMoved);
     }
     Ok(())

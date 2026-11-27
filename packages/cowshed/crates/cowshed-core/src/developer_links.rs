@@ -18,7 +18,7 @@ use std::sync::{Arc, LazyLock};
 use crate::capabilities::bun::BUN_HOME;
 use crate::capabilities::cache::SharedToolHome;
 use crate::capabilities::pnpm::PNPM_HOME;
-use crate::input_memo::InputMemo;
+use crate::input_memo::{InputMemo, Reads};
 use crate::runtime::shell_host::SHELL_HOST_DIRECTORY;
 use crate::runtime::shell_watch::FileState;
 use crate::{CowshedError, Result};
@@ -246,7 +246,7 @@ impl DeveloperLinks {
         reads.path(&root.join(DECLARED_RECORD));
         reads.path(&root.join("package.json"));
         let receipts = declaration_receipts(&root)?;
-        reads.packages(&root)?;
+        record_packages(reads, &root)?;
         let mut snapshot = Self {
             links: Vec::new(),
             released: Vec::new(),
@@ -635,120 +635,21 @@ fn build_volume(root: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-/// What a capture to be kept read: every path whose identity decides the snapshot
-/// ([`DeveloperLinks::capture_kept`]). A capture that keeps nothing records nothing.
-struct Reads(Option<BTreeSet<PathBuf>>);
-
-impl Reads {
-    fn ignoring() -> Self {
-        Self(None)
+/// Record the checkout's tracked listing and every tracked package's directory: where an install
+/// makes or removes a package tree.
+fn record_packages(reads: &mut Reads, root: &Path) -> Result<()> {
+    if !reads.is_recording() {
+        return Ok(());
     }
-
-    fn recording() -> Self {
-        Self(Some(BTreeSet::new()))
-    }
-
-    fn path(&mut self, path: &Path) {
-        if let Some(paths) = &mut self.0 {
-            paths.insert(path.to_owned());
+    if let Some(listing) = crate::capabilities::kept_listing_inputs(root) {
+        for input in &listing {
+            reads.path(input);
         }
     }
-
-    /// `path` and every directory above it up to `root`: the entries that decide what it names.
-    fn within(&mut self, root: &Path, path: &Path) {
-        if self.0.is_none() {
-            return;
-        }
-        for directory in path.ancestors() {
-            self.path(directory);
-            if directory == root {
-                return;
-            }
-        }
+    for directory in crate::capabilities::tracked_package_directories(root)? {
+        reads.path(&directory);
     }
-
-    /// What decides where `path` resolves: beneath `root`, every directory above each path the
-    /// resolution passes through; elsewhere, each such path and the directory holding each link it
-    /// follows. A replaced link changes the directory that holds it, and a resolution that comes to
-    /// name another directory changes the identity at its end. A directory that is no link is its
-    /// own input: replacing it moves its identity, so the entries beside it (another checkout's
-    /// mount point beside a build volume) are not inputs.
-    fn resolution(&mut self, root: &Path, path: &Path) {
-        if self.0.is_none() {
-            return;
-        }
-        let mut pending = path.to_owned();
-        for _ in 0..MAX_RESOLUTION_LINKS {
-            if pending.starts_with(root) {
-                self.within(root, &pending);
-            } else {
-                self.path(&pending);
-            }
-            match first_link(root, &pending) {
-                Some((link, next)) => {
-                    if !link.starts_with(root)
-                        && let Some(holder) = link.parent()
-                    {
-                        self.path(holder);
-                    }
-                    pending = next;
-                }
-                None => return,
-            }
-        }
-    }
-
-    /// The checkout's tracked listing and every tracked package's directory: where an install
-    /// makes or removes a package tree.
-    fn packages(&mut self, root: &Path) -> Result<()> {
-        if self.0.is_none() {
-            return Ok(());
-        }
-        if let Some(listing) = crate::capabilities::kept_listing_inputs(root) {
-            for input in &listing {
-                self.path(input);
-            }
-        }
-        for directory in crate::capabilities::tracked_package_directories(root)? {
-            self.path(&directory);
-        }
-        Ok(())
-    }
-
-    fn into_paths(self) -> Vec<PathBuf> {
-        self.0
-            .map(|paths| paths.into_iter().collect())
-            .unwrap_or_default()
-    }
-}
-
-/// The links one recorded resolution follows; past it, the capture's own resolution names the
-/// cycle.
-const MAX_RESOLUTION_LINKS: usize = 40;
-
-/// The first link of `path` and `path` with that link replaced by its text, or `None` when no
-/// component is a link, or one cannot be read (the capture's own resolution reports it). Beneath
-/// `root` only the components below it are examined.
-fn first_link(root: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
-    let (mut prefix, rest) = match path.strip_prefix(root) {
-        Ok(rest) => (root.to_path_buf(), rest),
-        Err(_) => (PathBuf::new(), path),
-    };
-    let mut components = rest.components();
-    while let Some(component) = components.next() {
-        prefix.push(component);
-        if fs::symlink_metadata(&prefix).ok()?.file_type().is_symlink() {
-            let target = fs::read_link(&prefix).ok()?;
-            let mut next = prefix.parent().map(Path::to_path_buf).unwrap_or_default();
-            next.push(target);
-            let rest = components.as_path();
-            if !rest.as_os_str().is_empty() {
-                next.push(rest);
-            }
-            return Some((prefix, next));
-        }
-    }
-    None
+    Ok(())
 }
 
 /// One row of `DECLARED_RECORD`; its `declaration` field is the managed script's own.

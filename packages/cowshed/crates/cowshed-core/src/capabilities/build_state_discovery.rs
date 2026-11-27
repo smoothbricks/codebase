@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock};
 use serde::{Deserialize, Serialize};
 
 use super::{BuildStatePath, CapabilityId, DeclaredState, DetectionContext, merge_build_state};
-use crate::input_memo::InputMemo;
+use crate::input_memo::{InputMemo, Reads};
 use crate::runtime::supervisor::ObservedRun;
 use crate::workspace_environment::{NODE_COMPILE_CACHE_CHECKOUT, NODE_COMPILE_CACHE_DIRECTORY};
 use crate::{CowshedError, Result};
@@ -218,11 +218,38 @@ const PACKAGE_MANIFEST: &str = "package.json";
 /// A function of the checkout at `workspace` alone: the controller's refresh and a resident
 /// `exec` (06_cli.md, "Resident workspaces") compute the same value for the same checkout.
 pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
+    tracked_manifest_fingerprint_reading(workspace, &mut Reads::ignoring())
+}
+
+/// [`tracked_manifest_fingerprint`] kept in this process while every file, directory and listing
+/// input its reading depended on keeps its identity (11_shell.md, "Kept readings"). Used on the
+/// resident `exec` admission path (`asIs`). A checkout whose tracked listing is not its own
+/// `.git` index is computed afresh every time.
+pub(crate) fn tracked_manifest_fingerprint_kept(workspace: &Path) -> Result<Arc<str>> {
+    static KEPT: LazyLock<InputMemo<PathBuf, Arc<str>>> = LazyLock::new(InputMemo::new);
+    let Some(listing) = kept_listing_inputs(workspace) else {
+        return tracked_manifest_fingerprint(workspace).map(Arc::from);
+    };
+    KEPT.read_recorded(&workspace.to_owned(), || {
+        let mut reads = Reads::recording();
+        for input in &listing {
+            reads.path(input);
+        }
+        let fingerprint = tracked_manifest_fingerprint_reading(workspace, &mut reads)?;
+        Ok((Arc::from(fingerprint), reads.into_paths()))
+    })
+}
+
+fn tracked_manifest_fingerprint_reading(workspace: &Path, reads: &mut Reads) -> Result<String> {
     let mut digest = blake3::Hasher::new();
     digest.update(DISCOVERY_REVISION);
     digest.update(&[0]);
     // The canonical activation's input identity: a changed devenv pin or resolved mbx build
     // cannot keep an earlier capability answer (15_capabilities.md, "mbx detection").
+    reads.resolution(
+        workspace,
+        &crate::runtime::shell_inherit::record_path(workspace),
+    );
     digest.update(
         crate::runtime::shell_inherit::recorded_key(workspace)
             .unwrap_or_default()
@@ -240,8 +267,10 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
         digest.update(name);
         digest.update(&[0]);
         if relative.file_name() == Some(std::ffi::OsStr::new(PACKAGE_MANIFEST)) {
-            digest.update(&[u8::from(installed_package(workspace, &path)?)]);
-        } else if super::convention_file(workspace, &path)? {
+            digest.update(&[u8::from(installed_package_reading(
+                workspace, &path, reads,
+            )?)]);
+        } else if super::convention_file_reading(workspace, &path, reads)? {
             let bytes = fs::read(&path).map_err(|error| super::detection_error(&path, error))?;
             digest.update(&[1]);
             digest.update(blake3::hash(&bytes).as_bytes());
@@ -250,6 +279,7 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
         }
     }
     let config = workspace.join(".cowshed.toml");
+    reads.resolution(workspace, &config);
     match fs::read(&config) {
         Ok(bytes) => {
             digest.update(&bytes);
@@ -257,7 +287,7 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(super::detection_error(&config, error)),
     }
-    let settings = super::workspace_config(workspace)?;
+    let settings = super::workspace_config_reading(workspace, reads)?;
     for state in expand_declared(workspace, settings.build_state())? {
         digest.update(state.checkout.as_path().as_os_str().as_bytes());
         digest.update(&[0]);
@@ -278,11 +308,12 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
             .and_then(|setting| setting.directory.as_ref())
             .map(|directory| workspace.join(directory))
             .unwrap_or_else(|| workspace.to_owned());
-        super::validate_project_directory(workspace, &project)?;
-        digest.update(&[u8::from(detector.matches(
+        super::validate_project_directory_reading(workspace, &project, reads)?;
+        digest.update(&[u8::from(detector.matches_reading(
             workspace,
             &project,
             &mut tracked,
+            reads,
         )?)]);
     }
     Ok(digest.finalize().to_hex().to_string())
@@ -1247,13 +1278,18 @@ fn visit_installed_javascript_trees(
 /// Whether the package whose tracked manifest is `manifest` is installed: the manifest is a file
 /// in the checkout and a real `node_modules` directory sits beside it.
 fn installed_package(workspace: &Path, manifest: &Path) -> Result<bool> {
-    if !super::convention_file(workspace, manifest)? {
+    installed_package_reading(workspace, manifest, &mut Reads::ignoring())
+}
+
+fn installed_package_reading(workspace: &Path, manifest: &Path, reads: &mut Reads) -> Result<bool> {
+    if !super::convention_file_reading(workspace, manifest, reads)? {
         return Ok(false);
     }
     let modules = manifest
         .parent()
         .expect("a manifest path names a file")
         .join("node_modules");
+    reads.within(workspace, &modules);
     match fs::symlink_metadata(&modules) {
         Ok(metadata) => Ok(metadata.is_dir()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -1274,13 +1310,14 @@ impl TrackedManifests {
         Ok(self.inputs.as_deref().expect("snapshot was loaded"))
     }
 
-    pub(super) fn contains(
+    pub(super) fn contains_reading(
         &mut self,
         workspace: &Path,
         directory: &Path,
         manifest: &str,
+        reads: &mut Reads,
     ) -> Result<bool> {
-        super::validate_project_directory(workspace, directory)?;
+        super::validate_project_directory_reading(workspace, directory, reads)?;
         let prefix = directory
             .strip_prefix(workspace)
             .expect("directory was contained");
@@ -1291,7 +1328,7 @@ impl TrackedManifests {
         {
             let path = Path::new(std::ffi::OsStr::from_bytes(name));
             if tracked_manifest(path, prefix, manifest)
-                && super::convention_file(workspace, &workspace.join(path))?
+                && super::convention_file_reading(workspace, &workspace.join(path), reads)?
             {
                 return Ok(true);
             }
@@ -3082,5 +3119,167 @@ printf '%s:%s\n' "$index" "$PWD"
             (held.clone(), Vec::new()),
             "a package tracked again"
         );
+    }
+
+    /// A resident exec's build-state fingerprint is kept while every input its reading depended on
+    /// keeps its identity (11_shell.md, "Kept readings"): a second call in an unchanged, settled
+    /// checkout serves the kept `Arc<str>` with no manifest read, `.git/index.lock` churn leaves
+    /// it standing, and editing a tracked manifest, tracking a new `package.json`, installing a
+    /// package, editing `.cowshed.toml` `[build] state`, or changing `activation.json` each moves
+    /// the answer. A checkout with `.git/commondir` bypasses the memo.
+    #[test]
+    fn a_kept_fingerprint_stands_while_unchanged_and_moves_on_each_input() {
+        let scratch = crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "kept-fingerprint");
+        let root = scratch.join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = crate::git::git_command_at(&root)
+                .args(args)
+                .output_bounded()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let put = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, contents).unwrap();
+        };
+        let write_activation = |envrc_body: &str| {
+            fs::create_dir_all(root.join(crate::runtime::shell_host::SHELL_HOST_DIRECTORY))
+                .unwrap();
+            put(".envrc", envrc_body);
+            let envrc = root.join(".envrc");
+            let (_, contents) = crate::runtime::shell_watch::certify([envrc.as_path()]).unwrap();
+            let baseline = BTreeMap::new();
+            let placement = crate::runtime::shell_inherit::Placement::of(&root, &baseline, &[]);
+            crate::runtime::shell_inherit::write_record(
+                &placement,
+                &baseline,
+                &[crate::runtime::shell_watch::WatchEntry {
+                    path: envrc,
+                    exists: true,
+                }],
+                &contents,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        };
+
+        run_git(&["init", "--quiet"]);
+        put(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        put("packages/app/package.json", "{}\n");
+        fs::create_dir_all(root.join("packages/app/node_modules")).unwrap();
+        run_git(&["add", "--", "Cargo.toml", "packages/app/package.json"]);
+        put(
+            ".cowshed.toml",
+            "[build]\nstate = [\"packages/*/.cache/lmao\"]\n",
+        );
+        write_activation("export DEMO=one\n");
+        assert!(crate::runtime::shell_inherit::recorded_key(&root).is_some());
+
+        for settled in [
+            root.clone(),
+            root.join(".git"),
+            root.join(".git/index"),
+            root.join(".git/config"),
+            root.join("Cargo.toml"),
+            root.join("packages"),
+            root.join("packages/app"),
+            root.join("packages/app/package.json"),
+            root.join("packages/app/node_modules"),
+            root.join(".cowshed.toml"),
+            root.join(".cowshed"),
+            root.join(".cowshed/shell-host"),
+            crate::runtime::shell_inherit::record_path(&root),
+        ] {
+            crate::input_memo::settle(&settled);
+        }
+
+        let first = tracked_manifest_fingerprint_kept(&root).unwrap();
+        let again = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "unchanged settled checkout must serve the kept fingerprint without re-reading"
+        );
+        assert_eq!(first.as_ref(), tracked_manifest_fingerprint(&root).unwrap());
+
+        // Git lock churn under .git moves .git while absent .git/commondir stays absent.
+        let lock = root.join(".git/index.lock");
+        fs::write(&lock, b"").unwrap();
+        fs::remove_file(&lock).unwrap();
+        let after_lock = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &after_lock),
+            "git index.lock churn must keep the kept fingerprint"
+        );
+
+        // Control 1: editing a tracked Cargo.toml moves the fingerprint.
+        put(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.2.0\"\n",
+        );
+        let after_cargo = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert!(!Arc::ptr_eq(&first, &after_cargo));
+        assert_ne!(after_cargo.as_ref(), first.as_ref());
+        assert_eq!(
+            after_cargo.as_ref(),
+            tracked_manifest_fingerprint(&root).unwrap()
+        );
+
+        // Control 2: tracking a new package.json via git add moves .git/index and the fingerprint.
+        put("packages/extra/package.json", "{}\n");
+        run_git(&["add", "--", "packages/extra/package.json"]);
+        let after_pkg = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert_ne!(after_pkg.as_ref(), after_cargo.as_ref());
+        assert_eq!(
+            after_pkg.as_ref(),
+            tracked_manifest_fingerprint(&root).unwrap()
+        );
+
+        // Control 2b: installing that tracked package moves the fingerprint.
+        fs::create_dir_all(root.join("packages/extra/node_modules")).unwrap();
+        let after_install = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert_ne!(after_install.as_ref(), after_pkg.as_ref());
+        assert_eq!(
+            after_install.as_ref(),
+            tracked_manifest_fingerprint(&root).unwrap()
+        );
+
+        // Control 3: editing .cowshed.toml [build] state moves the fingerprint.
+        put(
+            ".cowshed.toml",
+            "[build]\nstate = [\"packages/*/.cache/lmao\", \"vendor/upstream\"]\n",
+        );
+        let after_config = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert_ne!(after_config.as_ref(), after_install.as_ref());
+        assert_eq!(
+            after_config.as_ref(),
+            tracked_manifest_fingerprint(&root).unwrap()
+        );
+
+        // Control 4: changing activation.json moves recorded_key and the fingerprint.
+        write_activation("export DEMO=two\n");
+        let after_activation = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert_ne!(after_activation.as_ref(), after_config.as_ref());
+        assert_eq!(
+            after_activation.as_ref(),
+            tracked_manifest_fingerprint(&root).unwrap()
+        );
+
+        // Control 5: creating .git/commondir bypasses the memo even when settled.
+        fs::write(root.join(".git/commondir"), ".\n").unwrap();
+        assert!(kept_listing_inputs(&root).is_none());
+        let unkept_a = tracked_manifest_fingerprint_kept(&root).unwrap();
+        let unkept_b = tracked_manifest_fingerprint_kept(&root).unwrap();
+        assert!(
+            !Arc::ptr_eq(&unkept_a, &unkept_b),
+            "checkout with .git/commondir must bypass the memo"
+        );
+        assert_eq!(unkept_a.as_ref(), unkept_b.as_ref());
     }
 }

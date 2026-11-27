@@ -7,6 +7,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
+use crate::input_memo::Reads;
 use crate::{CowshedError, Result};
 use cache::{SharedLayout, SharedToolHome};
 
@@ -23,7 +24,7 @@ pub use build_state_discovery::{
 };
 pub(crate) use build_state_discovery::{
     installed_javascript_trees, kept_listing_inputs, local_config_inputs, removed_package_caches,
-    tracked_package_directories,
+    tracked_manifest_fingerprint_kept, tracked_package_directories,
 };
 pub mod bun;
 pub mod cache;
@@ -301,12 +302,23 @@ impl Detector {
         directory: &Path,
         tracked: &mut build_state_discovery::TrackedManifests,
     ) -> Result<bool> {
-        let present = |path: &Path| match self.marker_kind {
-            MarkerKind::File => convention_file(workspace, path),
-            MarkerKind::Directory => convention_directory(workspace, path),
-        };
+        self.matches_reading(workspace, directory, tracked, &mut Reads::ignoring())
+    }
+
+    fn matches_reading(
+        &self,
+        workspace: &Path,
+        directory: &Path,
+        tracked: &mut build_state_discovery::TrackedManifests,
+        reads: &mut Reads,
+    ) -> Result<bool> {
         for file in self.all {
-            if !present(&directory.join(file))? {
+            let path = directory.join(file);
+            let found = match self.marker_kind {
+                MarkerKind::File => convention_file_reading(workspace, &path, reads)?,
+                MarkerKind::Directory => convention_directory_reading(workspace, &path, reads)?,
+            };
+            if !found {
                 return Ok(false);
             }
         }
@@ -314,13 +326,18 @@ impl Detector {
             return Ok(true);
         }
         for file in self.any {
-            if present(&directory.join(file))? {
+            let path = directory.join(file);
+            let found = match self.marker_kind {
+                MarkerKind::File => convention_file_reading(workspace, &path, reads)?,
+                MarkerKind::Directory => convention_directory_reading(workspace, &path, reads)?,
+            };
+            if found {
                 return Ok(true);
             }
         }
         match self.reached_from {
             Some(ReachedConvention::TrackedManifest(name)) => {
-                tracked.contains(workspace, directory, name)
+                tracked.contains_reading(workspace, directory, name, reads)
             }
             Some(ReachedConvention::ProjectFile(reached)) => reached(workspace, directory),
             None => Ok(false),
@@ -356,8 +373,15 @@ pub fn detect_for_workspace(context: &DetectionContext<'_>) -> Result<DetectedCa
 }
 
 fn workspace_config(workspace_root: &Path) -> Result<crate::storage::bootstrap::CowshedConfig> {
+    workspace_config_reading(workspace_root, &mut Reads::ignoring())
+}
+
+fn workspace_config_reading(
+    workspace_root: &Path,
+    reads: &mut Reads,
+) -> Result<crate::storage::bootstrap::CowshedConfig> {
     let path = workspace_root.join(".cowshed.toml");
-    if convention_file(workspace_root, &path)? {
+    if convention_file_reading(workspace_root, &path, reads)? {
         let source = fs::read_to_string(&path).map_err(|error| detection_error(&path, error))?;
         crate::storage::bootstrap::parse_cowshed_config(&source).map_err(|error| {
             CowshedError::usage(
@@ -758,6 +782,11 @@ pub fn convention_file(workspace: &Path, path: &Path) -> Result<bool> {
     }
 }
 
+fn convention_file_reading(workspace: &Path, path: &Path, reads: &mut Reads) -> Result<bool> {
+    reads.resolution(workspace, path);
+    convention_file(workspace, path)
+}
+
 fn convention_directory(workspace: &Path, path: &Path) -> Result<bool> {
     let parent = path.parent().ok_or_else(|| {
         CowshedError::integrity(
@@ -799,6 +828,14 @@ fn convention_directory(workspace: &Path, path: &Path) -> Result<bool> {
     }
 }
 
+fn convention_directory_reading(workspace: &Path, path: &Path, reads: &mut Reads) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        reads.resolution(workspace, parent);
+    }
+    reads.within(workspace, path);
+    convention_directory(workspace, path)
+}
+
 fn validate_project_directory(workspace: &Path, project: &Path) -> Result<()> {
     if project
         .components()
@@ -827,6 +864,16 @@ fn validate_project_directory(workspace: &Path, project: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(detection_error(project, error)),
     }
+}
+
+fn validate_project_directory_reading(
+    workspace: &Path,
+    project: &Path,
+    reads: &mut Reads,
+) -> Result<()> {
+    validate_project_directory(workspace, project)?;
+    reads.resolution(workspace, project);
+    Ok(())
 }
 
 fn detection_error(path: &Path, error: io::Error) -> CowshedError {

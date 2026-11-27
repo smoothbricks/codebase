@@ -22,9 +22,10 @@
 //! [`InputMemo`] only reads identities and the clock, runs the reading, and publishes. An ask
 //! loads one published map; keeping an answer publishes a new one. Nothing locks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
 use std::hash::Hash;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -410,6 +411,109 @@ fn settled(identity: FileState, started_ns: i128) -> bool {
             started_ns - ctime_ns >= i128::try_from(SETTLED.as_nanos()).unwrap_or(i128::MAX)
         }
     }
+}
+
+/// What a reading to be kept inspected: every path whose identity decides the answer
+/// ([`InputMemo::read_recorded`]). A reading that keeps nothing records nothing.
+pub(crate) struct Reads(Option<BTreeSet<PathBuf>>);
+
+impl Reads {
+    pub(crate) fn ignoring() -> Self {
+        Self(None)
+    }
+
+    pub(crate) fn recording() -> Self {
+        Self(Some(BTreeSet::new()))
+    }
+
+    pub(crate) fn is_recording(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn path(&mut self, path: &Path) {
+        if let Some(paths) = &mut self.0 {
+            paths.insert(path.to_owned());
+        }
+    }
+
+    /// `path` and every directory above it up to `root`: the entries that decide what it names.
+    pub(crate) fn within(&mut self, root: &Path, path: &Path) {
+        if self.0.is_none() {
+            return;
+        }
+        for directory in path.ancestors() {
+            self.path(directory);
+            if directory == root {
+                return;
+            }
+        }
+    }
+
+    /// What decides where `path` resolves: beneath `root`, every directory above each path the
+    /// resolution passes through; elsewhere, each such path and the directory holding each link it
+    /// follows. A replaced link changes the directory that holds it, and a resolution that comes to
+    /// name another directory changes the identity at its end. A directory that is no link is its
+    /// own input: replacing it moves its identity, so the entries beside it (another checkout's
+    /// mount point beside a build volume) are not inputs.
+    pub(crate) fn resolution(&mut self, root: &Path, path: &Path) {
+        if self.0.is_none() {
+            return;
+        }
+        let mut pending = path.to_owned();
+        for _ in 0..MAX_RESOLUTION_LINKS {
+            if pending.starts_with(root) {
+                self.within(root, &pending);
+            } else {
+                self.path(&pending);
+            }
+            match first_link(root, &pending) {
+                Some((link, next)) => {
+                    if !link.starts_with(root)
+                        && let Some(holder) = link.parent()
+                    {
+                        self.path(holder);
+                    }
+                    pending = next;
+                }
+                None => return,
+            }
+        }
+    }
+
+    pub(crate) fn into_paths(self) -> Vec<PathBuf> {
+        self.0
+            .map(|paths| paths.into_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// The links one recorded resolution follows; past it, the reading's own resolution names the
+/// cycle.
+const MAX_RESOLUTION_LINKS: usize = 40;
+
+/// The first link of `path` and `path` with that link replaced by its text, or `None` when no
+/// component is a link, or one cannot be read (the reading's own resolution reports it). Beneath
+/// `root` only the components below it are examined.
+fn first_link(root: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (mut prefix, rest) = match path.strip_prefix(root) {
+        Ok(rest) => (root.to_path_buf(), rest),
+        Err(_) => (PathBuf::new(), path),
+    };
+    let mut components = rest.components();
+    while let Some(component) = components.next() {
+        prefix.push(component);
+        if fs::symlink_metadata(&prefix).ok()?.file_type().is_symlink() {
+            let target = fs::read_link(&prefix).ok()?;
+            let mut next = prefix.parent().map(Path::to_path_buf).unwrap_or_default();
+            next.push(target);
+            let rest = components.as_path();
+            if !rest.as_os_str().is_empty() {
+                next.push(rest);
+            }
+            return Some((prefix, next));
+        }
+    }
+    None
 }
 
 /// Wait until `path`'s last change is [`SETTLED`] behind the clock, so an answer that reads it is
