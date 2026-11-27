@@ -210,9 +210,23 @@ struct Asked {
 
 /// The paths that decide an answer read from `inputs`, and the identity of each now.
 fn observe(inputs: &[PathBuf]) -> (Vec<PathBuf>, Vec<FileState>) {
-    let states: Vec<FileState> = inputs.iter().map(|path| FileState::of(path)).collect();
-    let watched = watched(inputs, &states, FileState::of);
-    let identities = watched.iter().map(|path| FileState::of(path)).collect();
+    observe_with(inputs, FileState::of)
+}
+
+fn observe_with(
+    inputs: &[PathBuf],
+    mut state: impl FnMut(&std::path::Path) -> FileState,
+) -> (Vec<PathBuf>, Vec<FileState>) {
+    let mut identities: Vec<FileState> = inputs.iter().map(|path| state(path)).collect();
+    let mut watcher_identities = Vec::new();
+    let watched = watched(inputs, &identities, |directory| {
+        let found = state(directory);
+        if !matches!(found, FileState::Missing) {
+            watcher_identities.push(found);
+        }
+        found
+    });
+    identities.extend(watcher_identities);
     (watched, identities)
 }
 
@@ -223,7 +237,7 @@ fn observe(inputs: &[PathBuf]) -> (Vec<PathBuf>, Vec<FileState>) {
 fn watched(
     inputs: &[PathBuf],
     identities: &[FileState],
-    state: impl Fn(&std::path::Path) -> FileState,
+    mut state: impl FnMut(&std::path::Path) -> FileState,
 ) -> Vec<PathBuf> {
     let absent = inputs
         .iter()
@@ -444,6 +458,61 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn observe_reads_each_input_and_watcher_once() {
+        let present = |ino| FileState::Present {
+            dev: 1,
+            ino,
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        };
+        let inputs = vec![
+            PathBuf::from("/m/a"),
+            PathBuf::from("/m/b"),
+            PathBuf::from("/m/c"),
+            PathBuf::from("/m/absent"),
+        ];
+        let lookups = Cell::new(0_usize);
+        let (watched, identities) = observe_with(&inputs, |path| {
+            lookups.set(lookups.get() + 1);
+            match path.to_str() {
+                Some("/m/a") => present(1),
+                Some("/m/b") => present(2),
+                Some("/m/c") => present(3),
+                Some("/m/absent") => FileState::Missing,
+                Some("/m") => present(100),
+                other => panic!("unexpected path {other:?}"),
+            }
+        });
+        assert_eq!(
+            watched,
+            vec![
+                PathBuf::from("/m/a"),
+                PathBuf::from("/m/b"),
+                PathBuf::from("/m/c"),
+                PathBuf::from("/m/absent"),
+                PathBuf::from("/m"),
+            ]
+        );
+        let expected = [
+            present(1),
+            present(2),
+            present(3),
+            FileState::Missing,
+            present(100),
+        ];
+        assert_eq!(identities.len(), expected.len());
+        assert!(
+            identities
+                .iter()
+                .zip(expected)
+                .all(|(got, want)| got.same_as(want))
+        );
+        // N = 3 present inputs + 1 absent input + 1 watcher directory = N + 2 lookups.
+        assert_eq!(lookups.get(), inputs.len() + 1);
+    }
     /// One step of a model checkout whose files stamp their changes at a coarse clock, a
     /// Linux tick or an HFS+ second, behind this process's clock by up to one tick.
     #[derive(Clone, Debug)]
@@ -547,10 +616,7 @@ mod tests {
         }
 
         fn observe(&self, inputs: &[PathBuf]) -> (Vec<PathBuf>, Vec<FileState>) {
-            let states: Vec<FileState> = inputs.iter().map(|path| self.state(path)).collect();
-            let watched = watched(inputs, &states, |path| self.state(path));
-            let identities = watched.iter().map(|path| self.state(path)).collect();
-            (watched, identities)
+            observe_with(inputs, |path| self.state(path))
         }
 
         fn contents(&self) -> Vec<Option<u8>> {
