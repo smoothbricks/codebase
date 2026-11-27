@@ -318,9 +318,10 @@ fn thread_info(pid: libc::pid_t, thread: u64) -> io::Result<Option<libc::proc_th
 }
 
 /// The kernel priority ceiling (`pth_maxpriority` from `PROC_PIDTHREADINFO`) of every live thread
-/// of `pid`: `4` while `PRIO_DARWIN_BG` is set on the process, `63` once cleared (05_gateway.md
-/// "On macOS the order between classes is admission, not OS priority", "Read back, never assumed").
-/// Returns `Ok(None)` when no process holds `pid`.
+/// of `pid`: `63` (`MAXPRI_USER`) when unclamped, the task QoS clamp's ceiling when clamped (for
+/// example `20` under `UTILITY`), and `4` (`MAXPRI_THROTTLE`) while `PRIO_DARWIN_BG` is set on the
+/// process regardless of clamp (05_gateway.md "On macOS the order between classes is admission, not
+/// OS priority", "Read back, never assumed"). Returns `Ok(None)` when no process holds `pid`.
 pub fn thread_max_priorities(pid: libc::pid_t) -> io::Result<Option<Vec<i32>>> {
     let Some(threads) = list_threads(pid)? else {
         return Ok(None);
@@ -1491,18 +1492,18 @@ mod tests {
         }
     }
 
-    /// `PROC_PIDTHREADINFO` reports `pth_maxpriority` 63 on a normal child and 4 while
-    /// `PRIO_DARWIN_BG` is set on it, returning to 63 once cleared.
-    #[test]
-    fn thread_max_priorities_reads_back_darwin_bg() {
+    struct DarwinBgCeilings {
+        normal: Vec<i32>,
+        backgrounded: Vec<i32>,
+        cleared: Vec<i32>,
+    }
+
+    fn darwin_bg_ceiling_round_trip(command: &mut std::process::Command) -> DarwinBgCeilings {
         use std::io::Read as _;
-        let mut child = crate::test_support::SpawnReaped::spawn_reaped(
-            std::process::Command::new("/bin/sh")
-                .args(["-c", "printf r; read line; exit 0"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped()),
-        )
-        .expect("spawn");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = crate::test_support::SpawnReaped::spawn_reaped(command).expect("spawn");
         let mut ready = [0_u8; 1];
         child
             .stdout
@@ -1512,8 +1513,6 @@ mod tests {
             .unwrap();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
         let normal = thread_max_priorities(pid).unwrap().expect("child runs");
-        assert!(!normal.is_empty());
-        assert!(normal.iter().all(|&p| p == 63), "normal: {normal:?}");
         // SAFETY: setting PRIO_DARWIN_BG on our own live child.
         assert_eq!(
             unsafe {
@@ -1521,18 +1520,114 @@ mod tests {
             },
             0
         );
-        let bg = thread_max_priorities(pid).unwrap().expect("child runs");
-        assert!(!bg.is_empty());
-        assert!(bg.iter().all(|&p| p == 4), "backgrounded: {bg:?}");
+        let backgrounded = thread_max_priorities(pid).unwrap().expect("child runs");
         // SAFETY: clearing PRIO_DARWIN_BG on our own live child.
         assert_eq!(
             unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, child.id(), 0) },
             0
         );
         let cleared = thread_max_priorities(pid).unwrap().expect("child runs");
-        assert!(!cleared.is_empty());
-        assert!(cleared.iter().all(|&p| p == 63), "cleared: {cleared:?}");
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
+        DarwinBgCeilings {
+            normal,
+            backgrounded,
+            cleared,
+        }
+    }
+
+    /// `PROC_PIDTHREADINFO` reports the inherited task priority ceiling (matching this process, in
+    /// `(4, 63]`) on a normal child, drops to `4` while `PRIO_DARWIN_BG` is set on it, and returns
+    /// to that ceiling once cleared.
+    #[test]
+    fn thread_max_priorities_reads_back_darwin_bg() {
+        // SAFETY: reading this process's own pid.
+        let own = thread_max_priorities(unsafe { libc::getpid() })
+            .unwrap()
+            .expect("self runs");
+        assert!(!own.is_empty());
+        let own_ceiling = own[0];
+        assert!(
+            own.iter().all(|&p| p == own_ceiling),
+            "own threads share task max_priority: {own:?}"
+        );
+        assert!(
+            own_ceiling > 4 && own_ceiling <= 63,
+            "own ceiling in (4, 63]: {own:?}"
+        );
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf r; read line; exit 0"]);
+        let DarwinBgCeilings {
+            normal,
+            backgrounded,
+            cleared,
+        } = darwin_bg_ceiling_round_trip(&mut command);
+
+        assert!(!normal.is_empty());
+        let baseline = normal[0];
+        assert!(
+            normal.iter().all(|&p| p == baseline),
+            "normal threads share one ceiling: {normal:?}"
+        );
+        assert!(
+            baseline > 4 && baseline <= 63,
+            "normal ceiling in (4, 63]: {normal:?}"
+        );
+        assert_eq!(
+            baseline, own_ceiling,
+            "child inherits parent's task max_priority: child={normal:?}, self={own:?}"
+        );
+
+        assert!(!backgrounded.is_empty());
+        assert!(
+            backgrounded.iter().all(|&p| p == 4),
+            "backgrounded: {backgrounded:?}"
+        );
+
+        assert!(!cleared.is_empty());
+        assert!(
+            cleared.iter().all(|&p| p == baseline),
+            "cleared: {cleared:?} (expected {baseline})"
+        );
+    }
+
+    /// Under a `UTILITY` task QoS clamp, XNU clamps `task->max_priority` to `BASEPRI_UTILITY` (20)
+    /// (`osfmk/kern/task_policy.c:1272-1276`, inherited across spawn at `:746`), drops it to
+    /// `MAXPRI_THROTTLE` (4) while `PRIO_DARWIN_BG` is set (`:1250-1252`), and restores it to `20`
+    /// once `PRIO_DARWIN_BG` clears because the clamp remains in force.
+    #[test]
+    fn thread_max_priorities_reads_back_darwin_bg_under_utility_clamp() {
+        let mut command = std::process::Command::new("/usr/sbin/taskpolicy");
+        command.args([
+            "-c",
+            "utility",
+            "/bin/sh",
+            "-c",
+            "printf r; read line; exit 0",
+        ]);
+        let DarwinBgCeilings {
+            normal,
+            backgrounded,
+            cleared,
+        } = darwin_bg_ceiling_round_trip(&mut command);
+
+        assert!(!normal.is_empty());
+        assert!(
+            normal.iter().all(|&p| p == 20),
+            "clamped normal: {normal:?}"
+        );
+
+        assert!(!backgrounded.is_empty());
+        assert!(
+            backgrounded.iter().all(|&p| p == 4),
+            "clamped backgrounded: {backgrounded:?}"
+        );
+
+        assert!(!cleared.is_empty());
+        assert!(
+            cleared.iter().all(|&p| p == 20),
+            "clamped cleared: {cleared:?}"
+        );
     }
 }
