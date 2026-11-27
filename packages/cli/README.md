@@ -506,9 +506,14 @@ tool again. A non-empty `NODE_OPTIONS` no longer turns off the descriptor-answer
 `--require` target in it is listed in `TTSC_CACHE_TRUSTED_PRELOADS`
 ([samchon/ttsc#1914](https://github.com/samchon/ttsc/pull/1914)): ttsc walks each listed preload's module graph through
 `module.children`, records its files as inputs of a descriptor answer and digests them into the capability keys, and
-whoever lists a preload vouches for everything it does beyond that graph. A descriptor evaluator loads the build chain
-only when it compiles a TypeScript source ([samchon/ttsc#1915](https://github.com/samchon/ttsc/pull/1915)), so a `.cjs`
-descriptor starts 28 modules instead of 251.
+whoever lists a preload vouches for everything it does beyond that graph. An unlisted preload still refuses those caches
+through their keys, and leaves a fresh evaluation's input observation complete, as upstream merged it: a consumer that
+reads an incomplete observation as an unobservable host input (`@ttsc/unplugin`'s freshness proof) then refused every
+Vite build under a sandbox's port-0 preload. A descriptor evaluator loads the build chain only when it compiles a
+TypeScript source ([samchon/ttsc#1915](https://github.com/samchon/ttsc/pull/1915)), so a `.cjs` descriptor starts 28
+modules instead of 251. A warm launch proves an absent resolution candidate with one lstat, resolves each ancestor
+directory once per load phase, and mints its temporary clock reference only when a proof needs one
+([samchon/ttsc#1916](https://github.com/samchon/ttsc/pull/1916)).
 
 A resident `driver.Session` whose `Session.Apply` installs a new program generation resets `pluginsApplied`,
 `pluginsApplyErr` and the per-generation plugin ledgers (`declarations`, `inputs`, `outputs` via

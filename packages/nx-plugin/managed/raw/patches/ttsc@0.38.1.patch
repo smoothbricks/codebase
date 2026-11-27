@@ -2202,6 +2202,34 @@ index 2d31917..d880415 100644
              execution,
              generation,
              key: plan.key,
+diff --git a/lib/compiler/internal/build/RuntimeBuildInputs.js b/lib/compiler/internal/build/RuntimeBuildInputs.js
+index dfa200b..f9bd49c 100644
+--- a/lib/compiler/internal/build/RuntimeBuildInputs.js
++++ b/lib/compiler/internal/build/RuntimeBuildInputs.js
+@@ -342,17 +342,21 @@ var RuntimeBuildInputs;
+                     if (execution.nativePlugins.length !== 0)
+                         return undefined;
+                     const marker = pretraceMarker();
+-                    if (marker === undefined || !node_fs_1.default.existsSync(marker))
++                    if (marker === undefined || !node_fs_1.default.existsSync(marker)) {
+                         // The emitting run traces its own resolution. The trace is
+                         // kept and its files are hashed when the result is published,
+                         // after the program has started; each must have stopped
+                         // changing before the store opened, ahead of the compile, and
+                         // one that cannot be shown to have marks this build to trace
+-                        // beforehand instead.
++                        // beforehand instead. Force any temporary-volume reference now,
++                        // before the compile runs, so parked and post-compile proofs
++                        // compare against pre-compile stamps.
++                        PluginContentIdentities_1.PluginContentIdentities.ensureTemporaryReference(identities);
+                         return (output, status) => {
+                             if (status === 0)
+                                 tracedOutput = output;
+                         };
++                    }
+                     // An input of this build lives where no clock reference shows
+                     // its bytes predate the compile, such as another volume. Its
+                     // resolution is traced and hashed before the compile, and the
 diff --git a/lib/compiler/internal/build/appendBuildOutput.js b/lib/compiler/internal/build/appendBuildOutput.js
 index 84e1479..4276ae8 100644
 --- a/lib/compiler/internal/build/appendBuildOutput.js
@@ -2605,10 +2633,18 @@ index 121e016..711fb29 100644
      SidecarEnvironment_1.SidecarEnvironment.write(env, "TTSC_NATIVE_PLUGIN_RECORD_ROOT", identities?.root);
      // The anchor is per-invocation state owned by this host: when this run
 diff --git a/lib/compiler/internal/transformProjectInMemory.js b/lib/compiler/internal/transformProjectInMemory.js
-index e1de410..8e81f5a 100644
+index e1de410..4e007b2 100644
 --- a/lib/compiler/internal/transformProjectInMemory.js
 +++ b/lib/compiler/internal/transformProjectInMemory.js
-@@ -22,6 +22,7 @@ const createNativeProjectContextArgs_1 = require("./project/createNativeProjectC
+@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.transformProjectInMemory = transformProjectInMemory;
+ const node_path_1 = __importDefault(require("node:path"));
+ const resolveNodeBinary_1 = require("../../internal/resolveNodeBinary");
++const HostInputObservationPhase_1 = require("../../plugin/internal/load/HostInputObservationPhase");
+ const collectProjectHostInputs_1 = require("../../plugin/internal/load/collectProjectHostInputs");
+ const hashHostInputPaths_1 = require("../../plugin/internal/load/hashHostInputPaths");
+ const loadProjectPlugins_1 = require("../../plugin/internal/load/loadProjectPlugins");
+@@ -22,6 +23,7 @@ const createNativeProjectContextArgs_1 = require("./project/createNativeProjectC
  const resolveBinary_1 = require("./resolveBinary");
  const resolveTsgo_1 = require("./resolveTsgo");
  const runNativeCheckWithObservations_1 = require("./runNativeCheckWithObservations");
@@ -2616,7 +2652,19 @@ index e1de410..8e81f5a 100644
  const SidecarEnvironment_1 = require("./sharedHost/SidecarEnvironment");
  const assertSharedHostCompatibility_1 = require("./sharedHost/assertSharedHostCompatibility");
  const clearInheritedSemanticConfigPath_1 = require("./sharedHost/clearInheritedSemanticConfigPath");
-@@ -129,7 +130,7 @@ function transformProjectWithNativeHost(options, project, baseline) {
+@@ -114,8 +116,9 @@ function transformProjectWithNativeHost(options, project, baseline) {
+     // consumes the resolved config chain here, so dependency package manifests
+     // must not become per-project universal inputs a second time.
+     const projectHostInputs = (0, collectProjectHostInputs_1.collectProjectHostInputs)(project, false);
+-    const projectHostInputHashes = (0, hashHostInputPaths_1.hashHostInputPaths)(projectHostInputs);
+-    const projectHostInputRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(projectHostInputs);
++    const projectInputPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++    const projectHostInputHashes = (0, hashHostInputPaths_1.hashHostInputPaths)(projectHostInputs, projectInputPhase);
++    const projectHostInputRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(projectHostInputs, projectInputPhase);
+     const observedHostInputs = mergeHostInputs(baseline?.hostInputs, projectHostInputs);
+     const observedHostInputHashes = mergeCompatibleHostInputHashes(baseline?.hostInputHashes ?? {}, projectHostInputHashes, baseline?.hostInputs ?? [], projectHostInputs);
+     const observedHostInputRealpaths = mergeCompatibleHostInputHashes(baseline?.hostInputRealpaths ?? {}, projectHostInputRealpaths, baseline?.hostInputs ?? [], projectHostInputs);
+@@ -129,7 +132,7 @@ function transformProjectWithNativeHost(options, project, baseline) {
      });
      const res = (0, spawnNative_1.spawnNative)(binary, ["api-transform", "--cwd", project.root, "--tsconfig", project.path], {
          cwd: project.root,
@@ -2625,7 +2673,45 @@ index e1de410..8e81f5a 100644
      });
      if (res.error) {
          throw new Error(`ttsc: failed to spawn native compiler host ${binary}: ${res.error.message}`);
-@@ -485,6 +486,7 @@ function nativePluginEnv(options, projectRoot, tsgoBinary, nativePlugins, plugin
+@@ -234,10 +237,11 @@ function transformProjectWithPlugins(options, loaded) {
+         stdout: "",
+         stderr: (0, outputText_1.outputText)(res.stderr),
+     };
+-    const finalLoadedHostInputHashes = revalidateHostInputHashes(checkedHostInputHashes, checkedHostInputs);
+-    const finalOutputHostInputHashes = revalidateHostInputHashes(output.hostInputHashes ?? {}, output.hostInputs ?? []);
+-    const finalLoadedHostInputRealpaths = revalidateHostInputRealpaths(checkedHostInputRealpaths, checkedHostInputs);
+-    const finalOutputHostInputRealpaths = revalidateHostInputRealpaths(output.hostInputRealpaths ?? {}, output.hostInputs ?? []);
++    const revalidationPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++    const finalLoadedHostInputHashes = revalidateHostInputHashes(checkedHostInputHashes, checkedHostInputs, revalidationPhase);
++    const finalOutputHostInputHashes = revalidateHostInputHashes(output.hostInputHashes ?? {}, output.hostInputs ?? [], revalidationPhase);
++    const finalLoadedHostInputRealpaths = revalidateHostInputRealpaths(checkedHostInputRealpaths, checkedHostInputs, revalidationPhase);
++    const finalOutputHostInputRealpaths = revalidateHostInputRealpaths(output.hostInputRealpaths ?? {}, output.hostInputs ?? [], revalidationPhase);
+     const hostInputHashes = mergeCompatibleHostInputHashes(finalLoadedHostInputHashes, finalOutputHostInputHashes, checkedHostInputs, output.hostInputs, deferredTransformInputs);
+     const hostInputRealpaths = mergeCompatibleHostInputHashes(finalLoadedHostInputRealpaths, finalOutputHostInputRealpaths, checkedHostInputs, output.hostInputs, deferredTransformInputs);
+     return {
+@@ -253,8 +257,8 @@ function transformProjectWithPlugins(options, loaded) {
+     };
+ }
+ /** Keep evaluation proof only when the same input still has the same state. */
+-function revalidateHostInputHashes(initial, inputs) {
+-    const current = (0, hashHostInputPaths_1.hashHostInputPaths)(inputs);
++function revalidateHostInputHashes(initial, inputs, phase) {
++    const current = (0, hashHostInputPaths_1.hashHostInputPaths)(inputs, phase);
+     return Object.fromEntries(inputs.flatMap((input) => {
+         const absolute = node_path_1.default.resolve(input);
+         return Object.prototype.hasOwnProperty.call(initial, absolute) &&
+@@ -264,8 +268,8 @@ function revalidateHostInputHashes(initial, inputs) {
+     }));
+ }
+ /** Keep evaluation proof only while each lexical path selects the same target. */
+-function revalidateHostInputRealpaths(initial, inputs) {
+-    const current = (0, realpathHostInputPaths_1.realpathHostInputPaths)(inputs);
++function revalidateHostInputRealpaths(initial, inputs, phase) {
++    const current = (0, realpathHostInputPaths_1.realpathHostInputPaths)(inputs, phase);
+     return Object.fromEntries(inputs.flatMap((input) => {
+         const absolute = node_path_1.default.resolve(input);
+         return Object.prototype.hasOwnProperty.call(initial, absolute) &&
+@@ -485,6 +489,7 @@ function nativePluginEnv(options, projectRoot, tsgoBinary, nativePlugins, plugin
              node_path_1.default.join(__dirname, "..", "..", "launcher", "ttsx.js"),
      }, options.env, { TTSC_TSGO_BINARY: tsgoBinary });
      const node = (0, resolveNodeBinary_1.resolveNodeBinary)(env, projectRoot, identities);
@@ -4903,6 +4989,34 @@ index e52a130..df75872 100644
  }
  /**
   * Map the JavaScript extension a relative `specifier` carries to the TypeScript
+diff --git a/lib/launcher/internal/ttscserver/captureLSPPluginSelectionInputs.js b/lib/launcher/internal/ttscserver/captureLSPPluginSelectionInputs.js
+index 25b7780..eba5a13 100644
+--- a/lib/launcher/internal/ttscserver/captureLSPPluginSelectionInputs.js
++++ b/lib/launcher/internal/ttscserver/captureLSPPluginSelectionInputs.js
+@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.captureLSPPluginSelectionInputs = captureLSPPluginSelectionInputs;
+ const node_path_1 = __importDefault(require("node:path"));
++const HostInputObservationPhase_1 = require("../../../plugin/internal/load/HostInputObservationPhase");
+ const hashHostInputPaths_1 = require("../../../plugin/internal/load/hashHostInputPaths");
+ const realpathHostInputPaths_1 = require("../../../plugin/internal/load/realpathHostInputPaths");
+ const GoSourceInputs_1 = require("../../../plugin/internal/source/GoSourceInputs");
+@@ -66,12 +67,13 @@ function captureLSPPluginSelectionInputs(loaded) {
+         for (const file of (0, collectPluginSourceFiles_1.collectPluginSourceFiles)(source))
+             record(sourceFiles, node_path_1.default.resolve(file));
+     }
++    const observationPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
+     const proven = descriptorInputs.filter((file) => Object.prototype.hasOwnProperty.call(loaded.hostInputHashes, file));
+-    const current = (0, hashHostInputPaths_1.hashHostInputPaths)(proven);
++    const current = (0, hashHostInputPaths_1.hashHostInputPaths)(proven, observationPhase);
+     if (proven.some((file) => current[file] !== loaded.hostInputHashes[file]))
+         return undefined;
+     const physicalInputs = descriptorInputs.filter((file) => Object.prototype.hasOwnProperty.call(loaded.hostInputRealpaths, file));
+-    const currentRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(physicalInputs);
++    const currentRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(physicalInputs, observationPhase);
+     if (physicalInputs.some((file) => currentRealpaths[file] !== loaded.hostInputRealpaths[file]))
+         return undefined;
+     // The load's project names the plugin cache whose records prove the sources
 diff --git a/lib/launcher/internal/ttscserver/runTtscserver.js b/lib/launcher/internal/ttscserver/runTtscserver.js
 index 7697d9d..c15b87e 100644
 --- a/lib/launcher/internal/ttscserver/runTtscserver.js
@@ -5042,7 +5156,7 @@ index 3fe501c..145b02a 100644
      }
      CapabilityResolutionFormat.resolutionFile = resolutionFile;
 diff --git a/lib/plugin/internal/load/COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE.js b/lib/plugin/internal/load/COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE.js
-index 31832c4..eb9556a 100644
+index 31832c4..663525a 100644
 --- a/lib/plugin/internal/load/COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE.js
 +++ b/lib/plugin/internal/load/COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE.js
 @@ -28,6 +28,9 @@ exports.COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE = [
@@ -5055,14 +5169,16 @@ index 31832c4..eb9556a 100644
      `const { fileURLToPath } = require("node:url");`,
      `const { createResolutionInputRecorder, requireResolveConsultsHooks } = (() => {`,
      `  const file = ${JSON.stringify(RESOLUTION_INPUT_RECORDER_PATH_1.RESOLUTION_INPUT_RECORDER_PATH)};`,
-@@ -167,7 +170,23 @@ exports.COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE = [
+@@ -167,7 +170,25 @@ exports.COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE = [
      // lazily require a config; snapshotting inputs first would silently omit
      // that influence.
      `  const serializedDescriptor = JSON.stringify(descriptor);`,
 +    `  let recordedPreloadFiles = [];`,
-+    `  if (trustedPreloadRoots === null) {`,
-+    `    recorder.invalidateObservation();`,
-+    `  } else if (trustedPreloadRoots.length !== 0) {`,
++    // An untrusted startup preload refuses the descriptor cache through its key
++    // (PluginDescriptorEvaluationCache.locate); it does not make this fresh
++    // evaluation's input observation incomplete (upstream samchon/ttsc#1914 as
++    // merged: declining persistent preload reuse keeps the ordinary observations).
++    `  if (trustedPreloadRoots !== null && trustedPreloadRoots.length !== 0) {`,
 +    `    const preloadGraph = trustedPreloadGraph.walkModuleGraph(trustedPreloadRoots, require.cache);`,
 +    `    if (preloadGraph === null) {`,
 +    `      recorder.invalidateObservation();`,
@@ -5079,11 +5195,494 @@ index 31832c4..eb9556a 100644
      `  PluginDescriptorInputReport.finish();`,
      `  const observation = PluginDescriptorInputObservation.snapshot();`,
      `  observation.complete = observation.complete && recorded.complete === true;`,
+diff --git a/lib/plugin/internal/load/HostInputObservationPhase.d.ts b/lib/plugin/internal/load/HostInputObservationPhase.d.ts
+new file mode 100644
+index 0000000..bb3421b
+--- /dev/null
++++ b/lib/plugin/internal/load/HostInputObservationPhase.d.ts
+@@ -0,0 +1,124 @@
++/**
++ * Per-phase filesystem observation memo for host-input hashing and physical
++ * path resolution.
++ *
++ * Within one synchronous load or verification phase, each candidate path is
++ * observed with at most one `lstatSync`: an absent path (`ENOENT` or `ENOTDIR`)
++ * answers both its content hash (`null`) and physical path (`null`), a present
++ * non-symlink file hashes its bytes without a separate `statSync`, a present
++ * non-symlink directory gets the fixed directory marker without reading
++ * children, and a symlink follows native `statSync` and `realpathSync.native`.
++ *
++ * A descendant whose ancestor was already observed in the same phase as missing
++ * (`ENOENT` or `ENOTDIR`) or as a non-symlink non-directory short-circuits to
++ * `null` for both hash and realpath with zero syscalls. A symlink parent never
++ * short-circuits its descendants. This relies on the same one-consistent-phase
++ * premise as #1900's per-phase observation memo: sequential observations within
++ * one synchronous phase are not an atomic snapshot, and the caller drops the
++ * phase memo when that phase ends so later phases observe filesystem changes
++ * afresh.
++ *
++ * For present non-symlink leaves, each ancestor directory is resolved once per
++ * phase with `fs.realpathSync.native` and listed once per phase with
++ * `fs.readdirSync` so the leaf keeps its exact on-disk spelling, byte-identical
++ * to `fs.realpathSync.native` including case on case-insensitive volumes. Exact
++ * entry matches resolve directly; case-folded matches apply only when both the
++ * lexical name and the matched entry are entirely ASCII and unambiguous.
++ * Symlink leaves, non-ASCII or ambiguous folds, and unreadable directory
++ * listings fall back to `fs.realpathSync.native`.
++ *
++ * @evidence contracts/common.md#principled-implementation Absent paths map ENOENT and ENOTDIR from one lstat to null hash and null realpath; present files, directories and symlinks preserve exact content-hash and native physical-path semantics, only confirmed non-symlink non-directory or missing ancestors short-circuit descendants within one phase, and case folding applies only to unambiguous ASCII-to-ASCII matches.
++ * @evidence contracts/common.md#clear-and-simple-design One phase owner coordinates lstat kind, content hashes, physical targets, ancestor realpaths and directory listings so hashHostInputPaths and realpathHostInputPaths share observations without duplicating filesystem rules.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts Symlink parents never short-circuit descendants, lexical leaf basenames never replace on-disk spelling, non-ASCII or ambiguous folds and unreadable listings fall back to native realpathSync.native, and nothing is cached in module state across phases.
++ * @evidence contracts/common.md#meaningful-documentation Native paragraphs state the lstat-sharing rule, absent-parent short-circuit boundary, one-consistent-phase premise, phase-end drop requirement and exact on-disk casing protocol.
++ * @evidence contracts/portability.md#os-neutral-implementation Native path.dirname/join/resolve, portable ENOENT/ENOTDIR classification, fs.lstatSync/statSync, fs.readdirSync and fs.realpathSync.native handle POSIX and Windows links, case-insensitive volumes and fallback spellings without platform-name branching.
++ * @evidence contracts/performance.md#efficient-algorithms Each independent absent candidate incurs one lstatSync and zero statSync/realpath calls; descendants of already-observed missing or non-directory parents incur zero syscalls; present non-symlink files reuse their lstat kind and share one realpathSync.native and one readdirSync per parent directory per phase.
++ * @evidence contracts/performance.md#reuse-equivalent-work Observations are shared only through an explicit caller-owned Phase instance within one synchronous load or verification phase and are dropped when that phase ends; separate phases observe the filesystem afresh.
++ * @evidence contracts/performance.md#bound-retention-and-release-resources Maps belong strictly to the caller-owned Phase object and are reclaimed when the phase ends; synchronous filesystem calls retain no open descriptors or global state.
++ */
++export declare namespace HostInputObservationPhase {
++    const PHASE_BRAND: unique symbol;
++    type LstatKind = "missing" | "non-directory" | "directory" | "symlink" | "error";
++    interface DirectoryListing {
++        readonly exact: ReadonlySet<string>;
++        readonly lower: ReadonlyMap<string, string | null>;
++    }
++    /**
++     * Caller-owned observation state for one synchronous verification phase.
++     *
++     * Drop this object as soon as the phase ends; reusing it across a read,
++     * resolution, subprocess, build, retry or yield would mask mutations.
++     *
++     * @evidence contracts/common.md#principled-implementation Holds exact per-phase lstat classifications, content hashes, physical targets and ancestor canonicalizations for one consistent phase.
++     * @evidence contracts/common.md#clear-and-simple-design Groups all phase-scoped maps in one typed record branded against plain Map arguments.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Carries only observations made in this phase and never persists across loads.
++     * @evidence contracts/common.md#meaningful-documentation Documents the caller's phase-end disposal requirement.
++     * @evidenceExclude contracts/portability.md#os-neutral-implementation A record type performs no native operation; namespace operations handle native boundaries.
++     * @evidenceExclude contracts/performance.md#efficient-algorithms A record type executes no algorithm.
++     * @evidenceExclude contracts/performance.md#reuse-equivalent-work Reuse scope is defined by create and the observation operations.
++     * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Owned by the caller for one synchronous phase.
++     */
++    export interface Phase {
++        readonly [PHASE_BRAND]: true;
++        readonly hashes: Map<string, string | null>;
++        readonly realpaths: Map<string, string | null>;
++        readonly lstats: Map<string, LstatKind>;
++        readonly directoryRealpaths: Map<string, string | null>;
++        readonly directoryEntries: Map<string, DirectoryListing | null>;
++    }
++    /**
++     * Create an empty observation memo for one synchronous phase.
++     *
++     * @evidence contracts/common.md#principled-implementation Starts every phase with empty maps so no prior phase's filesystem observation leaks into the new phase.
++     * @evidence contracts/common.md#clear-and-simple-design Single factory produces a branded Phase record.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Allocates fresh per-phase maps rather than returning shared module state.
++     * @evidence contracts/common.md#meaningful-documentation States single-phase factory purpose.
++     * @evidenceExclude contracts/portability.md#os-neutral-implementation Allocates JavaScript Maps with no native boundary.
++     * @evidence contracts/performance.md#efficient-algorithms Constant-time allocation of five empty Maps.
++     * @evidenceExclude contracts/performance.md#reuse-equivalent-work Creates a fresh empty phase; sharing happens across calls given this instance.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Returned object is caller-owned and holds no handles.
++     */
++    export function create(): Phase;
++    /**
++     * Type guard distinguishing a {@link Phase} from a plain `Map` or legacy
++     * hash/realpath map pair.
++     *
++     * @evidence contracts/common.md#principled-implementation Uses a private module symbol so arbitrary objects cannot masquerade as a Phase.
++     * @evidence contracts/common.md#clear-and-simple-design One predicate lets mappers accept either a Phase or legacy Map cleanly.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Checks an unforgeable symbol brand rather than duck-typing Map properties.
++     * @evidence contracts/common.md#meaningful-documentation States exact discrimination purpose.
++     * @evidenceExclude contracts/portability.md#os-neutral-implementation Pure JavaScript symbol check.
++     * @evidence contracts/performance.md#efficient-algorithms Constant-time property check.
++     * @evidenceExclude contracts/performance.md#reuse-equivalent-work Stateless type guard.
++     * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Retains nothing.
++     */
++    export function isPhase(value: unknown): value is Phase;
++    /**
++     * Observe and memoize the content hash of a resolved path within `phase`.
++     *
++     * @evidence contracts/common.md#principled-implementation Reuses one lstat per path: missing paths record null for both hash and realpath, non-symlink directories return the fixed directory digest, non-symlink files hash their bytes without an extra statSync, and symlinks follow statSync as before.
++     * @evidence contracts/common.md#clear-and-simple-design Shares lstat classification and absent-parent short-circuiting with realpath observation.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Follows symlinks with statSync rather than trusting link metadata, and returns null on unreadable paths without fabricating digests.
++     * @evidence contracts/common.md#meaningful-documentation States resolved-path input and phase-scoped memoization.
++     * @evidence contracts/portability.md#os-neutral-implementation Native fs.lstatSync, fs.statSync and fs.readFileSync handle host path and link semantics.
++     * @evidence contracts/performance.md#efficient-algorithms Zero syscalls on repeat lookup or absent/non-directory ancestor hit; one lstatSync on independent absent paths and non-symlink directories; one lstatSync plus readFileSync on non-symlink files.
++     * @evidence contracts/performance.md#reuse-equivalent-work Shares lstat and hash results within the caller-owned phase only.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Stores one hash string or null in phase.hashes; synchronous file reads close their descriptors before returning.
++     */
++    export function hash(resolved: string, phase: Phase): string | null;
++    /**
++     * Observe and memoize the physical path of a resolved path within `phase`,
++     * byte-identical to `fs.realpathSync.native`.
++     *
++     * @evidence contracts/common.md#principled-implementation Absent paths short-circuit to null from one lstat, symlink leaves resolve with native realpathSync.native, and non-symlink leaves join their cached physical parent directory with the exact on-disk entry name from a memoized readdirSync listing, falling back to realpathSync.native whenever the listing is unreadable or ambiguous.
++     * @evidence contracts/common.md#clear-and-simple-design Shares lstat classification and absent-parent short-circuiting with hash observation while caching ancestor realpaths and directory listings per phase.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Never constructs a physical path from the lexical leaf basename; symlink leaves and unreadable or ambiguous listings always delegate to fs.realpathSync.native.
++     * @evidence contracts/common.md#meaningful-documentation States byte-identical native realpath semantics and phase-scoped memoization.
++     * @evidence contracts/portability.md#os-neutral-implementation Uses fs.realpathSync.native for ancestor canonicalization and symlink/fallback resolution and fs.readdirSync for exact on-disk leaf casing on case-insensitive volumes without platform-name assumptions.
++     * @evidence contracts/performance.md#efficient-algorithms Zero syscalls on repeat lookup, already-observed absent path or absent/non-directory ancestor; present non-symlink files share one realpathSync.native and one readdirSync per parent directory per phase.
++     * @evidence contracts/performance.md#reuse-equivalent-work Shares lstat, realpath, ancestor realpath and directory listing results only within the caller-owned phase.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Retained maps belong to the caller-owned Phase and are dropped when the phase ends; synchronous filesystem calls hold no open handles.
++     */
++    export function realpath(resolved: string, phase: Phase): string | null;
++    export {};
++}
+diff --git a/lib/plugin/internal/load/HostInputObservationPhase.js b/lib/plugin/internal/load/HostInputObservationPhase.js
+new file mode 100644
+index 0000000..45ca9d1
+--- /dev/null
++++ b/lib/plugin/internal/load/HostInputObservationPhase.js
+@@ -0,0 +1,340 @@
++"use strict";
++var __importDefault = (this && this.__importDefault) || function (mod) {
++    return (mod && mod.__esModule) ? mod : { "default": mod };
++};
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.HostInputObservationPhase = void 0;
++const node_crypto_1 = __importDefault(require("node:crypto"));
++const node_fs_1 = __importDefault(require("node:fs"));
++const node_path_1 = __importDefault(require("node:path"));
++const RuntimeFilesystem_1 = require("../../../launcher/internal/runtime/RuntimeFilesystem");
++/**
++ * Per-phase filesystem observation memo for host-input hashing and physical
++ * path resolution.
++ *
++ * Within one synchronous load or verification phase, each candidate path is
++ * observed with at most one `lstatSync`: an absent path (`ENOENT` or `ENOTDIR`)
++ * answers both its content hash (`null`) and physical path (`null`), a present
++ * non-symlink file hashes its bytes without a separate `statSync`, a present
++ * non-symlink directory gets the fixed directory marker without reading
++ * children, and a symlink follows native `statSync` and `realpathSync.native`.
++ *
++ * A descendant whose ancestor was already observed in the same phase as missing
++ * (`ENOENT` or `ENOTDIR`) or as a non-symlink non-directory short-circuits to
++ * `null` for both hash and realpath with zero syscalls. A symlink parent never
++ * short-circuits its descendants. This relies on the same one-consistent-phase
++ * premise as #1900's per-phase observation memo: sequential observations within
++ * one synchronous phase are not an atomic snapshot, and the caller drops the
++ * phase memo when that phase ends so later phases observe filesystem changes
++ * afresh.
++ *
++ * For present non-symlink leaves, each ancestor directory is resolved once per
++ * phase with `fs.realpathSync.native` and listed once per phase with
++ * `fs.readdirSync` so the leaf keeps its exact on-disk spelling, byte-identical
++ * to `fs.realpathSync.native` including case on case-insensitive volumes. Exact
++ * entry matches resolve directly; case-folded matches apply only when both the
++ * lexical name and the matched entry are entirely ASCII and unambiguous.
++ * Symlink leaves, non-ASCII or ambiguous folds, and unreadable directory
++ * listings fall back to `fs.realpathSync.native`.
++ *
++ * @evidence contracts/common.md#principled-implementation Absent paths map ENOENT and ENOTDIR from one lstat to null hash and null realpath; present files, directories and symlinks preserve exact content-hash and native physical-path semantics, only confirmed non-symlink non-directory or missing ancestors short-circuit descendants within one phase, and case folding applies only to unambiguous ASCII-to-ASCII matches.
++ * @evidence contracts/common.md#clear-and-simple-design One phase owner coordinates lstat kind, content hashes, physical targets, ancestor realpaths and directory listings so hashHostInputPaths and realpathHostInputPaths share observations without duplicating filesystem rules.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts Symlink parents never short-circuit descendants, lexical leaf basenames never replace on-disk spelling, non-ASCII or ambiguous folds and unreadable listings fall back to native realpathSync.native, and nothing is cached in module state across phases.
++ * @evidence contracts/common.md#meaningful-documentation Native paragraphs state the lstat-sharing rule, absent-parent short-circuit boundary, one-consistent-phase premise, phase-end drop requirement and exact on-disk casing protocol.
++ * @evidence contracts/portability.md#os-neutral-implementation Native path.dirname/join/resolve, portable ENOENT/ENOTDIR classification, fs.lstatSync/statSync, fs.readdirSync and fs.realpathSync.native handle POSIX and Windows links, case-insensitive volumes and fallback spellings without platform-name branching.
++ * @evidence contracts/performance.md#efficient-algorithms Each independent absent candidate incurs one lstatSync and zero statSync/realpath calls; descendants of already-observed missing or non-directory parents incur zero syscalls; present non-symlink files reuse their lstat kind and share one realpathSync.native and one readdirSync per parent directory per phase.
++ * @evidence contracts/performance.md#reuse-equivalent-work Observations are shared only through an explicit caller-owned Phase instance within one synchronous load or verification phase and are dropped when that phase ends; separate phases observe the filesystem afresh.
++ * @evidence contracts/performance.md#bound-retention-and-release-resources Maps belong strictly to the caller-owned Phase object and are reclaimed when the phase ends; synchronous filesystem calls retain no open descriptors or global state.
++ */
++var HostInputObservationPhase;
++(function (HostInputObservationPhase) {
++    const PHASE_BRAND = Symbol("ttsc.HostInputObservationPhase");
++    const DIRECTORY_HASH = node_crypto_1.default
++        .createHash("sha256")
++        .update("ttsc:host-input:directory\0")
++        .digest("hex");
++    /**
++     * Create an empty observation memo for one synchronous phase.
++     *
++     * @evidence contracts/common.md#principled-implementation Starts every phase with empty maps so no prior phase's filesystem observation leaks into the new phase.
++     * @evidence contracts/common.md#clear-and-simple-design Single factory produces a branded Phase record.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Allocates fresh per-phase maps rather than returning shared module state.
++     * @evidence contracts/common.md#meaningful-documentation States single-phase factory purpose.
++     * @evidenceExclude contracts/portability.md#os-neutral-implementation Allocates JavaScript Maps with no native boundary.
++     * @evidence contracts/performance.md#efficient-algorithms Constant-time allocation of five empty Maps.
++     * @evidenceExclude contracts/performance.md#reuse-equivalent-work Creates a fresh empty phase; sharing happens across calls given this instance.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Returned object is caller-owned and holds no handles.
++     */
++    function create() {
++        return {
++            [PHASE_BRAND]: true,
++            hashes: new Map(),
++            realpaths: new Map(),
++            lstats: new Map(),
++            directoryRealpaths: new Map(),
++            directoryEntries: new Map(),
++        };
++    }
++    HostInputObservationPhase.create = create;
++    /**
++     * Type guard distinguishing a {@link Phase} from a plain `Map` or legacy
++     * hash/realpath map pair.
++     *
++     * @evidence contracts/common.md#principled-implementation Uses a private module symbol so arbitrary objects cannot masquerade as a Phase.
++     * @evidence contracts/common.md#clear-and-simple-design One predicate lets mappers accept either a Phase or legacy Map cleanly.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Checks an unforgeable symbol brand rather than duck-typing Map properties.
++     * @evidence contracts/common.md#meaningful-documentation States exact discrimination purpose.
++     * @evidenceExclude contracts/portability.md#os-neutral-implementation Pure JavaScript symbol check.
++     * @evidence contracts/performance.md#efficient-algorithms Constant-time property check.
++     * @evidenceExclude contracts/performance.md#reuse-equivalent-work Stateless type guard.
++     * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Retains nothing.
++     */
++    function isPhase(value) {
++        return (typeof value === "object" &&
++            value !== null &&
++            PHASE_BRAND in value &&
++            value[PHASE_BRAND] === true);
++    }
++    HostInputObservationPhase.isPhase = isPhase;
++    /**
++     * Observe and memoize the content hash of a resolved path within `phase`.
++     *
++     * @evidence contracts/common.md#principled-implementation Reuses one lstat per path: missing paths record null for both hash and realpath, non-symlink directories return the fixed directory digest, non-symlink files hash their bytes without an extra statSync, and symlinks follow statSync as before.
++     * @evidence contracts/common.md#clear-and-simple-design Shares lstat classification and absent-parent short-circuiting with realpath observation.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Follows symlinks with statSync rather than trusting link metadata, and returns null on unreadable paths without fabricating digests.
++     * @evidence contracts/common.md#meaningful-documentation States resolved-path input and phase-scoped memoization.
++     * @evidence contracts/portability.md#os-neutral-implementation Native fs.lstatSync, fs.statSync and fs.readFileSync handle host path and link semantics.
++     * @evidence contracts/performance.md#efficient-algorithms Zero syscalls on repeat lookup or absent/non-directory ancestor hit; one lstatSync on independent absent paths and non-symlink directories; one lstatSync plus readFileSync on non-symlink files.
++     * @evidence contracts/performance.md#reuse-equivalent-work Shares lstat and hash results within the caller-owned phase only.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Stores one hash string or null in phase.hashes; synchronous file reads close their descriptors before returning.
++     */
++    function hash(resolved, phase) {
++        if (phase.hashes.has(resolved)) {
++            return phase.hashes.get(resolved);
++        }
++        const kind = observeLstat(resolved, phase);
++        if (kind === "missing") {
++            return null;
++        }
++        let digest;
++        if (kind === "directory") {
++            digest = DIRECTORY_HASH;
++        }
++        else if (kind === "non-directory") {
++            try {
++                digest = node_crypto_1.default
++                    .createHash("sha256")
++                    .update(node_fs_1.default.readFileSync(resolved))
++                    .digest("hex");
++            }
++            catch {
++                digest = null;
++            }
++        }
++        else {
++            try {
++                if (node_fs_1.default.statSync(resolved).isDirectory()) {
++                    digest = DIRECTORY_HASH;
++                }
++                else {
++                    digest = node_crypto_1.default
++                        .createHash("sha256")
++                        .update(node_fs_1.default.readFileSync(resolved))
++                        .digest("hex");
++                }
++            }
++            catch {
++                digest = null;
++            }
++        }
++        phase.hashes.set(resolved, digest);
++        return digest;
++    }
++    HostInputObservationPhase.hash = hash;
++    /**
++     * Observe and memoize the physical path of a resolved path within `phase`,
++     * byte-identical to `fs.realpathSync.native`.
++     *
++     * @evidence contracts/common.md#principled-implementation Absent paths short-circuit to null from one lstat, symlink leaves resolve with native realpathSync.native, and non-symlink leaves join their cached physical parent directory with the exact on-disk entry name from a memoized readdirSync listing, falling back to realpathSync.native whenever the listing is unreadable or ambiguous.
++     * @evidence contracts/common.md#clear-and-simple-design Shares lstat classification and absent-parent short-circuiting with hash observation while caching ancestor realpaths and directory listings per phase.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Never constructs a physical path from the lexical leaf basename; symlink leaves and unreadable or ambiguous listings always delegate to fs.realpathSync.native.
++     * @evidence contracts/common.md#meaningful-documentation States byte-identical native realpath semantics and phase-scoped memoization.
++     * @evidence contracts/portability.md#os-neutral-implementation Uses fs.realpathSync.native for ancestor canonicalization and symlink/fallback resolution and fs.readdirSync for exact on-disk leaf casing on case-insensitive volumes without platform-name assumptions.
++     * @evidence contracts/performance.md#efficient-algorithms Zero syscalls on repeat lookup, already-observed absent path or absent/non-directory ancestor; present non-symlink files share one realpathSync.native and one readdirSync per parent directory per phase.
++     * @evidence contracts/performance.md#reuse-equivalent-work Shares lstat, realpath, ancestor realpath and directory listing results only within the caller-owned phase.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Retained maps belong to the caller-owned Phase and are dropped when the phase ends; synchronous filesystem calls hold no open handles.
++     */
++    function realpath(resolved, phase) {
++        if (phase.realpaths.has(resolved)) {
++            return phase.realpaths.get(resolved);
++        }
++        const kind = observeLstat(resolved, phase);
++        if (kind === "missing") {
++            return null;
++        }
++        let target;
++        if (kind === "symlink" || kind === "error") {
++            target = nativeRealpath(resolved);
++        }
++        else if (kind === "directory") {
++            target = resolveDirectoryRealpath(resolved, phase);
++        }
++        else {
++            target = resolveNonSymlinkLeafRealpath(resolved, phase);
++        }
++        phase.realpaths.set(resolved, target);
++        return target;
++    }
++    HostInputObservationPhase.realpath = realpath;
++    function observeLstat(resolved, phase) {
++        const existing = phase.lstats.get(resolved);
++        if (existing !== undefined) {
++            return existing;
++        }
++        if (hasAbsentOrNonDirectoryAncestor(resolved, phase)) {
++            phase.lstats.set(resolved, "missing");
++            phase.hashes.set(resolved, null);
++            phase.realpaths.set(resolved, null);
++            return "missing";
++        }
++        try {
++            const stats = node_fs_1.default.lstatSync(resolved);
++            const kind = stats.isSymbolicLink()
++                ? "symlink"
++                : stats.isDirectory()
++                    ? "directory"
++                    : "non-directory";
++            phase.lstats.set(resolved, kind);
++            return kind;
++        }
++        catch (error) {
++            if (RuntimeFilesystem_1.RuntimeFilesystem.isMissingPathError(error)) {
++                phase.lstats.set(resolved, "missing");
++                phase.hashes.set(resolved, null);
++                phase.realpaths.set(resolved, null);
++                return "missing";
++            }
++            phase.lstats.set(resolved, "error");
++            return "error";
++        }
++    }
++    /**
++     * True only when a strict ancestor was already observed in this phase as
++     * missing (`ENOENT`/`ENOTDIR`) or as a non-symlink non-directory. Symlink
++     * parents never short-circuit descendants.
++     */
++    function hasAbsentOrNonDirectoryAncestor(resolved, phase) {
++        let current = node_path_1.default.dirname(resolved);
++        while (current !== resolved) {
++            const ancestor = phase.lstats.get(current);
++            if (ancestor === "missing" || ancestor === "non-directory") {
++                return true;
++            }
++            const parent = node_path_1.default.dirname(current);
++            if (parent === current) {
++                break;
++            }
++            current = parent;
++        }
++        return false;
++    }
++    function resolveNonSymlinkLeafRealpath(resolved, phase) {
++        const parent = node_path_1.default.dirname(resolved);
++        if (parent === resolved) {
++            return nativeRealpath(resolved);
++        }
++        const physicalParent = resolveDirectoryRealpath(parent, phase);
++        if (physicalParent === null) {
++            return nativeRealpath(resolved);
++        }
++        const listing = listDirectory(physicalParent, phase);
++        if (listing !== null) {
++            const exactLeaf = lookupEntry(listing, node_path_1.default.basename(resolved));
++            if (exactLeaf !== undefined) {
++                return node_path_1.default.join(physicalParent, exactLeaf);
++            }
++        }
++        return nativeRealpath(resolved);
++    }
++    function resolveDirectoryRealpath(directory, phase) {
++        if (phase.directoryRealpaths.has(directory)) {
++            return phase.directoryRealpaths.get(directory);
++        }
++        const parent = node_path_1.default.dirname(directory);
++        if (parent !== directory && phase.directoryRealpaths.has(parent)) {
++            const physicalParent = phase.directoryRealpaths.get(parent);
++            if (physicalParent !== null &&
++                physicalParent !== undefined &&
++                phase.directoryEntries.has(physicalParent)) {
++                const listing = phase.directoryEntries.get(physicalParent);
++                if (listing !== null && listing !== undefined) {
++                    const kind = observeLstat(directory, phase);
++                    if (kind === "directory") {
++                        const exactName = lookupEntry(listing, node_path_1.default.basename(directory));
++                        if (exactName !== undefined) {
++                            const target = node_path_1.default.join(physicalParent, exactName);
++                            phase.directoryRealpaths.set(directory, target);
++                            return target;
++                        }
++                    }
++                }
++            }
++        }
++        const target = nativeRealpath(directory);
++        phase.directoryRealpaths.set(directory, target);
++        return target;
++    }
++    function listDirectory(physicalDirectory, phase) {
++        if (phase.directoryEntries.has(physicalDirectory)) {
++            return phase.directoryEntries.get(physicalDirectory);
++        }
++        let names;
++        try {
++            names = node_fs_1.default.readdirSync(physicalDirectory);
++        }
++        catch {
++            phase.directoryEntries.set(physicalDirectory, null);
++            return null;
++        }
++        const exact = new Set(names);
++        const lower = new Map();
++        for (const name of names) {
++            const folded = name.toLowerCase();
++            if (!isAscii(name) || lower.has(folded)) {
++                lower.set(folded, null);
++            }
++            else {
++                lower.set(folded, name);
++            }
++        }
++        const listing = { exact, lower };
++        phase.directoryEntries.set(physicalDirectory, listing);
++        return listing;
++    }
++    function lookupEntry(listing, lexicalName) {
++        if (listing.exact.has(lexicalName)) {
++            return lexicalName;
++        }
++        if (!isAscii(lexicalName)) {
++            return undefined;
++        }
++        const folded = listing.lower.get(lexicalName.toLowerCase());
++        return folded === undefined || folded === null ? undefined : folded;
++    }
++    function isAscii(value) {
++        for (let index = 0; index < value.length; index++) {
++            if (value.charCodeAt(index) > 0x7f)
++                return false;
++        }
++        return true;
++    }
++    function nativeRealpath(file) {
++        try {
++            return node_fs_1.default.realpathSync.native(file);
++        }
++        catch {
++            return null;
++        }
++    }
++})(HostInputObservationPhase || (exports.HostInputObservationPhase = HostInputObservationPhase = {}));
++//# sourceMappingURL=HostInputObservationPhase.js.map
+\ No newline at end of file
 diff --git a/lib/plugin/internal/load/PluginDescriptorEvaluationCache.d.ts b/lib/plugin/internal/load/PluginDescriptorEvaluationCache.d.ts
-index d4194ef..65dc534 100644
+index d4194ef..4013337 100644
 --- a/lib/plugin/internal/load/PluginDescriptorEvaluationCache.d.ts
 +++ b/lib/plugin/internal/load/PluginDescriptorEvaluationCache.d.ts
-@@ -23,9 +23,18 @@ import type { PluginContentIdentities } from "../source/PluginContentIdentities"
+@@ -1,4 +1,5 @@
+ import type { PluginContentIdentities } from "../source/PluginContentIdentities";
++import { HostInputObservationPhase } from "./HostInputObservationPhase";
+ /**
+  * The persistent answers of isolated CommonJS descriptor evaluations, each
+  * recorded with the state it was computed from.
+@@ -23,9 +24,18 @@ import type { PluginContentIdentities } from "../source/PluginContentIdentities"
   * observations refuse a write. The caller also excludes evaluations whose
   * captured diagnostics file is nonempty, since a hit replays no diagnostics.
   * Startup preloads run before these observations and cannot authorize
@@ -5104,7 +5703,7 @@ index d4194ef..65dc534 100644
   * @evidence contracts/common.md#clear-and-simple-design Locate/read/write separate key construction, proof validation and publication while the loader owns evaluation and its diagnostics.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts A descriptor without its explicit external-read declaration is not persisted, and the caller excludes nonempty captured diagnostics because a cache hit cannot replay them.
   * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains isolation cost, input-proof responsibility, working-directory/environment identity and write refusal in distinct paragraphs; exported operation comments and tag spacing follow the documentation skill.
-@@ -65,8 +74,14 @@ export declare namespace PluginDescriptorEvaluationCache {
+@@ -65,8 +75,14 @@ export declare namespace PluginDescriptorEvaluationCache {
      }
      /**
       * Where the answer for one evaluation lives, or `null` when no cache root can
@@ -5121,7 +5720,7 @@ index d4194ef..65dc534 100644
       *
       * @param props.projectRoot The project whose cache root holds the entry.
       * @param props.cacheDir The plugin cache directory the caller selected.
-@@ -78,7 +93,7 @@ export declare namespace PluginDescriptorEvaluationCache {
+@@ -78,7 +94,7 @@ export declare namespace PluginDescriptorEvaluationCache {
       * @param props.additionalRuntime Selected Node executable exposed to the
       *   descriptor and used by ttsx/config loaders, when distinct from runtime.
       * @param props.version This ttsc build's version.
@@ -5130,7 +5729,7 @@ index d4194ef..65dc534 100644
       * @evidence contracts/common.md#clear-and-simple-design The locator delegates cache-root policy and runtime observation, then constructs only the descriptor entry identity.
       * @evidence contracts/common.md#prohibited-implementation-shortcuts Unidentifiable runtime/storage returns null for uncached evaluation rather than weakening the key or selecting a fixture-specific runtime.
       * @evidence contracts/common.md#meaningful-documentation Native JSDoc identifies every key premise and null result; parameter entries and separate tags follow the documentation skill.
-@@ -126,10 +141,13 @@ export declare namespace PluginDescriptorEvaluationCache {
+@@ -126,10 +142,13 @@ export declare namespace PluginDescriptorEvaluationCache {
       * @evidence contracts/common.md#meaningful-documentation Native JSDoc states the exact observation-state condition and null fallback, with separate acknowledgment prose under the documentation skill.
       * @evidence contracts/portability.md#os-neutral-implementation Current native hash/realpath observations preserve content and physical selection independently, including symlink/junction retargeting.
       * @evidence contracts/performance.md#efficient-algorithms Complete UTF-8 entry read/JSON parse and state-map validation precede key/value comparisons, current full file hashing and native realpath queries. Entry/key/path/file bytes and native lookup contribute processing and transient storage; a valid hit also performs usage metadata queries and avoids actual child evaluation.
@@ -5139,7 +5738,7 @@ index d4194ef..65dc534 100644
       * @evidence contracts/performance.md#bound-retention-and-release-resources The returned parsed data belongs to the caller; recordCacheFileUse attempts disk-entry last-use refresh for pruning and can skip or fail, with no global in-memory answer map.
       */
 -    function read(file: string): IEvaluation | null;
-+    function read(file: string, observed?: {
++    function read(file: string, observed?: HostInputObservationPhase.Phase | {
 +        hashes: Map<string, string | null>;
 +        realpaths: Map<string, string | null>;
 +    }): IEvaluation | null;
@@ -5147,10 +5746,10 @@ index d4194ef..65dc534 100644
       * Record an evaluation's answer with the state it was computed from.
       *
 diff --git a/lib/plugin/internal/load/PluginDescriptorEvaluationCache.js b/lib/plugin/internal/load/PluginDescriptorEvaluationCache.js
-index 66b95f7..cd59d5a 100644
+index 66b95f7..78ac9fd 100644
 --- a/lib/plugin/internal/load/PluginDescriptorEvaluationCache.js
 +++ b/lib/plugin/internal/load/PluginDescriptorEvaluationCache.js
-@@ -9,6 +9,7 @@ const node_fs_1 = __importDefault(require("node:fs"));
+@@ -9,10 +9,12 @@ const node_fs_1 = __importDefault(require("node:fs"));
  const node_path_1 = __importDefault(require("node:path"));
  const runtimeBuildEnvironment_1 = require("../../../compiler/internal/build/runtimeBuildEnvironment");
  const SidecarEnvironment_1 = require("../../../compiler/internal/sharedHost/SidecarEnvironment");
@@ -5158,7 +5757,12 @@ index 66b95f7..cd59d5a 100644
  const runtimeExecutableIdentity_1 = require("../../../internal/runtimeExecutableIdentity");
  const SourceBuildCacheLayout_1 = require("../source/SourceBuildCacheLayout");
  const recordCacheFileUse_1 = require("../source/recordCacheFileUse");
-@@ -40,9 +41,18 @@ const realpathHostInputPaths_1 = require("./realpathHostInputPaths");
+ const resolveSourceBuildCachePaths_1 = require("../source/resolveSourceBuildCachePaths");
++const HostInputObservationPhase_1 = require("./HostInputObservationPhase");
+ const declaresHostInputReads_1 = require("./declaresHostInputReads");
+ const hashHostInputPaths_1 = require("./hashHostInputPaths");
+ const realpathHostInputPaths_1 = require("./realpathHostInputPaths");
+@@ -40,9 +42,18 @@ const realpathHostInputPaths_1 = require("./realpathHostInputPaths");
   * observations refuse a write. The caller also excludes evaluations whose
   * captured diagnostics file is nonempty, since a hit replays no diagnostics.
   * Startup preloads run before these observations and cannot authorize
@@ -5179,7 +5783,7 @@ index 66b95f7..cd59d5a 100644
   * @evidence contracts/common.md#clear-and-simple-design Locate/read/write separate key construction, proof validation and publication while the loader owns evaluation and its diagnostics.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts A descriptor without its explicit external-read declaration is not persisted, and the caller excludes nonempty captured diagnostics because a cache hit cannot replay them.
   * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains isolation cost, input-proof responsibility, working-directory/environment identity and write refusal in distinct paragraphs; exported operation comments and tag spacing follow the documentation skill.
-@@ -55,8 +65,14 @@ var PluginDescriptorEvaluationCache;
+@@ -55,8 +66,14 @@ var PluginDescriptorEvaluationCache;
  (function (PluginDescriptorEvaluationCache) {
      /**
       * Where the answer for one evaluation lives, or `null` when no cache root can
@@ -5196,7 +5800,7 @@ index 66b95f7..cd59d5a 100644
       *
       * @param props.projectRoot The project whose cache root holds the entry.
       * @param props.cacheDir The plugin cache directory the caller selected.
-@@ -68,7 +84,7 @@ var PluginDescriptorEvaluationCache;
+@@ -68,7 +85,7 @@ var PluginDescriptorEvaluationCache;
       * @param props.additionalRuntime Selected Node executable exposed to the
       *   descriptor and used by ttsx/config loaders, when distinct from runtime.
       * @param props.version This ttsc build's version.
@@ -5205,7 +5809,7 @@ index 66b95f7..cd59d5a 100644
       * @evidence contracts/common.md#clear-and-simple-design The locator delegates cache-root policy and runtime observation, then constructs only the descriptor entry identity.
       * @evidence contracts/common.md#prohibited-implementation-shortcuts Unidentifiable runtime/storage returns null for uncached evaluation rather than weakening the key or selecting a fixture-specific runtime.
       * @evidence contracts/common.md#meaningful-documentation Native JSDoc identifies every key premise and null result; parameter entries and separate tags follow the documentation skill.
-@@ -80,9 +96,14 @@ var PluginDescriptorEvaluationCache;
+@@ -80,9 +97,14 @@ var PluginDescriptorEvaluationCache;
       */
      function locate(props) {
          const environment = SidecarEnvironment_1.SidecarEnvironment.merge(props.env);
@@ -5223,7 +5827,7 @@ index 66b95f7..cd59d5a 100644
              return null;
          const runtime = runtimeIdentity(props.runtime, props.identities);
          if (runtime === null)
-@@ -119,6 +140,7 @@ var PluginDescriptorEvaluationCache;
+@@ -119,6 +141,7 @@ var PluginDescriptorEvaluationCache;
                  .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
              runtime,
              additionalRuntime,
@@ -5231,7 +5835,7 @@ index 66b95f7..cd59d5a 100644
          ]))
              .digest("hex");
          return node_path_1.default.join(root, SourceBuildCacheLayout_1.SourceBuildCacheLayout.DESCRIPTOR_CACHE_DIRNAME, `${key}.json`);
-@@ -137,10 +159,10 @@ var PluginDescriptorEvaluationCache;
+@@ -137,10 +160,10 @@ var PluginDescriptorEvaluationCache;
       * @evidence contracts/common.md#meaningful-documentation Native JSDoc states the exact observation-state condition and null fallback, with separate acknowledgment prose under the documentation skill.
       * @evidence contracts/portability.md#os-neutral-implementation Current native hash/realpath observations preserve content and physical selection independently, including symlink/junction retargeting.
       * @evidence contracts/performance.md#efficient-algorithms Complete UTF-8 entry read/JSON parse and state-map validation precede key/value comparisons, current full file hashing and native realpath queries. Entry/key/path/file bytes and native lookup contribute processing and transient storage; a valid hit also performs usage metadata queries and avoids actual child evaluation.
@@ -5244,14 +5848,31 @@ index 66b95f7..cd59d5a 100644
          let entry;
          try {
              entry = JSON.parse(node_fs_1.default.readFileSync(file, "utf8"));
-@@ -152,8 +174,8 @@ var PluginDescriptorEvaluationCache;
+@@ -151,9 +174,24 @@ var PluginDescriptorEvaluationCache;
+         if (!isEntry(entry) || entry.format !== FORMAT)
              return null;
          const hashed = Object.keys(entry.proof.hashes);
-         if (hashed.length === 0 ||
+-        if (hashed.length === 0 ||
 -            !sameMap(entry.proof.hashes, (0, hashHostInputPaths_1.hashHostInputPaths)(hashed)) ||
 -            !sameMap(entry.proof.realpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(entry.proof.realpaths))))
-+            !sameMap(entry.proof.hashes, (0, hashHostInputPaths_1.hashHostInputPaths)(hashed, observed?.hashes)) ||
-+            !sameMap(entry.proof.realpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(entry.proof.realpaths), observed?.realpaths)))
++        if (hashed.length === 0)
++            return null;
++        const phase = HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)
++            ? observed
++            : HostInputObservationPhase_1.HostInputObservationPhase.create();
++        const currentHashes = (0, hashHostInputPaths_1.hashHostInputPaths)(hashed, phase);
++        const currentRealpaths = sameMap(entry.proof.hashes, currentHashes)
++            ? (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(entry.proof.realpaths), phase)
++            : null;
++        if (observed !== undefined &&
++            !HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)) {
++            for (const [key, value] of phase.hashes)
++                observed.hashes.set(key, value);
++            for (const [key, value] of phase.realpaths)
++                observed.realpaths.set(key, value);
++        }
++        if (currentRealpaths === null ||
++            !sameMap(entry.proof.realpaths, currentRealpaths))
              return null;
          (0, recordCacheFileUse_1.recordCacheFileUse)(file);
          return entry.evaluation;
@@ -5661,59 +6282,141 @@ index fe9cb1d..f23c769 100644
          out.push(node_path_1.default.join(packageDirectory, "package.json"));
          if ((0, moduleResolutionBaseSelects_1.moduleResolutionBaseSelects)(packageDirectory, selectedManifest, []))
 diff --git a/lib/plugin/internal/load/hashHostInputPaths.d.ts b/lib/plugin/internal/load/hashHostInputPaths.d.ts
-index 1f4cb5d..be7a575 100644
+index 1f4cb5d..129d1f0 100644
 --- a/lib/plugin/internal/load/hashHostInputPaths.d.ts
 +++ b/lib/plugin/internal/load/hashHostInputPaths.d.ts
-@@ -9,9 +9,9 @@
-  * @evidence contracts/common.md#prohibited-implementation-shortcuts The directory marker encodes type, not an expected answer; unreadability stays null rather than synthetic content or a known-path bypass.
-  * @evidence contracts/common.md#meaningful-documentation Native JSDoc states null's unreadable meaning and downstream comparison purpose; descriptive and acknowledgment paragraphs are separated following the documentation skill.
-  * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve/stat/readFile preserve host path semantics and follow links; directory kind comes from actual stat rather than separators or platform-name inference.
+@@ -1,17 +1,23 @@
++import { HostInputObservationPhase } from "./HostInputObservationPhase";
+ /**
+  * Content hash of each host input, keyed by its resolved path; `null` for an
+  * input that cannot be read. A persistent plugin cache compares these against
+  * the hashes it recorded to decide whether a descriptor must be evaluated
+  * again.
+  *
++ * When a caller supplies a {@link HostInputObservationPhase.Phase}, hashing and
++ * physical-path resolution share one `lstatSync` per candidate, skip
++ * descendants of already-observed missing or non-directory parents, and drop
++ * the phase memo when that synchronous phase ends.
++ *
+  * @evidence contracts/common.md#principled-implementation Resolved path keys pair readable content with SHA-256, directory kind with a domain marker, and unavailable input with null; consumers must pair this content projection with physical identity.
+- * @evidence contracts/common.md#clear-and-simple-design The operation snapshots supplied inputs only, leaving discovery, read-time stability and cache acceptance with their respective owners.
+- * @evidence contracts/common.md#prohibited-implementation-shortcuts The directory marker encodes type, not an expected answer; unreadability stays null rather than synthetic content or a known-path bypass.
+- * @evidence contracts/common.md#meaningful-documentation Native JSDoc states null's unreadable meaning and downstream comparison purpose; descriptive and acknowledgment paragraphs are separated following the documentation skill.
+- * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve/stat/readFile preserve host path semantics and follow links; directory kind comes from actual stat rather than separators or platform-name inference.
 - * @evidence contracts/performance.md#efficient-algorithms Each input incurs native key normalization and stat; a readable nondirectory allocates and hashes its full bytes, while directories hash a fixed kind marker without scanning children. Processing includes input/path text, native queries and readable file bytes; mapped pairs and the result coexist, and duplicate keys still repeat observation before overwriting. Each file read needs a buffer proportional to its complete size.
-+ * @evidence contracts/performance.md#efficient-algorithms Each distinct resolved path incurs one native stat (or reuses an observation already recorded in an optional caller-owned phase map); a readable nondirectory allocates and hashes its full bytes, while directories hash a fixed kind marker without scanning children. Duplicate resolved keys skip repeated filesystem reads.
++ * @evidence contracts/common.md#clear-and-simple-design The operation snapshots supplied inputs only, delegating phase-scoped lstat, absent-parent and content hashing to HostInputObservationPhase while leaving discovery and cache acceptance with their respective owners.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts The directory marker encodes type, not an expected answer; symlink parents never short-circuit descendants, and unreadability stays null rather than synthetic content or a known-path bypass.
++ * @evidence contracts/common.md#meaningful-documentation Native JSDoc states null's unreadable meaning, phase-scoped sharing and downstream comparison purpose; descriptive and acknowledgment paragraphs are separated following the documentation skill.
++ * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and delegated lstat/stat/readFile preserve host path semantics and follow links; directory kind comes from actual filesystem metadata rather than separators or platform-name inference.
++ * @evidence contracts/performance.md#efficient-algorithms Each independent resolved path incurs at most one lstatSync per phase (zero for descendants of an already-observed missing or non-directory parent or duplicate resolved keys); a readable nondirectory hashes its bytes without a separate statSync, directories return the fixed marker without scanning children, and symlinks follow statSync.
   *
 - * @evidenceExclude contracts/performance.md#reuse-equivalent-work This current-state snapshot must reread its supplied files; reusable accepted answers belong to the cache that validates these observations.
-+ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase map shares content hashes across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a map, each call rereads every distinct file anew.
++ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase memo shares lstat and content-hash observations across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a caller phase, a call-local phase serves only the current call and is dropped on return.
   * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Synchronous file APIs close their own descriptors and the returned record is caller-owned; this snapshot keeps no global collection or acquired handle.
   */
 -export declare function hashHostInputPaths(files: readonly string[]): Record<string, string | null>;
-+export declare function hashHostInputPaths(files: readonly string[], observed?: Map<string, string | null>, observe?: (file: string) => string | null): Record<string, string | null>;
++export declare function hashHostInputPaths(files: readonly string[], observed?: Map<string, string | null> | HostInputObservationPhase.Phase, observe?: (file: string) => string | null): Record<string, string | null>;
 diff --git a/lib/plugin/internal/load/hashHostInputPaths.js b/lib/plugin/internal/load/hashHostInputPaths.js
-index e8a7a5e..40ab445 100644
+index e8a7a5e..f1ab8d4 100644
 --- a/lib/plugin/internal/load/hashHostInputPaths.js
 +++ b/lib/plugin/internal/load/hashHostInputPaths.js
-@@ -18,13 +18,28 @@ const node_path_1 = __importDefault(require("node:path"));
-  * @evidence contracts/common.md#prohibited-implementation-shortcuts The directory marker encodes type, not an expected answer; unreadability stays null rather than synthetic content or a known-path bypass.
-  * @evidence contracts/common.md#meaningful-documentation Native JSDoc states null's unreadable meaning and downstream comparison purpose; descriptive and acknowledgment paragraphs are separated following the documentation skill.
-  * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve/stat/readFile preserve host path semantics and follow links; directory kind comes from actual stat rather than separators or platform-name inference.
+@@ -4,43 +4,71 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.hashHostInputPaths = hashHostInputPaths;
+-const node_crypto_1 = __importDefault(require("node:crypto"));
+-const node_fs_1 = __importDefault(require("node:fs"));
+ const node_path_1 = __importDefault(require("node:path"));
++const HostInputObservationPhase_1 = require("./HostInputObservationPhase");
+ /**
+  * Content hash of each host input, keyed by its resolved path; `null` for an
+  * input that cannot be read. A persistent plugin cache compares these against
+  * the hashes it recorded to decide whether a descriptor must be evaluated
+  * again.
+  *
++ * When a caller supplies a {@link HostInputObservationPhase.Phase}, hashing and
++ * physical-path resolution share one `lstatSync` per candidate, skip
++ * descendants of already-observed missing or non-directory parents, and drop
++ * the phase memo when that synchronous phase ends.
++ *
+  * @evidence contracts/common.md#principled-implementation Resolved path keys pair readable content with SHA-256, directory kind with a domain marker, and unavailable input with null; consumers must pair this content projection with physical identity.
+- * @evidence contracts/common.md#clear-and-simple-design The operation snapshots supplied inputs only, leaving discovery, read-time stability and cache acceptance with their respective owners.
+- * @evidence contracts/common.md#prohibited-implementation-shortcuts The directory marker encodes type, not an expected answer; unreadability stays null rather than synthetic content or a known-path bypass.
+- * @evidence contracts/common.md#meaningful-documentation Native JSDoc states null's unreadable meaning and downstream comparison purpose; descriptive and acknowledgment paragraphs are separated following the documentation skill.
+- * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve/stat/readFile preserve host path semantics and follow links; directory kind comes from actual stat rather than separators or platform-name inference.
 - * @evidence contracts/performance.md#efficient-algorithms Each input incurs native key normalization and stat; a readable nondirectory allocates and hashes its full bytes, while directories hash a fixed kind marker without scanning children. Processing includes input/path text, native queries and readable file bytes; mapped pairs and the result coexist, and duplicate keys still repeat observation before overwriting. Each file read needs a buffer proportional to its complete size.
-+ * @evidence contracts/performance.md#efficient-algorithms Each distinct resolved path incurs one native stat (or reuses an observation already recorded in an optional caller-owned phase map); a readable nondirectory allocates and hashes its full bytes, while directories hash a fixed kind marker without scanning children. Duplicate resolved keys skip repeated filesystem reads.
++ * @evidence contracts/common.md#clear-and-simple-design The operation snapshots supplied inputs only, delegating phase-scoped lstat, absent-parent and content hashing to HostInputObservationPhase while leaving discovery and cache acceptance with their respective owners.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts The directory marker encodes type, not an expected answer; symlink parents never short-circuit descendants, and unreadability stays null rather than synthetic content or a known-path bypass.
++ * @evidence contracts/common.md#meaningful-documentation Native JSDoc states null's unreadable meaning, phase-scoped sharing and downstream comparison purpose; descriptive and acknowledgment paragraphs are separated following the documentation skill.
++ * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and delegated lstat/stat/readFile preserve host path semantics and follow links; directory kind comes from actual filesystem metadata rather than separators or platform-name inference.
++ * @evidence contracts/performance.md#efficient-algorithms Each independent resolved path incurs at most one lstatSync per phase (zero for descendants of an already-observed missing or non-directory parent or duplicate resolved keys); a readable nondirectory hashes its bytes without a separate statSync, directories return the fixed marker without scanning children, and symlinks follow statSync.
   *
 - * @evidenceExclude contracts/performance.md#reuse-equivalent-work This current-state snapshot must reread its supplied files; reusable accepted answers belong to the cache that validates these observations.
-+ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase map shares content hashes across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a map, each call rereads every distinct file anew.
++ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase memo shares lstat and content-hash observations across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a caller phase, a call-local phase serves only the current call and is dropped on return.
   * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Synchronous file APIs close their own descriptors and the returned record is caller-owned; this snapshot keeps no global collection or acquired handle.
   */
 -function hashHostInputPaths(files) {
 -    return Object.fromEntries(files.map((file) => [node_path_1.default.resolve(file), hashHostInput(file)]));
-+function hashHostInputPaths(files, observed, observe = hashHostInput) {
+-}
+-function hashHostInput(file) {
+-    try {
+-        if (node_fs_1.default.statSync(file).isDirectory()) {
+-            return node_crypto_1.default
+-                .createHash("sha256")
+-                .update("ttsc:host-input:directory\0")
+-                .digest("hex");
++function hashHostInputPaths(files, observed, observe) {
 +    const out = {};
++    if (observe !== undefined) {
++        const map = HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)
++            ? observed.hashes
++            : observed;
++        for (const file of files) {
++            const resolved = node_path_1.default.resolve(file);
++            if (Object.prototype.hasOwnProperty.call(out, resolved))
++                continue;
++            let digest;
++            if (map !== undefined && map.has(resolved)) {
++                digest = map.get(resolved);
++            }
++            else {
++                digest = observe(resolved);
++                map?.set(resolved, digest);
++            }
++            out[resolved] = digest;
+         }
+-        return node_crypto_1.default
+-            .createHash("sha256")
+-            .update(node_fs_1.default.readFileSync(file))
+-            .digest("hex");
++        return out;
+     }
+-    catch {
+-        return null;
++    const phase = HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)
++        ? observed
++        : HostInputObservationPhase_1.HostInputObservationPhase.create();
++    const legacyMap = HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)
++        ? undefined
++        : observed;
 +    for (const file of files) {
 +        const resolved = node_path_1.default.resolve(file);
 +        if (Object.prototype.hasOwnProperty.call(out, resolved))
 +            continue;
 +        let digest;
-+        if (observed !== undefined && observed.has(resolved)) {
-+            digest = observed.get(resolved);
++        if (legacyMap !== undefined && legacyMap.has(resolved)) {
++            digest = legacyMap.get(resolved);
 +        }
 +        else {
-+            digest = observe(resolved);
-+            observed?.set(resolved, digest);
++            digest = HostInputObservationPhase_1.HostInputObservationPhase.hash(resolved, phase);
++            legacyMap?.set(resolved, digest);
 +        }
 +        out[resolved] = digest;
-+    }
+     }
 +    return out;
  }
- function hashHostInput(file) {
-     try {
+ //# sourceMappingURL=hashHostInputPaths.js.map
+\ No newline at end of file
 diff --git a/lib/plugin/internal/load/loadProjectPlugins.d.ts b/lib/plugin/internal/load/loadProjectPlugins.d.ts
 index f84832d..c647783 100644
 --- a/lib/plugin/internal/load/loadProjectPlugins.d.ts
@@ -5728,9 +6431,25 @@ index f84832d..c647783 100644
   */
  export declare function loadProjectPlugins(options: {
 diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/internal/load/loadProjectPlugins.js
-index 65cb942..1f113dd 100644
+index 65cb942..de37c71 100644
 --- a/lib/plugin/internal/load/loadProjectPlugins.js
 +++ b/lib/plugin/internal/load/loadProjectPlugins.js
+@@ -35,6 +35,7 @@ const pluginSourceState_1 = require("../source/pluginSourceState");
+ const resolvePluginGoModule_1 = require("../source/resolvePluginGoModule");
+ const selectedRecordIdentityTempParent_1 = require("../source/selectedRecordIdentityTempParent");
+ const COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE_1 = require("./COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE");
++const HostInputObservationPhase_1 = require("./HostInputObservationPhase");
+ const PLUGIN_DESCRIPTOR_SHIM_SOURCE_1 = require("./PLUGIN_DESCRIPTOR_SHIM_SOURCE");
+ const PluginDescriptorAdmission_1 = require("./PluginDescriptorAdmission");
+ const PluginDescriptorEvaluationCache_1 = require("./PluginDescriptorEvaluationCache");
+@@ -47,7 +48,6 @@ const descriptorRecordEnvironment_1 = require("./descriptorRecordEnvironment");
+ const hashHostInputPaths_1 = require("./hashHostInputPaths");
+ const moduleResolutionBaseSelects_1 = require("./moduleResolutionBaseSelects");
+ const pluginLabel_1 = require("./pluginLabel");
+-const realpathHostInput_1 = require("./realpathHostInput");
+ const realpathHostInputPaths_1 = require("./realpathHostInputPaths");
+ const rejectJsTransformFunctions_1 = require("./rejectJsTransformFunctions");
+ const requirePluginSource_1 = require("./requirePluginSource");
 @@ -108,7 +108,7 @@ const visitImportMappedCandidates_1 = require("./visitImportMappedCandidates");
   * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains result provenance, environment and path options; helper comments explain input races, conservative proof omission, fallback authority and cleanup. Member/tag spacing and separated concepts follow the documentation skill.
   * @evidence contracts/portability.md#os-neutral-implementation Native path/file-URL conversion, createRequire and hidden spawn with explicit argv/environment implement OS-neutral selection and process execution. Physical identities are preserved separately from lexical candidates; Bun-specific differences are capability decisions, not OS guesses.
@@ -5740,7 +6459,7 @@ index 65cb942..1f113dd 100644
   * @evidence contracts/performance.md#bound-retention-and-release-resources Finally restores injected environment locators, attempts evaluator directory removal and closes direct-evaluator diagnostic descriptors. Close/removal can fail; synchronous completion concerns the selected evaluator and does not certify arbitrary descendants are gone. Generation maps/results scale with observed data, and disk diagnostics/result/observation files have no independent byte ceiling here. Default disk pruning has its own interval/protection/failure policy; explicit roots remain caller-owned.
   */
  function loadProjectPlugins(options) {
-@@ -160,7 +160,7 @@ function loadProjectPlugins(options) {
+@@ -160,11 +160,12 @@ function loadProjectPlugins(options) {
          const projectHostInputRealpaths = projectSnapshot.hostInputRealpaths;
          const entries = options.entries === false
              ? []
@@ -5748,19 +6467,37 @@ index 65cb942..1f113dd 100644
 +            : ProjectPluginEntries_1.ProjectPluginEntries.resolvePluginEntries(project, options.entries, options.pluginConfigDir, projectSnapshot.discovery).filter((entry) => entry.config.enabled !== false);
          if (entries.length === 0) {
              yield options.onWatchInputs?.([]);
++            const finalPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
              return {
-@@ -232,8 +232,8 @@ function loadProjectPlugins(options) {
+-                ...collectHostInputSnapshot(project, {}, [], projectHostInputs, revalidateHostInputHashes(projectHostInputHashes, projectHostInputs), revalidateHostInputRealpaths(projectHostInputRealpaths, projectHostInputs)),
++                ...collectHostInputSnapshot(project, {}, [], projectHostInputs, revalidateHostInputHashes(projectHostInputHashes, projectHostInputs, finalPhase), revalidateHostInputRealpaths(projectHostInputRealpaths, projectHostInputs, finalPhase)),
+                 descriptorReadsDeclared: true,
+                 discoveryInputsComplete: project.configInputsComplete === true,
+                 nativePlugins: [],
+@@ -214,8 +215,9 @@ function loadProjectPlugins(options) {
+             // Capture every candidate before resolution chooses the descriptor entry.
+             // A post-resolution snapshot could bless a higher-priority file created
+             // after the resolver had already selected the old entry.
+-            const probedCandidateHashes = (0, hashHostInputPaths_1.hashHostInputPaths)(probedCandidates);
+-            const probedCandidateRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(probedCandidates);
++            const probedPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++            const probedCandidateHashes = (0, hashHostInputPaths_1.hashHostInputPaths)(probedCandidates, probedPhase);
++            const probedCandidateRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(probedCandidates, probedPhase);
+             const request = PluginPackageResolution_1.PluginPackageResolution.resolvePluginRequest(specifier, entry.baseDir);
+             // Keep the candidates of the search roots up to the one the entry
+             // resolved in: the lookup never read the roots after it
+@@ -232,8 +234,8 @@ function loadProjectPlugins(options) {
                  // native cwd, cache ownership and returned relative Go sources.
                  projectRoot: ProjectPluginEntries_1.ProjectPluginEntries.resolvePluginBaseDir(project, options.pluginConfigDir),
              }, request, effectiveEnv, descriptorCache);
 -            const loadedHostInputHashes = mergeObservedHostInputHashes(loaded.hostInputHashes, (0, hashHostInputPaths_1.hashHostInputPaths)(Object.keys(loaded.hostInputHashes)));
 -            const loadedHostInputRealpaths = mergeObservedHostInputRealpaths(loaded.hostInputRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(loaded.hostInputRealpaths)));
-+            const loadedHostInputHashes = mergeObservedHostInputHashes(loaded.hostInputHashes, (0, hashHostInputPaths_1.hashHostInputPaths)(Object.keys(loaded.hostInputHashes), loaded.verifiedHashes));
-+            const loadedHostInputRealpaths = mergeObservedHostInputRealpaths(loaded.hostInputRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(loaded.hostInputRealpaths), loaded.verifiedRealpaths));
++            const loadedHostInputHashes = mergeObservedHostInputHashes(loaded.hostInputHashes, (0, hashHostInputPaths_1.hashHostInputPaths)(Object.keys(loaded.hostInputHashes), loaded.verifiedPhase));
++            const loadedHostInputRealpaths = mergeObservedHostInputRealpaths(loaded.hostInputRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(loaded.hostInputRealpaths), loaded.verifiedPhase));
              const hostInputHashes = mergeObservedHostInputHashes(entryCandidateHashes, loadedHostInputHashes);
              const hostInputRealpaths = mergeObservedHostInputRealpaths(entryCandidateRealpaths, loadedHostInputRealpaths);
              for (const input of loaded.hostInputs) {
-@@ -276,8 +276,9 @@ function loadProjectPlugins(options) {
+@@ -276,8 +278,9 @@ function loadProjectPlugins(options) {
          // selection already read keys on that reading instead of probing Go again.
          const environmentWitnesses = new Map();
          // The overlay modules every selection and build of this load uses, found
@@ -5772,7 +6509,7 @@ index 65cb942..1f113dd 100644
          const readings = {
              sources: sourceDigests,
              environments: environmentDigests,
-@@ -311,6 +312,7 @@ function loadProjectPlugins(options) {
+@@ -311,6 +314,7 @@ function loadProjectPlugins(options) {
                  candidate.packageDir,
                  ...(candidate.contributors ?? []).map((input) => input.source),
              ])
@@ -5780,7 +6517,7 @@ index 65cb942..1f113dd 100644
                  .filter(reportsPluginSource));
              // WARNING (#1728): hand the watch owner this load's store with the roots.
              // It baselines each root before any build reads it; without the store it
-@@ -406,6 +408,7 @@ function loadProjectPlugins(options) {
+@@ -406,6 +410,7 @@ function loadProjectPlugins(options) {
              }
              for (const record of transformHosts)
                  contexts.get(record.moduleRoot).records.push(record);
@@ -5788,7 +6525,7 @@ index 65cb942..1f113dd 100644
              for (const host of contexts.values()) {
                  const moduleHosts = host.records;
                  const hostEntries = moduleHosts.map((record) => ({
-@@ -417,7 +420,10 @@ function loadProjectPlugins(options) {
+@@ -417,7 +422,10 @@ function loadProjectPlugins(options) {
                      env: effectiveEnv,
                      readers: packageReaders,
                      identities: sourceIdentities,
@@ -5800,7 +6537,18 @@ index 65cb942..1f113dd 100644
                      packages: [
                          ...hostEntries,
                          ...linkedContributors.map((input) => ({
-@@ -565,18 +571,21 @@ function loadProjectPlugins(options) {
+@@ -552,8 +560,9 @@ function loadProjectPlugins(options) {
+                 stage: record.stage,
+             };
+         });
++        const finalPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
+         return {
+-            ...collectHostInputSnapshot(project, context, records, projectHostInputs, revalidateHostInputHashes(projectHostInputHashes, projectHostInputs), revalidateHostInputRealpaths(projectHostInputRealpaths, projectHostInputs)),
++            ...collectHostInputSnapshot(project, context, records, projectHostInputs, revalidateHostInputHashes(projectHostInputHashes, projectHostInputs, finalPhase), revalidateHostInputRealpaths(projectHostInputRealpaths, projectHostInputs, finalPhase)),
+             descriptorReadsDeclared: loadedEntries.every((entry) => entry.observationsComplete && (0, declaresHostInputReads_1.declaresHostInputReads)(entry.plugin)),
+             discoveryInputsComplete: project.configInputsComplete === true,
+             ...(identities === undefined ? {} : { identities }),
+@@ -565,18 +574,21 @@ function loadProjectPlugins(options) {
              // read them. Package selection shares these readings and also reads a
              // linked plugin's module root, which no build keys on, so only the build
              // directories are reported.
@@ -5834,8 +6582,15 @@ index 65cb942..1f113dd 100644
              project,
          };
      }
-@@ -671,7 +680,12 @@ function readProjectHostInputSnapshot(options) {
-         const beforeRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(hostInputs);
+@@ -667,15 +679,22 @@ function readProjectHostInputSnapshot(options) {
+     let hostInputs = (0, collectProjectHostInputs_1.collectProjectHostInputs)(project, includePluginDiscovery, pluginConfigDir);
+     const observedInputs = new Set(hostInputs);
+     for (let attempt = 0; attempt < 3; attempt++) {
+-        const before = (0, hashHostInputPaths_1.hashHostInputPaths)(hostInputs);
+-        const beforeRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(hostInputs);
++        const beforePhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++        const before = (0, hashHostInputPaths_1.hashHostInputPaths)(hostInputs, beforePhase);
++        const beforeRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(hostInputs, beforePhase);
          const beforeSignatures = hostInputMetadataSignatures(hostInputs);
          const candidateProject = (0, readProjectConfig_1.readProjectConfig)(projectOptions);
 -        const candidateInputs = (0, collectProjectHostInputs_1.collectProjectHostInputs)(candidateProject, includePluginDiscovery, pluginConfigDir);
@@ -5847,8 +6602,15 @@ index 65cb942..1f113dd 100644
 +        const candidateInputs = (0, collectProjectHostInputs_1.collectProjectHostInputs)(candidateProject, includePluginDiscovery, pluginConfigDir, discovered);
          for (const input of candidateInputs)
              observedInputs.add(input);
-         const after = (0, hashHostInputPaths_1.hashHostInputPaths)(candidateInputs);
-@@ -684,6 +698,7 @@ function readProjectHostInputSnapshot(options) {
+-        const after = (0, hashHostInputPaths_1.hashHostInputPaths)(candidateInputs);
+-        const afterRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(candidateInputs);
++        const afterPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++        const after = (0, hashHostInputPaths_1.hashHostInputPaths)(candidateInputs, afterPhase);
++        const afterRealpaths = (0, realpathHostInputPaths_1.realpathHostInputPaths)(candidateInputs, afterPhase);
+         const afterSignatures = hostInputMetadataSignatures(candidateInputs);
+         if (equalHostInputLists(hostInputs, candidateInputs) &&
+             equalHostInputHashes(before, after) &&
+@@ -684,6 +703,7 @@ function readProjectHostInputSnapshot(options) {
              afterSignatures !== undefined &&
              equalHostInputHashes(beforeSignatures, afterSignatures)) {
              return {
@@ -5856,34 +6618,51 @@ index 65cb942..1f113dd 100644
                  hostInputHashes: after,
                  hostInputRealpaths: afterRealpaths,
                  hostInputs: candidateInputs,
-@@ -965,6 +980,8 @@ function loadPluginEntry(entry, base, request, effectiveEnv, descriptorCache) {
+@@ -711,8 +731,8 @@ function equalHostInputHashes(first, second) {
+             first[file] === second[file]));
+ }
+ /** Retain proof only for inputs whose initial and final observations agree. */
+-function revalidateHostInputHashes(initial, inputs) {
+-    const current = (0, hashHostInputPaths_1.hashHostInputPaths)(inputs);
++function revalidateHostInputHashes(initial, inputs, phase) {
++    const current = (0, hashHostInputPaths_1.hashHostInputPaths)(inputs, phase);
+     const output = {};
+     for (const input of inputs) {
+         const absolute = node_path_1.default.resolve(input);
+@@ -724,8 +744,8 @@ function revalidateHostInputHashes(initial, inputs) {
+     return output;
+ }
+ /** Keep physical-identity proof only while the same path resolves identically. */
+-function revalidateHostInputRealpaths(initial, inputs) {
+-    const current = (0, realpathHostInputPaths_1.realpathHostInputPaths)(inputs);
++function revalidateHostInputRealpaths(initial, inputs, phase) {
++    const current = (0, realpathHostInputPaths_1.realpathHostInputPaths)(inputs, phase);
+     return Object.fromEntries(inputs.flatMap((input) => {
+         const absolute = node_path_1.default.resolve(input);
+         return Object.prototype.hasOwnProperty.call(initial, absolute) &&
+@@ -965,6 +985,7 @@ function loadPluginEntry(entry, base, request, effectiveEnv, descriptorCache) {
          hostInputs: loaded.inputs,
          observationsComplete: loaded.observationsComplete,
          plugin,
-+        verifiedHashes: loaded.verifiedHashes,
-+        verifiedRealpaths: loaded.verifiedRealpaths,
++        verifiedPhase: loaded.verifiedPhase,
      };
  }
  /**
-@@ -1067,10 +1084,20 @@ function loadCommonJsDescriptor(request, context, loadEnv, descriptorCache) {
+@@ -1067,10 +1088,16 @@ function loadCommonJsDescriptor(request, context, loadEnv, descriptorCache) {
      catch {
          // Unproved runtime identity still permits an uncached actual evaluation.
      }
 -    const cached = cacheFile === null ? null : PluginDescriptorEvaluationCache_1.PluginDescriptorEvaluationCache.read(cacheFile);
-+    const cachedObserved = {
-+        hashes: new Map(),
-+        realpaths: new Map(),
-+    };
++    const cachedPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
 +    const cached = cacheFile === null
 +        ? null
-+        : PluginDescriptorEvaluationCache_1.PluginDescriptorEvaluationCache.read(cacheFile, cachedObserved);
++        : PluginDescriptorEvaluationCache_1.PluginDescriptorEvaluationCache.read(cacheFile, cachedPhase);
      if (cached !== null &&
          PluginDescriptorEvaluationCache_1.PluginDescriptorEvaluationCache.locate(cacheAuthority) === cacheFile)
 -        return cached;
 +        return {
 +            ...cached,
-+            verifiedHashes: cachedObserved.hashes,
-+            verifiedRealpaths: cachedObserved.realpaths,
++            verifiedPhase: cachedPhase,
 +        };
      const dir = createEvaluationTempDir(descriptorCache.identities);
      const out = node_path_1.default.join(dir, "descriptor.json");
@@ -5893,8 +6672,8 @@ index 65cb942..1f113dd 100644
                  : []))
              : {};
 -        const stableParsedRealpaths = mergeObservedHostInputRealpaths(parsedRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(parsedRealpaths)));
-+        const postEvalRealpaths = new Map();
-+        const stableParsedRealpaths = mergeObservedHostInputRealpaths(parsedRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(parsedRealpaths), postEvalRealpaths));
++        const postEvalPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++        const stableParsedRealpaths = mergeObservedHostInputRealpaths(parsedRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(Object.keys(parsedRealpaths), postEvalPhase));
          for (const input of parsed.inputs) {
              const absolute = node_path_1.default.resolve(String(input));
              if (!Object.prototype.hasOwnProperty.call(stableParsedRealpaths, absolute)) {
@@ -5902,7 +6681,7 @@ index 65cb942..1f113dd 100644
              }
          }
 -        const runtimeInputs = readTtsxDescriptorInputs(inputsOut, request, parsed.observation);
-+        const runtimeInputs = readTtsxDescriptorInputs(inputsOut, request, parsed.observation, postEvalRealpaths);
++        const runtimeInputs = readTtsxDescriptorInputs(inputsOut, request, parsed.observation, postEvalPhase);
          const evaluation = {
              descriptor: parsed.descriptor,
              observationsComplete: runtimeInputs.complete,
@@ -5910,7 +6689,7 @@ index 65cb942..1f113dd 100644
                      ...runtimeInputs.inputs,
                  ]),
              ].sort(),
-+            verifiedRealpaths: postEvalRealpaths,
++            verifiedPhase: postEvalPhase,
          };
          // A hit replays no diagnostics, so only an evaluation with an empty
          // captured diagnostics file is kept.
@@ -5919,15 +6698,15 @@ index 65cb942..1f113dd 100644
                  throw new Error("isolated output must contain a descriptor envelope");
              }
 -            const inputSnapshot = readTtsxDescriptorInputs(inputsOut, request, parsed.observation);
-+            const postEvalRealpaths = new Map();
-+            const inputSnapshot = readTtsxDescriptorInputs(inputsOut, request, parsed.observation, postEvalRealpaths);
++            const postEvalPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++            const inputSnapshot = readTtsxDescriptorInputs(inputsOut, request, parsed.observation, postEvalPhase);
              return {
                  descriptor: parsed.descriptor,
                  observationsComplete: inputSnapshot.complete,
                  hostInputHashes: omitUnstableHostInputHashes(inputSnapshot.hostInputHashes, inputSnapshot.unstableInputs),
                  hostInputRealpaths: inputSnapshot.hostInputRealpaths,
                  inputs: inputSnapshot.inputs,
-+                verifiedRealpaths: postEvalRealpaths,
++                verifiedPhase: postEvalPhase,
              };
          }
          catch (error) {
@@ -5936,28 +6715,21 @@ index 65cb942..1f113dd 100644
   * likewise refuses completeness without losing the descriptor.
   */
 -function readTtsxDescriptorInputs(file, request, observation) {
-+function readTtsxDescriptorInputs(file, request, observation, observedRealpaths) {
++function readTtsxDescriptorInputs(file, request, observation, observedPhase = HostInputObservationPhase_1.HostInputObservationPhase.create()) {
      const inputs = new Set([node_path_1.default.resolve(request)]);
      const hashes = new Map();
      const realpaths = new Map();
-@@ -1597,7 +1628,15 @@ function readTtsxDescriptorInputs(file, request, observation) {
+@@ -1597,7 +1628,8 @@ function readTtsxDescriptorInputs(file, request, observation) {
          }
      }
      for (const [resolved, observed] of realpaths) {
 -        if ((0, realpathHostInput_1.realpathHostInput)(resolved) === observed &&
-+        let currentRealpath;
-+        if (observedRealpaths !== undefined && observedRealpaths.has(resolved)) {
-+            currentRealpath = observedRealpaths.get(resolved);
-+        }
-+        else {
-+            currentRealpath = (0, realpathHostInput_1.realpathHostInput)(resolved);
-+            observedRealpaths?.set(resolved, currentRealpath);
-+        }
++        const currentRealpath = HostInputObservationPhase_1.HostInputObservationPhase.realpath(resolved, observedPhase);
 +        if (currentRealpath === observed &&
              signatures.get(resolved) === hostInputMetadataSignature(resolved)) {
              continue;
          }
-@@ -1706,8 +1745,21 @@ function pluginBuildDirectories(records, env, replacements, readers, identities)
+@@ -1706,8 +1738,21 @@ function pluginBuildDirectories(records, env, replacements, readers, identities)
          for (const contributor of record.contributors ?? [])
              directories.add(node_path_1.default.resolve(contributor.source));
      }
@@ -6061,52 +6833,122 @@ index 138b9f4..952511a 100644
      catch {
          return null;
 diff --git a/lib/plugin/internal/load/realpathHostInputPaths.d.ts b/lib/plugin/internal/load/realpathHostInputPaths.d.ts
-index 8579190..3e8e277 100644
+index 8579190..3385b2a 100644
 --- a/lib/plugin/internal/load/realpathHostInputPaths.d.ts
 +++ b/lib/plugin/internal/load/realpathHostInputPaths.d.ts
-@@ -9,9 +9,9 @@
-  * @evidence contracts/common.md#prohibited-implementation-shortcuts Failed canonicalization remains null instead of borrowing a recorded target or assuming the lexical path is physical identity.
-  * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains unresolved values and why realpaths accompany hashes, with prose/tag separation following the documentation skill.
-  * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and realpath observation support OS-neutral symlink/junction identity without blanket lowercasing or slash-only parsing.
+@@ -1,17 +1,24 @@
++import { HostInputObservationPhase } from "./HostInputObservationPhase";
+ /**
+  * The physical target of each host input, keyed by its resolved path; `null`
+  * where it does not resolve. Recorded beside the content hashes because
+  * retargeting a symlinked input changes what it names without changing any
+  * bytes a hash has seen yet.
+  *
+- * @evidence contracts/common.md#principled-implementation Each resolved lexical key retains the current physical target or unresolved null, preserving symlink retargeting as distinct from unchanged content.
+- * @evidence contracts/common.md#clear-and-simple-design The collection mapper delegates one-path observation and leaves content hashing and proof acceptance separate.
+- * @evidence contracts/common.md#prohibited-implementation-shortcuts Failed canonicalization remains null instead of borrowing a recorded target or assuming the lexical path is physical identity.
+- * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains unresolved values and why realpaths accompany hashes, with prose/tag separation following the documentation skill.
+- * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and realpath observation support OS-neutral symlink/junction identity without blanket lowercasing or slash-only parsing.
 - * @evidence contracts/performance.md#efficient-algorithms Each input is natively normalized for its lexical key and receives one delegated current realpath query. Path/target text and native query work accompany input count; mapped pairs and the result coexist transiently, and duplicate resolved keys overwrite earlier observations rather than avoiding their queries.
-+ * @evidence contracts/performance.md#efficient-algorithms Each distinct resolved path receives one delegated realpath query per call (or reuses an observation already recorded in an optional caller-owned phase map). Path/target text and native query work accompany unique input count; duplicate resolved keys skip repeated native queries.
++ * When a caller supplies a {@link HostInputObservationPhase.Phase}, realpath
++ * resolution reuses the `lstatSync` and absent-parent observations taken during
++ * hashing and resolves each shared ancestor directory once per phase with exact
++ * on-disk leaf spelling. The phase memo is dropped when that synchronous phase
++ * ends.
   *
 - * @evidenceExclude contracts/performance.md#reuse-equivalent-work Current physical targets must be observed anew to detect retargeting; this mapper owns no canonicalization cache.
-+ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase map shares physical-target observations across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a map, each call observes every distinct path anew.
++ * @evidence contracts/common.md#principled-implementation Each resolved lexical key retains the current physical target byte-identical to native realpath or unresolved null, preserving symlink retargeting as distinct from unchanged content.
++ * @evidence contracts/common.md#clear-and-simple-design The collection mapper delegates phase-scoped lstat, absent-parent and ancestor-cached physical resolution to HostInputObservationPhase and leaves content hashing and proof acceptance separate.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts Failed canonicalization remains null instead of borrowing a recorded target or assuming the lexical path is physical identity; non-symlink leaf names come from directory listings or native realpathSync.native, never from lexical basenames.
++ * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains unresolved values, phase-scoped sharing and why realpaths accompany hashes, with prose/tag separation following the documentation skill.
++ * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and delegated realpath/listing observation support OS-neutral symlink/junction and case-insensitive identity without blanket lowercasing or slash-only parsing.
++ * @evidence contracts/performance.md#efficient-algorithms Each independent resolved path reuses its phase lstat (zero syscalls for absent paths already observed or descendants of missing/non-directory parents); present non-symlink files share one realpathSync.native and one readdirSync per ancestor directory per phase.
++ *
++ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase memo shares lstat, physical-target, ancestor-realpath and listing observations across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a caller phase, a call-local phase serves only the current call and is dropped on return.
   * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources It returns caller-owned observations and retains no cross-call population or resource.
   */
 -export declare function realpathHostInputPaths(files: readonly string[]): Record<string, string | null>;
-+export declare function realpathHostInputPaths(files: readonly string[], observed?: Map<string, string | null>, observe?: (file: string) => string | null): Record<string, string | null>;
++export declare function realpathHostInputPaths(files: readonly string[], observed?: Map<string, string | null> | HostInputObservationPhase.Phase, observe?: (file: string) => string | null): Record<string, string | null>;
 diff --git a/lib/plugin/internal/load/realpathHostInputPaths.js b/lib/plugin/internal/load/realpathHostInputPaths.js
-index 4244ef8..4be015a 100644
+index 4244ef8..97027ab 100644
 --- a/lib/plugin/internal/load/realpathHostInputPaths.js
 +++ b/lib/plugin/internal/load/realpathHostInputPaths.js
-@@ -17,12 +17,27 @@ const realpathHostInput_1 = require("./realpathHostInput");
-  * @evidence contracts/common.md#prohibited-implementation-shortcuts Failed canonicalization remains null instead of borrowing a recorded target or assuming the lexical path is physical identity.
-  * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains unresolved values and why realpaths accompany hashes, with prose/tag separation following the documentation skill.
-  * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and realpath observation support OS-neutral symlink/junction identity without blanket lowercasing or slash-only parsing.
+@@ -5,24 +5,71 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.realpathHostInputPaths = realpathHostInputPaths;
+ const node_path_1 = __importDefault(require("node:path"));
+-const realpathHostInput_1 = require("./realpathHostInput");
++const HostInputObservationPhase_1 = require("./HostInputObservationPhase");
+ /**
+  * The physical target of each host input, keyed by its resolved path; `null`
+  * where it does not resolve. Recorded beside the content hashes because
+  * retargeting a symlinked input changes what it names without changing any
+  * bytes a hash has seen yet.
+  *
+- * @evidence contracts/common.md#principled-implementation Each resolved lexical key retains the current physical target or unresolved null, preserving symlink retargeting as distinct from unchanged content.
+- * @evidence contracts/common.md#clear-and-simple-design The collection mapper delegates one-path observation and leaves content hashing and proof acceptance separate.
+- * @evidence contracts/common.md#prohibited-implementation-shortcuts Failed canonicalization remains null instead of borrowing a recorded target or assuming the lexical path is physical identity.
+- * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains unresolved values and why realpaths accompany hashes, with prose/tag separation following the documentation skill.
+- * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and realpath observation support OS-neutral symlink/junction identity without blanket lowercasing or slash-only parsing.
 - * @evidence contracts/performance.md#efficient-algorithms Each input is natively normalized for its lexical key and receives one delegated current realpath query. Path/target text and native query work accompany input count; mapped pairs and the result coexist transiently, and duplicate resolved keys overwrite earlier observations rather than avoiding their queries.
-+ * @evidence contracts/performance.md#efficient-algorithms Each distinct resolved path receives one delegated realpath query per call (or reuses an observation already recorded in an optional caller-owned phase map). Path/target text and native query work accompany unique input count; duplicate resolved keys skip repeated native queries.
++ * When a caller supplies a {@link HostInputObservationPhase.Phase}, realpath
++ * resolution reuses the `lstatSync` and absent-parent observations taken during
++ * hashing and resolves each shared ancestor directory once per phase with exact
++ * on-disk leaf spelling. The phase memo is dropped when that synchronous phase
++ * ends.
   *
 - * @evidenceExclude contracts/performance.md#reuse-equivalent-work Current physical targets must be observed anew to detect retargeting; this mapper owns no canonicalization cache.
-+ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase map shares physical-target observations across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a map, each call observes every distinct path anew.
++ * @evidence contracts/common.md#principled-implementation Each resolved lexical key retains the current physical target byte-identical to native realpath or unresolved null, preserving symlink retargeting as distinct from unchanged content.
++ * @evidence contracts/common.md#clear-and-simple-design The collection mapper delegates phase-scoped lstat, absent-parent and ancestor-cached physical resolution to HostInputObservationPhase and leaves content hashing and proof acceptance separate.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts Failed canonicalization remains null instead of borrowing a recorded target or assuming the lexical path is physical identity; non-symlink leaf names come from directory listings or native realpathSync.native, never from lexical basenames.
++ * @evidence contracts/common.md#meaningful-documentation Native JSDoc explains unresolved values, phase-scoped sharing and why realpaths accompany hashes, with prose/tag separation following the documentation skill.
++ * @evidence contracts/portability.md#os-neutral-implementation Native path.resolve and delegated realpath/listing observation support OS-neutral symlink/junction and case-insensitive identity without blanket lowercasing or slash-only parsing.
++ * @evidence contracts/performance.md#efficient-algorithms Each independent resolved path reuses its phase lstat (zero syscalls for absent paths already observed or descendants of missing/non-directory parents); present non-symlink files share one realpathSync.native and one readdirSync per ancestor directory per phase.
++ *
++ * @evidence contracts/performance.md#reuse-equivalent-work An optional caller-owned phase memo shares lstat, physical-target, ancestor-realpath and listing observations across overlapping checks within one synchronous verification phase and is dropped when that phase ends; without a caller phase, a call-local phase serves only the current call and is dropped on return.
   * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources It returns caller-owned observations and retains no cross-call population or resource.
   */
 -function realpathHostInputPaths(files) {
 -    return Object.fromEntries(files.map((file) => [node_path_1.default.resolve(file), (0, realpathHostInput_1.realpathHostInput)(file)]));
-+function realpathHostInputPaths(files, observed, observe = realpathHostInput_1.realpathHostInput) {
++function realpathHostInputPaths(files, observed, observe) {
 +    const out = {};
++    if (observe !== undefined) {
++        const map = HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)
++            ? observed.realpaths
++            : observed;
++        for (const file of files) {
++            const resolved = node_path_1.default.resolve(file);
++            if (Object.prototype.hasOwnProperty.call(out, resolved))
++                continue;
++            let target;
++            if (map !== undefined && map.has(resolved)) {
++                target = map.get(resolved);
++            }
++            else {
++                target = observe(resolved);
++                map?.set(resolved, target);
++            }
++            out[resolved] = target;
++        }
++        return out;
++    }
++    const phase = HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)
++        ? observed
++        : HostInputObservationPhase_1.HostInputObservationPhase.create();
++    const legacyMap = HostInputObservationPhase_1.HostInputObservationPhase.isPhase(observed)
++        ? undefined
++        : observed;
 +    for (const file of files) {
 +        const resolved = node_path_1.default.resolve(file);
 +        if (Object.prototype.hasOwnProperty.call(out, resolved))
 +            continue;
 +        let target;
-+        if (observed !== undefined && observed.has(resolved)) {
-+            target = observed.get(resolved);
++        if (legacyMap !== undefined && legacyMap.has(resolved)) {
++            target = legacyMap.get(resolved);
 +        }
 +        else {
-+            target = observe(resolved);
-+            observed?.set(resolved, target);
++            target = HostInputObservationPhase_1.HostInputObservationPhase.realpath(resolved, phase);
++            legacyMap?.set(resolved, target);
 +        }
 +        out[resolved] = target;
 +    }
@@ -6114,6 +6956,30 @@ index 4244ef8..4be015a 100644
  }
  //# sourceMappingURL=realpathHostInputPaths.js.map
 \ No newline at end of file
+diff --git a/lib/plugin/internal/readCapabilityResolution.js b/lib/plugin/internal/readCapabilityResolution.js
+index b62dfa8..5a10dcc 100644
+--- a/lib/plugin/internal/readCapabilityResolution.js
++++ b/lib/plugin/internal/readCapabilityResolution.js
+@@ -7,6 +7,7 @@ exports.readCapabilityResolution = readCapabilityResolution;
+ const node_fs_1 = __importDefault(require("node:fs"));
+ const node_path_1 = __importDefault(require("node:path"));
+ const CapabilityResolutionFormat_1 = require("./CapabilityResolutionFormat");
++const HostInputObservationPhase_1 = require("./load/HostInputObservationPhase");
+ const hashHostInputPaths_1 = require("./load/hashHostInputPaths");
+ const realpathHostInputPaths_1 = require("./load/realpathHostInputPaths");
+ const PluginContentIdentities_1 = require("./source/PluginContentIdentities");
+@@ -63,8 +64,9 @@ function readCapabilityResolution(options) {
+     // rather than a project with no inputs.
+     if (entry.hostInputs.length === 0)
+         return null;
+-    if (!sameMap(entry.hostInputHashes, (0, hashHostInputPaths_1.hashHostInputPaths)(entry.hostInputs)) ||
+-        !sameMap(entry.hostInputRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(entry.hostInputs)))
++    const observationPhase = HostInputObservationPhase_1.HostInputObservationPhase.create();
++    if (!sameMap(entry.hostInputHashes, (0, hashHostInputPaths_1.hashHostInputPaths)(entry.hostInputs, observationPhase)) ||
++        !sameMap(entry.hostInputRealpaths, (0, realpathHostInputPaths_1.realpathHostInputPaths)(entry.hostInputs, observationPhase)))
+         return null;
+     // What each binary path was keyed on, proven by the build's own rule: a
+     // module root, linked package, or contributor that moved, or another build
 diff --git a/lib/plugin/internal/source/CompilerTarget.d.ts b/lib/plugin/internal/source/CompilerTarget.d.ts
 index 0c7e5c9..c38e08f 100644
 --- a/lib/plugin/internal/source/CompilerTarget.d.ts
@@ -6750,7 +7616,7 @@ index da585c3..63c842d 100644
          const retire = () => {
              if (worker === created)
 diff --git a/lib/plugin/internal/source/PluginContentIdentities.d.ts b/lib/plugin/internal/source/PluginContentIdentities.d.ts
-index cdaa8b9..cbc2651 100644
+index cdaa8b9..f897053 100644
 --- a/lib/plugin/internal/source/PluginContentIdentities.d.ts
 +++ b/lib/plugin/internal/source/PluginContentIdentities.d.ts
 @@ -24,37 +24,49 @@ import type { IPluginSourceListing } from "./IPluginSourceListing";
@@ -6832,7 +7698,32 @@ index cdaa8b9..cbc2651 100644
          /** Ttsc package version entering every record identity. */
          readonly version: string;
      }
-@@ -108,20 +128,23 @@ export declare namespace PluginContentIdentities {
+@@ -92,36 +112,41 @@ export declare namespace PluginContentIdentities {
+         readonly signature: string;
+     }
+     /**
+-     * Open the store under a plugin cache root and mint its clock reference, or
+-     * return `undefined` when the root cannot hold records, so callers read
+-     * content as they did without one.
++     * Open the store under a plugin cache root and mint its cache-volume clock
++     * reference, or return `undefined` when the root cannot hold records, so
++     * callers read content as they did without one.
+      *
+      * The root follows the plugin cache policy (`resolveSourceBuildCachePaths`):
+      * an explicit `cacheDir`, `TTSC_CACHE_DIR`, or the workspace-local default. A
+      * default root is marked as selected before its first write, as every other
+      * default writer does, so a later root search never mistakes the new payload
+      * for an older orphan. One reference is minted in the root's identity
+-     * directory, and the store exists only when that write succeeds. Another is
+-     * minted in a private per-user directory below the system temporary
+-     * directory, so an executable or SDK on the system volume is separable even
+-     * when the project lives on another volume.
++     * directory, and the store exists only when that write succeeds. A second
++     * reference in a private per-user directory below the system temporary
++     * directory is minted lazily, at most once per store, only when a proof
++     * encounters a device absent from the cache root's own references (or when a
++     * caller forces it before a compile via {@link ensureTemporaryReference}), so
++     * single-volume loads and store-only openers never write in `os.tmpdir()`.
       *
       * A root inside any of `sources` is refused before anything is written: the
       * build rejects such a cache (`SourcePluginAdmission`), and a record written
@@ -6849,22 +7740,48 @@ index cdaa8b9..cbc2651 100644
       * @param props.sources Plugin source directories the root must lie outside.
 -     * @evidence contracts/common.md#principled-implementation The plugin cache policy selects the root, default roots are marked before payload, and the reference comes from a fresh owned probe; any failure withholds the store so callers keep the content path.
 -     * @evidence contracts/common.md#clear-and-simple-design Root policy and the probe are delegated to their existing owners; this function composes them once per load.
-+     * @evidence contracts/common.md#principled-implementation The plugin cache policy selects the root, default roots are marked before payload, the reference comes from a fresh owned probe, and the optional Nix store root is recorded only when its real path is an existing directory; any failure withholds the store so callers keep the content path.
-+     * @evidence contracts/common.md#clear-and-simple-design Root policy, Nix store lookup and the probe are delegated to their helpers; this function composes them once per load.
++     * @evidence contracts/common.md#principled-implementation The plugin cache policy selects the root, default roots are marked before payload, and the reference comes from a fresh owned probe; the optional Nix store root is recorded only when its real path is an existing directory; any failure withholds the store so callers keep the content path, while cross-device proofs lazily mint the temporary-volume reference preserving owned precedence and union listing semantics.
++     * @evidence contracts/common.md#clear-and-simple-design Root policy, Nix store lookup and the probe are delegated to their existing owners; this function composes them once per load with lazy cross-device minting.
       * @evidence contracts/common.md#prohibited-implementation-shortcuts No wall clock or historical stamp substitutes for the minted reference.
 -     * @evidence contracts/common.md#meaningful-documentation Native paragraphs state root selection, the marker ordering and the undefined fallback.
 -     * @evidence contracts/portability.md#os-neutral-implementation Native path resolution and the probe's device identity carry platform semantics; Windows environment names are read case-insensitively by the shared reader.
 -     * @evidence contracts/performance.md#efficient-algorithms Root selection can walk ancestors and read manifests; each of the two probes performs one directory creation, one write, up to three lstats and one removal; the temporary one also checks its directory's ownership. No plugin source is read.
-+     * @evidence contracts/common.md#meaningful-documentation Native paragraphs state root selection, the marker ordering, Nix store resolution and the undefined fallback.
++     * @evidence contracts/common.md#meaningful-documentation Native paragraphs state root selection, marker ordering, Nix store resolution, lazy temporary-volume minting and the undefined fallback.
 +     * @evidence contracts/portability.md#os-neutral-implementation Native path resolution and the probe's device identity carry platform semantics; environment names use the shared reader and Nix store ownership requires POSIX uid support.
-+     * @evidence contracts/performance.md#efficient-algorithms Root selection can walk ancestors and read manifests; each of the two probes performs one directory creation, one write, up to three lstats and one removal; the temporary one also checks its directory's ownership, and Nix store discovery performs at most one realpath and one lstat. No plugin source is read.
++     * @evidence contracts/performance.md#efficient-algorithms Root selection can walk ancestors and read manifests; opening performs one owned directory creation, one write, up to three lstats and one removal, and Nix store discovery performs at most one realpath and one lstat. The temporary-volume probe runs at most once per store only when a proof encounters a device absent from owned references or ensureTemporaryReference is called explicitly. No plugin source is read.
       * @evidenceExclude contracts/performance.md#reuse-equivalent-work Each load needs a freshly minted reference; reusing an older one would defeat the separation premise.
 -     * @evidence contracts/performance.md#bound-retention-and-release-resources Each probe is removed in its owner's finally; the per-user temporary directory stays, empty, for later loads so the temporary directory itself does not move. The returned store retains at most two device references and two strings.
-+     * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Each probe is removed in its owner's finally; the per-user temporary directory stays, empty, for later loads so the temporary directory itself does not move. The returned store retains at most two device references, one optional Nix store root pair and two strings.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Each probe is removed in its owner's finally; the per-user temporary directory stays, empty, for later loads so the temporary directory itself does not move. The returned store retains at most two device references, one optional Nix store root pair and two strings, and the private WeakMap entry drops with the store.
       */
      function open(props: {
          projectRoot: string;
-@@ -158,6 +181,21 @@ export declare namespace PluginContentIdentities {
+@@ -129,6 +154,25 @@ export declare namespace PluginContentIdentities {
+         env: NodeJS.ProcessEnv;
+         sources?: readonly string[];
+     }): Store | undefined;
++    /**
++     * Explicitly mint the store's temporary-volume clock reference now, at most
++     * once per store.
++     *
++     * Callers that snapshot `store.references` before a compile to prove later
++     * post-compile or parked traces (`RuntimeBuildInputs`) call this before the
++     * compile starts so any cross-volume reference predates the compile.
++     *
++     * @param store The opened store, if any.
++     * @evidence contracts/common.md#principled-implementation Forces the store's own temporary-volume probe ahead of a bracketed compile without minting a second probe when already minted.
++     * @evidence contracts/common.md#clear-and-simple-design One explicit entry point triggers the store's lazy temporaryReference closure without exposing internal mutable maps.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Mints a real probe through temporaryReference rather than synthesizing a timestamp or reusing a past store's probe.
++     * @evidence contracts/common.md#meaningful-documentation States why pre-compile callers invoke this explicitly and its at-most-once semantics.
++     * @evidence contracts/portability.md#os-neutral-implementation Delegates directly to the store's native temporaryReference probe.
++     * @evidence contracts/performance.md#efficient-algorithms Constant-time WeakMap lookup plus at most one temporary-volume probe per store; no-op on subsequent calls.
++     * @evidence contracts/performance.md#reuse-equivalent-work Idempotent per store; once minted, subsequent calls and cross-device lookups reuse that store's reference.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Retains no additional state beyond the store's WeakMap entry, which releases when the store is dropped.
++     */
++    function ensureTemporaryReference(store: Store | undefined): void;
+     /**
+      * The store when its root lies outside every one of `sources`, otherwise
+      * `undefined`. A loader opens its store before descriptor evaluation names
+@@ -158,6 +202,21 @@ export declare namespace PluginContentIdentities {
       * below a pruned directory such as `node_modules` is outside every
       * selection.
       *
@@ -6886,7 +7803,7 @@ index cdaa8b9..cbc2651 100644
       * @param store The opened store, or `undefined` to read content only.
       * @param kind Population family; records of different families never mix.
       * @param subject Absolute population path identifying the record.
-@@ -165,13 +203,13 @@ export declare namespace PluginContentIdentities {
+@@ -165,13 +224,13 @@ export declare namespace PluginContentIdentities {
       *   given the listing the record holds, if any; an observer that lists its
       *   population returns the listing for the record.
       * @param read The owning content reader; its result is the digest.
@@ -6908,7 +7825,7 @@ index cdaa8b9..cbc2651 100644
       */
      function digest(store: Store | undefined, kind: string, subject: string, observe: (references: ReadonlyMap<bigint, bigint>, listing?: IPluginSourceListing) => (Observation & {
 diff --git a/lib/plugin/internal/source/PluginContentIdentities.js b/lib/plugin/internal/source/PluginContentIdentities.js
-index 694d32e..4870f25 100644
+index 694d32e..6ffd0c1 100644
 --- a/lib/plugin/internal/source/PluginContentIdentities.js
 +++ b/lib/plugin/internal/source/PluginContentIdentities.js
 @@ -41,20 +41,32 @@ const ttscPackageVersion_1 = require("./ttscPackageVersion");
@@ -6952,7 +7869,32 @@ index 694d32e..4870f25 100644
   * @evidenceExclude contracts/performance.md#efficient-algorithms The namespace groups operations; each member states its own work.
   * @evidenceExclude contracts/performance.md#reuse-equivalent-work Members define the reuse identity and its validity.
   * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Members define what they retain; the namespace holds no state.
-@@ -78,20 +90,23 @@ var PluginContentIdentities;
+@@ -62,36 +74,41 @@ const ttscPackageVersion_1 = require("./ttscPackageVersion");
+ var PluginContentIdentities;
+ (function (PluginContentIdentities) {
+     /**
+-     * Open the store under a plugin cache root and mint its clock reference, or
+-     * return `undefined` when the root cannot hold records, so callers read
+-     * content as they did without one.
++     * Open the store under a plugin cache root and mint its cache-volume clock
++     * reference, or return `undefined` when the root cannot hold records, so
++     * callers read content as they did without one.
+      *
+      * The root follows the plugin cache policy (`resolveSourceBuildCachePaths`):
+      * an explicit `cacheDir`, `TTSC_CACHE_DIR`, or the workspace-local default. A
+      * default root is marked as selected before its first write, as every other
+      * default writer does, so a later root search never mistakes the new payload
+      * for an older orphan. One reference is minted in the root's identity
+-     * directory, and the store exists only when that write succeeds. Another is
+-     * minted in a private per-user directory below the system temporary
+-     * directory, so an executable or SDK on the system volume is separable even
+-     * when the project lives on another volume.
++     * directory, and the store exists only when that write succeeds. A second
++     * reference in a private per-user directory below the system temporary
++     * directory is minted lazily, at most once per store, only when a proof
++     * encounters a device absent from the cache root's own references (or when a
++     * caller forces it before a compile via {@link ensureTemporaryReference}), so
++     * single-volume loads and store-only openers never write in `os.tmpdir()`.
       *
       * A root inside any of `sources` is refused before anything is written: the
       * build rejects such a cache (`SourcePluginAdmission`), and a record written
@@ -6969,41 +7911,116 @@ index 694d32e..4870f25 100644
       * @param props.sources Plugin source directories the root must lie outside.
 -     * @evidence contracts/common.md#principled-implementation The plugin cache policy selects the root, default roots are marked before payload, and the reference comes from a fresh owned probe; any failure withholds the store so callers keep the content path.
 -     * @evidence contracts/common.md#clear-and-simple-design Root policy and the probe are delegated to their existing owners; this function composes them once per load.
-+     * @evidence contracts/common.md#principled-implementation The plugin cache policy selects the root, default roots are marked before payload, the reference comes from a fresh owned probe, and the optional Nix store root is recorded only when its real path is an existing directory; any failure withholds the store so callers keep the content path.
-+     * @evidence contracts/common.md#clear-and-simple-design Root policy, Nix store lookup and the probe are delegated to their helpers; this function composes them once per load.
++     * @evidence contracts/common.md#principled-implementation The plugin cache policy selects the root, default roots are marked before payload, and the reference comes from a fresh owned probe; the optional Nix store root is recorded only when its real path is an existing directory; any failure withholds the store so callers keep the content path, while cross-device proofs lazily mint the temporary-volume reference preserving owned precedence and union listing semantics.
++     * @evidence contracts/common.md#clear-and-simple-design Root policy, Nix store lookup and the probe are delegated to their existing owners; this function composes them once per load with lazy cross-device minting.
       * @evidence contracts/common.md#prohibited-implementation-shortcuts No wall clock or historical stamp substitutes for the minted reference.
 -     * @evidence contracts/common.md#meaningful-documentation Native paragraphs state root selection, the marker ordering and the undefined fallback.
 -     * @evidence contracts/portability.md#os-neutral-implementation Native path resolution and the probe's device identity carry platform semantics; Windows environment names are read case-insensitively by the shared reader.
 -     * @evidence contracts/performance.md#efficient-algorithms Root selection can walk ancestors and read manifests; each of the two probes performs one directory creation, one write, up to three lstats and one removal; the temporary one also checks its directory's ownership. No plugin source is read.
-+     * @evidence contracts/common.md#meaningful-documentation Native paragraphs state root selection, the marker ordering, Nix store resolution and the undefined fallback.
++     * @evidence contracts/common.md#meaningful-documentation Native paragraphs state root selection, marker ordering, Nix store resolution, lazy temporary-volume minting and the undefined fallback.
 +     * @evidence contracts/portability.md#os-neutral-implementation Native path resolution and the probe's device identity carry platform semantics; environment names use the shared reader and Nix store ownership requires POSIX uid support.
-+     * @evidence contracts/performance.md#efficient-algorithms Root selection can walk ancestors and read manifests; each of the two probes performs one directory creation, one write, up to three lstats and one removal; the temporary one also checks its directory's ownership, and Nix store discovery performs at most one realpath and one lstat. No plugin source is read.
++     * @evidence contracts/performance.md#efficient-algorithms Root selection can walk ancestors and read manifests; opening performs one owned directory creation, one write, up to three lstats and one removal, and Nix store discovery performs at most one realpath and one lstat. The temporary-volume probe runs at most once per store only when a proof encounters a device absent from owned references or ensureTemporaryReference is called explicitly. No plugin source is read.
       * @evidenceExclude contracts/performance.md#reuse-equivalent-work Each load needs a freshly minted reference; reusing an older one would defeat the separation premise.
 -     * @evidence contracts/performance.md#bound-retention-and-release-resources Each probe is removed in its owner's finally; the per-user temporary directory stays, empty, for later loads so the temporary directory itself does not move. The returned store retains at most two device references and two strings.
-+     * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Each probe is removed in its owner's finally; the per-user temporary directory stays, empty, for later loads so the temporary directory itself does not move. The returned store retains at most two device references, one optional Nix store root pair and two strings.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Each probe is removed in its owner's finally; the per-user temporary directory stays, empty, for later loads so the temporary directory itself does not move. The returned store retains at most two device references, one optional Nix store root pair and two strings, and the private WeakMap entry drops with the store.
       */
      function open(props) {
          try {
-@@ -114,10 +129,17 @@ var PluginContentIdentities;
-                 ...owned.references,
-             ]);
-             const listings = new Set([...temporary.listings, ...owned.listings]);
+@@ -107,23 +124,85 @@ var PluginContentIdentities;
+             // The cache root's device covers the project, its installed plugins and
+             // the toolchain bundled with them. A runtime or SDK installed elsewhere,
+             // typically on the system drive, is judged against a second reference
+-            // minted in a per-user directory below the system temporary directory.
+-            const temporary = temporaryReference();
+-            const references = new Map([
+-                ...temporary.references,
+-                ...owned.references,
+-            ]);
+-            const listings = new Set([...temporary.listings, ...owned.listings]);
++            // minted lazily in a per-user directory below the system temporary
++            // directory only when a proof meets a device absent from owned.references.
++            let temporaryMinted = false;
++            const references = new (class extends Map {
++                get(device) {
++                    if (!owned.references.has(device))
++                        ensureTemporary();
++                    return super.get(device);
++                }
++                has(device) {
++                    if (!owned.references.has(device))
++                        ensureTemporary();
++                    return super.has(device);
++                }
++            })(owned.references);
++            const listings = new (class extends Set {
++                has(device) {
++                    if (!owned.references.has(device))
++                        ensureTemporary();
++                    return super.has(device);
++                }
++            })(owned.listings);
++            const ensureTemporary = () => {
++                if (temporaryMinted)
++                    return;
++                temporaryMinted = true;
++                const temporary = temporaryReference();
++                for (const [device, stamp] of temporary.references) {
++                    // Keep owned precedence over temporary on the same device.
++                    if (!Map.prototype.has.call(references, device)) {
++                        Map.prototype.set.call(references, device, stamp);
++                    }
++                }
++                for (const device of temporary.listings) {
++                    Set.prototype.add.call(listings, device);
++                }
++            };
 +            const nixStore = resolveNixStore(props.env);
              // WARNING (#1726): resolve no module here. A descriptor evaluator opens a
              // store under its resolution recorder, and any lookup becomes an input of
              // the descriptor it did not read (`ttscPackageVersion`).
 -            return { root, references, listings, version: (0, ttscPackageVersion_1.ttscPackageVersion)() };
-+            return {
++            const store = {
 +                root,
 +                references,
 +                listings,
 +                ...(nixStore === undefined ? {} : { nixStore }),
 +                version: (0, ttscPackageVersion_1.ttscPackageVersion)(),
 +            };
++            temporaryMinters.set(store, ensureTemporary);
++            return store;
          }
          catch {
              return undefined;
-@@ -158,6 +180,21 @@ var PluginContentIdentities;
+         }
+     }
+     PluginContentIdentities.open = open;
++    /**
++     * Explicitly mint the store's temporary-volume clock reference now, at most
++     * once per store.
++     *
++     * Callers that snapshot `store.references` before a compile to prove later
++     * post-compile or parked traces (`RuntimeBuildInputs`) call this before the
++     * compile starts so any cross-volume reference predates the compile.
++     *
++     * @param store The opened store, if any.
++     * @evidence contracts/common.md#principled-implementation Forces the store's own temporary-volume probe ahead of a bracketed compile without minting a second probe when already minted.
++     * @evidence contracts/common.md#clear-and-simple-design One explicit entry point triggers the store's lazy temporaryReference closure without exposing internal mutable maps.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Mints a real probe through temporaryReference rather than synthesizing a timestamp or reusing a past store's probe.
++     * @evidence contracts/common.md#meaningful-documentation States why pre-compile callers invoke this explicitly and its at-most-once semantics.
++     * @evidence contracts/portability.md#os-neutral-implementation Delegates directly to the store's native temporaryReference probe.
++     * @evidence contracts/performance.md#efficient-algorithms Constant-time WeakMap lookup plus at most one temporary-volume probe per store; no-op on subsequent calls.
++     * @evidence contracts/performance.md#reuse-equivalent-work Idempotent per store; once minted, subsequent calls and cross-device lookups reuse that store's reference.
++     * @evidence contracts/performance.md#bound-retention-and-release-resources Retains no additional state beyond the store's WeakMap entry, which releases when the store is dropped.
++     */
++    function ensureTemporaryReference(store) {
++        if (store !== undefined)
++            temporaryMinters.get(store)?.();
++    }
++    PluginContentIdentities.ensureTemporaryReference = ensureTemporaryReference;
+     /**
+      * The store when its root lies outside every one of `sources`, otherwise
+      * `undefined`. A loader opens its store before descriptor evaluation names
+@@ -158,6 +237,21 @@ var PluginContentIdentities;
       * below a pruned directory such as `node_modules` is outside every
       * selection.
       *
@@ -7025,7 +8042,7 @@ index 694d32e..4870f25 100644
       * @param store The opened store, or `undefined` to read content only.
       * @param kind Population family; records of different families never mix.
       * @param subject Absolute population path identifying the record.
-@@ -165,13 +202,13 @@ var PluginContentIdentities;
+@@ -165,13 +259,13 @@ var PluginContentIdentities;
       *   given the listing the record holds, if any; an observer that lists its
       *   population returns the listing for the record.
       * @param read The owning content reader; its result is the digest.
@@ -7046,7 +8063,7 @@ index 694d32e..4870f25 100644
       * @evidence contracts/performance.md#bound-retention-and-release-resources One small file per subject is published atomically and aged out by the single-file collector; hits refresh its use time, or rewrite it once with the listing their walk read; nothing is retained in memory.
       */
      function digest(store, kind, subject, observe, read) {
-@@ -180,7 +217,8 @@ var PluginContentIdentities;
+@@ -180,7 +274,8 @@ var PluginContentIdentities;
              return read();
          const file = recordFile(store, kind, subject);
          const known = readRecord(file);
@@ -7056,7 +8073,7 @@ index 694d32e..4870f25 100644
          if (before?.separable === true) {
              if (known !== undefined &&
                  known.signature === before.signature &&
-@@ -211,7 +249,12 @@ var PluginContentIdentities;
+@@ -211,7 +306,12 @@ var PluginContentIdentities;
              }
          }
          const value = read();
@@ -7070,7 +8087,7 @@ index 694d32e..4870f25 100644
          const recorded = before?.separable === true &&
              after?.separable === true &&
              before.signature === after.signature;
-@@ -548,6 +591,61 @@ var PluginContentIdentities;
+@@ -548,6 +648,63 @@ var PluginContentIdentities;
      const FORMAT = "ttsc-content-identity-v1";
      /** Directory below the system temporary directory that holds its probes. */
      const TEMPORARY_REFERENCE_DIRNAME = "ttsc-clock-references";
@@ -7129,6 +8146,8 @@ index 694d32e..4870f25 100644
 +            return undefined;
 +        }
 +    }
++    /** Per-store lazy temporary-volume minters, released when the store drops. */
++    const temporaryMinters = new WeakMap();
      // The temporary-volume reference lives in one directory reused by every
      // load: creating and removing an entry of the temporary directory itself on
      // each load would move that directory's metadata, which is the signature of
