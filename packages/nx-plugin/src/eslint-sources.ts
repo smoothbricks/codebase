@@ -39,9 +39,9 @@ export interface EslintSources {
  * graph construction dies reading `sys.readFile`. The plugin declares TypeScript 6, whose
  * `sys` this uses, so the resolution is the one this package's manifest promises.
  */
-function readTestTsConfig(testConfig: string): ParsedCommandLine {
-  const readResult = readConfigFile(testConfig, typescriptSys.readFile);
-  return parseJsonConfigFileContent(readResult.config, typescriptSys, dirname(testConfig));
+function readDeclaration(declaration: string): ParsedCommandLine {
+  const readResult = readConfigFile(declaration, typescriptSys.readFile);
+  return parseJsonConfigFileContent(readResult.config, typescriptSys, dirname(declaration));
 }
 
 /** The workspace-relative POSIX path of `absolute`, or null when it lies outside the workspace. */
@@ -67,8 +67,10 @@ function walkedInput({ directory, recursive }: WalkedDirectory): string {
 
 /**
  * What ESLint lints for `projectRoot`, out of `indexed`, the JavaScript and TypeScript modules of an Nx workspace file
- * index (.gitignore and .nxignore applied): its `src` files, and the files its `tsconfig.test.json` declares wherever
- * they live. Only an indexed module counts: an ignored one is build output a fresh checkout lacks, and a JSON file is
+ * index (.gitignore and .nxignore applied): its `src` files, the files its `tsconfig.test.json` declares wherever they
+ * live, and the files its `tsconfig.lib.json` declares outside `src`. A library file and a test file belong to one
+ * declaration each, so a library module outside `src` (a schema directory) is in no test program and is linted, and
+ * keyed, through the library declaration. Only an indexed module counts: an ignored one is build output a fresh checkout lacks, and a JSON file is
  * not ESLint's. Which index `indexed` comes from is the caller's: the graph's to describe a project, the filesystem's
  * now to run ESLint on it.
  */
@@ -84,40 +86,50 @@ export function eslintSources(workspaceRoot: string, projectRoot: string, indexe
     }
   }
   const inputs: string[] = [];
-  const testConfig = join(workspaceRoot, projectRoot, 'tsconfig.test.json');
-  if (existsSync(testConfig)) {
-    // A test program can live anywhere the declaration selects, not just src.
+  const sourceDirectory = sourcePrefix.slice(0, -1);
+  const withinSource = (path: string): boolean => path === sourceDirectory || path.startsWith(sourcePrefix);
+  // The test program first, whole; then the library program's files outside src, which the src rule above already
+  // lints and the project's own inputs already key inside it.
+  for (const [name, outsideSourceOnly] of [
+    ['tsconfig.test.json', false],
+    ['tsconfig.lib.json', true],
+  ] as const) {
+    const declaration = join(workspaceRoot, projectRoot, name);
+    if (!existsSync(declaration)) continue;
+    // A program can live anywhere the declaration selects, not just src.
     // Use the compiler's file set and the existing declaration-chain hasher,
     // so inherited includes and files outside this project keep their keys.
-    const program = readTestTsConfig(testConfig);
+    const program = readDeclaration(declaration);
     const errors = program.errors.filter(({ code }) => code !== NO_INPUTS_FOUND);
     if (errors.length > 0) {
       throw new Error(
-        `${testConfig}: ${errors.map(({ code, messageText }) => `TS${code}: ${JSON.stringify(messageText)}`).join('; ')}`,
+        `${declaration}: ${errors.map(({ code, messageText }) => `TS${code}: ${JSON.stringify(messageText)}`).join('; ')}`,
       );
     }
-    inputs.push('{projectRoot}/tsconfig.test.json');
     // The directories the include patterns walk are keyed as globs, so a file added to one is keyed the moment it
     // exists, and the compiler's own set of walked directories says which they are.
     const walked: WalkedDirectory[] = [];
     for (const [absolute, flags] of Object.entries(program.wildcardDirectories ?? {})) {
       const directory = insideWorkspace(workspaceRoot, absolute);
       if (directory !== null && !directory.split('/').some(isNonSourceDirectory)) {
+        if (outsideSourceOnly && withinSource(directory)) continue;
         walked.push({ directory, recursive: (flags & WatchDirectoryFlags.Recursive) !== 0 });
       }
     }
-    inputs.push(...walked.map(walkedInput).sort());
     const named: string[] = [];
     for (const absolute of program.fileNames) {
       const path = insideWorkspace(workspaceRoot, absolute);
       if (path === null) {
-        throw new Error(`${testConfig}: test source ${absolute} is outside the workspace and cannot be hashed`);
+        throw new Error(`${declaration}: source ${absolute} is outside the workspace and cannot be hashed`);
       }
       if (!indexed.has(path) || path.split('/').some(isNonSourceDirectory)) continue;
+      if (outsideSourceOnly && withinSource(path)) continue;
       files.add(path);
       if (!walked.some((entry) => walks(entry, path))) named.push(`{workspaceRoot}/${path}`);
     }
-    inputs.push(...named.sort());
+    // A library declaration that selects nothing outside src adds no input: its src files are the project's own.
+    if (outsideSourceOnly && walked.length === 0 && named.length === 0) continue;
+    inputs.push(`{projectRoot}/${name}`, ...walked.map(walkedInput).sort(), ...named.sort());
   }
   return { files: [...files].sort(), inputs: [...new Set(inputs)] };
 }

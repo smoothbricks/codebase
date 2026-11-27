@@ -136,6 +136,50 @@ describe('eslintSources', () => {
       },
     ],
     [
+      'a library declaration adds its files outside src, keyed like the test declaration, and nothing inside src',
+      {
+        disk: {
+          [`${PROJECT}/tsconfig.lib.json`]: '{"include":["src/**/*.ts","schema/wire-schema.ts"]}',
+          [`${PROJECT}/tsconfig.test.json`]: '{"include":["src/**/*.test.ts","schema/fixtures.ts"]}',
+          [`${PROJECT}/src/a.ts`]: '',
+          [`${PROJECT}/src/a.test.ts`]: '',
+          [`${PROJECT}/schema/wire-schema.ts`]: '',
+          [`${PROJECT}/schema/fixtures.ts`]: '',
+        },
+        indexed: [
+          `${PROJECT}/src/a.ts`,
+          `${PROJECT}/src/a.test.ts`,
+          `${PROJECT}/schema/wire-schema.ts`,
+          `${PROJECT}/schema/fixtures.ts`,
+        ],
+        files: [
+          `${PROJECT}/schema/fixtures.ts`,
+          `${PROJECT}/schema/wire-schema.ts`,
+          `${PROJECT}/src/a.test.ts`,
+          `${PROJECT}/src/a.ts`,
+        ],
+        inputs: [
+          DECLARATION,
+          `{workspaceRoot}/${PROJECT}/src/**/${KINDS}`,
+          `{workspaceRoot}/${PROJECT}/schema/fixtures.ts`,
+          '{projectRoot}/tsconfig.lib.json',
+          `{workspaceRoot}/${PROJECT}/schema/wire-schema.ts`,
+        ],
+      },
+    ],
+    [
+      'a library declaration selecting only src adds nothing',
+      {
+        disk: {
+          [`${PROJECT}/tsconfig.lib.json`]: '{"include":["src/**/*.ts"]}',
+          [`${PROJECT}/src/a.ts`]: '',
+        },
+        indexed: [`${PROJECT}/src/a.ts`],
+        files: [`${PROJECT}/src/a.ts`],
+        inputs: [],
+      },
+    ],
+    [
       'the root project reads src beside the workspace root, and keys a directory from the root',
       {
         project: '.',
