@@ -45,6 +45,11 @@ inference.
 6. **Test through devkit values, never an Nx process.** The plugin's contract is the value its hook returns; Nx's
    behavior is Nx's to test (AGENTS.md, Proof). A wiring gets at most one `nx show project` smoke.
    [Test Fixtures That Run Nx](#test-fixtures-that-run-nx) owns the rule and its fixtures.
+7. **A change to inferred targets runs the workspace policy.** Its unit's checks include
+   `@smoothbricks/codebase:monorepo-check` beside this package's tests. The policy judges each target as Nx resolves it,
+   the inferred value merged with `nx.json`'s `targetDefaults`, and a test of the hook's returned value never sees that
+   merge: typecheck-once inferred a noop `typecheck` with no `inputs`, its tests asserted that shape, and only the batch
+   gate found that `targetDefaults` cached it, so Nx hashed every file under each project root.
 
 ## Target Ownership
 

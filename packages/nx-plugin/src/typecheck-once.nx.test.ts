@@ -148,22 +148,19 @@ it('fails typecheck through tsc-js on lib errors, typecheck-tests on test errors
     );
     await writeFile(join(workspace, 'packages/custom-emit/src/index.ts'), "export const bad: number = 'nope';\n");
 
-    // Each Nx process pays a whole graph build and plugin load, so the cases share two processes: the caller that runs
-    // `typecheck` alone, and one run-many over every other case (no task of it depends on another's failure).
-    // A lib type error fails `nx run lib-pkg:typecheck` through `lib-pkg:tsc-js`.
-    const libError = runNx('run', 'lib-pkg:typecheck');
-    expect(libError.status, libError.output).not.toBe(0);
-    expect(libError.output).toContain('lib-pkg:tsc-js');
-    expect(libError.output).toContain('TS2322');
-
-    // test-pkg's `typecheck` passes over its clean lib while its `typecheck-tests` fails on the test file; the emit-less
-    // project's own typecheck fails; and a project that declares its own tsc-js keeps the real `typecheck`, which fails.
+    // Each Nx process pays a whole process start, graph build and plugin load (2.5-5 s of the first run in a fresh
+    // checkout), so every case shares one run-many; no task of it depends on another case's failure.
+    // lib-pkg's lib type error fails its `typecheck` through `lib-pkg:tsc-js`: the noop never runs a compiler, so the
+    // failed task is tsc-js and typecheck itself never appears among them. test-pkg's `typecheck` passes over its
+    // clean lib while its `typecheck-tests` fails on the test file; the emit-less project's own typecheck fails; and a
+    // project that declares its own tsc-js keeps the real `typecheck`, which fails.
     const cases = runNx(
       'run-many',
       '-t',
       'typecheck',
       'typecheck-tests',
       '-p',
+      'lib-pkg',
       'test-pkg',
       'emitless',
       'custom-emit',
@@ -178,8 +175,8 @@ it('fails typecheck through tsc-js on lib errors, typecheck-tests on test errors
         .filter((task): task is string => task !== undefined),
     );
     expect([...failed].sort(), cases.output).toEqual(
-      ['custom-emit:typecheck', 'emitless:typecheck', 'test-pkg:typecheck-tests'].sort(),
+      ['custom-emit:typecheck', 'emitless:typecheck', 'lib-pkg:tsc-js', 'test-pkg:typecheck-tests'].sort(),
     );
-    expect(cases.output.match(/TS2322/g)?.length ?? 0, cases.output).toBeGreaterThanOrEqual(3);
+    expect(cases.output.match(/TS2322/g)?.length ?? 0, cases.output).toBeGreaterThanOrEqual(4);
   });
 });
