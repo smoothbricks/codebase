@@ -196,20 +196,23 @@ in {
     # The systems are nixpkgs' own three: the locked nixpkgs evaluates no
     # package set for x86_64-darwin.
     #
-    # A repository's own overlays apply after this one, so one that sets `bun`
-    # itself still decides its runtime Bun. The managed build stays reachable as
-    # `smooBun` whatever a repository does to `bun`: it is the Bun the Nx
-    # plugin's inferred `lint` runs as `bun lint` (SMOO_LINT_BUN below), so lint
-    # and its built-in rules are one pin across every managed repository, and a
-    # repository that builds its own runtime Bun does not move them. Where no
-    # repository overrides `bun`, `bun` and `smooBun` are the same store path:
-    # one Bun, fetched once.
+    # devenv applies a repository's input overlays before this module's, so
+    # overlay order cannot decide whether a repository keeps its own `bun` (and
+    # overriding `prev.bun` would rewrite a repository's own source build
+    # instead of nixpkgs' package). `smooBun` therefore builds from nixpkgs' own
+    # bun expression directly, so no overlay changes it, and `bun` is set to
+    # `smooBun` only where `prev.bun` is still nixpkgs' own derivation: a
+    # repository that builds its own runtime Bun keeps it, while SMOO_LINT_BUN
+    # below always runs `smooBun` so lint and its built-in rules stay one pin
+    # across every managed repository. Where no repository replaces `bun`, `bun`
+    # and `smooBun` are one store path: one Bun, fetched once.
     #
     # `bun --version` of this build prints 1.4.6, the release it precedes, and
     # that is what `packageManager` names. When Bun 1.4.6 is released, pin that
     # release here; `packageManager` then stays as it is.
     (_final: prev: let
-      smooBun = prev.bun.overrideAttrs (finalAttrs: previous: {
+      nixpkgsBun = prev.callPackage (prev.path + "/pkgs/by-name/bu/bun/package.nix") {};
+      smooBun = nixpkgsBun.overrideAttrs (finalAttrs: previous: {
         version = "1.4.5-canary.20261125.1";
         # nixpkgs warns when `version` changes and `src` is not set beside it.
         # Here `src` follows `passthru.sources`, as the derivation defines it.
@@ -241,7 +244,10 @@ in {
           };
       });
     in {
-      bun = smooBun;
+      bun =
+        if (prev.bun.drvPath or null) == nixpkgsBun.drvPath
+        then smooBun
+        else prev.bun;
       inherit smooBun;
     })
   ];

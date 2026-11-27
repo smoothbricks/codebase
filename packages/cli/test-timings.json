@@ -3,6 +3,7 @@
   "files": {
     "src/cli.test.ts": 11177,
     "src/monorepo/setup-environment-links.test.ts": 6616,
+    "src/monorepo/managed-bun-overlay.test.ts": 6300,
     "src/monorepo/setup-environment.test.ts": 5203,
     "src/monorepo/public-denylist.test.ts": 4563,
     "src/monorepo/public-denylist-hooks.test.ts": 4437,
