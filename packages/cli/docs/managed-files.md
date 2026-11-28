@@ -42,10 +42,10 @@ same module. Nix installs the prebuilt executable with the shell; no validation-
 CI puts the same devenv profile bin on PATH, so CI uses the same pin.
 
 The managed module also supplies `bun`, through an overlay on nixpkgs' own `bun` package, so every managed repository
-runs one Bun build. The pin is the daily canary `1.4.5-canary.20261125.1` (Bun commit `0966e99d8`), because no Bun
+runs one Bun build. The pin is the daily canary `1.4.5-canary.20261127.1` (Bun commit `d82a8a7b9`), because no Bun
 release has what the fleet needs. `bun lint` exists in canary builds only (oven-sh/bun#46438). On macOS, Bun 1.4.5 and
 earlier never reap a `Bun.spawn` child whose exit arrives during a nested event-loop tick, so the child stays a zombie
-and its `exited` promise never settles (oven-sh/bun#45365, #45527); Bun main has the fix at `bd92f9bef`, 14 commits
+and its `exited` promise never settles (oven-sh/bun#45365, #45527); Bun main has the fix at `bd92f9bef`, 17 commits
 before the pinned one. The archives are the npm registry's per-platform packages, for the three systems nixpkgs' own
 package has (`@oven/bun-darwin-aarch64`, `@oven/bun-linux-aarch64` and `@oven/bun-linux-x64-baseline`), where a
 published version is immutable and carries its SHA-512; GitHub's `canary` release is a rolling tag and is never fetched.

@@ -255,7 +255,7 @@ in {
     # - On macOS, 1.4.5 and earlier never reap a Bun.spawn child whose exit
     #   arrives during a nested event-loop tick: the child stays a zombie and
     #   `exited` never settles (oven-sh/bun#45365, #45527). Bun main has the fix
-    #   at bd92f9bef; this canary is commit 0966e99d8, 14 commits later.
+    #   at bd92f9bef; this canary is commit d82a8a7b9, 17 commits later.
     #
     # The archives are the npm registry's per-platform packages: a published
     # version is immutable there and the hashes below are the registry's own
@@ -284,7 +284,7 @@ in {
     (_final: prev: let
       nixpkgsBun = prev.callPackage (prev.path + "/pkgs/by-name/bu/bun/package.nix") {};
       smooBun = nixpkgsBun.overrideAttrs (finalAttrs: previous: {
-        version = "1.4.5-canary.20261125.1";
+        version = "1.4.5-canary.20261127.1";
         # nixpkgs warns when `version` changes and `src` is not set beside it.
         # Here `src` follows `passthru.sources`, as the derivation defines it.
         __intentionallyOverridingVersion = true;
@@ -299,17 +299,17 @@ in {
               }) {
               aarch64-darwin = {
                 platform = "darwin-aarch64";
-                hash = "sha512-x4bXdyG94iTFksBIxjg7UJ+4CSM2b5MyJrhs8Kb6glwJUK/RlrAKl6Mr+MHqKlgQkw22PHNJosxzi58vavTnfg==";
+                hash = "sha512-wErlyMFvEHDUBiFyhIMqxIh3UgTBG1B0M9YAi1e9WOz1cBg6gKda4e9WzgSY/3Vu3X/y32ZZqW0BuRlyitLNfQ==";
               };
               aarch64-linux = {
                 platform = "linux-aarch64";
-                hash = "sha512-a6alL6OL/BReQPgcadeyY3dweOS78m7sC8zZyhddiB8q9Ceq8MmymejOrjniv6LQi+R4bCKySgy/VJQImU9T5A==";
+                hash = "sha512-yiC5J03ZGTIFBaVJjh4c5bEcggg1jaHo5aGnGKY8uZUWKCrp9gM+kOQ5wcAPihnfEjlB78VD4LK9C6P5Z6ZlmA==";
               };
               x86_64-linux = {
                 # The baseline build, as nixpkgs' own x86_64-linux source: it
                 # runs on a CPU without AVX2.
                 platform = "linux-x64-baseline";
-                hash = "sha512-YVDDnjDhN2ZQZK65fxppMBOEkZfV63DSE2TDDF5/R4BPV0x97rZEBONBx1TJb5omC37UhMa93M8Cemh3j7Qf2g==";
+                hash = "sha512-OC4tNbC9kTzbiQCG8V0maAxTS4XejZJwJfLQbpURq57dtBOtnaJr/BrQTXU+R4hUp40iMnC3hU6uyU0liO91WQ==";
               };
             };
           };
